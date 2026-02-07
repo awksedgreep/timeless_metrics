@@ -1,8 +1,8 @@
-defmodule MetricStore.SchemaTest do
+defmodule Timeless.SchemaTest do
   use ExUnit.Case, async: true
 
   defmodule TestSchema do
-    use MetricStore.Schema
+    use Timeless.Schema
 
     raw_retention {3, :days}
 
@@ -69,7 +69,7 @@ defmodule MetricStore.SchemaTest do
   end
 
   test "default schema has sensible values" do
-    schema = MetricStore.Schema.default()
+    schema = Timeless.Schema.default()
 
     assert schema.raw_retention_seconds == 7 * 86_400
     assert length(schema.tiers) == 3

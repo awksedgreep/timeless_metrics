@@ -1,4 +1,4 @@
-defmodule MetricStore.Dashboard do
+defmodule Timeless.Dashboard do
   @moduledoc """
   Zero-dependency HTML dashboard generator.
 
@@ -27,15 +27,15 @@ defmodule MetricStore.Dashboard do
     chart_w = Keyword.get(opts, :width, 740)
     chart_h = Keyword.get(opts, :height, 220)
 
-    {:ok, metrics} = MetricStore.list_metrics(store)
-    {:ok, alerts} = MetricStore.list_alerts(store)
+    {:ok, metrics} = Timeless.list_metrics(store)
+    {:ok, alerts} = Timeless.list_alerts(store)
 
     firing_count =
       alerts
       |> Enum.flat_map(& &1.states)
       |> Enum.count(&(&1.state == "firing"))
 
-    info = MetricStore.info(store)
+    info = Timeless.info(store)
 
     label_qs =
       filter
@@ -98,7 +98,7 @@ defmodule MetricStore.Dashboard do
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>MetricStore</title>
+      <title>Timeless</title>
       <style>
         :root { --bg: #f9fafb; --card: #ffffff; --text: #111827; --muted: #6b7280; --border: #e5e7eb; --accent: #2563eb; }
         @media (prefers-color-scheme: dark) {
@@ -131,7 +131,7 @@ defmodule MetricStore.Dashboard do
     </head>
     <body>
       <div class="header">
-        <h1>MetricStore</h1>
+        <h1>Timeless</h1>
         <span class="stats">#{info.series_count} series &middot; #{format_points(info.total_points)} points &middot; #{format_bytes(info.storage_bytes)}</span>
         #{if firing_count > 0, do: ~s(<span class="fire-count"><span class="badge badge-fire">#{firing_count} firing</span></span>), else: ""}
       </div>

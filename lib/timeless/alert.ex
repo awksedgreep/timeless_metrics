@@ -1,4 +1,4 @@
-defmodule MetricStore.Alert do
+defmodule Timeless.Alert do
   @moduledoc """
   Alert engine that evaluates threshold rules against metric data.
 
@@ -28,8 +28,8 @@ defmodule MetricStore.Alert do
     created_at = System.os_time(:second)
 
     {:ok, id} =
-      MetricStore.DB.write_transaction(db, fn conn ->
-        MetricStore.DB.execute(
+      Timeless.DB.write_transaction(db, fn conn ->
+        Timeless.DB.execute(
           conn,
           """
           INSERT INTO alert_rules (name, metric, labels, condition, threshold, duration, aggregate, webhook_url, enabled, created_at)
@@ -38,7 +38,7 @@ defmodule MetricStore.Alert do
           [name, metric, labels, condition, threshold, duration, aggregate, webhook_url, created_at]
         )
 
-        {:ok, [[id]]} = MetricStore.DB.execute(conn, "SELECT last_insert_rowid()", [])
+        {:ok, [[id]]} = Timeless.DB.execute(conn, "SELECT last_insert_rowid()", [])
         id
       end)
 
@@ -50,7 +50,7 @@ defmodule MetricStore.Alert do
   """
   def list_rules(db) do
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         "SELECT id, name, metric, labels, condition, threshold, duration, aggregate, webhook_url, enabled FROM alert_rules ORDER BY id"
       )
@@ -59,7 +59,7 @@ defmodule MetricStore.Alert do
       Enum.map(rows, fn [id, name, metric, labels, condition, threshold, duration, aggregate, webhook_url, enabled] ->
         # Get current state for this rule
         {:ok, state_rows} =
-          MetricStore.DB.read(
+          Timeless.DB.read(
             db,
             "SELECT series_labels, state, triggered_at, last_value FROM alert_state WHERE rule_id = ?1",
             [id]
@@ -97,8 +97,8 @@ defmodule MetricStore.Alert do
   Delete an alert rule and its state.
   """
   def delete_rule(db, rule_id) do
-    MetricStore.DB.write(db, "DELETE FROM alert_state WHERE rule_id = ?1", [rule_id])
-    MetricStore.DB.write(db, "DELETE FROM alert_rules WHERE id = ?1", [rule_id])
+    Timeless.DB.write(db, "DELETE FROM alert_state WHERE rule_id = ?1", [rule_id])
+    Timeless.DB.write(db, "DELETE FROM alert_rules WHERE id = ?1", [rule_id])
     :ok
   end
 
@@ -126,7 +126,7 @@ defmodule MetricStore.Alert do
     agg = String.to_existing_atom(rule.aggregate)
 
     {:ok, results} =
-      MetricStore.query_aggregate_multi(store, rule.metric, label_filter,
+      Timeless.query_aggregate_multi(store, rule.metric, label_filter,
         from: now - lookback,
         to: now,
         bucket: {lookback, :seconds},
@@ -155,7 +155,7 @@ defmodule MetricStore.Alert do
 
   defp update_state(db, rule, series_key, labels, value, breaching, now) do
     {:ok, current_rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         "SELECT state, triggered_at FROM alert_state WHERE rule_id = ?1 AND series_labels = ?2",
         [rule.id, series_key]
@@ -218,7 +218,7 @@ defmodule MetricStore.Alert do
 
     resolved_at = if new_state == "resolved", do: now, else: nil
 
-    MetricStore.DB.write(
+    Timeless.DB.write(
       db,
       """
       INSERT OR REPLACE INTO alert_state (rule_id, series_labels, state, triggered_at, resolved_at, last_value)

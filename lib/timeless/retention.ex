@@ -1,4 +1,4 @@
-defmodule MetricStore.Retention do
+defmodule Timeless.Retention do
   @moduledoc """
   Tier-aware retention enforcer.
 
@@ -60,7 +60,7 @@ defmodule MetricStore.Retention do
       raw_cutoff = now - state.schema.raw_retention_seconds
 
       {:ok, _} =
-        MetricStore.DB.write(
+        Timeless.DB.write(
           state.db,
           "DELETE FROM raw_segments WHERE end_time < ?1",
           [raw_cutoff]
@@ -73,7 +73,7 @@ defmodule MetricStore.Retention do
         cutoff = now - tier.retention_seconds
 
         {:ok, _} =
-          MetricStore.DB.write(
+          Timeless.DB.write(
             state.db,
             "DELETE FROM #{tier.table_name} WHERE bucket < ?1",
             [cutoff]
@@ -88,7 +88,7 @@ defmodule MetricStore.Retention do
     counter = state.vacuum_counter + 1
 
     if rem(counter, @vacuum_every) == 0 do
-      MetricStore.DB.write(state.db, "PRAGMA incremental_vacuum(1000)", [])
+      Timeless.DB.write(state.db, "PRAGMA incremental_vacuum(1000)", [])
     end
 
     %{state | vacuum_counter: counter}
@@ -107,7 +107,7 @@ defmodule MetricStore.Retention do
     )
     """
 
-    MetricStore.DB.write(state.db, sql, [])
+    Timeless.DB.write(state.db, sql, [])
   end
 
   defp schedule_tick(interval) do

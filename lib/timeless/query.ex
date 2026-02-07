@@ -1,4 +1,4 @@
-defmodule MetricStore.Query do
+defmodule Timeless.Query do
   @moduledoc """
   Query engine with automatic tier selection.
 
@@ -19,7 +19,7 @@ defmodule MetricStore.Query do
     compression = Keyword.get(opts, :compression, :zstd)
 
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         """
         SELECT data, start_time, end_time
@@ -44,7 +44,7 @@ defmodule MetricStore.Query do
       end)
 
     :telemetry.execute(
-      [:metric_store, :query, :raw],
+      [:timeless, :query, :raw],
       %{duration_us: us, point_count: length(points), segment_count: length(rows)},
       %{series_id: series_id}
     )
@@ -84,7 +84,7 @@ defmodule MetricStore.Query do
     table = "tier_#{tier_name}"
 
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         """
         SELECT bucket, avg, min, max, count, sum, last
@@ -113,7 +113,7 @@ defmodule MetricStore.Query do
 
     # Try raw first
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         """
         SELECT data
@@ -200,7 +200,7 @@ defmodule MetricStore.Query do
 
   defp get_watermark(db, tier_name) do
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         "SELECT last_bucket FROM _watermarks WHERE tier = ?1",
         [to_string(tier_name)]
@@ -229,7 +229,7 @@ defmodule MetricStore.Query do
 
   defp aggregate_from_rollup_tier(db, tier, series_id, from, to, bucket_seconds, agg_fn) do
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         """
         SELECT bucket, avg, min, max, count, sum, last
@@ -340,7 +340,7 @@ defmodule MetricStore.Query do
 
   defp latest_from_tier(db, table_name, series_id) do
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         "SELECT bucket, last FROM #{table_name} WHERE series_id = ?1 ORDER BY bucket DESC LIMIT 1",
         [series_id]

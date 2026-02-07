@@ -1,11 +1,11 @@
-defmodule MetricStore.RollupTest do
+defmodule Timeless.RollupTest do
   use ExUnit.Case, async: false
 
-  @data_dir "/tmp/metric_store_rollup_test_#{System.os_time(:millisecond)}"
+  @data_dir "/tmp/timeless_rollup_test_#{System.os_time(:millisecond)}"
 
   setup do
     start_supervised!(
-      {MetricStore,
+      {Timeless,
        name: :rollup_test,
        data_dir: @data_dir,
        buffer_shards: 1,
@@ -13,7 +13,7 @@ defmodule MetricStore.RollupTest do
     )
 
     on_exit(fn ->
-      :persistent_term.erase({MetricStore, :rollup_test, :schema})
+      :persistent_term.erase({Timeless, :rollup_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -27,19 +27,19 @@ defmodule MetricStore.RollupTest do
 
     # Write 12 points (every 5 minutes) in a past hour
     for i <- 0..11 do
-      MetricStore.write(:rollup_test, "cpu", %{"host" => "a"}, 10.0 + i,
+      Timeless.write(:rollup_test, "cpu", %{"host" => "a"}, 10.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    MetricStore.flush(:rollup_test)
+    Timeless.flush(:rollup_test)
 
     # Run rollup
-    MetricStore.rollup(:rollup_test)
+    Timeless.rollup(:rollup_test)
 
     # Read hourly tier
     {:ok, rows} =
-      MetricStore.query_tier(:rollup_test, :hourly, "cpu", %{"host" => "a"},
+      Timeless.query_tier(:rollup_test, :hourly, "cpu", %{"host" => "a"},
         from: hour_start - 3600,
         to: hour_start + 7200
       )
@@ -65,21 +65,21 @@ defmodule MetricStore.RollupTest do
       hour_start = day_start + hour * 3600
 
       for i <- 0..5 do
-        MetricStore.write(:rollup_test, "temp", %{"sensor" => "1"}, 20.0 + hour + i * 0.1,
+        Timeless.write(:rollup_test, "temp", %{"sensor" => "1"}, 20.0 + hour + i * 0.1,
           timestamp: hour_start + i * 300
         )
       end
     end
 
-    MetricStore.flush(:rollup_test)
+    Timeless.flush(:rollup_test)
 
     # Run hourly rollup first, then daily
-    MetricStore.rollup(:rollup_test, :hourly)
-    MetricStore.rollup(:rollup_test, :daily)
+    Timeless.rollup(:rollup_test, :hourly)
+    Timeless.rollup(:rollup_test, :daily)
 
     # Read daily tier
     {:ok, daily_rows} =
-      MetricStore.query_tier(:rollup_test, :daily, "temp", %{"sensor" => "1"},
+      Timeless.query_tier(:rollup_test, :daily, "temp", %{"sensor" => "1"},
         from: day_start - 86_400,
         to: day_start + 172_800
       )
@@ -99,19 +99,19 @@ defmodule MetricStore.RollupTest do
     hour_start = div(now - 7200, 3600) * 3600
 
     for i <- 0..5 do
-      MetricStore.write(:rollup_test, "gauge", %{"id" => "1"}, 50.0 + i,
+      Timeless.write(:rollup_test, "gauge", %{"id" => "1"}, 50.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    MetricStore.flush(:rollup_test)
+    Timeless.flush(:rollup_test)
 
     # Run rollup twice
-    MetricStore.rollup(:rollup_test, :hourly)
-    MetricStore.rollup(:rollup_test, :hourly)
+    Timeless.rollup(:rollup_test, :hourly)
+    Timeless.rollup(:rollup_test, :hourly)
 
     {:ok, rows} =
-      MetricStore.query_tier(:rollup_test, :hourly, "gauge", %{"id" => "1"},
+      Timeless.query_tier(:rollup_test, :hourly, "gauge", %{"id" => "1"},
         from: hour_start - 3600,
         to: hour_start + 7200
       )
@@ -125,17 +125,17 @@ defmodule MetricStore.RollupTest do
     hour_start = div(now - 7200, 3600) * 3600
 
     for i <- 0..11 do
-      MetricStore.write(:rollup_test, "net", %{"if" => "eth0"}, 100.0 + i * 10,
+      Timeless.write(:rollup_test, "net", %{"if" => "eth0"}, 100.0 + i * 10,
         timestamp: hour_start + i * 300
       )
     end
 
-    MetricStore.flush(:rollup_test)
-    MetricStore.rollup(:rollup_test, :hourly)
+    Timeless.flush(:rollup_test)
+    Timeless.rollup(:rollup_test, :hourly)
 
     # Query with hourly bucket — should use the rollup tier
     {:ok, buckets} =
-      MetricStore.query_aggregate(:rollup_test, "net", %{"if" => "eth0"},
+      Timeless.query_aggregate(:rollup_test, "net", %{"if" => "eth0"},
         from: hour_start - 3600,
         to: hour_start + 7200,
         bucket: :hour,
@@ -151,17 +151,17 @@ defmodule MetricStore.RollupTest do
 
     # Write initial data and rollup
     for i <- 0..5 do
-      MetricStore.write(:rollup_test, "late_metric", %{"id" => "1"}, 10.0 + i,
+      Timeless.write(:rollup_test, "late_metric", %{"id" => "1"}, 10.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    MetricStore.flush(:rollup_test)
-    MetricStore.rollup(:rollup_test, :hourly)
+    Timeless.flush(:rollup_test)
+    Timeless.rollup(:rollup_test, :hourly)
 
     # Verify initial rollup
     {:ok, [initial_row]} =
-      MetricStore.query_tier(:rollup_test, :hourly, "late_metric", %{"id" => "1"},
+      Timeless.query_tier(:rollup_test, :hourly, "late_metric", %{"id" => "1"},
         from: hour_start - 3600,
         to: hour_start + 7200
       )
@@ -170,17 +170,17 @@ defmodule MetricStore.RollupTest do
     assert_in_delta initial_row.avg, 12.5, 0.01
 
     # Now a "late" point arrives for the already-rolled-up hour
-    MetricStore.write(:rollup_test, "late_metric", %{"id" => "1"}, 100.0,
+    Timeless.write(:rollup_test, "late_metric", %{"id" => "1"}, 100.0,
       timestamp: hour_start + 1800
     )
 
-    MetricStore.flush(:rollup_test)
+    Timeless.flush(:rollup_test)
 
     # Normal rollup won't pick it up (watermark already advanced)
-    MetricStore.rollup(:rollup_test, :hourly)
+    Timeless.rollup(:rollup_test, :hourly)
 
     {:ok, [still_old]} =
-      MetricStore.query_tier(:rollup_test, :hourly, "late_metric", %{"id" => "1"},
+      Timeless.query_tier(:rollup_test, :hourly, "late_metric", %{"id" => "1"},
         from: hour_start - 3600,
         to: hour_start + 7200
       )
@@ -189,10 +189,10 @@ defmodule MetricStore.RollupTest do
     assert still_old.count == 6
 
     # Run the late-arrival catch-up
-    MetricStore.catch_up(:rollup_test)
+    Timeless.catch_up(:rollup_test)
 
     {:ok, [updated_row]} =
-      MetricStore.query_tier(:rollup_test, :hourly, "late_metric", %{"id" => "1"},
+      Timeless.query_tier(:rollup_test, :hourly, "late_metric", %{"id" => "1"},
         from: hour_start - 3600,
         to: hour_start + 7200
       )
@@ -214,7 +214,7 @@ defmodule MetricStore.RollupTest do
 
     for {hour_start, base_val} <- [{old_hour_1, 10.0}, {old_hour_2, 20.0}, {old_hour_3, 30.0}] do
       for i <- 0..5 do
-        MetricStore.write(:rollup_test, "stitch", %{"id" => "1"}, base_val + i,
+        Timeless.write(:rollup_test, "stitch", %{"id" => "1"}, base_val + i,
           timestamp: hour_start + i * 300
         )
       end
@@ -224,17 +224,17 @@ defmodule MetricStore.RollupTest do
     current_hour = div(now, 3600) * 3600
 
     for i <- 0..2 do
-      MetricStore.write(:rollup_test, "stitch", %{"id" => "1"}, 50.0 + i,
+      Timeless.write(:rollup_test, "stitch", %{"id" => "1"}, 50.0 + i,
         timestamp: current_hour + i * 300
       )
     end
 
-    MetricStore.flush(:rollup_test)
-    MetricStore.rollup(:rollup_test, :hourly)
+    Timeless.flush(:rollup_test)
+    Timeless.rollup(:rollup_test, :hourly)
 
     # Query spanning old (rolled up) + current (raw only) hours
     {:ok, buckets} =
-      MetricStore.query_aggregate(:rollup_test, "stitch", %{"id" => "1"},
+      Timeless.query_aggregate(:rollup_test, "stitch", %{"id" => "1"},
         from: old_hour_1,
         to: current_hour + 3600,
         bucket: :hour,

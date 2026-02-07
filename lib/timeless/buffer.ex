@@ -1,4 +1,4 @@
-defmodule MetricStore.Buffer do
+defmodule Timeless.Buffer do
   @moduledoc """
   Sharded ETS write buffer.
 
@@ -49,7 +49,7 @@ defmodule MetricStore.Buffer do
 
       {:error, :backpressure} = err ->
         :telemetry.execute(
-          [:metric_store, :write, :backpressure],
+          [:timeless, :write, :backpressure],
           %{count: 1},
           %{shard: shard_name}
         )
@@ -160,12 +160,12 @@ defmodule MetricStore.Buffer do
         |> Enum.group_by(&elem(&1, 0), fn {_sid, ts, val} -> {ts, val} end)
 
       :telemetry.execute(
-        [:metric_store, :buffer, :flush],
+        [:timeless, :buffer, :flush],
         %{point_count: length(points), series_count: map_size(grouped)},
         %{shard: state.shard_id}
       )
 
-      MetricStore.SegmentBuilder.ingest(state.segment_builder, grouped)
+      Timeless.SegmentBuilder.ingest(state.segment_builder, grouped)
     end
   end
 
@@ -188,7 +188,7 @@ defmodule MetricStore.Buffer do
         end)
         |> Enum.group_by(&elem(&1, 0), fn {_sid, ts, val} -> {ts, val} end)
 
-      MetricStore.SegmentBuilder.ingest_sync(state.segment_builder, grouped)
+      Timeless.SegmentBuilder.ingest_sync(state.segment_builder, grouped)
     end
   end
 

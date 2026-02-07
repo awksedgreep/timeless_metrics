@@ -1,11 +1,11 @@
-defmodule MetricStore.MetadataRateTest do
+defmodule Timeless.MetadataRateTest do
   use ExUnit.Case, async: false
 
-  @data_dir "/tmp/metric_store_meta_test_#{System.os_time(:millisecond)}"
+  @data_dir "/tmp/timeless_meta_test_#{System.os_time(:millisecond)}"
 
   setup do
     start_supervised!(
-      {MetricStore,
+      {Timeless,
        name: :meta_test,
        data_dir: @data_dir,
        buffer_shards: 1,
@@ -13,7 +13,7 @@ defmodule MetricStore.MetadataRateTest do
     )
 
     on_exit(fn ->
-      :persistent_term.erase({MetricStore, :meta_test, :schema})
+      :persistent_term.erase({Timeless, :meta_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -23,8 +23,8 @@ defmodule MetricStore.MetadataRateTest do
   # --- Metadata ---
 
   test "register and retrieve metric metadata" do
-    MetricStore.register_metric(:meta_test, "cpu_usage", :gauge, unit: "%", description: "CPU utilization")
-    {:ok, meta} = MetricStore.get_metadata(:meta_test, "cpu_usage")
+    Timeless.register_metric(:meta_test, "cpu_usage", :gauge, unit: "%", description: "CPU utilization")
+    {:ok, meta} = Timeless.get_metadata(:meta_test, "cpu_usage")
 
     assert meta.type == :gauge
     assert meta.unit == "%"
@@ -32,15 +32,15 @@ defmodule MetricStore.MetadataRateTest do
   end
 
   test "get_metadata returns nil for unregistered metric" do
-    {:ok, meta} = MetricStore.get_metadata(:meta_test, "nonexistent")
+    {:ok, meta} = Timeless.get_metadata(:meta_test, "nonexistent")
     assert meta == nil
   end
 
   test "register_metric upserts" do
-    MetricStore.register_metric(:meta_test, "bytes_in", :counter, unit: "bytes")
-    MetricStore.register_metric(:meta_test, "bytes_in", :counter, unit: "bytes/s", description: "Inbound traffic")
+    Timeless.register_metric(:meta_test, "bytes_in", :counter, unit: "bytes")
+    Timeless.register_metric(:meta_test, "bytes_in", :counter, unit: "bytes/s", description: "Inbound traffic")
 
-    {:ok, meta} = MetricStore.get_metadata(:meta_test, "bytes_in")
+    {:ok, meta} = Timeless.get_metadata(:meta_test, "bytes_in")
     assert meta.unit == "bytes/s"
     assert meta.description == "Inbound traffic"
   end
@@ -56,13 +56,13 @@ defmodule MetricStore.MetadataRateTest do
         description: "Disk utilization"
       }))
       |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> MetricStore.HTTP.call(store: :meta_test)
+      |> Timeless.HTTP.call(store: :meta_test)
 
     assert conn.status == 200
 
     conn =
       Plug.Test.conn(:get, "/api/v1/metadata?metric=disk_usage")
-      |> MetricStore.HTTP.call(store: :meta_test)
+      |> Timeless.HTTP.call(store: :meta_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -77,7 +77,7 @@ defmodule MetricStore.MetadataRateTest do
         type: "invalid"
       }))
       |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> MetricStore.HTTP.call(store: :meta_test)
+      |> Timeless.HTTP.call(store: :meta_test)
 
     assert conn.status == 400
   end
@@ -85,7 +85,7 @@ defmodule MetricStore.MetadataRateTest do
   test "GET /api/v1/metadata returns default gauge for unregistered metric" do
     conn =
       Plug.Test.conn(:get, "/api/v1/metadata?metric=unknown_metric")
-      |> MetricStore.HTTP.call(store: :meta_test)
+      |> Timeless.HTTP.call(store: :meta_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -102,15 +102,15 @@ defmodule MetricStore.MetadataRateTest do
     # Monotonically increasing counter: 0, 100, 200, 300, 400, 500
     # 100 units per 60 seconds = 1.667/s
     for i <- 0..5 do
-      MetricStore.write(:meta_test, "bytes_in", %{"if" => "eth0"}, i * 100.0,
+      Timeless.write(:meta_test, "bytes_in", %{"if" => "eth0"}, i * 100.0,
         timestamp: base + i * 60
       )
     end
 
-    MetricStore.flush(:meta_test)
+    Timeless.flush(:meta_test)
 
     {:ok, buckets} =
-      MetricStore.query_aggregate(:meta_test, "bytes_in", %{"if" => "eth0"},
+      Timeless.query_aggregate(:meta_test, "bytes_in", %{"if" => "eth0"},
         from: base,
         to: base + 360,
         bucket: {300, :seconds},
@@ -131,15 +131,15 @@ defmodule MetricStore.MetadataRateTest do
     values = [100.0, 200.0, 300.0, 50.0, 150.0, 250.0]
 
     for {val, i} <- Enum.with_index(values) do
-      MetricStore.write(:meta_test, "counter_reset", %{"id" => "1"}, val,
+      Timeless.write(:meta_test, "counter_reset", %{"id" => "1"}, val,
         timestamp: base + i * 60
       )
     end
 
-    MetricStore.flush(:meta_test)
+    Timeless.flush(:meta_test)
 
     {:ok, buckets} =
-      MetricStore.query_aggregate(:meta_test, "counter_reset", %{"id" => "1"},
+      Timeless.query_aggregate(:meta_test, "counter_reset", %{"id" => "1"},
         from: base,
         to: base + 360,
         bucket: {360, :seconds},
@@ -159,16 +159,16 @@ defmodule MetricStore.MetadataRateTest do
     base = div(now, 60) * 60
 
     for i <- 0..9 do
-      MetricStore.write(:meta_test, "http_rate", %{"host" => "web-1"}, i * 1000.0,
+      Timeless.write(:meta_test, "http_rate", %{"host" => "web-1"}, i * 1000.0,
         timestamp: base + i * 60
       )
     end
 
-    MetricStore.flush(:meta_test)
+    Timeless.flush(:meta_test)
 
     conn =
       Plug.Test.conn(:get, "/api/v1/query_range?metric=http_rate&host=web-1&from=#{base}&to=#{base + 600}&step=600&aggregate=rate")
-      |> MetricStore.HTTP.call(store: :meta_test)
+      |> Timeless.HTTP.call(store: :meta_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -184,14 +184,14 @@ defmodule MetricStore.MetadataRateTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    MetricStore.write(:meta_test, "single_point", %{"id" => "1"}, 42.0,
+    Timeless.write(:meta_test, "single_point", %{"id" => "1"}, 42.0,
       timestamp: base
     )
 
-    MetricStore.flush(:meta_test)
+    Timeless.flush(:meta_test)
 
     {:ok, buckets} =
-      MetricStore.query_aggregate(:meta_test, "single_point", %{"id" => "1"},
+      Timeless.query_aggregate(:meta_test, "single_point", %{"id" => "1"},
         from: base,
         to: base + 60,
         bucket: {60, :seconds},

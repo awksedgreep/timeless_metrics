@@ -1,14 +1,14 @@
-# MetricStore - Embedded Time Series Storage for Elixir
+# Timeless - Embedded Time Series Storage for Elixir
 
 ## Overview
 
-MetricStore is an embedded time series database library for Elixir applications.
+Timeless is an embedded time series database library for Elixir applications.
 It combines Gorilla compression (via `gorilla_stream`) with SQLite/libsql for
 storage, providing automatic rollups, configurable retention, and microsecond
 query latency with zero external dependencies.
 
 **Design principles:**
-- Embedded library, not a service — `use MetricStore` and go
+- Embedded library, not a service — `use Timeless` and go
 - Zero network hops — ETS write buffer, local SQLite storage
 - Declarative configuration — define tiers once, the engine handles the rest
 - Compression first — gorilla + zstd achieves ~2 bytes/sample
@@ -70,7 +70,7 @@ query latency with zero external dependencies.
 defmodule MyApp.Application do
   def start(_type, _args) do
     children = [
-      {MetricStore, name: :metrics, data_dir: "/var/lib/myapp/metrics"}
+      {Timeless, name: :metrics, data_dir: "/var/lib/myapp/metrics"}
     ]
     Supervisor.start_link(children, strategy: :one_for_one)
   end
@@ -81,31 +81,31 @@ end
 
 ```elixir
 # Single point
-MetricStore.write(:metrics, "cpu_usage", %{device_id: 42, host: "router-7"}, 73.2)
+Timeless.write(:metrics, "cpu_usage", %{device_id: 42, host: "router-7"}, 73.2)
 
 # Batch write (preferred for throughput)
-MetricStore.write_batch(:metrics, [
+Timeless.write_batch(:metrics, [
   {"cpu_usage",    %{device_id: 42}, 73.2},
   {"memory_used",  %{device_id: 42}, 4_812_000},
   {"if_in_octets", %{device_id: 42, interface: "eth0"}, 1_293_847}
 ])
 
 # Write with explicit timestamp (unix seconds)
-MetricStore.write(:metrics, "cpu_usage", %{device_id: 42}, 73.2, timestamp: 1_707_300_000)
+Timeless.write(:metrics, "cpu_usage", %{device_id: 42}, 73.2, timestamp: 1_707_300_000)
 ```
 
 ### Querying
 
 ```elixir
 # Raw points for a series (auto-selects best tier based on time range)
-MetricStore.query(:metrics, "cpu_usage", %{device_id: 42},
+Timeless.query(:metrics, "cpu_usage", %{device_id: 42},
   from: ~U[2025-01-01 00:00:00Z],
   to:   ~U[2025-01-02 00:00:00Z]
 )
 # => {:ok, [{1735689600, 73.2}, {1735689900, 71.8}, ...]}
 
 # Aggregated query
-MetricStore.query(:metrics, "cpu_usage", %{device_id: 42},
+Timeless.query(:metrics, "cpu_usage", %{device_id: 42},
   from: ~U[2025-01-01 00:00:00Z],
   to:   ~U[2025-01-07 00:00:00Z],
   aggregate: :avg,
@@ -114,13 +114,13 @@ MetricStore.query(:metrics, "cpu_usage", %{device_id: 42},
 # => {:ok, [%{bucket: 1735689600, avg: 72.4}, ...]}
 
 # Latest value across all devices
-MetricStore.query(:metrics, "cpu_usage", %{},
+Timeless.query(:metrics, "cpu_usage", %{},
   aggregate: :last
 )
 # => {:ok, [%{device_id: 42, last: 73.2}, %{device_id: 43, last: 68.1}, ...]}
 
 # Multi-aggregate
-MetricStore.query(:metrics, "cpu_usage", %{device_id: 42},
+Timeless.query(:metrics, "cpu_usage", %{device_id: 42},
   from: ~U[2025-01-01 00:00:00Z],
   to:   ~U[2025-01-31 00:00:00Z],
   aggregate: [:avg, :min, :max, :p95],
@@ -132,7 +132,7 @@ MetricStore.query(:metrics, "cpu_usage", %{device_id: 42},
 
 ```elixir
 # Runtime stats
-MetricStore.info(:metrics)
+Timeless.info(:metrics)
 # => %{
 #      series_count: 100_000,
 #      raw_segments: 12_340,
@@ -143,10 +143,10 @@ MetricStore.info(:metrics)
 #    }
 
 # Force a rollup (normally automatic)
-MetricStore.rollup(:metrics, :hourly)
+Timeless.rollup(:metrics, :hourly)
 
 # Force retention enforcement
-MetricStore.enforce_retention(:metrics)
+Timeless.enforce_retention(:metrics)
 ```
 
 ---
@@ -157,7 +157,7 @@ MetricStore.enforce_retention(:metrics)
 
 ```elixir
 defmodule MyApp.MetricSchema do
-  use MetricStore.Schema
+  use Timeless.Schema
 
   # How incoming writes are identified
   series_key [:metric_name, :device_id]
@@ -201,7 +201,7 @@ end
 Then reference it at startup:
 
 ```elixir
-{MetricStore, name: :metrics, schema: MyApp.MetricSchema, data_dir: "/var/lib/myapp/metrics"}
+{Timeless, name: :metrics, schema: MyApp.MetricSchema, data_dir: "/var/lib/myapp/metrics"}
 ```
 
 ### Runtime Configuration (application config)
@@ -210,7 +210,7 @@ For simpler setups without a schema module:
 
 ```elixir
 # config/config.exs
-config :metric_store, :default,
+config :timeless, :default,
   data_dir: "/var/lib/myapp/metrics",
   series_key: [:metric_name, :device_id],
   segment_duration: :timer.hours(1),
@@ -308,7 +308,7 @@ on insert — if it fires, we look up the existing id.
 
 ## Internal Components
 
-### 1. Write Buffer (`MetricStore.Buffer`)
+### 1. Write Buffer (`Timeless.Buffer`)
 
 - **Implementation:** Sharded ETS tables, one per scheduler
 - **Sharding:** `series_id |> rem(shard_count)` routes writes to the correct shard
@@ -318,7 +318,7 @@ on insert — if it fires, we look up the existing id.
   `write/4` returns `{:error, :backpressure}` so callers can buffer or drop
 
 ```elixir
-defmodule MetricStore.Buffer do
+defmodule Timeless.Buffer do
   use GenServer
 
   # Each shard owns one ETS table
@@ -331,7 +331,7 @@ defmodule MetricStore.Buffer do
 end
 ```
 
-### 2. Segment Builder (`MetricStore.SegmentBuilder`)
+### 2. Segment Builder (`Timeless.SegmentBuilder`)
 
 - **Receives** flushed points grouped by series_id
 - **Accumulates** points into per-series accumulators until a segment boundary is crossed
@@ -340,7 +340,7 @@ end
 - **Registers** new series in the `series` table on first encounter
 
 ```elixir
-defmodule MetricStore.SegmentBuilder do
+defmodule Timeless.SegmentBuilder do
   use GenServer
 
   # State holds in-progress segments:
@@ -353,7 +353,7 @@ defmodule MetricStore.SegmentBuilder do
 end
 ```
 
-### 3. Rollup Engine (`MetricStore.Rollup`)
+### 3. Rollup Engine (`Timeless.Rollup`)
 
 - **Schedule:** Runs every `rollup_interval` (default 5 minutes)
 - **Incremental:** Reads watermark, processes only new data since last run
@@ -362,7 +362,7 @@ end
 - **Ordered:** Processes tiers bottom-up (hourly first, then daily, then monthly)
 
 ```elixir
-defmodule MetricStore.Rollup do
+defmodule Timeless.Rollup do
   use GenServer
 
   def handle_info(:tick, state) do
@@ -409,7 +409,7 @@ defp aggregate_from_tier(rows) do
 end
 ```
 
-### 4. Retention Enforcer (`MetricStore.Retention`)
+### 4. Retention Enforcer (`Timeless.Retention`)
 
 - **Schedule:** Runs every `retention_interval` (default 1 hour)
 - **Per-tier cleanup:** Deletes rows older than the tier's configured retention
@@ -417,7 +417,7 @@ end
 - **Orphan cleanup:** Removes entries from `series` table when no data remains
 
 ```elixir
-defmodule MetricStore.Retention do
+defmodule Timeless.Retention do
   use GenServer
 
   def handle_info(:enforce, state) do
@@ -452,13 +452,13 @@ defmodule MetricStore.Retention do
 end
 ```
 
-### 5. Query Router (`MetricStore.Query`)
+### 5. Query Router (`Timeless.Query`)
 
 The query router automatically selects the best data source based on the
 requested time range and resolution:
 
 ```elixir
-defmodule MetricStore.Query do
+defmodule Timeless.Query do
 
   def execute(store, metric_name, labels, opts) do
     from = opts[:from]
@@ -504,20 +504,20 @@ end
 ## Supervision Tree
 
 ```
-MetricStore.Supervisor (:metrics)
-├── MetricStore.DB                    # Exqlite connection pool (SQLite)
-├── MetricStore.SeriesRegistry        # ETS table mapping series keys to IDs
-├── MetricStore.Buffer.Supervisor     # DynamicSupervisor for buffer shards
-│   ├── MetricStore.Buffer.Shard_0
-│   ├── MetricStore.Buffer.Shard_1
+Timeless.Supervisor (:metrics)
+├── Timeless.DB                    # Exqlite connection pool (SQLite)
+├── Timeless.SeriesRegistry        # ETS table mapping series keys to IDs
+├── Timeless.Buffer.Supervisor     # DynamicSupervisor for buffer shards
+│   ├── Timeless.Buffer.Shard_0
+│   ├── Timeless.Buffer.Shard_1
 │   ├── ...
-│   └── MetricStore.Buffer.Shard_N
-├── MetricStore.SegmentBuilder        # Compresses and writes segments
-├── MetricStore.Rollup                # Periodic rollup engine
-└── MetricStore.Retention             # Periodic retention enforcer
+│   └── Timeless.Buffer.Shard_N
+├── Timeless.SegmentBuilder        # Compresses and writes segments
+├── Timeless.Rollup                # Periodic rollup engine
+└── Timeless.Retention             # Periodic retention enforcer
 ```
 
-Each named MetricStore instance (`:metrics`, `:logs`, etc.) gets its own
+Each named Timeless instance (`:metrics`, `:logs`, etc.) gets its own
 supervision tree, its own SQLite database file, and its own ETS tables.
 Multiple instances can coexist in the same application.
 
@@ -529,7 +529,7 @@ SQLite has a single-writer constraint. We handle this with a dedicated writer
 and concurrent readers:
 
 ```elixir
-defmodule MetricStore.DB do
+defmodule Timeless.DB do
   # One write connection (serialized through a GenServer)
   # N read connections (pool, concurrent via WAL mode)
 
@@ -615,12 +615,12 @@ Based on gorilla_stream benchmarks and our DDNet benchmark data:
 
 ## Horizontal Scaling (Future)
 
-When a single node isn't enough, MetricStore partitions across an Erlang cluster
+When a single node isn't enough, Timeless partitions across an Erlang cluster
 using consistent hashing on `series_id`:
 
 ```
                     ┌──────────────────────────────────────┐
-  write_metric() ──►  MetricStore.Router                   │
+  write_metric() ──►  Timeless.Router                   │
                     │  series_id = hash(metric, labels)    │
                     │  node = ConsistentHash.lookup(id)    │
                     └─────┬──────────┬──────────┬──────────┘
@@ -662,10 +662,10 @@ optional dependency (recommended). No Ecto, no Phoenix, no external services.
 ## Project Structure
 
 ```
-metric_store/
+timeless/
 ├── lib/
-│   ├── metric_store.ex                  # Public API facade
-│   ├── metric_store/
+│   ├── timeless.ex                  # Public API facade
+│   ├── timeless/
 │   │   ├── schema.ex                    # DSL macro for compile-time config
 │   │   ├── config.ex                    # Runtime config normalization
 │   │   ├── supervisor.ex                # Top-level supervisor
@@ -681,8 +681,8 @@ metric_store/
 │   │   ├── retention.ex                 # Retention enforcer + vacuum
 │   │   └── query.ex                     # Query router + tier selection
 ├── test/
-│   ├── metric_store_test.exs            # Integration tests
-│   ├── metric_store/
+│   ├── timeless_test.exs            # Integration tests
+│   ├── timeless/
 │   │   ├── buffer_test.exs
 │   │   ├── segment_builder_test.exs
 │   │   ├── rollup_test.exs
@@ -702,20 +702,20 @@ metric_store/
 
 ### Phase 1: Core Storage (MVP)
 - [ ] Project scaffold, mix.exs, deps
-- [ ] `MetricStore.DB` — SQLite connection with WAL mode, migrations
-- [ ] `MetricStore.SeriesRegistry` — series ID assignment and lookup
-- [ ] `MetricStore.Buffer` — sharded ETS write buffer with flush
-- [ ] `MetricStore.SegmentBuilder` — gorilla encode + write to SQLite
-- [ ] `MetricStore.Query` — read raw segments, decompress, return points
-- [ ] `MetricStore` — public API facade (`write/4`, `query/4`, `info/1`)
+- [ ] `Timeless.DB` — SQLite connection with WAL mode, migrations
+- [ ] `Timeless.SeriesRegistry` — series ID assignment and lookup
+- [ ] `Timeless.Buffer` — sharded ETS write buffer with flush
+- [ ] `Timeless.SegmentBuilder` — gorilla encode + write to SQLite
+- [ ] `Timeless.Query` — read raw segments, decompress, return points
+- [ ] `Timeless` — public API facade (`write/4`, `query/4`, `info/1`)
 - [ ] Basic tests
 
-**Milestone:** `MetricStore.write()` and `MetricStore.query()` work end-to-end.
+**Milestone:** `Timeless.write()` and `Timeless.query()` work end-to-end.
 
 ### Phase 2: Rollups & Retention
-- [ ] `MetricStore.Schema` — declarative tier DSL
-- [ ] `MetricStore.Rollup` — incremental rollup engine with watermarks
-- [ ] `MetricStore.Retention` — tier-aware retention + vacuum
+- [ ] `Timeless.Schema` — declarative tier DSL
+- [ ] `Timeless.Rollup` — incremental rollup engine with watermarks
+- [ ] `Timeless.Retention` — tier-aware retention + vacuum
 - [ ] Query router — automatic tier selection based on time range
 - [ ] Cross-tier query stitching
 
@@ -725,7 +725,7 @@ metric_store/
 - [ ] Backpressure on write path
 - [ ] Segment builder crash recovery (re-read unflushed ETS on restart)
 - [ ] Telemetry integration (`:telemetry.execute` for write/query/rollup events)
-- [ ] `MetricStore.info/1` with live stats
+- [ ] `Timeless.info/1` with live stats
 - [ ] Benchmarks: write throughput, query latency, compression ratios
 - [ ] Property-based tests for compression round-trip correctness
 

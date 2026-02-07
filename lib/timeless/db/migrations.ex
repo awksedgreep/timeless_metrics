@@ -1,4 +1,4 @@
-defmodule MetricStore.DB.Migrations do
+defmodule Timeless.DB.Migrations do
   @moduledoc false
 
   def run(conn) do

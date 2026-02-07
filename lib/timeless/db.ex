@@ -1,4 +1,4 @@
-defmodule MetricStore.DB do
+defmodule Timeless.DB do
   @moduledoc """
   SQLite connection manager with a single writer and pooled readers.
 
@@ -133,7 +133,7 @@ defmodule MetricStore.DB do
   end
 
   defp run_migrations(conn) do
-    MetricStore.DB.Migrations.run(conn)
+    Timeless.DB.Migrations.run(conn)
   end
 
   @doc false

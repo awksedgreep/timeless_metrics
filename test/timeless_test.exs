@@ -1,10 +1,10 @@
-defmodule MetricStoreTest do
+defmodule TimelessTest do
   use ExUnit.Case, async: false
 
-  @data_dir "/tmp/metric_store_test_#{System.os_time(:millisecond)}"
+  @data_dir "/tmp/timeless_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!({MetricStore, name: :test_store, data_dir: @data_dir, buffer_shards: 2})
+    start_supervised!({Timeless, name: :test_store, data_dir: @data_dir, buffer_shards: 2})
     on_exit(fn -> File.rm_rf!(@data_dir) end)
     :ok
   end
@@ -14,16 +14,16 @@ defmodule MetricStoreTest do
 
     # Write 10 points spread across time
     for i <- 0..9 do
-      MetricStore.write(:test_store, "cpu_usage", %{"host" => "web-1"}, 50.0 + i,
+      Timeless.write(:test_store, "cpu_usage", %{"host" => "web-1"}, 50.0 + i,
         timestamp: now - 3600 + i * 60
       )
     end
 
     # Flush to disk
-    MetricStore.flush(:test_store)
+    Timeless.flush(:test_store)
 
     # Query them back
-    {:ok, points} = MetricStore.query(:test_store, "cpu_usage", %{"host" => "web-1"},
+    {:ok, points} = Timeless.query(:test_store, "cpu_usage", %{"host" => "web-1"},
       from: now - 7200,
       to: now
     )
@@ -41,10 +41,10 @@ defmodule MetricStoreTest do
         {"memory_used", %{"host" => "db-1"}, 1000.0 + i * 100, now - 300 + i * 60}
       end
 
-    MetricStore.write_batch(:test_store, entries)
-    MetricStore.flush(:test_store)
+    Timeless.write_batch(:test_store, entries)
+    Timeless.flush(:test_store)
 
-    {:ok, points} = MetricStore.query(:test_store, "memory_used", %{"host" => "db-1"},
+    {:ok, points} = Timeless.query(:test_store, "memory_used", %{"host" => "db-1"},
       from: now - 600,
       to: now
     )
@@ -58,14 +58,14 @@ defmodule MetricStoreTest do
     hour_start = div(now, 3600) * 3600
 
     for i <- 0..5 do
-      MetricStore.write(:test_store, "temp", %{"sensor" => "a"}, 20.0 + i,
+      Timeless.write(:test_store, "temp", %{"sensor" => "a"}, 20.0 + i,
         timestamp: hour_start + i * 60
       )
     end
 
-    MetricStore.flush(:test_store)
+    Timeless.flush(:test_store)
 
-    {:ok, buckets} = MetricStore.query_aggregate(:test_store, "temp", %{"sensor" => "a"},
+    {:ok, buckets} = Timeless.query_aggregate(:test_store, "temp", %{"sensor" => "a"},
       from: hour_start - 3600,
       to: hour_start + 3600,
       bucket: :hour,
@@ -81,24 +81,24 @@ defmodule MetricStoreTest do
   test "latest value" do
     now = System.os_time(:second)
 
-    MetricStore.write(:test_store, "gauge", %{"id" => "1"}, 100.0, timestamp: now - 60)
-    MetricStore.write(:test_store, "gauge", %{"id" => "1"}, 200.0, timestamp: now)
-    MetricStore.flush(:test_store)
+    Timeless.write(:test_store, "gauge", %{"id" => "1"}, 100.0, timestamp: now - 60)
+    Timeless.write(:test_store, "gauge", %{"id" => "1"}, 200.0, timestamp: now)
+    Timeless.flush(:test_store)
 
-    {:ok, {_ts, val}} = MetricStore.latest(:test_store, "gauge", %{"id" => "1"})
+    {:ok, {_ts, val}} = Timeless.latest(:test_store, "gauge", %{"id" => "1"})
     assert val == 200.0
   end
 
   test "separate series by labels" do
     now = System.os_time(:second)
 
-    MetricStore.write(:test_store, "cpu", %{"host" => "a"}, 10.0, timestamp: now)
-    MetricStore.write(:test_store, "cpu", %{"host" => "b"}, 90.0, timestamp: now)
-    MetricStore.flush(:test_store)
+    Timeless.write(:test_store, "cpu", %{"host" => "a"}, 10.0, timestamp: now)
+    Timeless.write(:test_store, "cpu", %{"host" => "b"}, 90.0, timestamp: now)
+    Timeless.flush(:test_store)
 
-    {:ok, points_a} = MetricStore.query(:test_store, "cpu", %{"host" => "a"},
+    {:ok, points_a} = Timeless.query(:test_store, "cpu", %{"host" => "a"},
       from: now - 60, to: now + 60)
-    {:ok, points_b} = MetricStore.query(:test_store, "cpu", %{"host" => "b"},
+    {:ok, points_b} = Timeless.query(:test_store, "cpu", %{"host" => "b"},
       from: now - 60, to: now + 60)
 
     assert [{_, 10.0}] = points_a
@@ -109,12 +109,12 @@ defmodule MetricStoreTest do
     now = System.os_time(:second)
 
     for i <- 1..5 do
-      MetricStore.write(:test_store, "metric_#{i}", %{"id" => "1"}, i * 1.0, timestamp: now)
+      Timeless.write(:test_store, "metric_#{i}", %{"id" => "1"}, i * 1.0, timestamp: now)
     end
 
-    MetricStore.flush(:test_store)
+    Timeless.flush(:test_store)
 
-    info = MetricStore.info(:test_store)
+    info = Timeless.info(:test_store)
     assert info.series_count == 5
     assert info.total_points == 5
     assert info.segment_count >= 1
@@ -127,24 +127,24 @@ defmodule MetricStoreTest do
 
     # Write points but do NOT call flush — data sits in the ETS buffer
     for i <- 0..4 do
-      MetricStore.write(:test_store, "shutdown_test", %{"id" => "1"}, i * 10.0,
+      Timeless.write(:test_store, "shutdown_test", %{"id" => "1"}, i * 10.0,
         timestamp: now + i
       )
     end
 
     # Stop the store (triggers terminate callbacks)
-    stop_supervised!({MetricStore, :test_store})
+    stop_supervised!({Timeless, :test_store})
 
     # Restart the store with the same data_dir
-    start_supervised!({MetricStore, name: :test_store, data_dir: @data_dir, buffer_shards: 2})
+    start_supervised!({Timeless, name: :test_store, data_dir: @data_dir, buffer_shards: 2})
 
     # The builder should have received the flush from terminate
     # Give the segment builder a moment to write to SQLite
     Process.sleep(200)
-    MetricStore.flush(:test_store)
+    Timeless.flush(:test_store)
 
     {:ok, points} =
-      MetricStore.query(:test_store, "shutdown_test", %{"id" => "1"},
+      Timeless.query(:test_store, "shutdown_test", %{"id" => "1"},
         from: now - 60,
         to: now + 60
       )
@@ -160,13 +160,13 @@ defmodule MetricStoreTest do
       for i <- 0..99 do
         ts = now - 5000 + i * 10
         val = :math.sin(i / 10) * 50 + 50
-        MetricStore.write(:test_store, "sine", %{"ch" => "0"}, val, timestamp: ts)
+        Timeless.write(:test_store, "sine", %{"ch" => "0"}, val, timestamp: ts)
         {ts, val}
       end
 
-    MetricStore.flush(:test_store)
+    Timeless.flush(:test_store)
 
-    {:ok, actual} = MetricStore.query(:test_store, "sine", %{"ch" => "0"},
+    {:ok, actual} = Timeless.query(:test_store, "sine", %{"ch" => "0"},
       from: now - 6000, to: now)
 
     assert length(actual) == 100

@@ -1,4 +1,4 @@
-defmodule MetricStore.Rollup do
+defmodule Timeless.Rollup do
   @moduledoc """
   Incremental rollup engine.
 
@@ -76,7 +76,7 @@ defmodule MetricStore.Rollup do
     # Evaluate alert rules after rollup
     if state.store do
       try do
-        MetricStore.Alert.evaluate(state.store)
+        Timeless.Alert.evaluate(state.store)
       rescue
         e -> Logger.warning("Alert evaluation failed: #{inspect(e)}")
       end
@@ -135,7 +135,7 @@ defmodule MetricStore.Rollup do
         end)
 
       :telemetry.execute(
-        [:metric_store, :rollup, :complete],
+        [:timeless, :rollup, :complete],
         %{duration_us: us},
         %{tier: tier.name, watermark: watermark, up_to: current_bucket}
       )
@@ -147,7 +147,7 @@ defmodule MetricStore.Rollup do
   defp rollup_from_raw(tier, watermark, up_to, state) do
     # Read raw segments that overlap with the rollup window
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         state.db,
         """
         SELECT series_id, start_time, end_time, data
@@ -174,7 +174,7 @@ defmodule MetricStore.Rollup do
       |> Enum.group_by(&elem(&1, 0))
 
     # Compute aggregates per series per bucket
-    MetricStore.DB.write_transaction(state.db, fn conn ->
+    Timeless.DB.write_transaction(state.db, fn conn ->
       Enum.each(points_by_series, fn {series_id, series_points} ->
         series_points
         |> Enum.group_by(fn {_sid, ts, _val} -> bucket_floor(ts, tier.resolution_seconds) end)
@@ -190,7 +190,7 @@ defmodule MetricStore.Rollup do
   defp rollup_from_tier(tier, source_tier, watermark, up_to, state) do
     # Read from source tier's table
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         state.db,
         """
         SELECT series_id, bucket, avg, min, max, count, sum, last
@@ -217,7 +217,7 @@ defmodule MetricStore.Rollup do
     end)
     |> Enum.group_by(& &1.series_id)
     |> then(fn grouped ->
-      MetricStore.DB.write_transaction(state.db, fn conn ->
+      Timeless.DB.write_transaction(state.db, fn conn ->
         Enum.each(grouped, fn {series_id, series_rows} ->
           series_rows
           |> Enum.group_by(fn row -> bucket_floor(row.bucket, tier.resolution_seconds) end)
@@ -256,7 +256,7 @@ defmodule MetricStore.Rollup do
             end)
 
           :telemetry.execute(
-            [:metric_store, :rollup, :late_catch_up],
+            [:timeless, :rollup, :late_catch_up],
             %{duration_us: us},
             %{tier: tier.name, scan_from: scan_from, watermark: watermark}
           )
@@ -297,7 +297,7 @@ defmodule MetricStore.Rollup do
   # --- SQLite Helpers ---
 
   defp write_rollup_row(conn, table_name, series_id, bucket, aggs) do
-    MetricStore.DB.execute(
+    Timeless.DB.execute(
       conn,
       """
       INSERT OR REPLACE INTO #{table_name} (series_id, bucket, avg, min, max, count, sum, last)
@@ -309,7 +309,7 @@ defmodule MetricStore.Rollup do
 
   defp init_watermarks(state) do
     Enum.each(state.schema.tiers, fn tier ->
-      MetricStore.DB.write(
+      Timeless.DB.write(
         state.db,
         "INSERT OR IGNORE INTO _watermarks (tier, last_bucket) VALUES (?1, 0)",
         [to_string(tier.name)]
@@ -319,7 +319,7 @@ defmodule MetricStore.Rollup do
 
   defp get_watermark(db, tier_name) do
     {:ok, rows} =
-      MetricStore.DB.read(db, "SELECT last_bucket FROM _watermarks WHERE tier = ?1", [
+      Timeless.DB.read(db, "SELECT last_bucket FROM _watermarks WHERE tier = ?1", [
         to_string(tier_name)
       ])
 
@@ -330,7 +330,7 @@ defmodule MetricStore.Rollup do
   end
 
   defp set_watermark(db, tier_name, bucket) do
-    MetricStore.DB.write(
+    Timeless.DB.write(
       db,
       "INSERT OR REPLACE INTO _watermarks (tier, last_bucket) VALUES (?1, ?2)",
       [to_string(tier_name), bucket]

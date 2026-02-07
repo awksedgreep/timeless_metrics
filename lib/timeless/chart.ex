@@ -1,4 +1,4 @@
-defmodule MetricStore.Chart do
+defmodule Timeless.Chart do
   @moduledoc """
   Pure-Elixir SVG chart generator for time series data.
 
@@ -12,7 +12,7 @@ defmodule MetricStore.Chart do
         %{labels: %{"host" => "web-2"}, data: [{1700000000, 81.0}, {1700000060, 79.5}]}
       ]
 
-      svg = MetricStore.Chart.render("cpu_usage", data, width: 800, height: 300)
+      svg = Timeless.Chart.render("cpu_usage", data, width: 800, height: 300)
   """
 
   @default_width 800

@@ -1,4 +1,4 @@
-defmodule MetricStore.SegmentBuilder do
+defmodule Timeless.SegmentBuilder do
   @moduledoc """
   Accumulates points per series and writes gorilla-compressed segments to SQLite.
 
@@ -149,7 +149,7 @@ defmodule MetricStore.SegmentBuilder do
   end
 
   defp write_segments(segments, state) do
-    MetricStore.DB.write_transaction(state.db, fn conn ->
+    Timeless.DB.write_transaction(state.db, fn conn ->
       Enum.each(segments, fn seg ->
         # Sort points by timestamp for optimal gorilla compression
         sorted_points = Enum.sort_by(seg.points, &elem(&1, 0))
@@ -160,7 +160,7 @@ defmodule MetricStore.SegmentBuilder do
             {first_ts, _} = List.first(sorted_points)
             {last_ts, _} = List.last(sorted_points)
 
-            MetricStore.DB.execute(
+            Timeless.DB.execute(
               conn,
               """
               INSERT OR REPLACE INTO raw_segments (series_id, start_time, end_time, point_count, data)
@@ -170,7 +170,7 @@ defmodule MetricStore.SegmentBuilder do
             )
 
             :telemetry.execute(
-              [:metric_store, :segment, :write],
+              [:timeless, :segment, :write],
               %{point_count: point_count, compressed_bytes: byte_size(blob)},
               %{series_id: seg.series_id}
             )

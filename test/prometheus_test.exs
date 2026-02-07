@@ -1,11 +1,11 @@
-defmodule MetricStore.PrometheusTest do
+defmodule Timeless.PrometheusTest do
   use ExUnit.Case, async: false
 
-  @data_dir "/tmp/metric_store_prom_test_#{System.os_time(:millisecond)}"
+  @data_dir "/tmp/timeless_prom_test_#{System.os_time(:millisecond)}"
 
   setup do
     start_supervised!(
-      {MetricStore,
+      {Timeless,
        name: :prom_test,
        data_dir: @data_dir,
        buffer_shards: 1,
@@ -13,7 +13,7 @@ defmodule MetricStore.PrometheusTest do
     )
 
     on_exit(fn ->
-      :persistent_term.erase({MetricStore, :prom_test, :schema})
+      :persistent_term.erase({Timeless, :prom_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -34,13 +34,13 @@ defmodule MetricStore.PrometheusTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> MetricStore.HTTP.call(store: :prom_test)
+      |> Timeless.HTTP.call(store: :prom_test)
 
     assert conn.status == 204
 
-    MetricStore.flush(:prom_test)
+    Timeless.flush(:prom_test)
 
-    {:ok, results} = MetricStore.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
+    {:ok, results} = Timeless.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
     assert length(results) == 2
 
     web1 = Enum.find(results, fn %{labels: l} -> l["host"] == "web-1" end)
@@ -58,13 +58,13 @@ defmodule MetricStore.PrometheusTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> MetricStore.HTTP.call(store: :prom_test)
+      |> Timeless.HTTP.call(store: :prom_test)
 
     assert conn.status == 204
 
-    MetricStore.flush(:prom_test)
+    Timeless.flush(:prom_test)
 
-    {:ok, results} = MetricStore.query_multi(:prom_test, "up", %{}, from: now_s - 60, to: now_s + 60)
+    {:ok, results} = Timeless.query_multi(:prom_test, "up", %{}, from: now_s - 60, to: now_s + 60)
     assert length(results) == 1
     [{_ts, val}] = List.first(results).points
     assert_in_delta val, 1.0, 0.01
@@ -84,13 +84,13 @@ defmodule MetricStore.PrometheusTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> MetricStore.HTTP.call(store: :prom_test)
+      |> Timeless.HTTP.call(store: :prom_test)
 
     assert conn.status == 204
 
-    MetricStore.flush(:prom_test)
+    Timeless.flush(:prom_test)
 
-    {:ok, results} = MetricStore.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
+    {:ok, results} = Timeless.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
     assert length(results) == 1
   end
 
@@ -100,14 +100,14 @@ defmodule MetricStore.PrometheusTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> MetricStore.HTTP.call(store: :prom_test)
+      |> Timeless.HTTP.call(store: :prom_test)
 
     assert conn.status == 204
 
-    MetricStore.flush(:prom_test)
+    Timeless.flush(:prom_test)
 
     now = System.os_time(:second)
-    {:ok, results} = MetricStore.query_multi(:prom_test, "my_gauge", %{}, from: now - 10, to: now + 10)
+    {:ok, results} = Timeless.query_multi(:prom_test, "my_gauge", %{}, from: now - 10, to: now + 10)
     assert length(results) == 1
   end
 
@@ -121,7 +121,7 @@ defmodule MetricStore.PrometheusTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> MetricStore.HTTP.call(store: :prom_test)
+      |> Timeless.HTTP.call(store: :prom_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -136,16 +136,16 @@ defmodule MetricStore.PrometheusTest do
     base = div(now, 60) * 60
 
     for i <- 0..9 do
-      MetricStore.write(:prom_test, "cpu_usage", %{"host" => "web-1"}, 50.0 + i,
+      Timeless.write(:prom_test, "cpu_usage", %{"host" => "web-1"}, 50.0 + i,
         timestamp: base + i * 60
       )
     end
 
-    MetricStore.flush(:prom_test)
+    Timeless.flush(:prom_test)
 
     conn =
       Plug.Test.conn(:get, "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=60")
-      |> MetricStore.HTTP.call(store: :prom_test)
+      |> Timeless.HTTP.call(store: :prom_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -173,21 +173,21 @@ defmodule MetricStore.PrometheusTest do
     base = div(now, 60) * 60
 
     for i <- 0..5 do
-      MetricStore.write(:prom_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
+      Timeless.write(:prom_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
         timestamp: base + i * 60
       )
 
-      MetricStore.write(:prom_test, "cpu_usage", %{"host" => "web-2"}, 70.0,
+      Timeless.write(:prom_test, "cpu_usage", %{"host" => "web-2"}, 70.0,
         timestamp: base + i * 60
       )
     end
 
-    MetricStore.flush(:prom_test)
+    Timeless.flush(:prom_test)
 
     # Query with PromQL-style label filter
     conn =
       Plug.Test.conn(:get, ~s(/prometheus/api/v1/query_range?query=cpu_usage%7Bhost%3D%22web-1%22%7D&start=#{base}&end=#{base + 600}&step=60))
-      |> MetricStore.HTTP.call(store: :prom_test)
+      |> Timeless.HTTP.call(store: :prom_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -201,16 +201,16 @@ defmodule MetricStore.PrometheusTest do
     base = div(now, 60) * 60
 
     for i <- 0..5 do
-      MetricStore.write(:prom_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
+      Timeless.write(:prom_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
         timestamp: base + i * 60
       )
     end
 
-    MetricStore.flush(:prom_test)
+    Timeless.flush(:prom_test)
 
     conn =
       Plug.Test.conn(:get, "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=5m")
-      |> MetricStore.HTTP.call(store: :prom_test)
+      |> Timeless.HTTP.call(store: :prom_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -223,7 +223,7 @@ defmodule MetricStore.PrometheusTest do
   test "prometheus query_range returns error for missing query" do
     conn =
       Plug.Test.conn(:get, "/prometheus/api/v1/query_range?start=1000&end=2000&step=60")
-      |> MetricStore.HTTP.call(store: :prom_test)
+      |> Timeless.HTTP.call(store: :prom_test)
 
     assert conn.status == 400
     result = Jason.decode!(conn.resp_body)

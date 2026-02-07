@@ -1,11 +1,11 @@
-defmodule MetricStore.Schema do
+defmodule Timeless.Schema do
   @moduledoc """
   Declarative DSL for defining metric storage tiers, retention, and rollup schedules.
 
   ## Example
 
       defmodule MyApp.MetricSchema do
-        use MetricStore.Schema
+        use Timeless.Schema
 
         raw_retention {7, :days}
 
@@ -25,9 +25,9 @@ defmodule MetricStore.Schema do
           retention: :forever
       end
 
-  Then pass it to MetricStore:
+  Then pass it to Timeless:
 
-      {MetricStore, name: :metrics, data_dir: "/data", schema: MyApp.MetricSchema}
+      {Timeless, name: :metrics, data_dir: "/data", schema: MyApp.MetricSchema}
   """
 
   defstruct [
@@ -45,13 +45,13 @@ defmodule MetricStore.Schema do
   @doc false
   defmacro __using__(_opts) do
     quote do
-      import MetricStore.Schema, only: [raw_retention: 1, tier: 2, rollup_interval: 1, retention_interval: 1]
+      import Timeless.Schema, only: [raw_retention: 1, tier: 2, rollup_interval: 1, retention_interval: 1]
       Module.register_attribute(__MODULE__, :tiers, accumulate: true)
       Module.put_attribute(__MODULE__, :raw_retention, {7, :days})
       Module.put_attribute(__MODULE__, :rollup_interval_ms, :timer.minutes(5))
       Module.put_attribute(__MODULE__, :retention_interval_ms, :timer.hours(1))
 
-      @before_compile MetricStore.Schema
+      @before_compile Timeless.Schema
     end
   end
 
@@ -64,19 +64,19 @@ defmodule MetricStore.Schema do
 
     quote do
       def __schema__ do
-        %MetricStore.Schema{
-          raw_retention_seconds: MetricStore.Schema.duration_to_seconds(unquote(Macro.escape(raw_ret))),
+        %Timeless.Schema{
+          raw_retention_seconds: Timeless.Schema.duration_to_seconds(unquote(Macro.escape(raw_ret))),
           rollup_interval: unquote(rollup_int),
           retention_interval: unquote(retention_int),
           tiers:
             unquote(
               Macro.escape(
                 Enum.map(tiers, fn {name, opts} ->
-                  %MetricStore.Schema.Tier{
+                  %Timeless.Schema.Tier{
                     name: name,
-                    resolution_seconds: MetricStore.Schema.resolution_to_seconds(opts[:resolution]),
+                    resolution_seconds: Timeless.Schema.resolution_to_seconds(opts[:resolution]),
                     aggregates: opts[:aggregates] || [:avg, :min, :max, :count, :sum, :last],
-                    retention_seconds: MetricStore.Schema.duration_to_seconds(opts[:retention]),
+                    retention_seconds: Timeless.Schema.duration_to_seconds(opts[:retention]),
                     table_name: "tier_#{name}"
                   }
                 end)

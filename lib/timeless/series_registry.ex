@@ -1,4 +1,4 @@
-defmodule MetricStore.SeriesRegistry do
+defmodule Timeless.SeriesRegistry do
   @moduledoc """
   ETS-backed series ID lookup and registration.
 
@@ -74,7 +74,7 @@ defmodule MetricStore.SeriesRegistry do
 
         # Try to insert; if UNIQUE conflict, fetch existing
         result =
-          MetricStore.DB.write(
+          Timeless.DB.write(
             state.db,
             "INSERT INTO series (metric_name, labels, created_at) VALUES (?1, ?2, ?3) ON CONFLICT(metric_name, labels) DO UPDATE SET created_at = created_at RETURNING id",
             [metric_name, labels_json, now]
@@ -93,7 +93,7 @@ defmodule MetricStore.SeriesRegistry do
   # --- Internals ---
 
   defp load_from_db(table, db) do
-    {:ok, rows} = MetricStore.DB.read(db, "SELECT id, metric_name, labels FROM series")
+    {:ok, rows} = Timeless.DB.read(db, "SELECT id, metric_name, labels FROM series")
 
     Enum.each(rows, fn [id, metric_name, labels_json] ->
       labels = decode_labels(labels_json)

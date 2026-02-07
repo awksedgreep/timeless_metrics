@@ -1,13 +1,13 @@
-defmodule MetricStore.EdgeCasesTest do
+defmodule Timeless.EdgeCasesTest do
   use ExUnit.Case, async: false
 
-  @data_dir "/tmp/metric_store_edge_test_#{System.os_time(:millisecond)}"
+  @data_dir "/tmp/timeless_edge_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!({MetricStore, name: :edge_test, data_dir: @data_dir, buffer_shards: 1})
+    start_supervised!({Timeless, name: :edge_test, data_dir: @data_dir, buffer_shards: 1})
 
     on_exit(fn ->
-      :persistent_term.erase({MetricStore, :edge_test, :schema})
+      :persistent_term.erase({Timeless, :edge_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -15,18 +15,18 @@ defmodule MetricStore.EdgeCasesTest do
   end
 
   test "query on empty store returns empty list" do
-    {:ok, points} = MetricStore.query(:edge_test, "nonexistent", %{"id" => "1"})
+    {:ok, points} = Timeless.query(:edge_test, "nonexistent", %{"id" => "1"})
     assert points == []
   end
 
   test "latest on empty store returns nil" do
-    {:ok, result} = MetricStore.latest(:edge_test, "nonexistent", %{"id" => "1"})
+    {:ok, result} = Timeless.latest(:edge_test, "nonexistent", %{"id" => "1"})
     assert result == nil
   end
 
   test "query_aggregate on empty store returns empty list" do
     {:ok, buckets} =
-      MetricStore.query_aggregate(:edge_test, "nonexistent", %{"id" => "1"},
+      Timeless.query_aggregate(:edge_test, "nonexistent", %{"id" => "1"},
         from: 0,
         to: System.os_time(:second),
         bucket: :hour,
@@ -38,21 +38,21 @@ defmodule MetricStore.EdgeCasesTest do
 
   test "single point write and query" do
     now = System.os_time(:second)
-    MetricStore.write(:edge_test, "solo", %{"id" => "1"}, 42.0, timestamp: now)
-    MetricStore.flush(:edge_test)
+    Timeless.write(:edge_test, "solo", %{"id" => "1"}, 42.0, timestamp: now)
+    Timeless.flush(:edge_test)
 
-    {:ok, points} = MetricStore.query(:edge_test, "solo", %{"id" => "1"}, from: now - 60, to: now + 60)
+    {:ok, points} = Timeless.query(:edge_test, "solo", %{"id" => "1"}, from: now - 60, to: now + 60)
     assert [{^now, 42.0}] = points
   end
 
   test "duplicate timestamps are preserved" do
     now = System.os_time(:second)
 
-    MetricStore.write(:edge_test, "dup", %{"id" => "1"}, 10.0, timestamp: now)
-    MetricStore.write(:edge_test, "dup", %{"id" => "1"}, 20.0, timestamp: now)
-    MetricStore.flush(:edge_test)
+    Timeless.write(:edge_test, "dup", %{"id" => "1"}, 10.0, timestamp: now)
+    Timeless.write(:edge_test, "dup", %{"id" => "1"}, 20.0, timestamp: now)
+    Timeless.flush(:edge_test)
 
-    {:ok, points} = MetricStore.query(:edge_test, "dup", %{"id" => "1"}, from: now - 60, to: now + 60)
+    {:ok, points} = Timeless.query(:edge_test, "dup", %{"id" => "1"}, from: now - 60, to: now + 60)
     # Both points should be stored (gorilla allows duplicate timestamps)
     assert length(points) == 2
   end
@@ -60,12 +60,12 @@ defmodule MetricStore.EdgeCasesTest do
   test "very large values" do
     now = System.os_time(:second)
 
-    MetricStore.write(:edge_test, "big", %{"id" => "1"}, 1.0e15, timestamp: now)
-    MetricStore.write(:edge_test, "big", %{"id" => "1"}, -1.0e15, timestamp: now + 1)
-    MetricStore.write(:edge_test, "big", %{"id" => "1"}, 0.0, timestamp: now + 2)
-    MetricStore.flush(:edge_test)
+    Timeless.write(:edge_test, "big", %{"id" => "1"}, 1.0e15, timestamp: now)
+    Timeless.write(:edge_test, "big", %{"id" => "1"}, -1.0e15, timestamp: now + 1)
+    Timeless.write(:edge_test, "big", %{"id" => "1"}, 0.0, timestamp: now + 2)
+    Timeless.flush(:edge_test)
 
-    {:ok, points} = MetricStore.query(:edge_test, "big", %{"id" => "1"}, from: now - 60, to: now + 60)
+    {:ok, points} = Timeless.query(:edge_test, "big", %{"id" => "1"}, from: now - 60, to: now + 60)
     assert length(points) == 3
     [{_, v1}, {_, v2}, {_, v3}] = points
     assert_in_delta v1, 1.0e15, 1.0e10
@@ -77,12 +77,12 @@ defmodule MetricStore.EdgeCasesTest do
     now = System.os_time(:second)
 
     for i <- 0..9 do
-      MetricStore.write(:edge_test, "zeros", %{"id" => "1"}, 0.0, timestamp: now + i)
+      Timeless.write(:edge_test, "zeros", %{"id" => "1"}, 0.0, timestamp: now + i)
     end
 
-    MetricStore.flush(:edge_test)
+    Timeless.flush(:edge_test)
 
-    {:ok, points} = MetricStore.query(:edge_test, "zeros", %{"id" => "1"}, from: now - 60, to: now + 60)
+    {:ok, points} = Timeless.query(:edge_test, "zeros", %{"id" => "1"}, from: now - 60, to: now + 60)
     assert length(points) == 10
     assert Enum.all?(points, fn {_ts, v} -> v == 0.0 end)
   end
@@ -90,10 +90,10 @@ defmodule MetricStore.EdgeCasesTest do
   test "empty labels map" do
     now = System.os_time(:second)
 
-    MetricStore.write(:edge_test, "no_labels", %{}, 99.0, timestamp: now)
-    MetricStore.flush(:edge_test)
+    Timeless.write(:edge_test, "no_labels", %{}, 99.0, timestamp: now)
+    Timeless.flush(:edge_test)
 
-    {:ok, points} = MetricStore.query(:edge_test, "no_labels", %{}, from: now - 60, to: now + 60)
+    {:ok, points} = Timeless.query(:edge_test, "no_labels", %{}, from: now - 60, to: now + 60)
     assert [{^now, 99.0}] = points
   end
 
@@ -101,17 +101,17 @@ defmodule MetricStore.EdgeCasesTest do
     now = System.os_time(:second)
 
     for i <- 1..100 do
-      MetricStore.write(:edge_test, "shared_metric", %{"id" => "#{i}"}, i * 1.0, timestamp: now)
+      Timeless.write(:edge_test, "shared_metric", %{"id" => "#{i}"}, i * 1.0, timestamp: now)
     end
 
-    MetricStore.flush(:edge_test)
+    Timeless.flush(:edge_test)
 
     # Each should be its own series
-    info = MetricStore.info(:edge_test)
+    info = Timeless.info(:edge_test)
     assert info.series_count == 100
 
     # Query one specific series
-    {:ok, points} = MetricStore.query(:edge_test, "shared_metric", %{"id" => "50"}, from: now - 60, to: now + 60)
+    {:ok, points} = Timeless.query(:edge_test, "shared_metric", %{"id" => "50"}, from: now - 60, to: now + 60)
     assert [{^now, 50.0}] = points
   end
 
@@ -130,13 +130,13 @@ defmodule MetricStore.EdgeCasesTest do
         for i <- 0..99 do
           ts = now - 500 + i * 5
           val = gen_fn.(i)
-          MetricStore.write(:edge_test, "pattern_#{name}", %{"t" => "1"}, val, timestamp: ts)
+          Timeless.write(:edge_test, "pattern_#{name}", %{"t" => "1"}, val, timestamp: ts)
           {ts, val}
         end
 
-      MetricStore.flush(:edge_test)
+      Timeless.flush(:edge_test)
 
-      {:ok, actual} = MetricStore.query(:edge_test, "pattern_#{name}", %{"t" => "1"}, from: now - 600, to: now)
+      {:ok, actual} = Timeless.query(:edge_test, "pattern_#{name}", %{"t" => "1"}, from: now - 600, to: now)
       assert length(actual) == 100, "Pattern #{name}: expected 100 points, got #{length(actual)}"
 
       Enum.zip(expected, actual)
@@ -148,7 +148,7 @@ defmodule MetricStore.EdgeCasesTest do
   end
 
   test "info includes tier stats" do
-    info = MetricStore.info(:edge_test)
+    info = Timeless.info(:edge_test)
 
     assert is_map(info.tiers)
     assert Map.has_key?(info.tiers, :hourly)
@@ -163,10 +163,10 @@ defmodule MetricStore.EdgeCasesTest do
 
   test "rollup with no data is a no-op" do
     # Should not crash
-    assert :ok = MetricStore.rollup(:edge_test)
+    assert :ok = Timeless.rollup(:edge_test)
   end
 
   test "enforce_retention with no data is a no-op" do
-    assert :ok = MetricStore.enforce_retention(:edge_test)
+    assert :ok = Timeless.enforce_retention(:edge_test)
   end
 end

@@ -1,14 +1,14 @@
-defmodule MetricStore.HTTP do
+defmodule Timeless.HTTP do
   @moduledoc """
   Optional HTTP ingest interface compatible with VictoriaMetrics JSON line import format.
 
   ## Usage
 
-  Add to your supervision tree alongside MetricStore:
+  Add to your supervision tree alongside Timeless:
 
       children = [
-        {MetricStore, name: :metrics, data_dir: "/var/lib/metrics"},
-        {MetricStore.HTTP, store: :metrics, port: 8428}
+        {Timeless, name: :metrics, data_dir: "/var/lib/metrics"},
+        {Timeless.HTTP, store: :metrics, port: 8428}
       ]
 
   ## Endpoints
@@ -83,20 +83,20 @@ defmodule MetricStore.HTTP do
 
   @impl Plug
   def call(conn, opts) do
-    conn = Plug.Conn.put_private(conn, :metric_store, Keyword.get(opts, :store))
+    conn = Plug.Conn.put_private(conn, :timeless, Keyword.get(opts, :store))
     super(conn, opts)
   end
 
   # VictoriaMetrics JSON line import
   post "/api/v1/import" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
 
     case Plug.Conn.read_body(conn, length: @max_body_bytes) do
       {:ok, body, conn} ->
         {count, errors} = ingest_json_lines(store, body)
 
         :telemetry.execute(
-          [:metric_store, :http, :import],
+          [:timeless, :http, :import],
           %{sample_count: count, error_count: errors},
           %{store: store}
         )
@@ -123,8 +123,8 @@ defmodule MetricStore.HTTP do
 
   # Health check with store stats
   get "/health" do
-    store = conn.private.metric_store
-    info = MetricStore.info(store)
+    store = conn.private.timeless
+    info = Timeless.info(store)
 
     body =
       Jason.encode!(%{
@@ -143,12 +143,12 @@ defmodule MetricStore.HTTP do
 
   # Export raw points in VictoriaMetrics JSON line format (multi-series)
   get "/api/v1/export" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_query_params(conn.query_params) do
       {:ok, metric, labels, from, to} ->
-        {:ok, results} = MetricStore.query_multi(store, metric, labels, from: from, to: to)
+        {:ok, results} = Timeless.query_multi(store, metric, labels, from: from, to: to)
 
         body =
           results
@@ -174,12 +174,12 @@ defmodule MetricStore.HTTP do
 
   # Latest value for matching series
   get "/api/v1/query" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_metric_and_labels(conn.query_params) do
       {:ok, metric, labels} ->
-        {:ok, results} = MetricStore.query_multi(store, metric, labels)
+        {:ok, results} = Timeless.query_multi(store, metric, labels)
 
         data =
           results
@@ -207,7 +207,7 @@ defmodule MetricStore.HTTP do
 
   # Range query with bucketed aggregation (multi-series)
   get "/api/v1/query_range" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_query_params(conn.query_params) do
@@ -217,7 +217,7 @@ defmodule MetricStore.HTTP do
         agg = parse_aggregate(params["aggregate"])
 
         {:ok, results} =
-          MetricStore.query_aggregate_multi(store, metric, labels,
+          Timeless.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
@@ -240,8 +240,8 @@ defmodule MetricStore.HTTP do
 
   # List all metric names
   get "/api/v1/label/__name__/values" do
-    store = conn.private.metric_store
-    {:ok, metrics} = MetricStore.list_metrics(store)
+    store = conn.private.timeless
+    {:ok, metrics} = Timeless.list_metrics(store)
 
     conn
     |> put_resp_content_type("application/json")
@@ -250,13 +250,13 @@ defmodule MetricStore.HTTP do
 
   # List values for a specific label key
   get "/api/v1/label/:name/values" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
     label_name = conn.path_params["name"]
     metric = conn.query_params["metric"]
 
     if metric do
-      {:ok, values} = MetricStore.label_values(store, metric, label_name)
+      {:ok, values} = Timeless.label_values(store, metric, label_name)
 
       conn
       |> put_resp_content_type("application/json")
@@ -268,7 +268,7 @@ defmodule MetricStore.HTTP do
 
   # List all series for a metric
   get "/api/v1/series" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
 
     case conn.query_params["metric"] do
@@ -276,7 +276,7 @@ defmodule MetricStore.HTTP do
         json_error(conn, 400, "missing required parameter: metric")
 
       metric ->
-        {:ok, series} = MetricStore.list_series(store, metric)
+        {:ok, series} = Timeless.list_series(store, metric)
 
         conn
         |> put_resp_content_type("application/json")
@@ -286,13 +286,13 @@ defmodule MetricStore.HTTP do
 
   # Register or update metric metadata
   post "/api/v1/metadata" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
         case Jason.decode(body) do
           {:ok, %{"metric" => metric, "type" => type} = params} when type in ~w(gauge counter histogram) ->
-            MetricStore.register_metric(store, metric, String.to_existing_atom(type),
+            Timeless.register_metric(store, metric, String.to_existing_atom(type),
               unit: params["unit"],
               description: params["description"]
             )
@@ -315,7 +315,7 @@ defmodule MetricStore.HTTP do
 
   # Get metric metadata
   get "/api/v1/metadata" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
 
     case conn.query_params["metric"] do
@@ -323,7 +323,7 @@ defmodule MetricStore.HTTP do
         json_error(conn, 400, "missing required parameter: metric")
 
       metric ->
-        {:ok, meta} = MetricStore.get_metadata(store, metric)
+        {:ok, meta} = Timeless.get_metadata(store, metric)
 
         if meta do
           conn
@@ -339,7 +339,7 @@ defmodule MetricStore.HTTP do
 
   # Create an annotation
   post "/api/v1/annotations" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
@@ -350,7 +350,7 @@ defmodule MetricStore.HTTP do
             description = params["description"]
 
             {:ok, id} =
-              MetricStore.annotate(store, timestamp, title,
+              Timeless.annotate(store, timestamp, title,
                 description: description,
                 tags: tags
               )
@@ -370,7 +370,7 @@ defmodule MetricStore.HTTP do
 
   # Query annotations in a time range
   get "/api/v1/annotations" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
@@ -384,7 +384,7 @@ defmodule MetricStore.HTTP do
         tags_str -> String.split(tags_str, ",", trim: true)
       end
 
-    {:ok, results} = MetricStore.annotations(store, from, to, tags: tag_filter)
+    {:ok, results} = Timeless.annotations(store, from, to, tags: tag_filter)
 
     conn
     |> put_resp_content_type("application/json")
@@ -393,9 +393,9 @@ defmodule MetricStore.HTTP do
 
   # Delete an annotation
   delete "/api/v1/annotations/:id" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     {id, _} = Integer.parse(conn.path_params["id"])
-    MetricStore.delete_annotation(store, id)
+    Timeless.delete_annotation(store, id)
 
     conn
     |> put_resp_content_type("application/json")
@@ -404,7 +404,7 @@ defmodule MetricStore.HTTP do
 
   # Create an alert rule
   post "/api/v1/alerts" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
@@ -422,7 +422,7 @@ defmodule MetricStore.HTTP do
               webhook_url: params["webhook_url"]
             ]
 
-            {:ok, id} = MetricStore.create_alert(store, opts)
+            {:ok, id} = Timeless.create_alert(store, opts)
 
             conn
             |> put_resp_content_type("application/json")
@@ -439,8 +439,8 @@ defmodule MetricStore.HTTP do
 
   # List all alert rules with state
   get "/api/v1/alerts" do
-    store = conn.private.metric_store
-    {:ok, rules} = MetricStore.list_alerts(store)
+    store = conn.private.timeless
+    {:ok, rules} = Timeless.list_alerts(store)
 
     conn
     |> put_resp_content_type("application/json")
@@ -449,9 +449,9 @@ defmodule MetricStore.HTTP do
 
   # Delete an alert rule
   delete "/api/v1/alerts/:id" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     {id, _} = Integer.parse(conn.path_params["id"])
-    MetricStore.delete_alert(store, id)
+    Timeless.delete_alert(store, id)
 
     conn
     |> put_resp_content_type("application/json")
@@ -460,24 +460,24 @@ defmodule MetricStore.HTTP do
 
   # SVG chart — embeddable via <img src="http://host:port/chart?metric=cpu&host=web-1&from=-1h">
   get "/chart" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
     case extract_chart_params(params) do
       {:ok, metric, labels, from, to, step, agg, width, height, theme} ->
         {:ok, results} =
-          MetricStore.query_aggregate_multi(store, metric, labels,
+          Timeless.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
             aggregate: agg
           )
 
-        {:ok, annots} = MetricStore.annotations(store, from, to)
+        {:ok, annots} = Timeless.annotations(store, from, to)
 
         svg =
-          MetricStore.Chart.render(metric, results,
+          Timeless.Chart.render(metric, results,
             width: width,
             height: height,
             theme: theme,
@@ -497,14 +497,14 @@ defmodule MetricStore.HTTP do
   # Prometheus text exposition format import
   # Each line: metric_name{label1="val1",label2="val2"} value [timestamp_ms]
   post "/api/v1/import/prometheus" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
 
     case Plug.Conn.read_body(conn, length: @max_body_bytes) do
       {:ok, body, conn} ->
         {count, errors} = ingest_prometheus_text(store, body)
 
         :telemetry.execute(
-          [:metric_store, :http, :import],
+          [:timeless, :http, :import],
           %{sample_count: count, error_count: errors},
           %{store: store, format: :prometheus}
         )
@@ -529,7 +529,7 @@ defmodule MetricStore.HTTP do
 
   # Prometheus-compatible query_range endpoint (for Grafana)
   get "/prometheus/api/v1/query_range" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
@@ -546,7 +546,7 @@ defmodule MetricStore.HTTP do
         step = parse_prom_step(params["step"], 60)
 
         {:ok, results} =
-          MetricStore.query_aggregate_multi(store, metric, labels,
+          Timeless.query_aggregate_multi(store, metric, labels,
             from: start_ts,
             to: end_ts,
             bucket: {step, :seconds},
@@ -582,7 +582,7 @@ defmodule MetricStore.HTTP do
 
   # Dashboard — zero-dependency HTML overview page
   get "/" do
-    store = conn.private.metric_store
+    store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
@@ -591,7 +591,7 @@ defmodule MetricStore.HTTP do
     filter = label_params(params)
 
     html =
-      MetricStore.Dashboard.render(
+      Timeless.Dashboard.render(
         store: store,
         from: from,
         to: to,
@@ -709,7 +709,7 @@ defmodule MetricStore.HTTP do
     |> Enum.reduce({0, 0}, fn line, {count, errors} ->
       case parse_vm_line(line) do
         {:ok, entries} ->
-          MetricStore.write_batch(store, entries)
+          Timeless.write_batch(store, entries)
           {count + length(entries), errors}
 
         :error ->
@@ -758,7 +758,7 @@ defmodule MetricStore.HTTP do
       else
         case parse_prometheus_line(line) do
           {:ok, metric, labels, value, timestamp} ->
-            MetricStore.write(store, metric, labels, value, timestamp: timestamp)
+            Timeless.write(store, metric, labels, value, timestamp: timestamp)
             {count + 1, errors}
 
           :error ->

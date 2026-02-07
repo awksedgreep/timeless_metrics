@@ -1,9 +1,9 @@
 defmodule WriteBench do
-  @data_dir "/tmp/metric_store_bench_#{System.os_time(:millisecond)}"
+  @data_dir "/tmp/timeless_bench_#{System.os_time(:millisecond)}"
 
   def run do
     IO.puts("\n=============================================")
-    IO.puts("  MetricStore Write Throughput Benchmark")
+    IO.puts("  Timeless Write Throughput Benchmark")
     IO.puts("=============================================\n")
 
     for scale <- [1_000, 10_000, 100_000, 1_000_000] do
@@ -19,7 +19,7 @@ defmodule WriteBench do
 
     {:ok, sup} =
       Supervisor.start_link(
-        [{MetricStore, name: :bench, data_dir: data_dir, buffer_shards: System.schedulers_online()}],
+        [{Timeless, name: :bench, data_dir: data_dir, buffer_shards: System.schedulers_online()}],
         strategy: :one_for_one
       )
 
@@ -34,7 +34,7 @@ defmodule WriteBench do
     {single_us, _} =
       :timer.tc(fn ->
         for s <- 1..series_count, i <- 0..(points_per_series - 1) do
-          MetricStore.write(:bench, "metric", %{"id" => "#{s}"}, :rand.uniform() * 100,
+          Timeless.write(:bench, "metric", %{"id" => "#{s}"}, :rand.uniform() * 100,
             timestamp: now - point_count + s * points_per_series + i
           )
         end
@@ -44,29 +44,29 @@ defmodule WriteBench do
     IO.puts("  Write (single):  #{format_number(single_rate)}/sec  (#{div(single_us, 1000)}ms)")
 
     # Flush
-    {flush_us, _} = :timer.tc(fn -> MetricStore.flush(:bench) end)
+    {flush_us, _} = :timer.tc(fn -> Timeless.flush(:bench) end)
     IO.puts("  Flush + compress: #{div(flush_us, 1000)}ms")
 
     # Info
-    info = MetricStore.info(:bench)
+    info = Timeless.info(:bench)
     IO.puts("  Segments: #{info.segment_count}")
     IO.puts("  Compressed: #{format_bytes(info.raw_compressed_bytes)}")
     IO.puts("  Bytes/point: #{info.bytes_per_point}")
     IO.puts("  DB size: #{format_bytes(info.storage_bytes)}")
 
     # Query benchmark
-    series_id_to_query = MetricStore.SeriesRegistry.get_or_create(:"bench_registry", "metric", %{"id" => "1"})
+    series_id_to_query = Timeless.SeriesRegistry.get_or_create(:"bench_registry", "metric", %{"id" => "1"})
 
     {query_us, {:ok, points}} =
       :timer.tc(fn ->
-        MetricStore.query(:bench, "metric", %{"id" => "1"}, from: 0, to: now + point_count)
+        Timeless.query(:bench, "metric", %{"id" => "1"}, from: 0, to: now + point_count)
       end)
 
     IO.puts("  Query #{length(points)} points: #{div(query_us, 1000)}ms")
     IO.puts("")
 
     Supervisor.stop(sup)
-    :persistent_term.erase({MetricStore, :bench, :schema})
+    :persistent_term.erase({Timeless, :bench, :schema})
     File.rm_rf!(data_dir)
   end
 
@@ -75,7 +75,7 @@ defmodule WriteBench do
 
     {:ok, sup} =
       Supervisor.start_link(
-        [{MetricStore, name: :cmp, data_dir: data_dir, buffer_shards: 1}],
+        [{Timeless, name: :cmp, data_dir: data_dir, buffer_shards: 1}],
         strategy: :one_for_one
       )
 
@@ -98,12 +98,12 @@ defmodule WriteBench do
     Enum.each(patterns, fn {label, gen_fn} ->
       # Write points
       for i <- 0..(n - 1) do
-        MetricStore.write(:cmp, label, %{"t" => "1"}, gen_fn.(i), timestamp: now - n + i)
+        Timeless.write(:cmp, label, %{"t" => "1"}, gen_fn.(i), timestamp: now - n + i)
       end
 
-      MetricStore.flush(:cmp)
+      Timeless.flush(:cmp)
 
-      info = MetricStore.info(:cmp)
+      info = Timeless.info(:cmp)
       bytes = info.raw_compressed_bytes
       bpp = Float.round(bytes / n, 2)
 
@@ -114,15 +114,15 @@ defmodule WriteBench do
       IO.puts("  │ #{label_fmt} │ #{bytes_fmt} │ #{bpp_fmt} │")
 
       # Reset for next pattern - drop table data
-      MetricStore.DB.write(:"cmp_db", "DELETE FROM raw_segments", [])
-      MetricStore.DB.write(:"cmp_db", "DELETE FROM series", [])
+      Timeless.DB.write(:"cmp_db", "DELETE FROM raw_segments", [])
+      Timeless.DB.write(:"cmp_db", "DELETE FROM series", [])
     end)
 
     IO.puts("  └──────────────────────┴────────────┴──────────────┘")
     IO.puts("")
 
     Supervisor.stop(sup)
-    :persistent_term.erase({MetricStore, :cmp, :schema})
+    :persistent_term.erase({Timeless, :cmp, :schema})
     File.rm_rf!(data_dir)
   end
 

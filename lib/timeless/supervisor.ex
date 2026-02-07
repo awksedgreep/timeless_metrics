@@ -1,4 +1,4 @@
-defmodule MetricStore.Supervisor do
+defmodule Timeless.Supervisor do
   @moduledoc false
 
   use Supervisor
@@ -21,9 +21,9 @@ defmodule MetricStore.Supervisor do
 
     schema =
       case Keyword.get(opts, :schema) do
-        nil -> MetricStore.Schema.default()
+        nil -> Timeless.Schema.default()
         mod when is_atom(mod) -> mod.__schema__()
-        %MetricStore.Schema{} = s -> s
+        %Timeless.Schema{} = s -> s
       end
 
     db_name = :"#{name}_db"
@@ -33,7 +33,7 @@ defmodule MetricStore.Supervisor do
     retention_name = :"#{name}_retention"
 
     # Store schema in persistent_term for query access
-    :persistent_term.put({MetricStore, name, :schema}, schema)
+    :persistent_term.put({Timeless, name, :schema}, schema)
 
     buffer_shards =
       for i <- 0..(shard_count - 1) do
@@ -42,7 +42,7 @@ defmodule MetricStore.Supervisor do
         %{
           id: shard_name,
           start:
-            {MetricStore.Buffer, :start_link,
+            {Timeless.Buffer, :start_link,
              [
                [
                  name: shard_name,
@@ -58,13 +58,13 @@ defmodule MetricStore.Supervisor do
     children =
       [
         # 1. SQLite connection manager
-        {MetricStore.DB, name: db_name, data_dir: data_dir},
+        {Timeless.DB, name: db_name, data_dir: data_dir},
 
         # 2. Series registry (depends on DB)
-        {MetricStore.SeriesRegistry, name: registry_name, db: db_name},
+        {Timeless.SeriesRegistry, name: registry_name, db: db_name},
 
         # 3. Segment builder (depends on DB)
-        {MetricStore.SegmentBuilder,
+        {Timeless.SegmentBuilder,
          name: builder_name,
          db: db_name,
          segment_duration: segment_duration,
@@ -73,7 +73,7 @@ defmodule MetricStore.Supervisor do
         buffer_shards ++
         [
           # 5. Rollup engine (depends on DB + data being written)
-          {MetricStore.Rollup,
+          {Timeless.Rollup,
            name: rollup_name,
            db: db_name,
            store: name,
@@ -81,7 +81,7 @@ defmodule MetricStore.Supervisor do
            compression: compression},
 
           # 6. Retention enforcer (depends on DB)
-          {MetricStore.Retention,
+          {Timeless.Retention,
            name: retention_name,
            db: db_name,
            schema: schema}

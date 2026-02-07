@@ -1,4 +1,4 @@
-defmodule MetricStore do
+defmodule Timeless do
   @moduledoc """
   Embedded time series storage for Elixir.
 
@@ -9,26 +9,26 @@ defmodule MetricStore do
 
       # Add to your supervision tree
       children = [
-        {MetricStore, name: :metrics, data_dir: "/tmp/metrics"}
+        {Timeless, name: :metrics, data_dir: "/tmp/metrics"}
       ]
 
       # Write metrics
-      MetricStore.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2)
+      Timeless.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2)
 
       # Query
-      MetricStore.query(:metrics, "cpu_usage", %{"host" => "web-1"},
+      Timeless.query(:metrics, "cpu_usage", %{"host" => "web-1"},
         from: System.os_time(:second) - 3600,
         to: System.os_time(:second)
       )
   """
 
-  @doc "Start a MetricStore instance as part of a supervision tree."
+  @doc "Start a Timeless instance as part of a supervision tree."
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
 
     %{
       id: {__MODULE__, name},
-      start: {MetricStore.Supervisor, :start_link, [opts]},
+      start: {Timeless.Supervisor, :start_link, [opts]},
       type: :supervisor
     }
   end
@@ -48,11 +48,11 @@ defmodule MetricStore do
   def write(store, metric_name, labels, value, opts \\ []) do
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
     registry = :"#{store}_registry"
-    series_id = MetricStore.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
     shard_count = buffer_shard_count(store)
     shard_idx = rem(abs(series_id), shard_count)
     shard_name = :"#{store}_shard_#{shard_idx}"
-    MetricStore.Buffer.write(shard_name, series_id, timestamp, value)
+    Timeless.Buffer.write(shard_name, series_id, timestamp, value)
   end
 
   @doc """
@@ -68,16 +68,16 @@ defmodule MetricStore do
     Enum.each(entries, fn
       {metric_name, labels, value} ->
         timestamp = System.os_time(:second)
-        series_id = MetricStore.SeriesRegistry.get_or_create(registry, metric_name, labels)
+        series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
         shard_idx = rem(abs(series_id), shard_count)
         shard_name = :"#{store}_shard_#{shard_idx}"
-        MetricStore.Buffer.write(shard_name, series_id, timestamp, value)
+        Timeless.Buffer.write(shard_name, series_id, timestamp, value)
 
       {metric_name, labels, value, timestamp} ->
-        series_id = MetricStore.SeriesRegistry.get_or_create(registry, metric_name, labels)
+        series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
         shard_idx = rem(abs(series_id), shard_count)
         shard_name = :"#{store}_shard_#{shard_idx}"
-        MetricStore.Buffer.write(shard_name, series_id, timestamp, value)
+        Timeless.Buffer.write(shard_name, series_id, timestamp, value)
     end)
   end
 
@@ -94,8 +94,8 @@ defmodule MetricStore do
   def query(store, metric_name, labels, opts \\ []) do
     db = :"#{store}_db"
     registry = :"#{store}_registry"
-    series_id = MetricStore.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    MetricStore.Query.raw(db, series_id, opts)
+    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    Timeless.Query.raw(db, series_id, opts)
   end
 
   @doc """
@@ -112,7 +112,7 @@ defmodule MetricStore do
 
     results =
       Enum.map(matching, fn {series_id, labels} ->
-        {:ok, points} = MetricStore.Query.raw(db, series_id, opts)
+        {:ok, points} = Timeless.Query.raw(db, series_id, opts)
         %{labels: labels, points: points}
       end)
       |> Enum.reject(fn %{points: pts} -> pts == [] end)
@@ -136,8 +136,8 @@ defmodule MetricStore do
     db = :"#{store}_db"
     registry = :"#{store}_registry"
     schema = get_schema(store)
-    series_id = MetricStore.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    MetricStore.Query.aggregate(db, series_id, Keyword.put(opts, :schema, schema))
+    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    Timeless.Query.aggregate(db, series_id, Keyword.put(opts, :schema, schema))
   end
 
   @doc """
@@ -152,7 +152,7 @@ defmodule MetricStore do
 
     results =
       Enum.map(matching, fn {series_id, labels} ->
-        {:ok, buckets} = MetricStore.Query.aggregate(db, series_id, Keyword.put(opts, :schema, schema))
+        {:ok, buckets} = Timeless.Query.aggregate(db, series_id, Keyword.put(opts, :schema, schema))
         %{labels: labels, data: buckets}
       end)
       |> Enum.reject(fn %{data: d} -> d == [] end)
@@ -168,8 +168,8 @@ defmodule MetricStore do
   def query_tier(store, tier_name, metric_name, labels, opts \\ []) do
     db = :"#{store}_db"
     registry = :"#{store}_registry"
-    series_id = MetricStore.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    MetricStore.Query.read_tier(db, tier_name, series_id, opts)
+    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    Timeless.Query.read_tier(db, tier_name, series_id, opts)
   end
 
   @doc """
@@ -181,8 +181,8 @@ defmodule MetricStore do
     db = :"#{store}_db"
     registry = :"#{store}_registry"
     schema = get_schema(store)
-    series_id = MetricStore.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    MetricStore.Query.latest(db, series_id, schema: schema)
+    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    Timeless.Query.latest(db, series_id, schema: schema)
   end
 
   @doc """
@@ -205,7 +205,7 @@ defmodule MetricStore do
     Process.sleep(100)
 
     # Flush the segment builder
-    MetricStore.SegmentBuilder.flush(builder)
+    Timeless.SegmentBuilder.flush(builder)
   end
 
   @doc """
@@ -218,16 +218,16 @@ defmodule MetricStore do
     db = :"#{store}_db"
     schema = get_schema(store)
 
-    {:ok, [[series_count]]} = MetricStore.DB.read(db, "SELECT COUNT(*) FROM series")
-    {:ok, [[segment_count]]} = MetricStore.DB.read(db, "SELECT COUNT(*) FROM raw_segments")
-    {:ok, [[total_points]]} = MetricStore.DB.read(db, "SELECT COALESCE(SUM(point_count), 0) FROM raw_segments")
-    {:ok, [[raw_bytes]]} = MetricStore.DB.read(db, "SELECT COALESCE(SUM(length(data)), 0) FROM raw_segments")
+    {:ok, [[series_count]]} = Timeless.DB.read(db, "SELECT COUNT(*) FROM series")
+    {:ok, [[segment_count]]} = Timeless.DB.read(db, "SELECT COUNT(*) FROM raw_segments")
+    {:ok, [[total_points]]} = Timeless.DB.read(db, "SELECT COALESCE(SUM(point_count), 0) FROM raw_segments")
+    {:ok, [[raw_bytes]]} = Timeless.DB.read(db, "SELECT COALESCE(SUM(length(data)), 0) FROM raw_segments")
 
     {:ok, [[storage_bytes]]} =
-      MetricStore.DB.read(db, "SELECT page_count * page_size FROM pragma_page_count, pragma_page_size")
+      Timeless.DB.read(db, "SELECT page_count * page_size FROM pragma_page_count, pragma_page_size")
 
-    {:ok, oldest} = MetricStore.DB.read(db, "SELECT MIN(start_time) FROM raw_segments")
-    {:ok, newest} = MetricStore.DB.read(db, "SELECT MAX(end_time) FROM raw_segments")
+    {:ok, oldest} = Timeless.DB.read(db, "SELECT MIN(start_time) FROM raw_segments")
+    {:ok, newest} = Timeless.DB.read(db, "SELECT MAX(end_time) FROM raw_segments")
 
     oldest_ts = case oldest do
       [[nil]] -> nil
@@ -242,10 +242,10 @@ defmodule MetricStore do
     # Tier stats
     tier_stats =
       Enum.map(schema.tiers, fn tier ->
-        {:ok, [[count]]} = MetricStore.DB.read(db, "SELECT COUNT(*) FROM #{tier.table_name}")
+        {:ok, [[count]]} = Timeless.DB.read(db, "SELECT COUNT(*) FROM #{tier.table_name}")
 
         {:ok, watermark_rows} =
-          MetricStore.DB.read(db, "SELECT last_bucket FROM _watermarks WHERE tier = ?1", [
+          Timeless.DB.read(db, "SELECT last_bucket FROM _watermarks WHERE tier = ?1", [
             to_string(tier.name)
           ])
 
@@ -274,7 +274,7 @@ defmodule MetricStore do
     buffer_total =
       Enum.sum(
         for i <- 0..(shard_count - 1) do
-          MetricStore.Buffer.buffer_size(:"#{store}_shard_#{i}")
+          Timeless.Buffer.buffer_size(:"#{store}_shard_#{i}")
         end
       )
 
@@ -294,7 +294,7 @@ defmodule MetricStore do
       buffer_shards: shard_count,
       tiers: tier_stats,
       raw_retention: schema.raw_retention_seconds,
-      db_path: MetricStore.DB.db_path(db)
+      db_path: Timeless.DB.db_path(db)
     }
   end
 
@@ -302,7 +302,7 @@ defmodule MetricStore do
   Force a rollup of all tiers (or a specific tier).
   """
   def rollup(store, tier \\ :all) do
-    MetricStore.Rollup.run(:"#{store}_rollup", tier)
+    Timeless.Rollup.run(:"#{store}_rollup", tier)
   end
 
   @doc """
@@ -312,14 +312,14 @@ defmodule MetricStore do
   data points that arrived after rollup had already advanced past their timestamps.
   """
   def catch_up(store) do
-    MetricStore.Rollup.catch_up(:"#{store}_rollup")
+    Timeless.Rollup.catch_up(:"#{store}_rollup")
   end
 
   @doc """
   Force retention enforcement now.
   """
   def enforce_retention(store) do
-    MetricStore.Retention.enforce(:"#{store}_retention")
+    Timeless.Retention.enforce(:"#{store}_retention")
   end
 
   @doc """
@@ -329,7 +329,7 @@ defmodule MetricStore do
   """
   def list_metrics(store) do
     db = :"#{store}_db"
-    {:ok, rows} = MetricStore.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+    {:ok, rows} = Timeless.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
     {:ok, Enum.map(rows, fn [name] -> name end)}
   end
 
@@ -342,7 +342,7 @@ defmodule MetricStore do
     db = :"#{store}_db"
 
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         "SELECT labels FROM series WHERE metric_name = ?1 ORDER BY labels",
         [metric_name]
@@ -365,7 +365,7 @@ defmodule MetricStore do
     db = :"#{store}_db"
 
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         "SELECT labels FROM series WHERE metric_name = ?1",
         [metric_name]
@@ -399,7 +399,7 @@ defmodule MetricStore do
     unit = Keyword.get(opts, :unit)
     description = Keyword.get(opts, :description)
 
-    MetricStore.DB.write(
+    Timeless.DB.write(
       db,
       "INSERT OR REPLACE INTO metric_metadata (metric_name, metric_type, unit, description) VALUES (?1, ?2, ?3, ?4)",
       [metric_name, type_str, unit, description]
@@ -415,7 +415,7 @@ defmodule MetricStore do
     db = :"#{store}_db"
 
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         "SELECT metric_type, unit, description FROM metric_metadata WHERE metric_name = ?1",
         [metric_name]
@@ -451,15 +451,15 @@ defmodule MetricStore do
     created_at = System.os_time(:second)
 
     {:ok, id} =
-      MetricStore.DB.write_transaction(db, fn conn ->
-        MetricStore.DB.execute(
+      Timeless.DB.write_transaction(db, fn conn ->
+        Timeless.DB.execute(
           conn,
           "INSERT INTO annotations (timestamp, title, description, tags, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
           [timestamp, title, description, tags, created_at]
         )
 
         {:ok, [[id]]} =
-          MetricStore.DB.execute(conn, "SELECT last_insert_rowid()", [])
+          Timeless.DB.execute(conn, "SELECT last_insert_rowid()", [])
 
         id
       end)
@@ -481,7 +481,7 @@ defmodule MetricStore do
     tag_filter = Keyword.get(opts, :tags, [])
 
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         "SELECT id, timestamp, title, description, tags FROM annotations WHERE timestamp >= ?1 AND timestamp <= ?2 ORDER BY timestamp",
         [from, to]
@@ -512,7 +512,7 @@ defmodule MetricStore do
   """
   def delete_annotation(store, id) do
     db = :"#{store}_db"
-    MetricStore.DB.write(db, "DELETE FROM annotations WHERE id = ?1", [id])
+    Timeless.DB.write(db, "DELETE FROM annotations WHERE id = ?1", [id])
     :ok
   end
 
@@ -537,31 +537,31 @@ defmodule MetricStore do
   """
   def create_alert(store, opts) do
     db = :"#{store}_db"
-    MetricStore.Alert.create_rule(db, opts)
+    Timeless.Alert.create_rule(db, opts)
   end
 
   @doc "List all alert rules with current state."
   def list_alerts(store) do
     db = :"#{store}_db"
-    MetricStore.Alert.list_rules(db)
+    Timeless.Alert.list_rules(db)
   end
 
   @doc "Delete an alert rule."
   def delete_alert(store, rule_id) do
     db = :"#{store}_db"
-    MetricStore.Alert.delete_rule(db, rule_id)
+    Timeless.Alert.delete_rule(db, rule_id)
   end
 
   @doc "Evaluate all alert rules against current data."
   def evaluate_alerts(store) do
-    MetricStore.Alert.evaluate(store)
+    Timeless.Alert.evaluate(store)
   end
 
   @doc """
   Get the schema configuration for a store.
   """
   def get_schema(store) do
-    :persistent_term.get({MetricStore, store, :schema}, MetricStore.Schema.default())
+    :persistent_term.get({Timeless, store, :schema}, Timeless.Schema.default())
   end
 
   # --- Internals ---
@@ -581,7 +581,7 @@ defmodule MetricStore do
     db = :"#{store}_db"
 
     {:ok, rows} =
-      MetricStore.DB.read(
+      Timeless.DB.read(
         db,
         "SELECT id, labels FROM series WHERE metric_name = ?1",
         [metric_name]
