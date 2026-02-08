@@ -109,7 +109,8 @@ defmodule Timeless.Buffer do
     table = table_name(shard_name)
 
     try do
-      :ets.info(table, :size)
+      [{:__counter__, counter}] = :ets.lookup(table, :__counter__)
+      :atomics.get(counter, 1)
     rescue
       _ -> 0
     end
