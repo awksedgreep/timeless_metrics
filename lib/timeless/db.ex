@@ -110,12 +110,14 @@ defmodule Timeless.DB do
 
   defp configure_connection(conn) do
     pragmas = [
+      "PRAGMA page_size = 16384",
       "PRAGMA journal_mode = WAL",
       "PRAGMA synchronous = NORMAL",
-      "PRAGMA cache_size = -64000",
+      "PRAGMA cache_size = -128000",
       "PRAGMA auto_vacuum = INCREMENTAL",
-      "PRAGMA mmap_size = 1073741824",
-      "PRAGMA page_size = 8192",
+      "PRAGMA mmap_size = 2147483648",
+      "PRAGMA wal_autocheckpoint = 10000",
+      "PRAGMA temp_store = MEMORY",
       "PRAGMA busy_timeout = 5000"
     ]
 
@@ -124,8 +126,9 @@ defmodule Timeless.DB do
 
   defp configure_reader(conn) do
     pragmas = [
-      "PRAGMA mmap_size = 1073741824",
-      "PRAGMA cache_size = -32000",
+      "PRAGMA mmap_size = 2147483648",
+      "PRAGMA cache_size = -8000",
+      "PRAGMA temp_store = MEMORY",
       "PRAGMA busy_timeout = 5000"
     ]
 

@@ -1,17 +1,18 @@
 defmodule Timeless.Rollup do
   @moduledoc """
-  Incremental rollup engine.
+  Sharded rollup engine.
 
-  Processes data tier-by-tier using watermarks to track progress.
-  Each tier reads from its source: hourly reads raw segments,
-  daily reads hourly, monthly reads daily.
+  Processes data tier-by-tier with parallel per-shard execution.
+  Each shard maintains its own tier tables and watermarks.
+  The Rollup GenServer acts as a coordinator, spawning parallel
+  tasks for each shard.
   """
 
   use GenServer
 
   require Logger
 
-  defstruct [:db, :store, :schema, :compression, :tick_count, :late_lookback, :late_every_n_ticks]
+  defstruct [:store, :schema, :compression, :tick_count, :late_lookback, :late_every_n_ticks]
 
   @default_late_lookback 7_200       # 2 hours
   @default_late_every_n_ticks 3      # every 3rd tick (15 min at default interval)
@@ -35,7 +36,6 @@ defmodule Timeless.Rollup do
 
   @impl true
   def init(opts) do
-    db = Keyword.fetch!(opts, :db)
     store = Keyword.get(opts, :store)
     schema = Keyword.fetch!(opts, :schema)
     compression = Keyword.get(opts, :compression, :zstd)
@@ -44,7 +44,6 @@ defmodule Timeless.Rollup do
     late_every = Keyword.get(opts, :late_every_n_ticks, @default_late_every_n_ticks)
 
     state = %__MODULE__{
-      db: db,
       store: store,
       schema: schema,
       compression: compression,
@@ -53,8 +52,7 @@ defmodule Timeless.Rollup do
       late_every_n_ticks: late_every
     }
 
-    # Initialize watermarks for all tiers
-    init_watermarks(state)
+    # Watermarks are now initialized by each SegmentBuilder
 
     schedule_tick(schema.rollup_interval)
     {:ok, state}
@@ -117,38 +115,53 @@ defmodule Timeless.Rollup do
   end
 
   defp run_tier(tier, state) do
-    watermark = get_watermark(state.db, tier.name)
+    shard_count = :persistent_term.get({Timeless, state.store, :shard_count})
+    source = source_for_tier(tier, state.schema.tiers)
+
+    {us, _} =
+      :timer.tc(fn ->
+        tasks =
+          for i <- 0..(shard_count - 1) do
+            builder = :"#{state.store}_builder_#{i}"
+            Task.async(fn -> run_tier_on_shard(tier, source, builder, state) end)
+          end
+
+        Task.await_many(tasks, :infinity)
+      end)
+
+    :telemetry.execute(
+      [:timeless, :rollup, :complete],
+      %{duration_us: us},
+      %{tier: tier.name}
+    )
+  end
+
+  defp run_tier_on_shard(tier, source, builder, state) do
+    watermark = get_shard_watermark(builder, tier.name)
     now = System.os_time(:second)
-    # Only roll up complete buckets (current bucket is still accumulating)
     current_bucket = bucket_floor(now, tier.resolution_seconds)
 
     if watermark < current_bucket do
-      {us, _} =
-        :timer.tc(fn ->
-          case source_for_tier(tier, state.schema.tiers) do
-            :raw ->
-              rollup_from_raw(tier, watermark, current_bucket, state)
+      result =
+        case source do
+          :raw ->
+            rollup_shard_from_raw(tier, builder, watermark, current_bucket, state)
 
-            {:tier, source_tier} ->
-              rollup_from_tier(tier, source_tier, watermark, current_bucket, state)
-          end
-        end)
+          {:tier, source_tier} ->
+            rollup_shard_from_tier(tier, source_tier, builder, watermark, current_bucket, state)
+        end
 
-      :telemetry.execute(
-        [:timeless, :rollup, :complete],
-        %{duration_us: us},
-        %{tier: tier.name, watermark: watermark, up_to: current_bucket}
-      )
-
-      set_watermark(state.db, tier.name, current_bucket)
+      case result do
+        {:ok, _} -> :ok
+        {:error, e} -> Logger.warning("Shard rollup failed for #{tier.name} on #{builder}: #{inspect(e)}")
+      end
     end
   end
 
-  defp rollup_from_raw(tier, watermark, up_to, state) do
-    # Read raw segments that overlap with the rollup window
+  defp rollup_shard_from_raw(tier, builder, watermark, up_to, state) do
     {:ok, rows} =
-      Timeless.DB.read(
-        state.db,
+      Timeless.SegmentBuilder.read_shard(
+        builder,
         """
         SELECT series_id, start_time, end_time, data
         FROM raw_segments
@@ -173,25 +186,25 @@ defmodule Timeless.Rollup do
       |> Enum.filter(fn {_sid, ts, _val} -> ts >= watermark and ts < up_to end)
       |> Enum.group_by(&elem(&1, 0))
 
-    # Compute aggregates per series per bucket
-    Timeless.DB.write_transaction(state.db, fn conn ->
-      Enum.each(points_by_series, fn {series_id, series_points} ->
-        series_points
-        |> Enum.group_by(fn {_sid, ts, _val} -> bucket_floor(ts, tier.resolution_seconds) end)
-        |> Enum.each(fn {bucket, bucket_points} ->
-          values = Enum.map(bucket_points, fn {_sid, _ts, val} -> val end)
-          aggs = compute_aggregates(values, tier.aggregates)
-          write_rollup_row(conn, tier.table_name, series_id, bucket, aggs)
-        end)
-      end)
+    # Write tier rows + watermark atomically
+    Timeless.SegmentBuilder.write_transaction_shard(builder, fn conn ->
+      if points_by_series != %{} do
+        write_tier_rows(conn, tier, points_by_series)
+      end
+
+      # Always advance watermark
+      Timeless.SegmentBuilder.execute(
+        conn,
+        "INSERT OR REPLACE INTO _watermarks (tier, last_bucket) VALUES (?1, ?2)",
+        [to_string(tier.name), up_to]
+      )
     end)
   end
 
-  defp rollup_from_tier(tier, source_tier, watermark, up_to, state) do
-    # Read from source tier's table
+  defp rollup_shard_from_tier(tier, source_tier, builder, watermark, up_to, _state) do
     {:ok, rows} =
-      Timeless.DB.read(
-        state.db,
+      Timeless.SegmentBuilder.read_shard(
+        builder,
         """
         SELECT series_id, bucket, avg, min, max, count, sum, last
         FROM #{source_tier.table_name}
@@ -201,68 +214,133 @@ defmodule Timeless.Rollup do
         [watermark, up_to]
       )
 
-    # Group by series and target bucket, then re-aggregate
-    rows
-    |> Enum.map(fn [series_id, bucket, avg, min, max, count, sum, last] ->
-      %{
-        series_id: series_id,
-        bucket: bucket,
-        avg: avg,
-        min: min,
-        max: max,
-        count: count,
-        sum: sum,
-        last: last
-      }
-    end)
-    |> Enum.group_by(& &1.series_id)
-    |> then(fn grouped ->
-      Timeless.DB.write_transaction(state.db, fn conn ->
-        Enum.each(grouped, fn {series_id, series_rows} ->
-          series_rows
-          |> Enum.group_by(fn row -> bucket_floor(row.bucket, tier.resolution_seconds) end)
-          |> Enum.each(fn {target_bucket, source_rows} ->
-            aggs = reaggregate(source_rows, tier.aggregates)
-            write_rollup_row(conn, tier.table_name, series_id, target_bucket, aggs)
-          end)
-        end)
+    grouped =
+      rows
+      |> Enum.map(fn [series_id, bucket, avg, min, max, count, sum, last] ->
+        %{
+          series_id: series_id,
+          bucket: bucket,
+          avg: avg,
+          min: min,
+          max: max,
+          count: count,
+          sum: sum,
+          last: last
+        }
       end)
+      |> Enum.group_by(& &1.series_id)
+
+    Timeless.SegmentBuilder.write_transaction_shard(builder, fn conn ->
+      if grouped != %{} do
+        insert_sql = "INSERT OR REPLACE INTO #{tier.table_name} (series_id, bucket, avg, min, max, count, sum, last) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, insert_sql)
+
+        try do
+          Enum.each(grouped, fn {series_id, series_rows} ->
+            series_rows
+            |> Enum.group_by(fn row -> bucket_floor(row.bucket, tier.resolution_seconds) end)
+            |> Enum.each(fn {target_bucket, source_rows} ->
+              aggs = reaggregate(source_rows, tier.aggregates)
+              :ok = Exqlite.Sqlite3.bind(stmt, [series_id, target_bucket, aggs.avg, aggs.min, aggs.max, aggs.count, aggs.sum, aggs.last])
+              :done = Exqlite.Sqlite3.step(conn, stmt)
+              :ok = Exqlite.Sqlite3.reset(stmt)
+            end)
+          end)
+        after
+          Exqlite.Sqlite3.release(conn, stmt)
+        end
+      end
+
+      # Always advance watermark
+      Timeless.SegmentBuilder.execute(
+        conn,
+        "INSERT OR REPLACE INTO _watermarks (tier, last_bucket) VALUES (?1, ?2)",
+        [to_string(tier.name), up_to]
+      )
     end)
   end
 
+  defp write_tier_rows(conn, tier, points_by_series) do
+    insert_sql = "INSERT OR REPLACE INTO #{tier.table_name} (series_id, bucket, avg, min, max, count, sum, last) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, insert_sql)
+
+    try do
+      Enum.each(points_by_series, fn {series_id, series_points} ->
+        series_points
+        |> Enum.group_by(fn {_sid, ts, _val} -> bucket_floor(ts, tier.resolution_seconds) end)
+        |> Enum.each(fn {bucket, bucket_points} ->
+          values = Enum.map(bucket_points, fn {_sid, _ts, val} -> val end)
+          aggs = compute_aggregates(values, tier.aggregates)
+          :ok = Exqlite.Sqlite3.bind(stmt, [series_id, bucket, aggs.avg, aggs.min, aggs.max, aggs.count, aggs.sum, aggs.last])
+          :done = Exqlite.Sqlite3.step(conn, stmt)
+          :ok = Exqlite.Sqlite3.reset(stmt)
+        end)
+      end)
+    after
+      Exqlite.Sqlite3.release(conn, stmt)
+    end
+  end
+
   # --- Late-arrival catch-up ---
-  # Re-processes a lookback window behind each tier's watermark.
-  # Catches data that arrived after the watermark had already advanced.
-  # Idempotent: INSERT OR REPLACE safely updates existing rows.
+  # Re-processes a lookback window behind each tier's watermark per shard.
 
   defp catch_up_late_arrivals(state) do
+    shard_count = :persistent_term.get({Timeless, state.store, :shard_count})
+
     Enum.each(state.schema.tiers, fn tier ->
-      watermark = get_watermark(state.db, tier.name)
+      source = source_for_tier(tier, state.schema.tiers)
 
-      if watermark > 0 do
-        scan_from = max(watermark - state.late_lookback, 0)
-
-        # Only scan if there's actually a window to check
-        if scan_from < watermark do
-          {us, _} =
-            :timer.tc(fn ->
-              case source_for_tier(tier, state.schema.tiers) do
-                :raw ->
-                  rollup_from_raw(tier, scan_from, watermark, state)
-
-                {:tier, source_tier} ->
-                  rollup_from_tier(tier, source_tier, scan_from, watermark, state)
-              end
-            end)
-
-          :telemetry.execute(
-            [:timeless, :rollup, :late_catch_up],
-            %{duration_us: us},
-            %{tier: tier.name, scan_from: scan_from, watermark: watermark}
-          )
+      tasks =
+        for i <- 0..(shard_count - 1) do
+          builder = :"#{state.store}_builder_#{i}"
+          Task.async(fn -> catch_up_shard(tier, source, builder, state) end)
         end
-      end
+
+      Task.await_many(tasks, :infinity)
     end)
+  end
+
+  defp catch_up_shard(tier, source, builder, state) do
+    watermark = get_shard_watermark(builder, tier.name)
+
+    if watermark > 0 do
+      scan_from = max(watermark - state.late_lookback, 0)
+
+      if scan_from < watermark do
+        {us, _} =
+          :timer.tc(fn ->
+            case source do
+              :raw ->
+                rollup_shard_from_raw(tier, builder, scan_from, watermark, state)
+
+              {:tier, source_tier} ->
+                rollup_shard_from_tier(tier, source_tier, builder, scan_from, watermark, state)
+            end
+          end)
+
+        :telemetry.execute(
+          [:timeless, :rollup, :late_catch_up],
+          %{duration_us: us},
+          %{tier: tier.name}
+        )
+      end
+    end
+  end
+
+  # --- Shard watermark helpers ---
+
+  defp get_shard_watermark(builder, tier_name) do
+    {:ok, rows} =
+      Timeless.SegmentBuilder.read_shard(
+        builder,
+        "SELECT last_bucket FROM _watermarks WHERE tier = ?1",
+        [to_string(tier_name)]
+      )
+
+    case rows do
+      [[w]] -> w
+      [] -> 0
+    end
   end
 
   # --- Aggregation ---
@@ -294,48 +372,7 @@ defmodule Timeless.Rollup do
     }
   end
 
-  # --- SQLite Helpers ---
-
-  defp write_rollup_row(conn, table_name, series_id, bucket, aggs) do
-    Timeless.DB.execute(
-      conn,
-      """
-      INSERT OR REPLACE INTO #{table_name} (series_id, bucket, avg, min, max, count, sum, last)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-      """,
-      [series_id, bucket, aggs.avg, aggs.min, aggs.max, aggs.count, aggs.sum, aggs.last]
-    )
-  end
-
-  defp init_watermarks(state) do
-    Enum.each(state.schema.tiers, fn tier ->
-      Timeless.DB.write(
-        state.db,
-        "INSERT OR IGNORE INTO _watermarks (tier, last_bucket) VALUES (?1, 0)",
-        [to_string(tier.name)]
-      )
-    end)
-  end
-
-  defp get_watermark(db, tier_name) do
-    {:ok, rows} =
-      Timeless.DB.read(db, "SELECT last_bucket FROM _watermarks WHERE tier = ?1", [
-        to_string(tier_name)
-      ])
-
-    case rows do
-      [[bucket]] -> bucket
-      [] -> 0
-    end
-  end
-
-  defp set_watermark(db, tier_name, bucket) do
-    Timeless.DB.write(
-      db,
-      "INSERT OR REPLACE INTO _watermarks (tier, last_bucket) VALUES (?1, ?2)",
-      [to_string(tier_name), bucket]
-    )
-  end
+  # --- Helpers ---
 
   defp bucket_floor(timestamp, resolution) do
     div(timestamp, resolution) * resolution

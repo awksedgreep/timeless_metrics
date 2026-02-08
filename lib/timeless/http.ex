@@ -704,22 +704,38 @@ defmodule Timeless.HTTP do
   end
 
   defp ingest_json_lines(store, body) do
-    body
-    |> String.split("\n", trim: true)
-    |> Enum.reduce({0, 0}, fn line, {count, errors} ->
-      case parse_vm_line(line) do
-        {:ok, entries} ->
-          Timeless.write_batch(store, entries)
-          {count + length(entries), errors}
+    {all_entries, errors} =
+      body
+      |> String.split("\n", trim: true)
+      |> Enum.reduce({[], 0}, fn line, {entries_acc, errors} ->
+        case parse_vm_line(line) do
+          {:ok, entries} ->
+            {[entries | entries_acc], errors}
 
-        :error ->
-          {count, errors + 1}
-      end
-    end)
+          :error ->
+            {entries_acc, errors + 1}
+        end
+      end)
+
+    # One batch call for the entire body
+    flat_entries = List.flatten(all_entries)
+
+    if flat_entries != [] do
+      Timeless.write_batch(store, flat_entries)
+    end
+
+    {length(flat_entries), errors}
   end
 
   defp parse_vm_line(line) do
-    case Jason.decode(line) do
+    decoded =
+      try do
+        {:ok, :json.decode(line)}
+      rescue
+        _ -> :error
+      end
+
+    case decoded do
       {:ok, %{"metric" => metric_map, "values" => values, "timestamps" => timestamps}}
       when is_list(values) and is_list(timestamps) and length(values) == length(timestamps) ->
         {name, labels} = extract_metric(metric_map)
@@ -748,79 +764,93 @@ defmodule Timeless.HTTP do
   # Skips comments (#) and empty lines.
 
   defp ingest_prometheus_text(store, body) do
-    body
-    |> String.split("\n", trim: true)
-    |> Enum.reduce({0, 0}, fn line, {count, errors} ->
-      line = String.trim(line)
+    {all_entries, errors} =
+      body
+      |> String.split("\n", trim: true)
+      |> Enum.reduce({[], 0}, fn line, {entries_acc, errors} ->
+        line = String.trim(line)
 
-      if line == "" or String.starts_with?(line, "#") do
-        {count, errors}
-      else
-        case parse_prometheus_line(line) do
-          {:ok, metric, labels, value, timestamp} ->
-            Timeless.write(store, metric, labels, value, timestamp: timestamp)
-            {count + 1, errors}
+        if line == "" or String.starts_with?(line, "#") do
+          {entries_acc, errors}
+        else
+          case parse_prometheus_line(line) do
+            {:ok, metric, labels, value, timestamp} ->
+              {[{metric, labels, value, timestamp} | entries_acc], errors}
 
-          :error ->
-            {count, errors + 1}
+            :error ->
+              {entries_acc, errors + 1}
+          end
         end
-      end
-    end)
+      end)
+
+    if all_entries != [] do
+      Timeless.write_batch(store, all_entries)
+    end
+
+    {length(all_entries), errors}
   end
 
   defp parse_prometheus_line(line) do
-    case Regex.run(~r/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([^\s]+)(?:\s+(\d+))?$/, line) do
-      [_, metric, labels_str, value_str | rest] ->
-        with {value, _} <- Float.parse(value_str) do
-          labels = parse_prometheus_labels(labels_str)
+    # Binary matching — split metric{labels} from value [timestamp]
+    case :binary.match(line, <<"{">>) do
+      {brace_pos, 1} ->
+        metric = :binary.part(line, 0, brace_pos)
+        rest = :binary.part(line, brace_pos + 1, byte_size(line) - brace_pos - 1)
 
-          timestamp =
-            case rest do
-              [ts_str] ->
-                {ts, _} = Integer.parse(ts_str)
-                # Prometheus timestamps are in milliseconds
-                div(ts, 1000)
+        case :binary.split(rest, <<"} ">>) do
+          [labels_str, value_ts] ->
+            labels = parse_prometheus_labels_bin(labels_str)
+            parse_value_timestamp(String.trim(value_ts), metric, labels)
 
-              [] ->
-                System.os_time(:second)
-            end
+          _ ->
+            :error
+        end
 
-          {:ok, metric, labels, value, timestamp}
+      :nomatch ->
+        # No labels: metric value [timestamp]
+        case :binary.split(line, <<" ">>) do
+          [metric, value_ts] ->
+            parse_value_timestamp(String.trim(value_ts), metric, %{})
+
+          _ ->
+            :error
+        end
+    end
+  end
+
+  defp parse_value_timestamp(str, metric, labels) do
+    case :binary.split(str, <<" ">>) do
+      [value_str, ts_str] ->
+        with {value, _} <- Float.parse(value_str),
+             {ts_ms, _} <- Integer.parse(ts_str) do
+          {:ok, metric, labels, value, div(ts_ms, 1000)}
         else
           _ -> :error
         end
 
-      _ ->
-        :error
+      [value_str] ->
+        case Float.parse(value_str) do
+          {value, _} -> {:ok, metric, labels, value, System.os_time(:second)}
+          _ -> :error
+        end
     end
   end
 
-  defp parse_prometheus_labels(""), do: %{}
-  defp parse_prometheus_labels(nil), do: %{}
+  defp parse_prometheus_labels_bin(str) when byte_size(str) == 0, do: %{}
 
-  defp parse_prometheus_labels(str) do
-    # Strip surrounding braces
-    inner = String.slice(str, 1..-2//1)
+  defp parse_prometheus_labels_bin(str) do
+    str
+    |> :binary.split(<<",">>, [:global])
+    |> Enum.reduce(%{}, fn pair, acc ->
+      case :binary.split(pair, <<"=">>, [:global]) do
+        [key, value] ->
+          v = value |> String.trim() |> String.trim("\"")
+          Map.put(acc, String.trim(key), v)
 
-    if inner == "" do
-      %{}
-    else
-      inner
-      |> String.split(",")
-      |> Enum.map(fn pair ->
-        case String.split(pair, "=", parts: 2) do
-          [k, v] ->
-            # Strip surrounding quotes from value
-            v = v |> String.trim() |> String.trim("\"")
-            {String.trim(k), v}
-
-          _ ->
-            nil
-        end
-      end)
-      |> Enum.reject(&is_nil/1)
-      |> Map.new()
-    end
+        _ ->
+          acc
+      end
+    end)
   end
 
   # Simple PromQL parser — handles metric_name{label="value",...}

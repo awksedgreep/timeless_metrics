@@ -2,7 +2,7 @@ defmodule Timeless.Query do
   @moduledoc """
   Query engine with automatic tier selection.
 
-  For raw queries, reads gorilla-compressed segments.
+  For raw queries, reads gorilla-compressed segments from shard DBs.
   For aggregate queries, reads from rollup tiers when the time range
   falls outside raw retention, or when a matching tier resolution exists.
   Stitches results across tiers for queries spanning multiple windows.
@@ -11,16 +11,20 @@ defmodule Timeless.Query do
   @doc """
   Query raw points for a series within a time range.
 
+  Reads from the shard DB that owns this series_id.
+
   Returns `{:ok, [{timestamp, value}, ...]}` sorted by timestamp.
   """
-  def raw(db, series_id, opts \\ []) do
+  def raw(store, series_id, opts \\ []) do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
     compression = Keyword.get(opts, :compression, :zstd)
 
+    builder = builder_for_series(store, series_id)
+
     {:ok, rows} =
-      Timeless.DB.read(
-        db,
+      Timeless.SegmentBuilder.read_shard(
+        builder,
         """
         SELECT data, start_time, end_time
         FROM raw_segments
@@ -60,16 +64,16 @@ defmodule Timeless.Query do
 
   Returns `{:ok, [{bucket_timestamp, aggregate_value}, ...]}`.
   """
-  def aggregate(db, series_id, opts \\ []) do
+  def aggregate(store, series_id, opts \\ []) do
     bucket_seconds = bucket_to_seconds(Keyword.fetch!(opts, :bucket))
     agg_fn = Keyword.fetch!(opts, :aggregate)
     schema = Keyword.get(opts, :schema)
 
     # Try to read from a rollup tier if schema is available
     if schema do
-      aggregate_with_tiers(db, series_id, opts, schema, bucket_seconds, agg_fn)
+      aggregate_with_tiers(store, series_id, opts, schema, bucket_seconds, agg_fn)
     else
-      aggregate_from_raw(db, series_id, opts, bucket_seconds, agg_fn)
+      aggregate_from_raw(store, series_id, opts, bucket_seconds, agg_fn)
     end
   end
 
@@ -78,14 +82,15 @@ defmodule Timeless.Query do
 
   Returns `{:ok, [%{bucket: ts, avg: v, min: v, max: v, count: n, sum: v, last: v}, ...]}`.
   """
-  def read_tier(db, tier_name, series_id, opts \\ []) do
+  def read_tier(store, tier_name, series_id, opts \\ []) do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
+    builder = builder_for_series(store, series_id)
     table = "tier_#{tier_name}"
 
     {:ok, rows} =
-      Timeless.DB.read(
-        db,
+      Timeless.SegmentBuilder.read_shard(
+        builder,
         """
         SELECT bucket, avg, min, max, count, sum, last
         FROM #{table}
@@ -105,16 +110,18 @@ defmodule Timeless.Query do
 
   @doc """
   Query the latest value for a series.
-  Checks raw segments first, then falls back to the finest rollup tier.
+  Checks raw segments first (from shard DB), then falls back to the finest rollup tier.
   """
-  def latest(db, series_id, opts \\ []) do
+  def latest(store, series_id, opts \\ []) do
     compression = Keyword.get(opts, :compression, :zstd)
     schema = Keyword.get(opts, :schema)
 
-    # Try raw first
+    builder = builder_for_series(store, series_id)
+
+    # Try raw first (from shard DB)
     {:ok, rows} =
-      Timeless.DB.read(
-        db,
+      Timeless.SegmentBuilder.read_shard(
+        builder,
         """
         SELECT data
         FROM raw_segments
@@ -137,25 +144,33 @@ defmodule Timeless.Query do
         end
 
       [] ->
-        # Fall back to finest rollup tier
+        # Fall back to finest rollup tier (on shard DB)
         if schema && schema.tiers != [] do
           finest_tier = List.first(schema.tiers)
-          latest_from_tier(db, finest_tier.table_name, series_id)
+          latest_from_tier(store, finest_tier.table_name, series_id)
         else
           {:ok, nil}
         end
     end
   end
 
+  # --- Shard routing ---
+
+  defp builder_for_series(store, series_id) do
+    shard_count = :persistent_term.get({Timeless, store, :shard_count})
+    shard_idx = rem(abs(series_id), shard_count)
+    :"#{store}_builder_#{shard_idx}"
+  end
+
   # --- Tier-aware aggregation with watermark-based stitching ---
 
-  defp aggregate_with_tiers(db, series_id, opts, schema, bucket_seconds, agg_fn) do
+  defp aggregate_with_tiers(store, series_id, opts, schema, bucket_seconds, agg_fn) do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
 
     # No tiers configured — use raw for everything
     if schema.tiers == [] do
-      aggregate_from_raw(db, series_id, opts, bucket_seconds, agg_fn)
+      aggregate_from_raw(store, series_id, opts, bucket_seconds, agg_fn)
     else
       # Find best tier whose resolution is finer than or equal to requested bucket
       tier =
@@ -163,26 +178,27 @@ defmodule Timeless.Query do
         |> Enum.filter(fn t -> t.resolution_seconds <= bucket_seconds end)
         |> Enum.max_by(& &1.resolution_seconds, fn -> List.first(schema.tiers) end)
 
-      # Read the actual watermark — this is where rollup data exists up to
-      watermark = get_watermark(db, tier.name)
+      # Read watermark from the series' shard
+      builder = builder_for_series(store, series_id)
+      watermark = get_shard_watermark(builder, tier.name)
 
       cond do
         # Rollup hasn't run yet or no rollup data covers this range — use raw
         watermark == 0 or from >= watermark ->
-          aggregate_from_raw(db, series_id, opts, bucket_seconds, agg_fn)
+          aggregate_from_raw(store, series_id, opts, bucket_seconds, agg_fn)
 
         # Entire query range is covered by rollup data
         to <= watermark ->
-          aggregate_from_rollup_tier(db, tier, series_id, from, to, bucket_seconds, agg_fn)
+          aggregate_from_rollup_tier(store, tier, series_id, from, to, bucket_seconds, agg_fn)
 
         # Query spans the boundary — stitch rollup + raw
         true ->
           {:ok, rollup_results} =
-            aggregate_from_rollup_tier(db, tier, series_id, from, watermark, bucket_seconds, agg_fn)
+            aggregate_from_rollup_tier(store, tier, series_id, from, watermark, bucket_seconds, agg_fn)
 
           {:ok, raw_results} =
             aggregate_from_raw(
-              db, series_id, [from: watermark, to: to], bucket_seconds, agg_fn
+              store, series_id, [from: watermark, to: to], bucket_seconds, agg_fn
             )
 
           # Merge: raw wins for any overlapping buckets (more precise)
@@ -198,10 +214,10 @@ defmodule Timeless.Query do
     end
   end
 
-  defp get_watermark(db, tier_name) do
+  defp get_shard_watermark(builder, tier_name) do
     {:ok, rows} =
-      Timeless.DB.read(
-        db,
+      Timeless.SegmentBuilder.read_shard(
+        builder,
         "SELECT last_bucket FROM _watermarks WHERE tier = ?1",
         [to_string(tier_name)]
       )
@@ -212,8 +228,8 @@ defmodule Timeless.Query do
     end
   end
 
-  defp aggregate_from_raw(db, series_id, opts, bucket_seconds, agg_fn) do
-    {:ok, points} = raw(db, series_id, opts)
+  defp aggregate_from_raw(store, series_id, opts, bucket_seconds, agg_fn) do
+    {:ok, points} = raw(store, series_id, opts)
 
     bucketed =
       points
@@ -227,10 +243,12 @@ defmodule Timeless.Query do
     {:ok, bucketed}
   end
 
-  defp aggregate_from_rollup_tier(db, tier, series_id, from, to, bucket_seconds, agg_fn) do
+  defp aggregate_from_rollup_tier(store, tier, series_id, from, to, bucket_seconds, agg_fn) do
+    builder = builder_for_series(store, series_id)
+
     {:ok, rows} =
-      Timeless.DB.read(
-        db,
+      Timeless.SegmentBuilder.read_shard(
+        builder,
         """
         SELECT bucket, avg, min, max, count, sum, last
         FROM #{tier.table_name}
@@ -338,10 +356,12 @@ defmodule Timeless.Query do
     end)
   end
 
-  defp latest_from_tier(db, table_name, series_id) do
+  defp latest_from_tier(store, table_name, series_id) do
+    builder = builder_for_series(store, series_id)
+
     {:ok, rows} =
-      Timeless.DB.read(
-        db,
+      Timeless.SegmentBuilder.read_shard(
+        builder,
         "SELECT bucket, last FROM #{table_name} WHERE series_id = ?1 ORDER BY bucket DESC LIMIT 1",
         [series_id]
       )

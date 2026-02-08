@@ -19,7 +19,8 @@ defmodule Timeless.Buffer do
     :flush_interval,
     :flush_threshold,
     :backpressure_threshold,
-    :point_count
+    :counter,
+    :builder_pid
   ]
 
   @default_flush_interval :timer.seconds(5)
@@ -40,11 +41,56 @@ defmodule Timeless.Buffer do
   def write(shard_name, series_id, timestamp, value) do
     table = table_name(shard_name)
 
-    # Check backpressure before writing
     case check_backpressure(shard_name) do
       :ok ->
         :ets.insert(table, {{series_id, timestamp, :erlang.unique_integer()}, value})
-        GenServer.cast(shard_name, :maybe_flush)
+        [{:__counter__, counter}] = :ets.lookup(table, :__counter__)
+        count = :atomics.add_get(counter, 1, 1)
+
+        if count >= :ets.lookup_element(table, :__threshold__, 2) do
+          GenServer.cast(shard_name, :flush_now)
+          :atomics.put(counter, 1, 0)
+        end
+
+        :ok
+
+      {:error, :backpressure} = err ->
+        :telemetry.execute(
+          [:timeless, :write, :backpressure],
+          %{count: 1},
+          %{shard: shard_name}
+        )
+
+        err
+    end
+  end
+
+  @doc """
+  Bulk-write pre-resolved points to a shard. Called by write_batch.
+
+  `points` is a list of `{series_id, timestamp, value}` tuples.
+  Single ETS insert + single atomics update for the whole batch.
+  """
+  def write_bulk(shard_name, points) do
+    table = table_name(shard_name)
+
+    case check_backpressure(shard_name) do
+      :ok ->
+        rows =
+          Enum.map(points, fn {sid, ts, val} ->
+            {{sid, ts, :erlang.unique_integer()}, val}
+          end)
+
+        :ets.insert(table, rows)
+
+        [{:__counter__, counter}] = :ets.lookup(table, :__counter__)
+        count = :atomics.add_get(counter, 1, length(points))
+
+        if count >= :ets.lookup_element(table, :__threshold__, 2) do
+          GenServer.cast(shard_name, :flush_now)
+          :atomics.put(counter, 1, 0)
+        end
+
         :ok
 
       {:error, :backpressure} = err ->
@@ -92,9 +138,14 @@ defmodule Timeless.Buffer do
       write_concurrency: true
     ])
 
-    # Store builder pid for fast backpressure checks (no GenServer call needed)
+    # Atomics counter for lock-free point counting (no GenServer cast per write)
+    counter = :atomics.new(1, signed: false)
+
+    # Store metadata in ETS for fast access from caller processes
     builder_pid = GenServer.whereis(segment_builder) || segment_builder
     :ets.insert(table, {:__builder_pid__, builder_pid})
+    :ets.insert(table, {:__counter__, counter})
+    :ets.insert(table, {:__threshold__, flush_threshold})
 
     schedule_flush(flush_interval)
 
@@ -105,29 +156,35 @@ defmodule Timeless.Buffer do
       flush_interval: flush_interval,
       flush_threshold: flush_threshold,
       backpressure_threshold: backpressure_threshold,
-      point_count: 0
+      counter: counter,
+      builder_pid: builder_pid
     }
 
     {:ok, state}
   end
 
   @impl true
-  def handle_cast(:maybe_flush, state) do
-    count = state.point_count + 1
+  def handle_call(:flush_sync, _from, state) do
+    do_flush(state)
+    {:reply, :ok, state}
+  end
 
-    if count >= state.flush_threshold do
-      do_flush(state)
-      {:noreply, %{state | point_count: 0}}
-    else
-      {:noreply, %{state | point_count: count}}
-    end
+  @impl true
+  def handle_cast(:flush_now, state) do
+    do_flush(state)
+    {:noreply, state}
+  end
+
+  # Legacy: support old :maybe_flush casts from single writes
+  def handle_cast(:maybe_flush, state) do
+    {:noreply, state}
   end
 
   @impl true
   def handle_info(:flush, state) do
     do_flush(state)
     schedule_flush(state.flush_interval)
-    {:noreply, %{state | point_count: 0}}
+    {:noreply, state}
   end
 
   @impl true
@@ -138,26 +195,19 @@ defmodule Timeless.Buffer do
 
   # --- Internals ---
 
+  # Match spec: select data points as {series_id, timestamp, value}, skip metadata
+  @data_match_spec [{{{:"$1", :"$2", :_}, :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}]
+
   defp do_flush(state) do
-    # Save metadata, flush data, restore metadata
-    builder_entry = :ets.lookup(state.table, :__builder_pid__)
-    points = :ets.tab2list(state.table)
-    :ets.delete_all_objects(state.table)
-    Enum.each(builder_entry, &:ets.insert(state.table, &1))
+    # Select data points in one pass (skips metadata, strips unique ints)
+    points = :ets.select(state.table, @data_match_spec)
+    # Delete only data rows (3-tuple keys), metadata rows (atom keys) preserved
+    :ets.match_delete(state.table, {{:_, :_, :_}, :_})
+    # Reset atomics counter
+    :atomics.put(state.counter, 1, 0)
 
-    # Filter out metadata keys
-    data_points = Enum.filter(points, fn
-      {:__builder_pid__, _} -> false
-      _ -> true
-    end)
-
-    if data_points != [] do
-      grouped =
-        data_points
-        |> Enum.map(fn {{series_id, timestamp, _uniq}, value} ->
-          {series_id, timestamp, value}
-        end)
-        |> Enum.group_by(&elem(&1, 0), fn {_sid, ts, val} -> {ts, val} end)
+    if points != [] do
+      grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
 
       :telemetry.execute(
         [:timeless, :buffer, :flush],
@@ -170,45 +220,27 @@ defmodule Timeless.Buffer do
   end
 
   defp do_flush_sync(state) do
-    builder_entry = :ets.lookup(state.table, :__builder_pid__)
-    points = :ets.tab2list(state.table)
-    :ets.delete_all_objects(state.table)
-    Enum.each(builder_entry, &:ets.insert(state.table, &1))
+    points = :ets.select(state.table, @data_match_spec)
+    :ets.match_delete(state.table, {{:_, :_, :_}, :_})
+    :atomics.put(state.counter, 1, 0)
 
-    data_points = Enum.filter(points, fn
-      {:__builder_pid__, _} -> false
-      _ -> true
-    end)
-
-    if data_points != [] do
-      grouped =
-        data_points
-        |> Enum.map(fn {{series_id, timestamp, _uniq}, value} ->
-          {series_id, timestamp, value}
-        end)
-        |> Enum.group_by(&elem(&1, 0), fn {_sid, ts, val} -> {ts, val} end)
-
+    if points != [] do
+      grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
       Timeless.SegmentBuilder.ingest_sync(state.segment_builder, grouped)
     end
   end
 
   defp check_backpressure(shard_name) do
-    # Look up the builder pid from the shard's ETS metadata
-    # (stored during init as a special key)
     table = table_name(shard_name)
 
     try do
-      case :ets.lookup(table, :__builder_pid__) do
-        [{:__builder_pid__, builder_pid}] ->
-          case Process.info(builder_pid, :message_queue_len) do
-            {:message_queue_len, len} when len > @default_backpressure_threshold ->
-              {:error, :backpressure}
+      builder_pid = :ets.lookup_element(table, :__builder_pid__, 2)
 
-            _ ->
-              :ok
-          end
+      case Process.info(builder_pid, :message_queue_len) do
+        {:message_queue_len, len} when len > @default_backpressure_threshold ->
+          {:error, :backpressure}
 
-        [] ->
+        _ ->
           :ok
       end
     rescue

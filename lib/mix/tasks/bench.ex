@@ -5,11 +5,12 @@ defmodule Mix.Tasks.Bench do
 
   ## Usage
 
-      mix bench                    # quick: 100 devices × 20 metrics, 90 days
-      mix bench --tier medium      # 1K devices × 20 metrics, 90 days
-      mix bench --tier stress      # 10K devices × 20 metrics, 7 days
+      mix bench                         # quick: 100 devices × 20 metrics, 90 days
+      mix bench --tier fast-stress       # 5K devices × 2 days (~2 min)
+      mix bench --tier medium            # 1K devices × 20 metrics, 90 days
+      mix bench --tier stress            # 10K devices × 20 metrics, 7 days
       mix bench --devices 500 --days 30  # custom
-      mix bench --segment-duration 14400  # 4h segments (default)
+      mix bench --data-dir /var/bench    # real disk (default: /tmp = tmpfs)
 
   ## What it measures
 
@@ -36,16 +37,16 @@ defmodule Mix.Tasks.Bench do
   def run(args) do
     Mix.Task.run("app.start")
 
-    {tier_name, devices, days, seg_dur} = parse_args(args)
+    {tier_name, devices, days, seg_dur, custom_dir} = parse_args(args)
 
     metrics_count = length(@metrics)
     series_count = devices * metrics_count
     total_points = series_count * days * @intervals_per_day
 
-    data_dir = "/tmp/timeless_bench_#{System.os_time(:millisecond)}"
+    data_dir = custom_dir || "/tmp/timeless_bench_#{System.os_time(:millisecond)}"
     File.mkdir_p!(data_dir)
 
-    banner(tier_name, devices, metrics_count, days, series_count, total_points, seg_dur)
+    banner(tier_name, devices, metrics_count, days, series_count, total_points, seg_dur, data_dir)
 
     # Schema with disabled background ticks
     schema = %Timeless.Schema{
@@ -327,6 +328,21 @@ defmodule Mix.Tasks.Bench do
     rate = trunc(n / (us / 1_000_000))
     IO.puts("    #{fmt_int(n)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} writes/sec]")
 
+    # Single series, pre-resolved (no registry overhead)
+    IO.puts("")
+    IO.puts("  Single series, pre-resolved (100K writes):")
+    sid = Timeless.resolve_series(:bench, "cpu_usage", labels)
+
+    {us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..n do
+          Timeless.write_resolved(:bench, sid, 42.0)
+        end
+      end)
+
+    rate = trunc(n / (us / 1_000_000))
+    IO.puts("    #{fmt_int(n)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} writes/sec]")
+
     # Batch write speed (simulating one collection cycle)
     IO.puts("")
     IO.puts("  Batch write (#{devices} devices × #{length(@metrics)} metrics):")
@@ -345,6 +361,27 @@ defmodule Mix.Tasks.Bench do
       end)
 
     total = batch_iters * length(entries_per)
+    rate = trunc(total / (us / 1_000_000))
+    IO.puts("    #{fmt_int(total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} writes/sec]")
+
+    # Batch write, pre-resolved (no registry overhead)
+    IO.puts("")
+    IO.puts("  Batch write, pre-resolved (#{devices} devices × #{length(@metrics)} metrics):")
+
+    resolved_entries_per =
+      for dev <- 0..(devices - 1), metric <- @metrics do
+        sid = Timeless.resolve_series(:bench, metric, elem(labels_for, dev))
+        {sid, 42.0}
+      end
+
+    {us, _} =
+      :timer.tc(fn ->
+        for _ <- 1..batch_iters do
+          Timeless.write_batch_resolved(:bench, resolved_entries_per)
+        end
+      end)
+
+    total = batch_iters * length(resolved_entries_per)
     rate = trunc(total / (us / 1_000_000))
     IO.puts("    #{fmt_int(total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} writes/sec]")
   end
@@ -388,26 +425,32 @@ defmodule Mix.Tasks.Bench do
   defp parse_args(args) do
     {opts, _, _} =
       OptionParser.parse(args,
-        switches: [tier: :string, devices: :integer, days: :integer, segment_duration: :integer]
+        switches: [tier: :string, devices: :integer, days: :integer, segment_duration: :integer, data_dir: :string]
       )
 
     seg_dur = opts[:segment_duration] || 14_400
+    data_dir = opts[:data_dir]
 
-    case opts[:tier] do
-      "medium" -> {:medium, 1_000, 90, seg_dur}
-      "stress" -> {:stress, 10_000, 7, seg_dur}
-      "quick" -> {:quick, 100, 90, seg_dur}
-      nil ->
-        devices = opts[:devices] || 100
-        days = opts[:days] || 90
-        {:custom, devices, days, seg_dur}
-      _ -> {:quick, 100, 90, seg_dur}
-    end
+    {tier_name, devices, days} =
+      case opts[:tier] do
+        "medium" -> {:medium, 1_000, 90}
+        "stress" -> {:stress, 10_000, 7}
+        "fast-stress" -> {:"fast-stress", 5_000, 2}
+        "quick" -> {:quick, 100, 90}
+        nil ->
+          devices = opts[:devices] || 100
+          days = opts[:days] || 90
+          {:custom, devices, days}
+        _ -> {:quick, 100, 90}
+      end
+
+    {tier_name, devices, days, seg_dur, data_dir}
   end
 
   # ── Formatting ─────────────────────────────────────────────────────
 
-  defp banner(tier, devices, metrics, days, series, total, seg_dur) do
+  defp banner(tier, devices, metrics, days, series, total, seg_dur, data_dir) do
+    fs_type = detect_fs_type(data_dir)
     IO.puts("")
     IO.puts(bar())
     IO.puts("  Timeless Benchmark — #{tier}")
@@ -419,7 +462,16 @@ defmodule Mix.Tasks.Bench do
     IO.puts("  Segments:   #{div(seg_dur, 3600)}h (#{div(seg_dur, @interval)} pts/seg)")
     IO.puts("  Points:     #{fmt_int(total)}")
     IO.puts("  CPU:        #{System.schedulers_online()} cores")
+    IO.puts("  Storage:    #{data_dir} (#{fs_type})")
     IO.puts(bar())
+  end
+
+  defp detect_fs_type(path) do
+    case System.cmd("df", ["--output=fstype", path], stderr_to_stdout: true) do
+      {output, 0} ->
+        output |> String.split("\n", trim: true) |> List.last() |> String.trim()
+      _ -> "unknown"
+    end
   end
 
   defp header(title) do

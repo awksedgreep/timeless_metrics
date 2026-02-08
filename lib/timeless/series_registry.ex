@@ -108,7 +108,7 @@ defmodule Timeless.SeriesRegistry do
   end
 
   defp series_key(metric_name, labels) when is_map(labels) do
-    {metric_name, labels |> Enum.sort() |> List.to_tuple()}
+    {metric_name, labels}
   end
 
   defp encode_labels(labels) when is_map(labels) do
