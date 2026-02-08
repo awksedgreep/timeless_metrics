@@ -13,6 +13,7 @@ defmodule Timeless.MixProject do
 
   def application do
     [
+      mod: {Timeless.Application, []},
       extra_applications: [:logger]
     ]
   end

@@ -1,0 +1,8 @@
+_build/
+deps/
+.git/
+docs/
+test/
+*.db
+*.db-wal
+*.db-shm

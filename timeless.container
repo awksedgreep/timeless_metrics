@@ -1,0 +1,14 @@
+[Container]
+Image=localhost/timeless:latest
+ContainerName=timeless
+Volume=timeless_data:/data:Z
+PublishPort=8428:8428
+Network=victoria
+Environment=TIMELESS_DATA_DIR=/data
+Environment=TIMELESS_PORT=8428
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
