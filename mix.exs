@@ -20,7 +20,7 @@ defmodule Timeless.MixProject do
 
   defp deps do
     [
-      {:gorilla_stream, github: "awksedgreep/gorilla_stream"},
+      {:gorilla_stream, "~> 1.3"},
       {:exqlite, "~> 0.27"},
       {:ezstd, "~> 1.2"},
       {:bandit, "~> 1.6"},
