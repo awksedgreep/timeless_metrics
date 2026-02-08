@@ -49,14 +49,17 @@ defmodule Timeless.Chart do
     label_key = Keyword.get(opts, :label_key) || detect_label_key(series)
     theme = Keyword.get(opts, :theme, :auto)
     annots = Keyword.get(opts, :annotations, [])
+    forecast_data = Keyword.get(opts, :forecast, [])
+    anomaly_points = Keyword.get(opts, :anomalies, [])
 
     has_legend = length(series) > 1
     legend_h = if has_legend, do: @legend_height, else: 0
     plot_w = width - @padding.left - @padding.right
     plot_h = height - @padding.top - @padding.bottom - legend_h
 
-    # Compute global bounds across all series
-    {t_min, t_max, v_min, v_max} = compute_bounds(series)
+    # Compute global bounds across all series + forecast + anomaly points
+    extra_points = forecast_data ++ anomaly_points
+    {t_min, t_max, v_min, v_max} = compute_bounds(series, extra_points)
 
     # Handle edge cases
     if t_min == nil or t_max == nil do
@@ -78,6 +81,8 @@ defmodule Timeless.Chart do
       grid = render_grid(t_min, t_max, v_min, v_max, scale_x, scale_y, plot_w, plot_h, theme)
       legend = render_legend(series, label_key, width, height, legend_h, theme)
       annotation_markers = render_annotations(annots, t_min, t_max, scale_x, plot_h, theme)
+      forecast_line = render_forecast(forecast_data, scale_x, scale_y)
+      anomaly_dots = render_anomaly_dots(anomaly_points, scale_x, scale_y)
 
       """
       <svg xmlns="http://www.w3.org/2000/svg" width="#{width}" height="#{height}" viewBox="0 0 #{width} #{height}" style="font-family:-apple-system,system-ui,sans-serif;font-size:11px">
@@ -85,6 +90,8 @@ defmodule Timeless.Chart do
         <text x="#{div(width, 2)}" y="16" text-anchor="middle" #{text_attr(theme)} font-size="13" font-weight="600">#{escape(title)}</text>
         #{grid}
         #{lines}
+        #{forecast_line}
+        #{anomaly_dots}
         #{annotation_markers}
         #{legend}
       </svg>
@@ -358,8 +365,9 @@ defmodule Timeless.Chart do
 
   # --- Helpers ---
 
-  defp compute_bounds(series) do
-    all_points = Enum.flat_map(series, fn %{data: data} -> data end)
+  defp compute_bounds(series, extra_points) do
+    series_points = Enum.flat_map(series, fn %{data: data} -> data end)
+    all_points = series_points ++ extra_points
 
     if all_points == [] do
       {nil, nil, nil, nil}
@@ -385,6 +393,39 @@ defmodule Timeless.Chart do
       _ ->
         nil
     end
+  end
+
+  # --- Forecast overlay ---
+
+  @forecast_color "#8b5cf6"
+
+  defp render_forecast([], _scale_x, _scale_y), do: ""
+
+  defp render_forecast(forecast_data, scale_x, scale_y) do
+    points =
+      forecast_data
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {ts, val} ->
+        "#{Float.round(scale_x.(ts * 1.0), 1)},#{Float.round(scale_y.(val * 1.0), 1)}"
+      end)
+      |> Enum.join(" ")
+
+    ~s(<polyline points="#{points}" fill="none" stroke="#{@forecast_color}" stroke-width="2" stroke-dasharray="6,3" opacity="0.8"/>)
+  end
+
+  # --- Anomaly dots ---
+
+  defp render_anomaly_dots([], _scale_x, _scale_y), do: ""
+
+  defp render_anomaly_dots(anomaly_points, scale_x, scale_y) do
+    anomaly_points
+    |> Enum.map(fn {ts, val} ->
+      x = Float.round(scale_x.(ts * 1.0), 1)
+      y = Float.round(scale_y.(val * 1.0), 1)
+
+      ~s(<circle cx="#{x}" cy="#{y}" r="4" fill="#ef4444" stroke="#ffffff" stroke-width="1.5" opacity="0.9"/>)
+    end)
+    |> Enum.join("\n    ")
   end
 
   defp escape(str) do

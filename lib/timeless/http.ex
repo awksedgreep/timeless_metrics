@@ -65,15 +65,18 @@ defmodule Timeless.HTTP do
   @max_body_bytes 10 * 1024 * 1024
 
   plug :match
+  plug :authenticate
   plug :dispatch
 
   def child_spec(opts) do
     store = Keyword.fetch!(opts, :store)
     port = Keyword.get(opts, :port, 8428)
+    bearer_token = Keyword.get(opts, :bearer_token)
+    plug_opts = [store: store, bearer_token: bearer_token]
 
     %{
       id: {__MODULE__, store},
-      start: {Bandit, :start_link, [[plug: {__MODULE__, [store: store]}, port: port]]},
+      start: {Bandit, :start_link, [[plug: {__MODULE__, plug_opts}, port: port]]},
       type: :supervisor
     }
   end
@@ -83,8 +86,54 @@ defmodule Timeless.HTTP do
 
   @impl Plug
   def call(conn, opts) do
-    conn = Plug.Conn.put_private(conn, :timeless, Keyword.get(opts, :store))
-    super(conn, opts)
+    conn
+    |> Plug.Conn.put_private(:timeless, Keyword.get(opts, :store))
+    |> Plug.Conn.put_private(:timeless_token, Keyword.get(opts, :bearer_token))
+    |> super(opts)
+  end
+
+  # Bearer token authentication plug.
+  # Skips auth when no token is configured (backwards compatible).
+  # Exempts /health for load balancers and monitoring.
+  defp authenticate(%{request_path: "/health"} = conn, _opts), do: conn
+
+  defp authenticate(conn, _opts) do
+    case conn.private[:timeless_token] do
+      nil -> conn
+      expected -> check_token(conn, expected)
+    end
+  end
+
+  defp check_token(conn, expected) do
+    case extract_token(conn) do
+      nil ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(401, ~s({"error":"unauthorized"}))
+        |> halt()
+
+      token ->
+        if Plug.Crypto.secure_compare(token, expected) do
+          conn
+        else
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(403, ~s({"error":"forbidden"}))
+          |> halt()
+        end
+    end
+  end
+
+  defp extract_token(conn) do
+    case Plug.Conn.get_req_header(conn, "authorization") do
+      ["Bearer " <> token] ->
+        String.trim(token)
+
+      _ ->
+        # Fallback: ?token= query param for browser access (dashboard, charts)
+        conn = Plug.Conn.fetch_query_params(conn)
+        conn.query_params["token"]
+    end
   end
 
   # VictoriaMetrics JSON line import
@@ -458,7 +507,87 @@ defmodule Timeless.HTTP do
     |> send_resp(200, Jason.encode!(%{status: "deleted"}))
   end
 
+  # Forecast future values
+  get "/api/v1/forecast" do
+    store = conn.private.timeless
+    conn = Plug.Conn.fetch_query_params(conn)
+
+    case extract_query_params(conn.query_params) do
+      {:ok, metric, labels, from, to} ->
+        params = conn.query_params
+        step = parse_int(params["step"], 300)
+        horizon = parse_duration_param(params["horizon"], 3600)
+
+        {:ok, results} =
+          Timeless.query_aggregate_multi(store, metric, labels,
+            from: from,
+            to: to,
+            bucket: {step, :seconds},
+            aggregate: :avg
+          )
+
+        forecasts =
+          Enum.map(results, fn %{labels: l, data: data} ->
+            case Timeless.Forecast.predict(data, horizon: horizon, bucket: step) do
+              {:ok, predictions} ->
+                %{
+                  labels: l,
+                  data: Enum.map(data, fn {ts, val} -> [ts, val] end),
+                  forecast: Enum.map(predictions, fn {ts, val} -> [ts, val] end)
+                }
+
+              {:error, _} ->
+                %{labels: l, data: Enum.map(data, fn {ts, val} -> [ts, val] end), forecast: []}
+            end
+          end)
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{metric: metric, series: forecasts}))
+
+      {:error, msg} ->
+        json_error(conn, 400, msg)
+    end
+  end
+
+  # Anomaly detection
+  get "/api/v1/anomalies" do
+    store = conn.private.timeless
+    conn = Plug.Conn.fetch_query_params(conn)
+
+    case extract_query_params(conn.query_params) do
+      {:ok, metric, labels, from, to} ->
+        params = conn.query_params
+        step = parse_int(params["step"], 300)
+        sensitivity = parse_sensitivity(params["sensitivity"])
+
+        {:ok, results} =
+          Timeless.query_aggregate_multi(store, metric, labels,
+            from: from,
+            to: to,
+            bucket: {step, :seconds},
+            aggregate: :avg
+          )
+
+        detections =
+          Enum.map(results, fn %{labels: l, data: data} ->
+            case Timeless.Anomaly.detect(data, sensitivity: sensitivity) do
+              {:ok, analysis} -> %{labels: l, analysis: analysis}
+              {:error, _} -> %{labels: l, analysis: []}
+            end
+          end)
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(%{metric: metric, series: detections}))
+
+      {:error, msg} ->
+        json_error(conn, 400, msg)
+    end
+  end
+
   # SVG chart — embeddable via <img src="http://host:port/chart?metric=cpu&host=web-1&from=-1h">
+  # Optional: &forecast=1h for forecast overlay, &anomalies=medium for anomaly markers
   get "/chart" do
     store = conn.private.timeless
     conn = Plug.Conn.fetch_query_params(conn)
@@ -476,12 +605,62 @@ defmodule Timeless.HTTP do
 
         {:ok, annots} = Timeless.annotations(store, from, to)
 
+        # Optional forecast overlay
+        forecast_data =
+          case params["forecast"] do
+            nil ->
+              []
+
+            horizon_str ->
+              horizon = parse_duration_param(horizon_str, 3600)
+
+              case results do
+                [%{data: data} | _] ->
+                  case Timeless.Forecast.predict(data, horizon: horizon, bucket: step) do
+                    {:ok, predictions} ->
+                      last_point = List.last(data)
+                      if last_point, do: [last_point | predictions], else: predictions
+
+                    _ ->
+                      []
+                  end
+
+                _ ->
+                  []
+              end
+          end
+
+        # Optional anomaly overlay
+        anomaly_points =
+          case params["anomalies"] do
+            nil ->
+              []
+
+            sensitivity_str ->
+              sensitivity = parse_sensitivity(sensitivity_str)
+
+              results
+              |> Enum.flat_map(fn %{data: data} ->
+                case Timeless.Anomaly.detect(data, sensitivity: sensitivity) do
+                  {:ok, analysis} ->
+                    analysis
+                    |> Enum.filter(& &1.anomaly)
+                    |> Enum.map(fn a -> {a.timestamp, a.value} end)
+
+                  _ ->
+                    []
+                end
+              end)
+          end
+
         svg =
           Timeless.Chart.render(metric, results,
             width: width,
             height: height,
             theme: theme,
-            annotations: annots
+            annotations: annots,
+            forecast: forecast_data,
+            anomalies: anomaly_points
           )
 
         conn
@@ -667,6 +846,24 @@ defmodule Timeless.HTTP do
       {n, "w"} -> n * 604_800
       {n, ""} -> n
       _ -> fallback
+    end
+  end
+
+  defp parse_sensitivity(nil), do: :medium
+  defp parse_sensitivity("true"), do: :medium
+  defp parse_sensitivity(s) when s in ~w(low medium high), do: String.to_existing_atom(s)
+  defp parse_sensitivity(_), do: :medium
+
+  defp parse_duration_param(nil, default), do: default
+
+  defp parse_duration_param(val, default) when is_binary(val) do
+    case Integer.parse(val) do
+      {n, "s"} -> n
+      {n, "m"} -> n * 60
+      {n, "h"} -> n * 3600
+      {n, "d"} -> n * 86400
+      {n, ""} -> n
+      _ -> default
     end
   end
 

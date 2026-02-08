@@ -12,5 +12,6 @@ if config_env() == :prod do
     port: String.to_integer(System.get_env("TIMELESS_PORT", "8428")),
     buffer_shards: shards,
     segment_duration:
-      String.to_integer(System.get_env("TIMELESS_SEGMENT_DURATION", "14400"))
+      String.to_integer(System.get_env("TIMELESS_SEGMENT_DURATION", "14400")),
+    bearer_token: System.get_env("TIMELESS_BEARER_TOKEN")
 end

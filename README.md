@@ -15,9 +15,12 @@ Run it as a library inside your Elixir app or as a standalone container.
 - **SVG charts** — pure Elixir chart rendering, embeddable via `<img>` tags with light/dark/auto themes
 - **Built-in dashboard** — zero-dependency HTML overview with auto-refresh
 - **Annotations** — event markers (deploys, incidents) that overlay on charts
-- **Alerts** — threshold-based rules with webhook notifications
+- **Forecasting** — polynomial trend + Fourier seasonal regression, auto-detects daily/weekly/yearly periods
+- **Anomaly detection** — z-score analysis on model residuals with configurable sensitivity
+- **Capacity planning** — forecast from daily/weekly data to predict growth months or years ahead
+- **Alerts** — threshold-based rules with webhook notifications (ntfy.sh, Slack, etc.)
 - **Metric metadata** — type, unit, and description registration
-- **Zero external dependencies** — SQLite + pure Elixir, no Redis/Kafka/Postgres required
+- **Zero external dependencies** — SQLite + pure Elixir, no Nx/Scholar/ML libraries required
 
 ## Quick Start
 
@@ -67,10 +70,22 @@ Query:
 curl 'http://localhost:8428/api/v1/query_range?metric=cpu_usage&from=-1h&step=60'
 ```
 
-Embed a chart:
+Embed a chart with forecast and anomaly overlays:
 
 ```html
-<img src="http://localhost:8428/chart?metric=cpu_usage&from=-6h&theme=auto" />
+<img src="http://localhost:8428/chart?metric=cpu_usage&from=-6h&forecast=1h&anomalies=medium&theme=auto" />
+```
+
+Forecast future values:
+
+```bash
+curl 'http://localhost:8428/api/v1/forecast?metric=cpu_usage&from=-24h&step=300&horizon=6h'
+```
+
+Detect anomalies:
+
+```bash
+curl 'http://localhost:8428/api/v1/anomalies?metric=cpu_usage&from=-24h&step=300&sensitivity=medium'
 ```
 
 View the dashboard at `http://localhost:8428/`.
@@ -96,11 +111,54 @@ View the dashboard at `http://localhost:8428/`.
 | `POST` | `/api/v1/alerts` | Create an alert rule |
 | `GET` | `/api/v1/alerts` | List alert rules |
 | `DELETE` | `/api/v1/alerts/:id` | Delete an alert rule |
-| `GET` | `/chart` | SVG line chart |
+| `GET` | `/api/v1/forecast` | Forecast future values |
+| `GET` | `/api/v1/anomalies` | Detect anomalies |
+| `GET` | `/chart` | SVG chart (supports `&forecast=` and `&anomalies=` overlays) |
 | `GET` | `/health` | Health check with stats |
 | `GET` | `/` | HTML dashboard |
 
 See [docs/API.md](docs/API.md) for full request/response documentation with examples.
+
+## Forecasting & Anomaly Detection
+
+Timeless includes a built-in forecast engine and anomaly detector — no external ML libraries needed. The pure Elixir normal equation solver runs in ~3ms for a year of daily data.
+
+Seasonal periods are auto-detected from the data's sampling interval:
+
+| Sampling | Periods | Use Case |
+|---|---|---|
+| Sub-hourly | Daily + half-daily | Operational monitoring |
+| Hourly | Daily + weekly | Trend analysis |
+| Daily+ | Weekly + yearly | Capacity planning |
+
+### Elixir API
+
+```elixir
+# Forecast 6 hours ahead from 24h of 5-minute data
+{:ok, results} = Timeless.forecast(:metrics, "cpu_usage", %{"host" => "web-1"},
+  from: now - 86_400, horizon: 21_600, bucket: {300, :seconds})
+
+# Detect anomalies
+{:ok, results} = Timeless.detect_anomalies(:metrics, "cpu_usage", %{"host" => "web-1"},
+  from: now - 86_400, bucket: {300, :seconds}, sensitivity: :medium)
+
+# Capacity planning: 1 year of daily data → 1 year forecast
+{:ok, results} = Timeless.forecast(:metrics, "bandwidth_peak", %{},
+  from: now - 365 * 86_400, horizon: 365 * 86_400, bucket: {1, :days}, aggregate: :max)
+```
+
+### Chart overlays
+
+```html
+<!-- Purple dashed forecast line + red anomaly dots -->
+<img src="http://localhost:8428/chart?metric=cpu_usage&from=-24h&forecast=6h&anomalies=medium" />
+```
+
+![Forecast + anomaly chart](docs/examples/chart_full_analysis.svg)
+
+See [docs/capacity_planning.md](docs/capacity_planning.md) for detailed capacity planning guide with ISP examples.
+
+See [docs/alerting.md](docs/alerting.md) for alert rules, webhook payloads, and integration with ntfy.sh/Slack.
 
 ## Container Configuration
 
@@ -110,6 +168,24 @@ See [docs/API.md](docs/API.md) for full request/response documentation with exam
 | `TIMELESS_PORT` | `8428` | HTTP listen port |
 | `TIMELESS_SHARDS` | CPU count | Write buffer shard count |
 | `TIMELESS_SEGMENT_DURATION` | `14400` | Raw segment duration (seconds) |
+| `TIMELESS_BEARER_TOKEN` | *(none)* | Bearer token for API auth (unset = no auth) |
+
+## Authentication
+
+Set `TIMELESS_BEARER_TOKEN` to require authentication on all endpoints (except `/health`):
+
+```bash
+# Via env var
+TIMELESS_BEARER_TOKEN=my-secret-token podman run -d -p 8428:8428 ...
+
+# API access
+curl -H "Authorization: Bearer my-secret-token" http://localhost:8428/api/v1/query_range?...
+
+# Browser access (dashboard, charts) via query param
+http://localhost:8428/chart?metric=cpu_usage&from=-6h&token=my-secret-token
+```
+
+When unset, all endpoints are open (backwards compatible, for trusted networks).
 
 ## Podman Quadlet
 

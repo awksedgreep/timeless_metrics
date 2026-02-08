@@ -658,6 +658,92 @@ defmodule Timeless do
     :persistent_term.get({Timeless, store, :schema}, Timeless.Schema.default())
   end
 
+  @doc """
+  Forecast future values for matching series.
+
+  ## Options
+
+    * `:from` - Training data start timestamp (required)
+    * `:to` - Training data end timestamp (default: now)
+    * `:horizon` - Seconds to forecast ahead (required)
+    * `:bucket` - Bucket size: `{n, :seconds}`, `:minute`, `:hour` (default: `{300, :seconds}`)
+    * `:aggregate` - Aggregate for bucketing training data (default: `:avg`)
+
+  Returns `{:ok, [%{labels: map, data: [{ts, val}], forecast: [{ts, val}]}, ...]}`.
+  """
+  def forecast(store, metric_name, labels, opts) do
+    from = Keyword.fetch!(opts, :from)
+    to = Keyword.get(opts, :to, System.os_time(:second))
+    horizon = Keyword.fetch!(opts, :horizon)
+    bucket = Keyword.get(opts, :bucket, {300, :seconds})
+    aggregate = Keyword.get(opts, :aggregate, :avg)
+
+    bucket_seconds = bucket_to_seconds(bucket)
+
+    {:ok, results} =
+      query_aggregate_multi(store, metric_name, labels,
+        from: from,
+        to: to,
+        bucket: bucket,
+        aggregate: aggregate
+      )
+
+    forecasts =
+      Enum.map(results, fn %{labels: l, data: data} ->
+        case Timeless.Forecast.predict(data, horizon: horizon, bucket: bucket_seconds) do
+          {:ok, predictions} -> %{labels: l, data: data, forecast: predictions}
+          {:error, _} -> %{labels: l, data: data, forecast: []}
+        end
+      end)
+
+    {:ok, forecasts}
+  end
+
+  @doc """
+  Detect anomalies in matching series.
+
+  ## Options
+
+    * `:from` - Start timestamp (required)
+    * `:to` - End timestamp (default: now)
+    * `:bucket` - Bucket size (default: `{300, :seconds}`)
+    * `:aggregate` - Aggregate for bucketing (default: `:avg`)
+    * `:sensitivity` - `:low`, `:medium`, or `:high` (default: `:medium`)
+
+  Returns `{:ok, [%{labels: map, analysis: [%{timestamp, value, expected, score, anomaly}]}, ...]}`.
+  """
+  def detect_anomalies(store, metric_name, labels, opts) do
+    from = Keyword.fetch!(opts, :from)
+    to = Keyword.get(opts, :to, System.os_time(:second))
+    bucket = Keyword.get(opts, :bucket, {300, :seconds})
+    aggregate = Keyword.get(opts, :aggregate, :avg)
+    sensitivity = Keyword.get(opts, :sensitivity, :medium)
+
+    {:ok, results} =
+      query_aggregate_multi(store, metric_name, labels,
+        from: from,
+        to: to,
+        bucket: bucket,
+        aggregate: aggregate
+      )
+
+    detections =
+      Enum.map(results, fn %{labels: l, data: data} ->
+        case Timeless.Anomaly.detect(data, sensitivity: sensitivity) do
+          {:ok, analysis} -> %{labels: l, analysis: analysis}
+          {:error, _} -> %{labels: l, analysis: []}
+        end
+      end)
+
+    {:ok, detections}
+  end
+
+  defp bucket_to_seconds(:minute), do: 60
+  defp bucket_to_seconds(:hour), do: 3600
+  defp bucket_to_seconds(:day), do: 86400
+  defp bucket_to_seconds({n, :seconds}), do: n
+  defp bucket_to_seconds(n) when is_integer(n), do: n
+
   # --- Internals ---
 
   defp buffer_shard_count(store) do

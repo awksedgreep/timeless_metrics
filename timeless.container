@@ -6,6 +6,7 @@ PublishPort=8428:8428
 Network=victoria
 Environment=TIMELESS_DATA_DIR=/data
 Environment=TIMELESS_PORT=8428
+# Environment=TIMELESS_BEARER_TOKEN=change-me
 
 [Service]
 Restart=always

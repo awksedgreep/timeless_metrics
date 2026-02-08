@@ -12,13 +12,15 @@ defmodule Timeless.Application do
           shards = Keyword.get(config, :buffer_shards, System.schedulers_online())
           segment_duration = Keyword.get(config, :segment_duration, 14_400)
 
+          bearer_token = Keyword.get(config, :bearer_token)
+
           [
             {Timeless,
              name: :timeless,
              data_dir: data_dir,
              buffer_shards: shards,
              segment_duration: segment_duration},
-            {Timeless.HTTP, store: :timeless, port: port}
+            {Timeless.HTTP, store: :timeless, port: port, bearer_token: bearer_token}
           ]
 
         :error ->

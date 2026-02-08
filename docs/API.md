@@ -21,6 +21,7 @@ covers the Elixir API, the HTTP interface, and the SVG charting endpoint.
   - [Alerts](#alerts)
   - [Operational](#operational)
 - [HTTP API](#http-api)
+  - [Authentication](#authentication)
   - [Ingest Endpoints](#ingest-endpoints)
   - [Query Endpoints](#query-endpoints)
   - [Prometheus-Compatible Endpoints](#prometheus-compatible-endpoints)
@@ -347,6 +348,39 @@ Or run the container (starts both automatically).
 
 All ingest and query endpoints are compatible with VictoriaMetrics tooling
 (Vector, Grafana, etc.).
+
+### Authentication
+
+Set the `TIMELESS_BEARER_TOKEN` environment variable to enable token authentication.
+When set, all endpoints except `/health` require a valid token.
+
+**Via header** (API clients, curl, Grafana):
+
+```bash
+curl -H "Authorization: Bearer my-secret-token" \
+  http://localhost:8428/api/v1/query_range?metric=cpu_usage&from=-1h
+```
+
+**Via query parameter** (browsers, embedded charts):
+
+```
+http://localhost:8428/chart?metric=cpu_usage&from=-6h&token=my-secret-token
+http://localhost:8428/?token=my-secret-token
+```
+
+**Elixir library usage** (pass `:bearer_token` in HTTP opts):
+
+```elixir
+{Timeless.HTTP, store: :metrics, port: 8428, bearer_token: "my-secret-token"}
+```
+
+| Response | Meaning |
+|---|---|
+| `401 {"error":"unauthorized"}` | No token provided (missing header and no `?token=` param) |
+| `403 {"error":"forbidden"}` | Token provided but doesn't match |
+
+When `TIMELESS_BEARER_TOKEN` is not set, all endpoints are open (no auth enforced).
+`/health` is always open regardless of token configuration.
 
 ### Ingest Endpoints
 

@@ -518,4 +518,112 @@ this is not json
 
     assert length(points) == 1
   end
+
+  # --- Bearer Token Auth ---
+
+  @secret "test-secret-token"
+
+  defp authed_call(conn, opts \\ []) do
+    Timeless.HTTP.call(conn, Keyword.merge([store: :http_test, bearer_token: @secret], opts))
+  end
+
+  test "auth disabled: requests work without token" do
+    conn =
+      Plug.Test.conn(:get, "/health")
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+  end
+
+  test "auth enabled: valid Bearer header returns 200" do
+    conn =
+      Plug.Test.conn(:get, "/health")
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{@secret}")
+      |> authed_call()
+
+    assert conn.status == 200
+  end
+
+  test "auth enabled: /health is exempt (no token needed)" do
+    conn =
+      Plug.Test.conn(:get, "/health")
+      |> authed_call()
+
+    assert conn.status == 200
+  end
+
+  test "auth enabled: missing token returns 401" do
+    now = 1_700_000_000
+
+    conn =
+      Plug.Test.conn(:get, "/api/v1/query?metric=cpu&from=#{now}&to=#{now + 60}")
+      |> authed_call()
+
+    assert conn.status == 401
+    assert Jason.decode!(conn.resp_body)["error"] == "unauthorized"
+  end
+
+  test "auth enabled: wrong token returns 403" do
+    now = 1_700_000_000
+
+    conn =
+      Plug.Test.conn(:get, "/api/v1/query?metric=cpu&from=#{now}&to=#{now + 60}")
+      |> Plug.Conn.put_req_header("authorization", "Bearer wrong-token")
+      |> authed_call()
+
+    assert conn.status == 403
+    assert Jason.decode!(conn.resp_body)["error"] == "forbidden"
+  end
+
+  test "auth enabled: valid token grants access to API" do
+    now = 1_700_000_000
+
+    conn =
+      Plug.Test.conn(:get, "/api/v1/query?metric=cpu&from=#{now}&to=#{now + 60}")
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{@secret}")
+      |> authed_call()
+
+    assert conn.status == 200
+  end
+
+  test "auth enabled: token via query param grants access" do
+    now = 1_700_000_000
+
+    conn =
+      Plug.Test.conn(:get, "/api/v1/query?metric=cpu&from=#{now}&to=#{now + 60}&token=#{@secret}")
+      |> authed_call()
+
+    assert conn.status == 200
+  end
+
+  test "auth enabled: wrong token via query param returns 403" do
+    now = 1_700_000_000
+
+    conn =
+      Plug.Test.conn(:get, "/api/v1/query?metric=cpu&from=#{now}&to=#{now + 60}&token=wrong")
+      |> authed_call()
+
+    assert conn.status == 403
+  end
+
+  test "auth enabled: POST endpoint requires token" do
+    lines = Jason.encode!(%{
+      metric: %{__name__: "cpu", host: "web-1"},
+      values: [1.0],
+      timestamps: [1_700_000_000]
+    })
+
+    conn =
+      Plug.Test.conn(:post, "/api/v1/import", lines)
+      |> authed_call()
+
+    assert conn.status == 401
+
+    conn =
+      Plug.Test.conn(:post, "/api/v1/import", lines)
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{@secret}")
+      |> authed_call()
+
+    assert conn.status == 204
+  end
 end

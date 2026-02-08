@@ -97,7 +97,7 @@ defmodule Timeless.MetadataRateTest do
 
   test "rate aggregate computes per-second rate from raw data" do
     now = System.os_time(:second)
-    base = div(now, 60) * 60
+    base = div(now, 300) * 300
 
     # Monotonically increasing counter: 0, 100, 200, 300, 400, 500
     # 100 units per 60 seconds = 1.667/s
@@ -125,7 +125,7 @@ defmodule Timeless.MetadataRateTest do
 
   test "rate handles counter resets gracefully" do
     now = System.os_time(:second)
-    base = div(now, 60) * 60
+    base = div(now, 360) * 360
 
     # Counter: 100, 200, 300, 50 (reset!), 150, 250
     values = [100.0, 200.0, 300.0, 50.0, 150.0, 250.0]
@@ -156,7 +156,7 @@ defmodule Timeless.MetadataRateTest do
 
   test "rate via HTTP query_range" do
     now = System.os_time(:second)
-    base = div(now, 60) * 60
+    base = div(now, 600) * 600
 
     for i <- 0..9 do
       Timeless.write(:meta_test, "http_rate", %{"host" => "web-1"}, i * 1000.0,
