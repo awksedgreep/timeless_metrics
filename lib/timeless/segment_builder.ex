@@ -48,6 +48,11 @@ defmodule Timeless.SegmentBuilder do
     GenServer.call(builder, :flush, :infinity)
   end
 
+  @doc "Get the count of points held in memory (not yet in a finalized segment)."
+  def pending_point_count(builder) do
+    GenServer.call(builder, :pending_point_count, :infinity)
+  end
+
   @doc """
   Read from this shard's DB using a reader connection. Lock-free (no GenServer).
 
@@ -188,6 +193,15 @@ defmodule Timeless.SegmentBuilder do
     end
 
     {:reply, :ok, %{state | segments: %{}}}
+  end
+
+  def handle_call(:pending_point_count, _from, state) do
+    count =
+      state.segments
+      |> Map.values()
+      |> Enum.reduce(0, fn seg, acc -> acc + length(seg.points) end)
+
+    {:reply, count, state}
   end
 
   def handle_call({:write_transaction, fun}, _from, state) do

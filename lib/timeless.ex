@@ -363,15 +363,17 @@ defmodule Timeless do
       end)
       |> Map.new()
 
-    # Buffer sizes
+    # Buffer sizes (ETS buffer + SegmentBuilder in-memory)
     shard_count = buffer_shard_count(store)
 
-    buffer_total =
-      Enum.sum(
-        for i <- 0..(shard_count - 1) do
-          Timeless.Buffer.buffer_size(:"#{store}_shard_#{i}")
-        end
-      )
+    {buffer_total, pending_total} =
+      Enum.reduce(0..(shard_count - 1), {0, 0}, fn i, {buf_acc, pend_acc} ->
+        buf = Timeless.Buffer.buffer_size(:"#{store}_shard_#{i}")
+        pend = Timeless.SegmentBuilder.pending_point_count(:"#{store}_builder_#{i}")
+        {buf_acc + buf, pend_acc + pend}
+      end)
+
+    all_points = total_points + pending_total
 
     bytes_per_point =
       if total_points > 0, do: Float.round(raw_bytes / total_points, 2), else: 0.0
@@ -379,7 +381,9 @@ defmodule Timeless do
     %{
       series_count: series_count,
       segment_count: segment_count,
-      total_points: total_points,
+      total_points: all_points,
+      segment_points: total_points,
+      pending_points: pending_total,
       raw_compressed_bytes: raw_bytes,
       bytes_per_point: bytes_per_point,
       storage_bytes: storage_bytes,

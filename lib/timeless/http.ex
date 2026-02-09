@@ -1,4 +1,6 @@
 defmodule Timeless.HTTP do
+  require Logger
+
   @moduledoc """
   Optional HTTP ingest interface compatible with VictoriaMetrics JSON line import format.
 
@@ -142,7 +144,7 @@ defmodule Timeless.HTTP do
 
     case Plug.Conn.read_body(conn, length: @max_body_bytes) do
       {:ok, body, conn} ->
-        {count, errors} = ingest_json_lines(store, body)
+        {count, errors, error_samples} = ingest_json_lines(store, body)
 
         :telemetry.execute(
           [:timeless, :http, :import],
@@ -153,7 +155,11 @@ defmodule Timeless.HTTP do
         if errors > 0 do
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(200, Jason.encode!(%{samples: count, errors: errors}))
+          |> send_resp(200, Jason.encode!(%{
+            samples: count,
+            errors: errors,
+            failed_lines: error_samples
+          }))
         else
           send_resp(conn, 204, "")
         end
@@ -689,7 +695,7 @@ defmodule Timeless.HTTP do
 
     case Plug.Conn.read_body(conn, length: @max_body_bytes) do
       {:ok, body, conn} ->
-        {count, errors} = ingest_prometheus_text(store, body)
+        {count, errors, error_samples} = ingest_prometheus_text(store, body)
 
         :telemetry.execute(
           [:timeless, :http, :import],
@@ -700,7 +706,11 @@ defmodule Timeless.HTTP do
         if errors > 0 do
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(200, Jason.encode!(%{samples: count, errors: errors}))
+          |> send_resp(200, Jason.encode!(%{
+            samples: count,
+            errors: errors,
+            failed_lines: error_samples
+          }))
         else
           send_resp(conn, 204, "")
         end
@@ -909,19 +919,32 @@ defmodule Timeless.HTTP do
     |> send_resp(status, Jason.encode!(%{error: msg}))
   end
 
+  @max_error_samples 3
+
   defp ingest_json_lines(store, body) do
-    {all_entries, errors} =
+    {all_entries, errors, error_samples} =
       body
       |> String.split("\n", trim: true)
-      |> Enum.reduce({[], 0}, fn line, {entries_acc, errors} ->
+      |> Enum.reduce({[], 0, []}, fn line, {entries_acc, errors, samples} ->
         case parse_vm_line(line) do
           {:ok, entries} ->
-            {[entries | entries_acc], errors}
+            {[entries | entries_acc], errors, samples}
 
           :error ->
-            {entries_acc, errors + 1}
+            samples =
+              if length(samples) < @max_error_samples do
+                [String.slice(line, 0, 200) | samples]
+              else
+                samples
+              end
+
+            {entries_acc, errors + 1, samples}
         end
       end)
+
+    if errors > 0 do
+      Logger.warning("Import: #{errors} line(s) failed to parse, sample: #{inspect(Enum.reverse(error_samples))}")
+    end
 
     # One batch call for the entire body
     flat_entries = List.flatten(all_entries)
@@ -930,7 +953,7 @@ defmodule Timeless.HTTP do
       Timeless.write_batch(store, flat_entries)
     end
 
-    {length(flat_entries), errors}
+    {length(flat_entries), errors, Enum.reverse(error_samples)}
   end
 
   defp parse_vm_line(line) do
@@ -970,30 +993,41 @@ defmodule Timeless.HTTP do
   # Skips comments (#) and empty lines.
 
   defp ingest_prometheus_text(store, body) do
-    {all_entries, errors} =
+    {all_entries, errors, error_samples} =
       body
       |> String.split("\n", trim: true)
-      |> Enum.reduce({[], 0}, fn line, {entries_acc, errors} ->
+      |> Enum.reduce({[], 0, []}, fn line, {entries_acc, errors, samples} ->
         line = String.trim(line)
 
         if line == "" or String.starts_with?(line, "#") do
-          {entries_acc, errors}
+          {entries_acc, errors, samples}
         else
           case parse_prometheus_line(line) do
             {:ok, metric, labels, value, timestamp} ->
-              {[{metric, labels, value, timestamp} | entries_acc], errors}
+              {[{metric, labels, value, timestamp} | entries_acc], errors, samples}
 
             :error ->
-              {entries_acc, errors + 1}
+              samples =
+                if length(samples) < @max_error_samples do
+                  [String.slice(line, 0, 200) | samples]
+                else
+                  samples
+                end
+
+              {entries_acc, errors + 1, samples}
           end
         end
       end)
+
+    if errors > 0 do
+      Logger.warning("Prometheus import: #{errors} line(s) failed to parse, sample: #{inspect(Enum.reverse(error_samples))}")
+    end
 
     if all_entries != [] do
       Timeless.write_batch(store, all_entries)
     end
 
-    {length(all_entries), errors}
+    {length(all_entries), errors, Enum.reverse(error_samples)}
   end
 
   defp parse_prometheus_line(line) do

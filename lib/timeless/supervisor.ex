@@ -17,6 +17,7 @@ defmodule Timeless.Supervisor do
     flush_interval = Keyword.get(opts, :flush_interval, :timer.seconds(5))
     flush_threshold = Keyword.get(opts, :flush_threshold, 10_000)
     segment_duration = Keyword.get(opts, :segment_duration, 3_600)
+    pending_flush_interval = Keyword.get(opts, :pending_flush_interval, :timer.seconds(60))
     compression = Keyword.get(opts, :compression, :zstd)
 
     schema =
@@ -52,6 +53,7 @@ defmodule Timeless.Supervisor do
                    shard_id: i,
                    data_dir: data_dir,
                    segment_duration: segment_duration,
+                   pending_flush_interval: pending_flush_interval,
                    compression: compression,
                    schema: schema
                  ]
