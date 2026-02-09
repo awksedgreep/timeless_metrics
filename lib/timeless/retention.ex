@@ -91,7 +91,10 @@ defmodule Timeless.Retention do
     # 3. Clean orphaned series (no data in any table)
     cleanup_orphaned_series(state, shard_count)
 
-    # 4. Periodic vacuum on main DB
+    # 4. Clean orphaned alert rules (metric no longer has any series)
+    cleanup_orphaned_alerts(state)
+
+    # 5. Periodic vacuum on main DB
     counter = state.vacuum_counter + 1
 
     if rem(counter, @vacuum_every) == 0 do
@@ -142,6 +145,28 @@ defmodule Timeless.Retention do
       sql = "DELETE FROM series WHERE id NOT IN (#{values})"
       Timeless.DB.write(state.db, sql, [])
     end
+  end
+
+  defp cleanup_orphaned_alerts(state) do
+    {:ok, rules} = Timeless.Alert.list_rules(state.db)
+
+    Enum.each(rules, fn rule ->
+      {:ok, series_rows} =
+        Timeless.DB.read(
+          state.db,
+          "SELECT COUNT(*) FROM series WHERE metric_name = ?1",
+          [rule.metric]
+        )
+
+      case series_rows do
+        [[0]] ->
+          Logger.info("Deleting orphaned alert rule #{rule.id} (#{rule.name}): metric '#{rule.metric}' has no series")
+          Timeless.Alert.delete_rule(state.db, rule.id)
+
+        _ ->
+          :ok
+      end
+    end)
   end
 
   defp schedule_tick(interval) do

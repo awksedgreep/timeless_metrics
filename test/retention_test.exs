@@ -93,4 +93,44 @@ defmodule Timeless.RetentionTest do
     info = Timeless.info(:ret_test)
     assert info.series_count == 0
   end
+
+  test "retention cleans orphaned alert rules" do
+    now = System.os_time(:second)
+
+    # Create a metric with data so its series exists
+    Timeless.write(:ret_test, "active_metric", %{"host" => "a"}, 42.0,
+      timestamp: now - 300
+    )
+
+    Timeless.flush(:ret_test)
+
+    # Create alert for active metric — should survive
+    {:ok, active_id} =
+      Timeless.create_alert(:ret_test,
+        name: "Active alert",
+        metric: "active_metric",
+        condition: :above,
+        threshold: 90.0
+      )
+
+    # Create alert for a metric that doesn't exist — orphaned
+    {:ok, orphan_id} =
+      Timeless.create_alert(:ret_test,
+        name: "Orphaned alert",
+        metric: "nonexistent_metric",
+        condition: :above,
+        threshold: 50.0
+      )
+
+    {:ok, rules_before} = Timeless.list_alerts(:ret_test)
+    assert length(rules_before) == 2
+
+    # Enforce retention — should clean up orphaned rule
+    Timeless.enforce_retention(:ret_test)
+
+    {:ok, rules_after} = Timeless.list_alerts(:ret_test)
+    assert length(rules_after) == 1
+    assert List.first(rules_after).id == active_id
+    assert Enum.find(rules_after, &(&1.id == orphan_id)) == nil
+  end
 end
