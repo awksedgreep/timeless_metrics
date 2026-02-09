@@ -698,4 +698,184 @@ this is not json
 
     assert conn.status == 204
   end
+
+  # --- Forecast endpoint ---
+
+  test "GET /api/v1/forecast returns predictions" do
+    now = System.os_time(:second)
+
+    # Need enough points for forecast model (3 + 2*periods minimum)
+    # 100 points at 5-min intervals
+    for i <- 0..99 do
+      ts = now - (99 - i) * 300
+      val = 50.0 + 20.0 * :math.sin(2 * :math.pi() * i / 50)
+      Timeless.write(:http_test, "forecast_test", %{"host" => "a"}, val, timestamp: ts)
+    end
+
+    Timeless.flush(:http_test)
+
+    conn =
+      Plug.Test.conn(
+        :get,
+        "/api/v1/forecast?metric=forecast_test&host=a&from=#{now - 100 * 300}&to=#{now}&step=300&horizon=3600"
+      )
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    result = Jason.decode!(conn.resp_body)
+    assert result["metric"] == "forecast_test"
+    assert length(result["series"]) >= 1
+
+    series = List.first(result["series"])
+    assert is_list(series["data"])
+    assert is_list(series["forecast"])
+    assert length(series["forecast"]) > 0
+  end
+
+  test "GET /api/v1/forecast with insufficient data returns empty forecast" do
+    now = System.os_time(:second)
+
+    Timeless.write(:http_test, "sparse_fc", %{"id" => "1"}, 42.0, timestamp: now)
+    Timeless.flush(:http_test)
+
+    conn =
+      Plug.Test.conn(
+        :get,
+        "/api/v1/forecast?metric=sparse_fc&id=1&from=#{now - 60}&to=#{now + 60}&step=300&horizon=3600"
+      )
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    result = Jason.decode!(conn.resp_body)
+    series = List.first(result["series"])
+    assert series["forecast"] == []
+  end
+
+  # --- Anomaly endpoint ---
+
+  test "GET /api/v1/anomalies returns anomaly analysis" do
+    now = System.os_time(:second)
+
+    # Write smooth data with one spike
+    for i <- 0..49 do
+      ts = now - (49 - i) * 300
+      val = if i == 25, do: 999.0, else: 50.0 + 5.0 * :math.sin(2 * :math.pi() * i / 25)
+      Timeless.write(:http_test, "anom_test", %{"host" => "b"}, val, timestamp: ts)
+    end
+
+    Timeless.flush(:http_test)
+
+    conn =
+      Plug.Test.conn(
+        :get,
+        "/api/v1/anomalies?metric=anom_test&host=b&from=#{now - 50 * 300}&to=#{now}&step=300&sensitivity=high"
+      )
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    result = Jason.decode!(conn.resp_body)
+    assert result["metric"] == "anom_test"
+    assert length(result["series"]) >= 1
+
+    series = List.first(result["series"])
+    assert is_list(series["analysis"])
+
+    # At least one anomaly should be flagged (the spike)
+    anomalies = Enum.filter(series["analysis"], & &1["anomaly"])
+    assert length(anomalies) >= 1
+  end
+
+  # --- Chart with forecast and anomaly overlays ---
+
+  test "GET /chart with forecast overlay renders SVG" do
+    now = System.os_time(:second)
+
+    for i <- 0..99 do
+      ts = now - (99 - i) * 300
+      val = 50.0 + 20.0 * :math.sin(2 * :math.pi() * i / 50)
+      Timeless.write(:http_test, "chart_fc", %{"id" => "1"}, val, timestamp: ts)
+    end
+
+    Timeless.flush(:http_test)
+
+    conn =
+      Plug.Test.conn(
+        :get,
+        "/chart?metric=chart_fc&id=1&from=#{now - 100 * 300}&to=#{now}&step=300&forecast=1h"
+      )
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "<svg"
+    # Forecast line should be rendered as a dashed polyline
+    assert conn.resp_body =~ "stroke-dasharray"
+  end
+
+  test "GET /chart with anomaly dots renders SVG" do
+    now = System.os_time(:second)
+
+    for i <- 0..49 do
+      ts = now - (49 - i) * 300
+      val = if i == 25, do: 999.0, else: 50.0 + 5.0 * :math.sin(2 * :math.pi() * i / 25)
+      Timeless.write(:http_test, "chart_anom", %{"id" => "1"}, val, timestamp: ts)
+    end
+
+    Timeless.flush(:http_test)
+
+    conn =
+      Plug.Test.conn(
+        :get,
+        "/chart?metric=chart_anom&id=1&from=#{now - 50 * 300}&to=#{now}&step=300&anomalies=high"
+      )
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "<svg"
+    # Anomaly points rendered as circles
+    assert conn.resp_body =~ "<circle"
+  end
+
+  # --- Annotations endpoint ---
+
+  test "POST /api/v1/annotations creates annotation" do
+    now = System.os_time(:second)
+
+    body =
+      Jason.encode!(%{
+        title: "Deploy v1.2.3",
+        description: "Production rollout",
+        timestamp: now,
+        tags: ["deploy", "production"]
+      })
+
+    conn =
+      Plug.Test.conn(:post, "/api/v1/annotations", body)
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 201
+    result = Jason.decode!(conn.resp_body)
+    assert result["status"] == "created"
+    assert is_integer(result["id"])
+
+    # Verify annotation was stored
+    conn =
+      Plug.Test.conn(:get, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}")
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 200
+    result = Jason.decode!(conn.resp_body)
+    assert length(result["data"]) == 1
+    annot = List.first(result["data"])
+    assert annot["title"] == "Deploy v1.2.3"
+  end
+
+  test "POST /api/v1/annotations rejects missing title" do
+    body = Jason.encode!(%{description: "no title"})
+
+    conn =
+      Plug.Test.conn(:post, "/api/v1/annotations", body)
+      |> Timeless.HTTP.call(store: :http_test)
+
+    assert conn.status == 400
+  end
 end

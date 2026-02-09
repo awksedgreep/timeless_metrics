@@ -35,6 +35,11 @@ defmodule Timeless.DB do
     GenServer.call(db, :db_path)
   end
 
+  @doc "Create a consistent backup of this database using VACUUM INTO."
+  def backup(db, target_path) do
+    GenServer.call(db, {:backup, target_path}, :infinity)
+  end
+
   # --- Server ---
 
   @impl true
@@ -98,6 +103,11 @@ defmodule Timeless.DB do
 
   def handle_call(:db_path, _from, state) do
     {:reply, state.db_path, state}
+  end
+
+  def handle_call({:backup, target_path}, _from, state) do
+    result = execute(state.writer, "VACUUM INTO ?1", [target_path])
+    {:reply, result, state}
   end
 
   @impl true

@@ -271,6 +271,59 @@ defmodule Timeless do
   end
 
   @doc """
+  Create a consistent online backup of all databases (main + shards).
+
+  Flushes all in-flight data first, then uses SQLite's `VACUUM INTO` to
+  create compacted snapshots while the service continues running.
+
+  ## Parameters
+
+    * `store` - The store name (atom)
+    * `target_dir` - Directory to write backup files into (will be created)
+
+  ## Returns
+
+      {:ok, %{path: target_dir, files: [filenames], total_bytes: n}}
+
+  ## Errors
+
+      {:error, reason} if backup fails (e.g., target files already exist)
+  """
+  def backup(store, target_dir) do
+    shard_count = buffer_shard_count(store)
+    db = :"#{store}_db"
+
+    # Flush all buffers and builders to capture in-flight data
+    flush(store)
+
+    File.mkdir_p!(target_dir)
+
+    # Backup main DB
+    main_target = Path.join(target_dir, "metrics.db")
+    {:ok, _} = Timeless.DB.backup(db, main_target)
+
+    # Backup all shard DBs in parallel
+    tasks =
+      for i <- 0..(shard_count - 1) do
+        builder = :"#{store}_builder_#{i}"
+        shard_target = Path.join(target_dir, "shard_#{i}.db")
+
+        Task.async(fn ->
+          {:ok, _} = Timeless.SegmentBuilder.backup(builder, shard_target)
+          {"shard_#{i}.db", File.stat!(shard_target).size}
+        end)
+      end
+
+    shard_results = Task.await_many(tasks, :infinity)
+
+    main_size = File.stat!(main_target).size
+    files = ["metrics.db" | Enum.map(shard_results, &elem(&1, 0))]
+    total_bytes = main_size + Enum.reduce(shard_results, 0, fn {_, size}, acc -> acc + size end)
+
+    {:ok, %{path: target_dir, files: files, total_bytes: total_bytes}}
+  end
+
+  @doc """
   Get store info and statistics.
 
   Returns a map with raw segment stats, rollup tier stats, buffer sizes,

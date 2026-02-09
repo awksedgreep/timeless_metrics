@@ -318,4 +318,173 @@ defmodule Timeless.AlertTest do
     rule = Enum.find(rules, &(&1.id == rule_id))
     assert Enum.any?(rule.states, &(&1.state == "firing"))
   end
+
+  test "ok → pending → firing full transition with duration" do
+    now = System.os_time(:second)
+    base = div(now, 60) * 60
+
+    # Write data exceeding threshold
+    for i <- 0..5 do
+      Timeless.write(:alert_test, "cpu_usage", %{"host" => "transition-1"}, 95.0,
+        timestamp: base + i * 60
+      )
+    end
+
+    Timeless.flush(:alert_test)
+
+    # Create alert with 300s duration requirement
+    {:ok, rule_id} =
+      Timeless.create_alert(:alert_test,
+        name: "Transition Test",
+        metric: "cpu_usage",
+        condition: :above,
+        threshold: 90.0,
+        duration: 300,
+        labels: %{"host" => "transition-1"}
+      )
+
+    # 1st eval: ok → pending
+    Timeless.evaluate_alerts(:alert_test)
+
+    {:ok, rules} = Timeless.list_alerts(:alert_test)
+    rule = Enum.find(rules, &(&1.id == rule_id))
+    assert length(rule.states) == 1
+    assert List.first(rule.states).state == "pending"
+
+    # Simulate time passing by backdating triggered_at
+    series_key = Jason.encode!(%{"host" => "transition-1"})
+
+    Timeless.DB.write(
+      :alert_test_db,
+      "UPDATE alert_state SET triggered_at = ?1 WHERE rule_id = ?2 AND series_labels = ?3",
+      [now - 600, rule_id, series_key]
+    )
+
+    # 2nd eval: pending → firing (duration exceeded)
+    Timeless.evaluate_alerts(:alert_test)
+
+    {:ok, rules} = Timeless.list_alerts(:alert_test)
+    rule = Enum.find(rules, &(&1.id == rule_id))
+    assert List.first(rule.states).state == "firing"
+  end
+
+  test "firing → resolved → ok cleans up state row" do
+    now = System.os_time(:second)
+    base = div(now, 60) * 60
+
+    # Write data BELOW threshold so it resolves
+    for i <- 0..5 do
+      Timeless.write(:alert_test, "cpu_usage", %{"host" => "cleanup-1"}, 50.0,
+        timestamp: base + i * 60
+      )
+    end
+
+    Timeless.flush(:alert_test)
+
+    {:ok, rule_id} =
+      Timeless.create_alert(:alert_test,
+        name: "Cleanup Test",
+        metric: "cpu_usage",
+        condition: :above,
+        threshold: 90.0,
+        labels: %{"host" => "cleanup-1"}
+      )
+
+    # Manually set state to "firing"
+    series_key = Jason.encode!(%{"host" => "cleanup-1"})
+
+    Timeless.DB.write(
+      :alert_test_db,
+      "INSERT OR REPLACE INTO alert_state (rule_id, series_labels, state, triggered_at, resolved_at, last_value) VALUES (?1, ?2, 'firing', ?3, NULL, 95.0)",
+      [rule_id, series_key, now - 300]
+    )
+
+    # Eval: firing → resolved (value below threshold)
+    Timeless.evaluate_alerts(:alert_test)
+
+    {:ok, rules} = Timeless.list_alerts(:alert_test)
+    rule = Enum.find(rules, &(&1.id == rule_id))
+    assert List.first(rule.states).state == "resolved"
+
+    # Eval again: resolved → ok (still below threshold, state row should be deleted)
+    Timeless.evaluate_alerts(:alert_test)
+
+    {:ok, rules} = Timeless.list_alerts(:alert_test)
+    rule = Enum.find(rules, &(&1.id == rule_id))
+    assert rule.states == []
+  end
+
+  test "resolved → firing re-triggers on breach (duration=0)" do
+    now = System.os_time(:second)
+    base = div(now, 60) * 60
+
+    # Write data ABOVE threshold
+    for i <- 0..5 do
+      Timeless.write(:alert_test, "cpu_usage", %{"host" => "retrigger-1"}, 95.0,
+        timestamp: base + i * 60
+      )
+    end
+
+    Timeless.flush(:alert_test)
+
+    {:ok, rule_id} =
+      Timeless.create_alert(:alert_test,
+        name: "Retrigger Test",
+        metric: "cpu_usage",
+        condition: :above,
+        threshold: 90.0,
+        labels: %{"host" => "retrigger-1"}
+      )
+
+    # Manually set state to "resolved" (simulating previous resolution)
+    series_key = Jason.encode!(%{"host" => "retrigger-1"})
+
+    Timeless.DB.write(
+      :alert_test_db,
+      "INSERT OR REPLACE INTO alert_state (rule_id, series_labels, state, triggered_at, resolved_at, last_value) VALUES (?1, ?2, 'resolved', ?3, ?4, 50.0)",
+      [rule_id, series_key, now - 600, now - 300]
+    )
+
+    # Eval: resolved → firing (value is above threshold again, duration=0)
+    Timeless.evaluate_alerts(:alert_test)
+
+    {:ok, rules} = Timeless.list_alerts(:alert_test)
+    rule = Enum.find(rules, &(&1.id == rule_id))
+    assert List.first(rule.states).state == "firing"
+  end
+
+  test "alert with empty labels matches all series" do
+    now = System.os_time(:second)
+    base = div(now, 60) * 60
+
+    # Write high data for multiple hosts
+    for host <- ["h1", "h2", "h3"] do
+      for i <- 0..5 do
+        Timeless.write(:alert_test, "cpu_all", %{"host" => host}, 95.0,
+          timestamp: base + i * 60
+        )
+      end
+    end
+
+    Timeless.flush(:alert_test)
+
+    # Alert with empty labels — should match all series
+    {:ok, rule_id} =
+      Timeless.create_alert(:alert_test,
+        name: "All Hosts CPU",
+        metric: "cpu_all",
+        condition: :above,
+        threshold: 90.0,
+        labels: %{}
+      )
+
+    Timeless.evaluate_alerts(:alert_test)
+
+    {:ok, rules} = Timeless.list_alerts(:alert_test)
+    rule = Enum.find(rules, &(&1.id == rule_id))
+
+    # All 3 series should have fired
+    assert length(rule.states) == 3
+    assert Enum.all?(rule.states, &(&1.state == "firing"))
+  end
 end

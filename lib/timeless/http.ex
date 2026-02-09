@@ -196,6 +196,40 @@ defmodule Timeless.HTTP do
     |> send_resp(200, body)
   end
 
+  # Online backup — creates consistent snapshot of all databases
+  post "/api/v1/backup" do
+    store = conn.private.timeless
+
+    parsed_path =
+      case Plug.Conn.read_body(conn, length: 64_000) do
+        {:ok, "", _} ->
+          nil
+
+        {:ok, body, _} ->
+          case Jason.decode(body) do
+            {:ok, %{"path" => path}} when is_binary(path) and path != "" -> path
+            _ -> nil
+          end
+
+        _ ->
+          nil
+      end
+
+    target_dir =
+      parsed_path || default_backup_dir(store)
+
+    {:ok, result} = Timeless.backup(store, target_dir)
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Jason.encode!(%{
+      status: "ok",
+      path: result.path,
+      files: result.files,
+      total_bytes: result.total_bytes
+    }))
+  end
+
   # Export raw points in VictoriaMetrics JSON line format (multi-series)
   get "/api/v1/export" do
     store = conn.private.timeless
@@ -907,6 +941,12 @@ defmodule Timeless.HTTP do
       error ->
         error
     end
+  end
+
+  defp default_backup_dir(store) do
+    db_path = Timeless.DB.db_path(:"#{store}_db")
+    data_dir = Path.dirname(db_path)
+    Path.join([data_dir, "backups", to_string(System.os_time(:second))])
   end
 
   defp parse_theme("dark"), do: :dark

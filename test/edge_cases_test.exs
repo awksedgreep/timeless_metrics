@@ -169,4 +169,103 @@ defmodule Timeless.EdgeCasesTest do
   test "enforce_retention with no data is a no-op" do
     assert :ok = Timeless.enforce_retention(:edge_test)
   end
+
+  # --- Phase 4: Numerical edge cases ---
+
+  test "extreme float values survive compression round-trip" do
+    now = System.os_time(:second)
+
+    # IEEE 754 extremes
+    extreme_values = [
+      1.7976931348623157e+308,   # max float64
+      -1.7976931348623157e+308,  # min float64
+      5.0e-324,                  # smallest positive subnormal
+      1.0e-100,                  # small positive
+      -1.0e-200,                 # small negative
+      0.0                        # exact zero
+    ]
+
+    for {val, i} <- Enum.with_index(extreme_values) do
+      Timeless.write(:edge_test, "extreme_floats", %{"id" => "1"}, val, timestamp: now + i)
+    end
+
+    Timeless.flush(:edge_test)
+
+    {:ok, points} =
+      Timeless.query(:edge_test, "extreme_floats", %{"id" => "1"},
+        from: now - 1,
+        to: now + 10
+      )
+
+    assert length(points) == length(extreme_values)
+
+    Enum.zip(extreme_values, Enum.map(points, &elem(&1, 1)))
+    |> Enum.each(fn {expected, actual} ->
+      assert actual == expected,
+        "Extreme float #{expected} not preserved: got #{actual}"
+    end)
+  end
+
+  test "infinity-scale values don't crash aggregation" do
+    now = System.os_time(:second)
+
+    # Values near IEEE 754 limits that exercise edge cases
+    Timeless.write(:edge_test, "inf_agg", %{"id" => "1"}, 1.0e308, timestamp: now)
+    Timeless.write(:edge_test, "inf_agg", %{"id" => "1"}, 42.0, timestamp: now + 1)
+    Timeless.write(:edge_test, "inf_agg", %{"id" => "1"}, -1.0e308, timestamp: now + 2)
+    Timeless.flush(:edge_test)
+
+    for agg <- [:avg, :min, :max, :sum, :count, :last, :first] do
+      {:ok, results} =
+        Timeless.query_aggregate_multi(:edge_test, "inf_agg", %{"id" => "1"},
+          from: now - 1,
+          to: now + 10,
+          bucket: {3600, :seconds},
+          aggregate: agg
+        )
+
+      assert length(results) == 1, "#{agg} returned no results"
+      series = List.first(results)
+      [{_ts, val}] = series.data
+      assert is_number(val), "#{agg} returned non-number: #{inspect(val)}"
+    end
+  end
+
+  test "negative values in all aggregate functions" do
+    now = System.os_time(:second)
+
+    values = [-10.0, -20.0, -5.0, -30.0, -15.0]
+
+    for {val, i} <- Enum.with_index(values) do
+      Timeless.write(:edge_test, "neg_agg", %{"id" => "1"}, val, timestamp: now + i)
+    end
+
+    Timeless.flush(:edge_test)
+
+    expectations = [
+      {:avg, -16.0},
+      {:min, -30.0},
+      {:max, -5.0},
+      {:sum, -80.0},
+      {:count, 5},
+      {:last, -15.0},
+      {:first, -10.0}
+    ]
+
+    for {agg, expected} <- expectations do
+      {:ok, results} =
+        Timeless.query_aggregate_multi(:edge_test, "neg_agg", %{"id" => "1"},
+          from: now - 1,
+          to: now + 10,
+          bucket: {3600, :seconds},
+          aggregate: agg
+        )
+
+      series = List.first(results)
+      [{_ts, val}] = series.data
+
+      assert_in_delta val, expected, 0.01,
+        "#{agg} of negatives: expected #{expected}, got #{val}"
+    end
+  end
 end

@@ -85,6 +85,11 @@ defmodule Timeless.SegmentBuilder do
     :persistent_term.get({__MODULE__, builder_name, :db_path})
   end
 
+  @doc "Create a consistent backup of this shard's database using VACUUM INTO."
+  def backup(builder_name, target_path) do
+    GenServer.call(builder_name, {:backup, target_path}, :infinity)
+  end
+
   # --- Server ---
 
   @impl true
@@ -211,6 +216,11 @@ defmodule Timeless.SegmentBuilder do
 
   def handle_call({:delete_shard, sql, params}, _from, state) do
     result = execute(state.writer, sql, params)
+    {:reply, result, state}
+  end
+
+  def handle_call({:backup, target_path}, _from, state) do
+    result = execute(state.writer, "VACUUM INTO ?1", [target_path])
     {:reply, result, state}
   end
 
