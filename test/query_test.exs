@@ -138,18 +138,13 @@ defmodule Timeless.QueryTest do
 
     assert length(tier_data) >= 1, "Rollup did not produce tier data"
 
-    # Now delete raw segments to simulate retention expiry
-    registry = :query_test_registry
-    series_id = Timeless.SeriesRegistry.get_or_create(registry, "fallback_metric", %{"host" => "x"})
+    # Delete all raw segments to simulate retention expiry
     shard_count = :persistent_term.get({Timeless, :query_test, :shard_count})
-    shard_idx = rem(abs(series_id), shard_count)
-    builder = :"query_test_builder_#{shard_idx}"
 
-    Timeless.SegmentBuilder.delete_shard(
-      builder,
-      "DELETE FROM raw_segments WHERE series_id = ?1",
-      [series_id]
-    )
+    for i <- 0..(shard_count - 1) do
+      builder = :"query_test_builder_#{i}"
+      Timeless.SegmentBuilder.delete_raw_before(builder, now + 86_400)
+    end
 
     # latest should fall back to tier data
     {:ok, result} = Timeless.latest(:query_test, "fallback_metric", %{"host" => "x"})

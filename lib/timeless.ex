@@ -207,19 +207,33 @@ defmodule Timeless do
     schema = get_schema(store)
     transform = Keyword.get(opts, :transform)
     matching = find_matching_series(store, metric_name, label_filter)
+    shard_count = buffer_shard_count(store)
+    query_opts = Keyword.put(opts, :schema, schema)
+
+    # Group series by shard so each task reads from a single shard's files,
+    # eliminating cross-task contention on the same .seg / tier files.
+    by_shard =
+      Enum.group_by(matching, fn {series_id, _labels} ->
+        rem(abs(series_id), shard_count)
+      end)
 
     results =
-      matching
+      by_shard
       |> Task.async_stream(
-        fn {series_id, labels} ->
-          {:ok, buckets} = Timeless.Query.aggregate(store, series_id, Keyword.put(opts, :schema, schema))
-          %{labels: labels, data: Timeless.Transform.apply(buckets, transform)}
+        fn {_shard_idx, shard_series} ->
+          Enum.flat_map(shard_series, fn {series_id, labels} ->
+            {:ok, buckets} = Timeless.Query.aggregate(store, series_id, query_opts)
+
+            case Timeless.Transform.apply(buckets, transform) do
+              [] -> []
+              data -> [%{labels: labels, data: data}]
+            end
+          end)
         end,
-        max_concurrency: System.schedulers_online(),
+        max_concurrency: shard_count,
         ordered: false
       )
-      |> Enum.map(fn {:ok, result} -> result end)
-      |> Enum.reject(fn %{data: d} -> d == [] end)
+      |> Enum.flat_map(fn {:ok, shard_results} -> shard_results end)
 
     {:ok, results}
   end
@@ -302,15 +316,40 @@ defmodule Timeless do
     main_target = Path.join(target_dir, "metrics.db")
     {:ok, _} = Timeless.DB.backup(db, main_target)
 
-    # Backup all shard DBs in parallel
+    # Backup all shard directories in parallel
+    data_dir = Path.dirname(Timeless.DB.db_path(db))
+    schema = get_schema(store)
+
     tasks =
       for i <- 0..(shard_count - 1) do
-        builder = :"#{store}_builder_#{i}"
-        shard_target = Path.join(target_dir, "shard_#{i}.db")
-
         Task.async(fn ->
-          {:ok, _} = Timeless.SegmentBuilder.backup(builder, shard_target)
-          {"shard_#{i}.db", File.stat!(shard_target).size}
+          shard_src = Path.join(data_dir, "shard_#{i}")
+          shard_dst = Path.join(target_dir, "shard_#{i}")
+
+          # Copy raw segment files (.seg + .wal)
+          raw_size = copy_dir_files(Path.join(shard_src, "raw"), Path.join(shard_dst, "raw"))
+
+          # Copy tier chunk files (chunks.dat + index.ets)
+          tier_size =
+            Enum.reduce(schema.tiers, 0, fn tier, acc ->
+              src = Path.join(shard_src, "tier_#{tier.name}")
+              dst = Path.join(shard_dst, "tier_#{tier.name}")
+              acc + copy_dir_files(src, dst)
+            end)
+
+          # Copy watermarks.bin
+          File.mkdir_p!(shard_dst)
+          wm_size =
+            case File.cp(Path.join(shard_src, "watermarks.bin"), Path.join(shard_dst, "watermarks.bin")) do
+              :ok ->
+                case File.stat(Path.join(shard_dst, "watermarks.bin")) do
+                  {:ok, %{size: s}} -> s
+                  _ -> 0
+                end
+              _ -> 0
+            end
+
+          {"shard_#{i}", raw_size + tier_size + wm_size}
         end)
       end
 
@@ -336,81 +375,87 @@ defmodule Timeless do
 
     {:ok, [[series_count]]} = Timeless.DB.read(db, "SELECT COUNT(*) FROM series")
 
-    # Aggregate raw segment stats from all shard DBs
+    # Aggregate raw segment stats from all shards
     {segment_count, total_points, raw_bytes, oldest_ts, newest_ts} =
       Enum.reduce(0..(shard_count - 1), {0, 0, 0, nil, nil}, fn i, {sc, tp, rb, oldest, newest} ->
         builder = :"#{store}_builder_#{i}"
-        {:ok, [[s]]} = Timeless.SegmentBuilder.read_shard(builder, "SELECT COUNT(*) FROM raw_segments")
-        {:ok, [[p]]} = Timeless.SegmentBuilder.read_shard(builder, "SELECT COALESCE(SUM(point_count), 0) FROM raw_segments")
-        {:ok, [[b]]} = Timeless.SegmentBuilder.read_shard(builder, "SELECT COALESCE(SUM(length(data)), 0) FROM raw_segments")
-        {:ok, old_rows} = Timeless.SegmentBuilder.read_shard(builder, "SELECT MIN(start_time) FROM raw_segments")
-        {:ok, new_rows} = Timeless.SegmentBuilder.read_shard(builder, "SELECT MAX(end_time) FROM raw_segments")
-
-        old_ts = case old_rows do
-          [[nil]] -> nil
-          [[ts]] -> ts
-        end
-
-        new_ts = case new_rows do
-          [[nil]] -> nil
-          [[ts]] -> ts
-        end
+        stats = Timeless.SegmentBuilder.raw_stats(builder)
 
         merged_oldest = cond do
-          oldest == nil -> old_ts
-          old_ts == nil -> oldest
-          true -> min(oldest, old_ts)
+          oldest == nil -> stats.oldest_ts
+          stats.oldest_ts == nil -> oldest
+          true -> min(oldest, stats.oldest_ts)
         end
 
         merged_newest = cond do
-          newest == nil -> new_ts
-          new_ts == nil -> newest
-          true -> max(newest, new_ts)
+          newest == nil -> stats.newest_ts
+          stats.newest_ts == nil -> newest
+          true -> max(newest, stats.newest_ts)
         end
 
-        {sc + s, tp + p, rb + b, merged_oldest, merged_newest}
+        {sc + stats.segment_count, tp + stats.total_points, rb + stats.raw_bytes,
+         merged_oldest, merged_newest}
       end)
 
-    # Sum all .db files (main + shards) for true on-disk usage
+    # Sum all storage files (.db + shard dirs with .seg/.wal) for true on-disk usage
     db_path = Timeless.DB.db_path(db)
     data_dir = Path.dirname(db_path)
 
     storage_bytes =
       case File.ls(data_dir) do
         {:ok, files} ->
-          files
-          |> Enum.filter(&String.ends_with?(&1, ".db"))
-          |> Enum.reduce(0, fn file, acc ->
-            case File.stat(Path.join(data_dir, file)) do
-              {:ok, %{size: size}} -> acc + size
-              _ -> acc
+          db_bytes =
+            files
+            |> Enum.filter(&String.ends_with?(&1, ".db"))
+            |> Enum.reduce(0, fn file, acc ->
+              case File.stat(Path.join(data_dir, file)) do
+                {:ok, %{size: size}} -> acc + size
+                _ -> acc
+              end
+            end)
+
+          shard_bytes =
+            for i <- 0..(shard_count - 1), reduce: 0 do
+              acc ->
+                shard_dir = Path.join(data_dir, "shard_#{i}")
+
+                # Raw segment files
+                raw_dir = Path.join(shard_dir, "raw")
+                raw_bytes = dir_file_bytes(raw_dir)
+
+                # Tier chunk files
+                tier_bytes =
+                  Enum.reduce(schema.tiers, 0, fn tier, t_acc ->
+                    tier_dir = Path.join(shard_dir, "tier_#{tier.name}")
+                    t_acc + dir_file_bytes(tier_dir)
+                  end)
+
+                # Watermarks file
+                wm_bytes =
+                  case File.stat(Path.join(shard_dir, "watermarks.bin")) do
+                    {:ok, %{size: s}} -> s
+                    _ -> 0
+                  end
+
+                acc + raw_bytes + tier_bytes + wm_bytes
             end
-          end)
+
+          db_bytes + shard_bytes
 
         _ ->
           0
       end
 
-    # Tier stats (aggregated from all shard DBs)
+    # Tier stats (aggregated from all shard ShardStores)
     tier_stats =
       Enum.map(schema.tiers, fn tier ->
-        {chunks, buckets, compressed_bytes, min_watermark} =
-          Enum.reduce(0..(shard_count - 1), {0, 0, 0, nil}, fn i, {ch_acc, bk_acc, cb_acc, wm_acc} ->
+        {chunks, buckets, compressed_bytes, dead_bytes, min_watermark} =
+          Enum.reduce(0..(shard_count - 1), {0, 0, 0, 0, nil}, fn i, {ch_acc, bk_acc, cb_acc, db_acc, wm_acc} ->
             builder = :"#{store}_builder_#{i}"
-            {:ok, [[c]]} = Timeless.SegmentBuilder.read_shard(builder, "SELECT COUNT(*) FROM #{tier.table_name}")
-            {:ok, [[b]]} = Timeless.SegmentBuilder.read_shard(builder, "SELECT COALESCE(SUM(bucket_count), 0) FROM #{tier.table_name}")
-            {:ok, [[cb]]} = Timeless.SegmentBuilder.read_shard(builder, "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM #{tier.table_name}")
+            {c, b, cb} = Timeless.SegmentBuilder.read_tier_stats(builder, tier.name)
+            {dead, _total} = Timeless.SegmentBuilder.tier_dead_bytes(builder, tier.name)
 
-            {:ok, wm_rows} = Timeless.SegmentBuilder.read_shard(
-              builder,
-              "SELECT last_bucket FROM _watermarks WHERE tier = ?1",
-              [to_string(tier.name)]
-            )
-
-            wm = case wm_rows do
-              [[w]] -> w
-              [] -> 0
-            end
+            wm = Timeless.SegmentBuilder.read_watermark(builder, tier.name)
 
             merged_wm = cond do
               wm_acc == nil -> wm
@@ -418,7 +463,7 @@ defmodule Timeless do
               true -> min(wm_acc, wm)
             end
 
-            {ch_acc + c, bk_acc + b, cb_acc + cb, merged_wm}
+            {ch_acc + c, bk_acc + b, cb_acc + cb, db_acc + dead, merged_wm}
           end)
 
         retention_label =
@@ -431,6 +476,7 @@ defmodule Timeless do
           chunks: chunks,
           buckets: buckets,
           compressed_bytes: compressed_bytes,
+          dead_bytes: dead_bytes,
           resolution_seconds: tier.resolution_seconds,
           retention: retention_label,
           watermark: min_watermark || 0
@@ -448,7 +494,11 @@ defmodule Timeless do
         {buf_acc + buf, pend_acc + pend}
       end)
 
-    all_points = total_points + pending_total
+    # total_points from ShardStore.stats includes WAL entries (pending data
+    # written during flush).  Don't add pending_total — after flush, pending
+    # segments are in both WAL and in-memory, so adding would double-count.
+    # buffer_total and pending_total remain as separate monitoring fields.
+    all_points = total_points
 
     bytes_per_point =
       if total_points > 0, do: Float.round(raw_bytes / total_points, 2), else: 0.0
@@ -487,6 +537,43 @@ defmodule Timeless do
   """
   def catch_up(store) do
     Timeless.Rollup.catch_up(:"#{store}_rollup")
+  end
+
+  @doc """
+  Compact tier chunk files across all shards to reclaim dead space.
+
+  Dead space accumulates from read-modify-write during rollup (old versions
+  of chunks remain in the append-only file). Compaction rewrites only live
+  entries and atomically replaces the file.
+
+  ## Options
+
+    * `:threshold` - minimum dead/total ratio to trigger (default: 0.3)
+
+  Returns `%{tier_name => reclaimed_bytes, ...}` for tiers that were compacted.
+  """
+  def compact(store, opts \\ []) do
+    schema = get_schema(store)
+    shard_count = buffer_shard_count(store)
+
+    results =
+      Enum.map(schema.tiers, fn tier ->
+        reclaimed =
+          for i <- 0..(shard_count - 1), reduce: 0 do
+            acc ->
+              builder = :"#{store}_builder_#{i}"
+              case Timeless.SegmentBuilder.compact_tier(builder, tier.name, opts) do
+                {:ok, bytes} -> acc + bytes
+                :noop -> acc
+              end
+          end
+
+        {tier.name, reclaimed}
+      end)
+      |> Enum.reject(fn {_name, bytes} -> bytes == 0 end)
+      |> Map.new()
+
+    results
   end
 
   @doc """
@@ -845,6 +932,36 @@ defmodule Timeless do
     |> Enum.filter(fn {_id, labels} ->
       Enum.all?(label_filter, fn {k, v} -> Map.get(labels, k) == v end)
     end)
+  end
+
+  defp copy_dir_files(src_dir, dst_dir) do
+    case File.ls(src_dir) do
+      {:ok, files} ->
+        File.mkdir_p!(dst_dir)
+        Enum.reduce(files, 0, fn f, acc ->
+          src = Path.join(src_dir, f)
+          dst = Path.join(dst_dir, f)
+          File.cp!(src, dst)
+          case File.stat(dst) do
+            {:ok, %{size: s}} -> acc + s
+            _ -> acc
+          end
+        end)
+      _ -> 0
+    end
+  end
+
+  defp dir_file_bytes(dir) do
+    case File.ls(dir) do
+      {:ok, files} ->
+        Enum.reduce(files, 0, fn f, acc ->
+          case File.stat(Path.join(dir, f)) do
+            {:ok, %{size: size}} -> acc + size
+            _ -> acc
+          end
+        end)
+      _ -> 0
+    end
   end
 
   defp decode_labels(""), do: %{}

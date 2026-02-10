@@ -1,12 +1,15 @@
 defmodule Timeless.SegmentBuilder do
   @moduledoc """
-  Accumulates points per series and writes gorilla-compressed segments to a
-  per-shard SQLite database.
+  Accumulates points per series and writes gorilla-compressed segments to
+  file-based storage (ShardStore).
 
-  Each SegmentBuilder owns its own shard DB file (`shard_{i}.db`), eliminating
-  the single-writer bottleneck. Points arrive in batches from the paired Buffer
-  shard. The SegmentBuilder groups them into time-bounded segments (default 4h),
-  compresses with GorillaStream + zstd, and writes directly to its shard DB.
+  Each SegmentBuilder owns its own shard directory. Points arrive in batches
+  from the paired Buffer shard. The SegmentBuilder groups them into
+  time-bounded segments (default 4h), compresses with GorillaStream + zstd,
+  and writes to ShardStore (WAL + immutable .seg files).
+
+  Tier chunks, watermarks, and raw segments are all in ShardStore.
+  No SQLite is used for shard data.
   """
 
   use GenServer
@@ -16,13 +19,11 @@ defmodule Timeless.SegmentBuilder do
     :segment_duration,
     :pending_flush_interval,
     :compression,
-    :writer,
-    :readers,
     :shard_id,
     :data_dir,
-    :db_path,
     :name,
-    :schema
+    :schema,
+    :shard_store
   ]
 
   @default_segment_duration 14_400  # 4 hours in seconds
@@ -53,41 +54,185 @@ defmodule Timeless.SegmentBuilder do
     GenServer.call(builder, :pending_point_count, :infinity)
   end
 
-  @doc """
-  Read from this shard's DB using a reader connection. Lock-free (no GenServer).
-
-  Returns `{:ok, rows}`.
-  """
-  def read_shard(builder_name, sql, params \\ []) do
-    readers = :persistent_term.get({__MODULE__, builder_name, :readers})
-    reader = Enum.random(readers)
-    execute(reader, sql, params)
-  end
+  # --- Raw segment APIs (Phase 1: file-based storage) ---
 
   @doc """
-  Execute a write transaction on this shard's DB.
-  The callback receives the writer connection. Goes through GenServer for write serialization.
-  Returns `{:ok, result}` or `{:error, exception}`.
+  Read raw segments for a specific series within a time range. Lock-free.
+
+  Returns `{:ok, [[data, start_time, end_time], ...]}` sorted by start_time.
   """
-  def write_transaction_shard(builder_name, fun) do
-    GenServer.call(builder_name, {:write_transaction, fun}, :infinity)
+  def read_raw_segments(builder_name, series_id, from, to) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.read_segments(store, series_id, from, to)
   end
 
   @doc """
-  Delete from this shard's DB. Goes through the GenServer for write serialization.
+  Read raw segments for ALL series within a time range (used by rollup). Lock-free.
+
+  Returns `{:ok, [[series_id, start_time, end_time, data], ...]}` sorted by (series_id, start_time).
   """
-  def delete_shard(builder_name, sql, params \\ []) do
-    GenServer.call(builder_name, {:delete_shard, sql, params}, :infinity)
+  def read_raw_for_rollup(builder_name, from, to) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.read_all_segments(store, from, to)
   end
 
-  @doc "Get the shard database path."
-  def shard_db_path(builder_name) do
-    :persistent_term.get({__MODULE__, builder_name, :db_path})
+  @doc """
+  Read the latest raw segment for a series. Lock-free.
+
+  Returns `{:ok, [[data]]}` or `{:ok, []}`.
+  """
+  def read_raw_latest(builder_name, series_id) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.read_latest(store, series_id)
   end
 
-  @doc "Create a consistent backup of this shard's database using VACUUM INTO."
-  def backup(builder_name, target_path) do
-    GenServer.call(builder_name, {:backup, target_path}, :infinity)
+  @doc """
+  Delete raw segments with end_time before cutoff. Goes through GenServer.
+  """
+  def delete_raw_before(builder_name, cutoff) do
+    GenServer.call(builder_name, {:delete_raw_before, cutoff}, :infinity)
+  end
+
+  @doc """
+  Get distinct series_ids present in raw storage. Lock-free.
+
+  Returns `{:ok, [[series_id], ...]}`.
+  """
+  def raw_series_ids(builder_name) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.distinct_series_ids(store)
+  end
+
+  @doc """
+  Get aggregate stats for raw segments in this shard. Lock-free.
+
+  Returns `%{segment_count, total_points, raw_bytes, oldest_ts, newest_ts}`.
+  """
+  def raw_stats(builder_name) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.stats(store)
+  end
+
+  # --- Tier chunk APIs (Phase 2: file-based storage) ---
+
+  @doc """
+  Read tier chunks for a specific series within a time range. Lock-free.
+
+  Returns `{:ok, [[data], ...]}` sorted by chunk_start.
+  """
+  def read_tier_chunks(builder_name, tier_name, series_id, from, to) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.read_tier_range(store, tier_name, series_id, from, to)
+  end
+
+  @doc """
+  Read a single tier chunk by exact key (for rollup merge). Lock-free.
+
+  Returns the blob binary, or nil if not found.
+  """
+  def read_tier_chunk_for_merge(builder_name, tier_name, series_id, chunk_start) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.read_tier_chunk(store, tier_name, series_id, chunk_start)
+  end
+
+  @doc """
+  Read the latest tier chunk for a series. Lock-free.
+
+  Returns `{:ok, [[data]]}` or `{:ok, []}`.
+  """
+  def read_tier_latest(builder_name, tier_name, series_id) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.read_tier_latest(store, tier_name, series_id)
+  end
+
+  @doc """
+  Read tier chunks for ALL series in a time range (for tier-to-tier rollup). Lock-free.
+
+  Returns `{:ok, [[series_id, data], ...]}`.
+  """
+  def read_tier_for_rollup(builder_name, tier_name, from, to) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.read_tier_for_rollup(store, tier_name, from, to)
+  end
+
+  @doc """
+  Get distinct series_ids from a tier. Lock-free.
+
+  Returns `{:ok, [[series_id], ...]}`.
+  """
+  def read_tier_series_ids(builder_name, tier_name) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.tier_series_ids(store, tier_name)
+  end
+
+  @doc """
+  Get aggregate stats for a tier. Lock-free.
+
+  Returns `{chunks, buckets, compressed_bytes}`.
+  """
+  def read_tier_stats(builder_name, tier_name) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.tier_stats(store, tier_name)
+  end
+
+  @doc """
+  Write a batch of tier chunks. Goes through GenServer for write serialization.
+
+  entries = [{series_id, chunk_start, chunk_end, bucket_count, blob}, ...]
+  """
+  def write_tier_batch(builder_name, tier_name, entries) do
+    GenServer.call(builder_name, {:write_tier_batch, tier_name, entries}, :infinity)
+  end
+
+  @doc """
+  Delete tier chunks where chunk_end < cutoff. Goes through GenServer.
+  """
+  def delete_tier_before(builder_name, tier_name, cutoff) do
+    GenServer.call(builder_name, {:delete_tier_before, tier_name, cutoff}, :infinity)
+  end
+
+  # --- Watermark APIs (Phase 3: binary file + ETS) ---
+
+  @doc """
+  Read a watermark value for a tier. Lock-free (ETS lookup).
+
+  Returns the integer watermark value, or 0 if not set.
+  """
+  def read_watermark(builder_name, tier_name) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.read_watermark(store, tier_name)
+  end
+
+  @doc """
+  Write a watermark value for a tier. Goes through GenServer.
+  """
+  def write_watermark(builder_name, tier_name, value) do
+    GenServer.call(builder_name, {:write_watermark, tier_name, value}, :infinity)
+  end
+
+  # --- Compaction APIs (Phase 4) ---
+
+  @doc """
+  Calculate dead bytes in a tier's chunks.dat. Lock-free.
+
+  Returns `{dead_bytes, total_file_bytes}`.
+  """
+  def tier_dead_bytes(builder_name, tier_name) do
+    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
+    Timeless.ShardStore.tier_dead_bytes(store, tier_name)
+  end
+
+  @doc """
+  Compact a tier's chunks.dat by rewriting only live entries. Goes through GenServer.
+
+  ## Options
+
+    * `:threshold` - minimum dead/total ratio to trigger (default: 0.3)
+
+  Returns `{:ok, reclaimed_bytes}` or `:noop`.
+  """
+  def compact_tier(builder_name, tier_name, opts \\ []) do
+    GenServer.call(builder_name, {:compact_tier, tier_name, opts}, :infinity)
   end
 
   # --- Server ---
@@ -104,44 +249,39 @@ defmodule Timeless.SegmentBuilder do
 
     Process.flag(:trap_exit, true)
 
-    # Open shard DB
     File.mkdir_p!(data_dir)
-    db_path = Path.join(data_dir, "shard_#{shard_id}.db")
 
-    {:ok, writer} = Exqlite.Sqlite3.open(db_path)
-    configure_writer(writer)
-    create_raw_segments_table(writer)
+    # Initialize file-based storage (raw segments + tiers + watermarks)
+    shard_store = Timeless.ShardStore.init(data_dir, shard_id, segment_duration)
 
-    # Create tier tables and watermarks if schema is provided
-    if schema do
-      create_tier_tables(writer, schema)
-    end
+    shard_store =
+      if schema do
+        tier_names = Enum.map(schema.tiers, & &1.name)
 
-    reader_count = max(System.schedulers_online() |> div(2), 2)
-
-    readers =
-      for _ <- 1..reader_count do
-        {:ok, conn} = Exqlite.Sqlite3.open(db_path)
-        configure_reader(conn)
-        conn
+        shard_store
+        |> then(fn ss ->
+          Enum.reduce(schema.tiers, ss, fn tier, acc ->
+            Timeless.ShardStore.init_tier(acc, tier.name)
+          end)
+        end)
+        |> Timeless.ShardStore.init_watermarks(tier_names)
+      else
+        shard_store
       end
 
-    # Store readers and db_path in persistent_term for lock-free access
-    :persistent_term.put({__MODULE__, name, :readers}, readers)
-    :persistent_term.put({__MODULE__, name, :db_path}, db_path)
+    # Store in persistent_term for lock-free access
+    :persistent_term.put({__MODULE__, name, :shard_store}, shard_store)
 
     state = %__MODULE__{
       segments: %{},
       segment_duration: segment_duration,
       pending_flush_interval: pending_flush_interval,
       compression: compression,
-      writer: writer,
-      readers: readers,
       shard_id: shard_id,
       data_dir: data_dir,
-      db_path: db_path,
       name: name,
-      schema: schema
+      schema: schema,
+      shard_store: shard_store
     }
 
     # Periodic check for completed segments
@@ -174,14 +314,10 @@ defmodule Timeless.SegmentBuilder do
         end)
       end)
 
-    # Check if any segments are complete (their time window has passed)
-    {completed, pending} = split_completed(new_segments, state.segment_duration)
-
-    if completed != [] do
-      write_segments(completed, state)
-    end
-
-    {:noreply, %{state | segments: pending}}
+    # Accumulate only — sealing happens on flush or :check_segments timer.
+    # This ensures all points for a series+window are compressed into one
+    # gorilla stream, regardless of how many buffer flushes delivered them.
+    {:noreply, %{state | segments: new_segments}}
   end
 
   @impl true
@@ -191,13 +327,21 @@ defmodule Timeless.SegmentBuilder do
   end
 
   def handle_call(:flush, _from, state) do
-    all_segments = Map.values(state.segments)
+    {completed, pending} = split_completed(state.segments, state.segment_duration)
 
-    if all_segments != [] do
-      write_segments(all_segments, state)
+    # Write pending segments to WAL (makes fresh data queryable)
+    pending_segs = Map.values(pending)
+
+    if pending_segs != [] do
+      write_segments(pending_segs, state)
     end
 
-    {:reply, :ok, %{state | segments: %{}}}
+    # Seal completed windows into .seg files
+    if completed != [] do
+      write_and_seal(completed, state)
+    end
+
+    {:reply, :ok, %{state | segments: pending}}
   end
 
   def handle_call(:pending_point_count, _from, state) do
@@ -209,18 +353,28 @@ defmodule Timeless.SegmentBuilder do
     {:reply, count, state}
   end
 
-  def handle_call({:write_transaction, fun}, _from, state) do
-    result = run_write_transaction(state.writer, fun)
+  def handle_call({:delete_raw_before, cutoff}, _from, state) do
+    result = Timeless.ShardStore.delete_before(state.shard_store, cutoff)
     {:reply, result, state}
   end
 
-  def handle_call({:delete_shard, sql, params}, _from, state) do
-    result = execute(state.writer, sql, params)
-    {:reply, result, state}
+  def handle_call({:write_tier_batch, tier_name, entries}, _from, state) do
+    Timeless.ShardStore.write_tier_batch(state.shard_store, tier_name, entries)
+    {:reply, :ok, state}
   end
 
-  def handle_call({:backup, target_path}, _from, state) do
-    result = execute(state.writer, "VACUUM INTO ?1", [target_path])
+  def handle_call({:delete_tier_before, tier_name, cutoff}, _from, state) do
+    Timeless.ShardStore.delete_tier_before(state.shard_store, tier_name, cutoff)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:write_watermark, tier_name, value}, _from, state) do
+    Timeless.ShardStore.write_watermark(state.shard_store, tier_name, value)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:compact_tier, tier_name, opts}, _from, state) do
+    result = Timeless.ShardStore.compact_tier(state.shard_store, tier_name, opts)
     {:reply, result, state}
   end
 
@@ -229,7 +383,7 @@ defmodule Timeless.SegmentBuilder do
     {completed, pending} = split_completed(state.segments, state.segment_duration)
 
     if completed != [] do
-      write_segments(completed, state)
+      write_and_seal(completed, state)
     end
 
     Process.send_after(self(), :check_segments, :timer.seconds(10))
@@ -237,9 +391,8 @@ defmodule Timeless.SegmentBuilder do
   end
 
   def handle_info(:flush_pending, state) do
-    # Write in-progress segments to SQLite so fresh data is queryable,
+    # Write in-progress segments to WAL so fresh data is queryable,
     # but keep them in memory for continued accumulation.
-    # INSERT OR REPLACE on (series_id, start_time) naturally updates the partial segment.
     pending = Map.values(state.segments)
 
     if pending != [] do
@@ -258,13 +411,17 @@ defmodule Timeless.SegmentBuilder do
       write_segments(all_segments, state)
     end
 
-    # Clean up persistent_term
-    :persistent_term.erase({__MODULE__, state.name, :readers})
-    :persistent_term.erase({__MODULE__, state.name, :db_path})
+    # Persist tier ETS indexes and watermarks to disk
+    if state.shard_store.tier_state != %{} do
+      Timeless.ShardStore.persist_tier_indexes(state.shard_store)
+      Timeless.ShardStore.cleanup_tiers(state.shard_store)
+    end
 
-    # Close connections
-    Exqlite.Sqlite3.close(state.writer)
-    Enum.each(state.readers, &Exqlite.Sqlite3.close/1)
+    Timeless.ShardStore.persist_watermarks(state.shard_store)
+    Timeless.ShardStore.cleanup_watermarks(state.shard_store)
+
+    # Clean up persistent_term
+    :persistent_term.erase({__MODULE__, state.name, :shard_store})
 
     :ok
   end
@@ -290,262 +447,56 @@ defmodule Timeless.SegmentBuilder do
     {completed, pending}
   end
 
-  @insert_sql "INSERT OR REPLACE INTO raw_segments (series_id, start_time, end_time, point_count, data) VALUES (?1, ?2, ?3, ?4, ?5)"
+  defp compress_segments(segments, state) do
+    Enum.flat_map(segments, fn seg ->
+      sorted_points = Enum.sort_by(seg.points, &elem(&1, 0))
 
-  defp write_segments(segments, state) do
-    # Phase 1: Compress outside the write lock (CPU-bound, runs in this builder's process)
-    compressed =
-      Enum.flat_map(segments, fn seg ->
-        sorted_points = Enum.sort_by(seg.points, &elem(&1, 0))
+      case GorillaStream.compress(sorted_points, compression: state.compression) do
+        {:ok, blob} ->
+          point_count = length(sorted_points)
+          {last_ts, _} = List.last(sorted_points)
 
-        case GorillaStream.compress(sorted_points, compression: state.compression) do
-          {:ok, blob} ->
-            point_count = length(sorted_points)
-            {first_ts, _} = List.first(sorted_points)
-            {last_ts, _} = List.last(sorted_points)
+          :telemetry.execute(
+            [:timeless, :segment, :write],
+            %{point_count: point_count, compressed_bytes: byte_size(blob)},
+            %{series_id: seg.series_id}
+          )
 
-            :telemetry.execute(
-              [:timeless, :segment, :write],
-              %{point_count: point_count, compressed_bytes: byte_size(blob)},
-              %{series_id: seg.series_id}
-            )
+          # Use bucket start_time as entry key so WAL merge correctly deduplicates
+          # entries for the same series+window across multiple flushes
+          [{seg.series_id, seg.start_time, last_ts, point_count, blob}]
 
-            [{seg.series_id, first_ts, last_ts, point_count, blob}]
-
-          {:error, reason} ->
-            require Logger
-            Logger.warning("Failed to compress segment for series #{seg.series_id}: #{inspect(reason)}")
-            []
-        end
-      end)
-
-    # Phase 2: Write compressed blobs directly to shard DB (no GenServer bottleneck)
-    if compressed != [] do
-      execute(state.writer, "BEGIN IMMEDIATE", [])
-
-      try do
-        {:ok, stmt} = Exqlite.Sqlite3.prepare(state.writer, @insert_sql)
-
-        try do
-          Enum.each(compressed, fn {series_id, first_ts, last_ts, point_count, blob} ->
-            :ok = Exqlite.Sqlite3.bind(stmt, [series_id, first_ts, last_ts, point_count, blob])
-            :done = Exqlite.Sqlite3.step(state.writer, stmt)
-            :ok = Exqlite.Sqlite3.reset(stmt)
-          end)
-        after
-          Exqlite.Sqlite3.release(state.writer, stmt)
-        end
-
-        execute(state.writer, "COMMIT", [])
-      rescue
-        e ->
-          try do
-            execute(state.writer, "ROLLBACK", [])
-          rescue
-            _ -> :ok  # Transaction may have auto-rolled back
-          end
-
+        {:error, reason} ->
           require Logger
-          Logger.warning("Shard write failed: #{inspect(e)}")
+          Logger.warning("Failed to compress segment for series #{seg.series_id}: #{inspect(reason)}")
+          []
       end
-    end
-  end
-
-  defp run_write_transaction(conn, fun) do
-    execute(conn, "BEGIN IMMEDIATE", [])
-
-    try do
-      result = fun.(conn)
-      execute(conn, "COMMIT", [])
-      {:ok, result}
-    rescue
-      e ->
-        try do
-          execute(conn, "ROLLBACK", [])
-        rescue
-          _ -> :ok
-        end
-
-        {:error, e}
-    end
-  end
-
-  defp create_tier_tables(conn, schema) do
-    execute(conn, """
-    CREATE TABLE IF NOT EXISTS _watermarks (
-      tier         TEXT PRIMARY KEY,
-      last_bucket  INTEGER NOT NULL
-    ) WITHOUT ROWID
-    """, [])
-
-    Enum.each(schema.tiers, fn tier ->
-      maybe_migrate_tier_table(conn, tier)
-
-      execute(conn, """
-      CREATE TABLE IF NOT EXISTS #{tier.table_name} (
-        series_id    INTEGER NOT NULL,
-        chunk_start  INTEGER NOT NULL,
-        chunk_end    INTEGER NOT NULL,
-        bucket_count INTEGER NOT NULL,
-        data         BLOB NOT NULL,
-        PRIMARY KEY (series_id, chunk_start)
-      ) WITHOUT ROWID
-      """, [])
-
-      # Insert migrated chunks if migration happened
-      case Process.delete({:tier_migration, tier.table_name}) do
-        nil ->
-          :ok
-
-        chunks ->
-          insert_sql =
-            "INSERT OR REPLACE INTO #{tier.table_name} " <>
-              "(series_id, chunk_start, chunk_end, bucket_count, data) VALUES (?1, ?2, ?3, ?4, ?5)"
-
-          {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, insert_sql)
-
-          try do
-            Enum.each(chunks, fn {series_id, chunk_start, chunk_end, count, blob} ->
-              :ok = Exqlite.Sqlite3.bind(stmt, [series_id, chunk_start, chunk_end, count, blob])
-              :done = Exqlite.Sqlite3.step(conn, stmt)
-              :ok = Exqlite.Sqlite3.reset(stmt)
-            end)
-          after
-            Exqlite.Sqlite3.release(conn, stmt)
-          end
-      end
-
-      execute(conn, "INSERT OR IGNORE INTO _watermarks (tier, last_bucket) VALUES (?1, 0)",
-        [to_string(tier.name)])
     end)
   end
 
-  defp maybe_migrate_tier_table(conn, tier) do
-    # Detect old uncompressed schema by checking for 'avg' column
-    {:ok, columns} = execute(conn, "PRAGMA table_info(#{tier.table_name})", [])
+  # Write segments to WAL (for in-progress / pending flush)
+  defp write_segments(segments, state) do
+    compressed = compress_segments(segments, state)
 
-    if columns != [] do
-      has_avg = Enum.any?(columns, fn row -> Enum.at(row, 1) == "avg" end)
-
-      if has_avg do
-        require Logger
-
-        Logger.info(
-          "Migrating #{tier.table_name} from row-per-bucket to compressed chunks..."
-        )
-
-        # Read all existing data
-        {:ok, rows} =
-          execute(
-            conn,
-            "SELECT series_id, bucket, avg, min, max, count, sum, last FROM #{tier.table_name} ORDER BY series_id, bucket",
-            []
-          )
-
-        # Group by series_id and chunk boundary
-        chunks =
-          rows
-          |> Enum.map(fn [sid, bucket, avg, min, max, count, sum, last] ->
-            %{
-              series_id: sid,
-              bucket: bucket,
-              avg: avg || 0.0,
-              min: min || 0.0,
-              max: max || 0.0,
-              count: count || 0,
-              sum: sum || 0.0,
-              last: last || 0.0
-            }
-          end)
-          |> Enum.group_by(& &1.series_id)
-          |> Enum.flat_map(fn {series_id, series_rows} ->
-            series_rows
-            |> Enum.group_by(fn row ->
-              div(row.bucket, tier.chunk_seconds) * tier.chunk_seconds
-            end)
-            |> Enum.map(fn {chunk_start, bucket_rows} ->
-              chunk_end = chunk_start + tier.chunk_seconds
-              buckets = Enum.map(bucket_rows, &Map.delete(&1, :series_id))
-              blob = Timeless.TierChunk.encode(buckets, tier.aggregates)
-              {series_id, chunk_start, chunk_end, length(bucket_rows), blob}
-            end)
-          end)
-
-        # Drop old table and recreate will happen via CREATE TABLE IF NOT EXISTS
-        execute(conn, "DROP TABLE #{tier.table_name}", [])
-
-        Logger.info(
-          "Migrated #{tier.table_name}: #{length(rows)} rows → #{length(chunks)} chunks"
-        )
-
-        # The new table will be created by the caller's CREATE TABLE IF NOT EXISTS.
-        # Insert migrated chunks after table creation.
-        if chunks != [] do
-          # Defer chunk insertion — store in process dict for post-creation insert
-          Process.put({:tier_migration, tier.table_name}, chunks)
-        end
-      end
+    if compressed != [] do
+      Timeless.ShardStore.write_wal(state.shard_store, compressed)
     end
   end
 
-  defp configure_writer(conn) do
-    pragmas = [
-      "PRAGMA page_size = 16384",
-      "PRAGMA journal_mode = WAL",
-      "PRAGMA synchronous = NORMAL",
-      "PRAGMA cache_size = -64000",
-      "PRAGMA auto_vacuum = NONE",  # freelist pages reuse naturally, no vacuum needed on shards
-      "PRAGMA mmap_size = 2147483648",
-      "PRAGMA wal_autocheckpoint = 10000",
-      "PRAGMA temp_store = MEMORY",
-      "PRAGMA busy_timeout = 5000"
-    ]
+  # Write completed segments to WAL, then seal their windows into .seg files
+  defp write_and_seal(segments, state) do
+    compressed = compress_segments(segments, state)
 
-    Enum.each(pragmas, &execute(conn, &1, []))
-  end
+    if compressed != [] do
+      Timeless.ShardStore.write_wal(state.shard_store, compressed)
 
-  defp configure_reader(conn) do
-    pragmas = [
-      "PRAGMA mmap_size = 2147483648",
-      "PRAGMA cache_size = -4000",
-      "PRAGMA temp_store = MEMORY",
-      "PRAGMA busy_timeout = 5000"
-    ]
-
-    Enum.each(pragmas, &execute(conn, &1, []))
-  end
-
-  defp create_raw_segments_table(conn) do
-    execute(conn, """
-    CREATE TABLE IF NOT EXISTS raw_segments (
-      series_id    INTEGER NOT NULL,
-      start_time   INTEGER NOT NULL,
-      end_time     INTEGER NOT NULL,
-      point_count  INTEGER NOT NULL,
-      data         BLOB NOT NULL,
-      PRIMARY KEY (series_id, start_time)
-    ) WITHOUT ROWID
-    """, [])
-  end
-
-  @doc false
-  def execute(conn, sql, params) do
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, sql)
-
-    if params != [] do
-      :ok = Exqlite.Sqlite3.bind(stmt, params)
-    end
-
-    rows = fetch_all(conn, stmt, [])
-    Exqlite.Sqlite3.release(conn, stmt)
-    {:ok, rows}
-  end
-
-  defp fetch_all(conn, stmt, acc) do
-    case Exqlite.Sqlite3.step(conn, stmt) do
-      {:row, row} -> fetch_all(conn, stmt, [row | acc])
-      :done -> Enum.reverse(acc)
-      {:error, reason} -> raise "SQLite error: #{reason}"
+      # Seal each completed window
+      compressed
+      |> Enum.map(fn {_sid, start, _, _, _} -> segment_bucket(start, state.segment_duration) end)
+      |> Enum.uniq()
+      |> Enum.each(fn window ->
+        Timeless.ShardStore.seal_window(state.shard_store, window)
+      end)
     end
   end
 end

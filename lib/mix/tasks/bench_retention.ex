@@ -151,11 +151,7 @@ defmodule Mix.Tasks.BenchRetention do
     {raw_us, _} = :timer.tc(fn ->
       for i <- 0..(shards - 1) do
         builder = :"#{store}_builder_#{i}"
-        Timeless.SegmentBuilder.delete_shard(
-          builder,
-          "DELETE FROM raw_segments WHERE end_time < ?1",
-          [cutoff]
-        )
+        Timeless.SegmentBuilder.delete_raw_before(builder, cutoff)
       end
     end)
 
@@ -166,11 +162,7 @@ defmodule Mix.Tasks.BenchRetention do
       Enum.each(schema.tiers, fn tier ->
         for i <- 0..(shards - 1) do
           builder = :"#{store}_builder_#{i}"
-          Timeless.SegmentBuilder.delete_shard(
-            builder,
-            "DELETE FROM #{tier.table_name} WHERE bucket < ?1",
-            [cutoff]
-          )
+          Timeless.SegmentBuilder.delete_tier_before(builder, tier.name, cutoff)
         end
       end)
     end)
@@ -231,48 +223,34 @@ defmodule Mix.Tasks.BenchRetention do
 
   # --- Index management ---
 
-  defp drop_indexes(store, shards, schema) do
-    for i <- 0..(shards - 1) do
-      builder = :"#{store}_builder_#{i}"
-
-      Timeless.SegmentBuilder.delete_shard(
-        builder,
-        "DROP INDEX IF EXISTS idx_raw_segments_end_time",
-        []
-      )
-
-      Enum.each(schema.tiers, fn tier ->
-        Timeless.SegmentBuilder.delete_shard(
-          builder,
-          "DROP INDEX IF EXISTS idx_#{tier.table_name}_bucket",
-          []
-        )
-      end)
-    end
+  defp drop_indexes(_store, _shards, _schema) do
+    # No-op: file-based storage has no SQL indexes to drop
+    :ok
   end
 
   # --- Reporting ---
 
   defp report_counts(store, shards, schema) do
-    total_raw = count_across_shards(store, shards, "SELECT COUNT(*) FROM raw_segments")
+    total_raw =
+      Enum.reduce(0..(shards - 1), 0, fn i, acc ->
+        builder = :"#{store}_builder_#{i}"
+        stats = Timeless.SegmentBuilder.raw_stats(builder)
+        acc + stats.segment_count
+      end)
 
     tier_counts =
       Enum.map(schema.tiers, fn tier ->
-        count = count_across_shards(store, shards, "SELECT COUNT(*) FROM #{tier.table_name}")
+        count =
+          Enum.reduce(0..(shards - 1), 0, fn i, acc ->
+            builder = :"#{store}_builder_#{i}"
+            {c, _, _} = Timeless.SegmentBuilder.read_tier_stats(builder, tier.name)
+            acc + c
+          end)
         {tier.name, count}
       end)
 
     IO.puts("  Counts: #{fmt(total_raw)} raw segments" <>
       Enum.map_join(tier_counts, "", fn {name, count} -> ", #{fmt(count)} #{name}" end))
-  end
-
-  defp count_across_shards(store, shards, sql) do
-    for i <- 0..(shards - 1) do
-      builder = :"#{store}_builder_#{i}"
-      {:ok, [[count]]} = Timeless.SegmentBuilder.read_shard(builder, sql, [])
-      count
-    end
-    |> Enum.sum()
   end
 
   # --- Arg parsing ---

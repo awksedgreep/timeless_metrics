@@ -23,16 +23,7 @@ defmodule Timeless.Query do
     builder = builder_for_series(store, series_id)
 
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_shard(
-        builder,
-        """
-        SELECT data, start_time, end_time
-        FROM raw_segments
-        WHERE series_id = ?1 AND end_time >= ?2 AND start_time <= ?3
-        ORDER BY start_time
-        """,
-        [series_id, from, to]
-      )
+      Timeless.SegmentBuilder.read_raw_segments(builder, series_id, from, to)
 
     {us, points} =
       :timer.tc(fn ->
@@ -86,19 +77,9 @@ defmodule Timeless.Query do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
     builder = builder_for_series(store, series_id)
-    table = "tier_#{tier_name}"
 
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_shard(
-        builder,
-        """
-        SELECT data
-        FROM #{table}
-        WHERE series_id = ?1 AND chunk_end > ?2 AND chunk_start < ?3
-        ORDER BY chunk_start
-        """,
-        [series_id, from, to]
-      )
+      Timeless.SegmentBuilder.read_tier_chunks(builder, tier_name, series_id, from, to)
 
     results =
       rows
@@ -120,19 +101,9 @@ defmodule Timeless.Query do
 
     builder = builder_for_series(store, series_id)
 
-    # Try raw first (from shard DB)
+    # Try raw first (from shard storage)
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_shard(
-        builder,
-        """
-        SELECT data
-        FROM raw_segments
-        WHERE series_id = ?1
-        ORDER BY end_time DESC
-        LIMIT 1
-        """,
-        [series_id]
-      )
+      Timeless.SegmentBuilder.read_raw_latest(builder, series_id)
 
     case rows do
       [[blob]] ->
@@ -149,7 +120,7 @@ defmodule Timeless.Query do
         # Fall back to finest rollup tier (on shard DB)
         if schema && schema.tiers != [] do
           finest_tier = List.first(schema.tiers)
-          latest_from_tier(store, finest_tier.table_name, series_id)
+          latest_from_tier(store, finest_tier.name, series_id)
         else
           {:ok, nil}
         end
@@ -217,17 +188,7 @@ defmodule Timeless.Query do
   end
 
   defp get_shard_watermark(builder, tier_name) do
-    {:ok, rows} =
-      Timeless.SegmentBuilder.read_shard(
-        builder,
-        "SELECT last_bucket FROM _watermarks WHERE tier = ?1",
-        [to_string(tier_name)]
-      )
-
-    case rows do
-      [[w]] -> w
-      [] -> 0
-    end
+    Timeless.SegmentBuilder.read_watermark(builder, tier_name)
   end
 
   defp aggregate_from_raw(store, series_id, opts, bucket_seconds, agg_fn) do
@@ -249,16 +210,7 @@ defmodule Timeless.Query do
     builder = builder_for_series(store, series_id)
 
     {:ok, chunk_rows} =
-      Timeless.SegmentBuilder.read_shard(
-        builder,
-        """
-        SELECT data
-        FROM #{tier.table_name}
-        WHERE series_id = ?1 AND chunk_end > ?2 AND chunk_start < ?3
-        ORDER BY chunk_start
-        """,
-        [series_id, from, to]
-      )
+      Timeless.SegmentBuilder.read_tier_chunks(builder, tier.name, series_id, from, to)
 
     # Decode chunks and filter to requested range
     tier_rows =
@@ -362,15 +314,11 @@ defmodule Timeless.Query do
     end)
   end
 
-  defp latest_from_tier(store, table_name, series_id) do
+  defp latest_from_tier(store, tier_name, series_id) do
     builder = builder_for_series(store, series_id)
 
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_shard(
-        builder,
-        "SELECT data FROM #{table_name} WHERE series_id = ?1 ORDER BY chunk_start DESC LIMIT 1",
-        [series_id]
-      )
+      Timeless.SegmentBuilder.read_tier_latest(builder, tier_name, series_id)
 
     case rows do
       [[blob]] ->

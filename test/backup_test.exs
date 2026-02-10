@@ -57,9 +57,9 @@ defmodule Timeless.BackupTest do
 
     {:ok, result} = Timeless.backup(:backup_test, @backup_dir)
 
-    # 2 shards configured
-    assert "shard_0.db" in result.files
-    assert "shard_1.db" in result.files
+    # 2 shards configured (directories, not .db files)
+    assert "shard_0" in result.files
+    assert "shard_1" in result.files
     assert length(result.files) == 3  # metrics.db + 2 shards
   end
 
@@ -76,19 +76,21 @@ defmodule Timeless.BackupTest do
 
     {:ok, _result} = Timeless.backup(:backup_test, @backup_dir)
 
-    # Find which shard has the data by trying both
-    total_segments =
+    # Verify raw segment files were backed up (WAL or .seg files)
+    total_raw_files =
       Enum.reduce(0..1, 0, fn i, acc ->
-        shard_path = Path.join(@backup_dir, "shard_#{i}.db")
-        {:ok, conn} = Exqlite.Sqlite3.open(shard_path, mode: :readonly)
-        {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "SELECT COUNT(*) FROM raw_segments")
-        {:row, [count]} = Exqlite.Sqlite3.step(conn, stmt)
-        Exqlite.Sqlite3.release(conn, stmt)
-        Exqlite.Sqlite3.close(conn)
-        acc + count
+        raw_dir = Path.join(@backup_dir, "shard_#{i}/raw")
+        case File.ls(raw_dir) do
+          {:ok, files} ->
+            raw_count = Enum.count(files, fn f ->
+              String.ends_with?(f, ".seg") or String.ends_with?(f, ".wal")
+            end)
+            acc + raw_count
+          _ -> acc
+        end
       end)
 
-    assert total_segments >= 1
+    assert total_raw_files >= 1
   end
 
   test "backup during active writes does not crash" do

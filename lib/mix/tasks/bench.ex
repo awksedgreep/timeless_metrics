@@ -60,10 +60,10 @@ defmodule Mix.Tasks.Bench do
       Timeless.Supervisor.start_link(
         name: :bench,
         data_dir: data_dir,
-        buffer_shards: System.schedulers_online(),
+        # Use default shard count (cores/2, min 2)
         segment_duration: seg_dur,
         schema: schema,
-        flush_threshold: 50_000,
+        flush_threshold: 200_000,
         flush_interval: :timer.seconds(60)
       )
 

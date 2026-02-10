@@ -212,51 +212,26 @@ defmodule Mix.Tasks.BenchCompressedTiers do
   # --- Storage measurement ---
 
   defp measure_storage(store, shards, schema) do
-    raw_rows = count_across_shards(store, shards, "SELECT COUNT(*) FROM raw_segments")
-
-    raw_bytes =
-      sum_across_shards(store, shards, "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM raw_segments")
+    {raw_segs, raw_bytes} =
+      Enum.reduce(0..(shards - 1), {0, 0}, fn i, {s_acc, b_acc} ->
+        builder = :"#{store}_builder_#{i}"
+        stats = Timeless.SegmentBuilder.raw_stats(builder)
+        {s_acc + stats.segment_count, b_acc + stats.raw_bytes}
+      end)
 
     tier_stats =
       Enum.map(schema.tiers, fn tier ->
-        chunks = count_across_shards(store, shards, "SELECT COUNT(*) FROM #{tier.table_name}")
-
-        bucket_count =
-          sum_across_shards(
-            store,
-            shards,
-            "SELECT COALESCE(SUM(bucket_count), 0) FROM #{tier.table_name}"
-          )
-
-        tier_bytes =
-          sum_across_shards(
-            store,
-            shards,
-            "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM #{tier.table_name}"
-          )
+        {chunks, bucket_count, tier_bytes} =
+          Enum.reduce(0..(shards - 1), {0, 0, 0}, fn i, {c_acc, b_acc, tb_acc} ->
+            builder = :"#{store}_builder_#{i}"
+            {c, b, tb} = Timeless.SegmentBuilder.read_tier_stats(builder, tier.name)
+            {c_acc + c, b_acc + b, tb_acc + tb}
+          end)
 
         {tier.name, chunks, bucket_count, tier_bytes}
       end)
 
-    {raw_rows, raw_bytes, tier_stats}
-  end
-
-  defp count_across_shards(store, shards, sql) do
-    for i <- 0..(shards - 1) do
-      builder = :"#{store}_builder_#{i}"
-      {:ok, [[count]]} = Timeless.SegmentBuilder.read_shard(builder, sql, [])
-      count
-    end
-    |> Enum.sum()
-  end
-
-  defp sum_across_shards(store, shards, sql) do
-    for i <- 0..(shards - 1) do
-      builder = :"#{store}_builder_#{i}"
-      {:ok, [[val]]} = Timeless.SegmentBuilder.read_shard(builder, sql, [])
-      val || 0
-    end
-    |> Enum.sum()
+    {raw_segs, raw_bytes, tier_stats}
   end
 
   defp measure_disk(data_dir) do

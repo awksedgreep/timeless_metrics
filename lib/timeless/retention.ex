@@ -58,32 +58,27 @@ defmodule Timeless.Retention do
     now = System.os_time(:second)
     shard_count = :persistent_term.get({Timeless, state.store, :shard_count})
 
-    # 1. Drop expired raw segments from all shard DBs
+    # 1. Drop expired raw segments from all shards
     if state.schema.raw_retention_seconds != :forever do
       raw_cutoff = now - state.schema.raw_retention_seconds
 
       for i <- 0..(shard_count - 1) do
         builder = :"#{state.store}_builder_#{i}"
-        Timeless.SegmentBuilder.delete_shard(
-          builder,
-          "DELETE FROM raw_segments WHERE end_time < ?1",
-          [raw_cutoff]
-        )
+        Timeless.SegmentBuilder.delete_raw_before(builder, raw_cutoff)
       end
     end
 
-    # 2. Drop expired compressed tier chunks (fully expired only)
+    # 2. Drop expired compressed tier chunks (fully expired only) + compact
     Enum.each(state.schema.tiers, fn tier ->
       if tier.retention_seconds != :forever do
         cutoff = now - tier.retention_seconds
 
         for i <- 0..(shard_count - 1) do
           builder = :"#{state.store}_builder_#{i}"
-          Timeless.SegmentBuilder.delete_shard(
-            builder,
-            "DELETE FROM #{tier.table_name} WHERE chunk_end < ?1",
-            [cutoff]
-          )
+          Timeless.SegmentBuilder.delete_tier_before(builder, tier.name, cutoff)
+
+          # Compact if deletion created significant dead space
+          Timeless.SegmentBuilder.compact_tier(builder, tier.name)
         end
       end
     end)
@@ -111,21 +106,13 @@ defmodule Timeless.Retention do
         builder = :"#{state.store}_builder_#{i}"
 
         # Raw segments
-        {:ok, raw_rows} = Timeless.SegmentBuilder.read_shard(
-          builder,
-          "SELECT DISTINCT series_id FROM raw_segments",
-          []
-        )
+        {:ok, raw_rows} = Timeless.SegmentBuilder.raw_series_ids(builder)
         raw_ids = Enum.map(raw_rows, fn [id] -> id end)
 
-        # Tier tables
+        # Tier tables (from ShardStore ETS)
         tier_ids =
           Enum.flat_map(state.schema.tiers, fn tier ->
-            {:ok, tier_rows} = Timeless.SegmentBuilder.read_shard(
-              builder,
-              "SELECT DISTINCT series_id FROM #{tier.table_name}",
-              []
-            )
+            {:ok, tier_rows} = Timeless.SegmentBuilder.read_tier_series_ids(builder, tier.name)
             Enum.map(tier_rows, fn [id] -> id end)
           end)
 

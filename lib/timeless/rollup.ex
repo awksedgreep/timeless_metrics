@@ -152,6 +152,7 @@ defmodule Timeless.Rollup do
         end
 
       case result do
+        :ok -> :ok
         {:ok, _} -> :ok
         {:error, e} -> Logger.warning("Shard rollup failed for #{tier.name} on #{builder}: #{inspect(e)}")
       end
@@ -160,16 +161,7 @@ defmodule Timeless.Rollup do
 
   defp rollup_shard_from_raw(tier, builder, watermark, up_to, state) do
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_shard(
-        builder,
-        """
-        SELECT series_id, start_time, end_time, data
-        FROM raw_segments
-        WHERE end_time > ?1 AND start_time < ?2
-        ORDER BY series_id, start_time
-        """,
-        [watermark, up_to]
-      )
+      Timeless.SegmentBuilder.read_raw_for_rollup(builder, watermark, up_to)
 
     # Decompress all segments and gather points
     points_by_series =
@@ -186,34 +178,23 @@ defmodule Timeless.Rollup do
       |> Enum.filter(fn {_sid, ts, _val} -> ts >= watermark and ts < up_to end)
       |> Enum.group_by(&elem(&1, 0))
 
-    # Write tier rows + watermark atomically
-    Timeless.SegmentBuilder.write_transaction_shard(builder, fn conn ->
-      if points_by_series != %{} do
-        write_tier_rows(conn, tier, points_by_series)
-      end
+    # Prepare tier entries (lock-free reads for merge)
+    if points_by_series != %{} do
+      entries = collect_tier_entries(builder, tier, points_by_series)
 
-      # Always advance watermark
-      Timeless.SegmentBuilder.execute(
-        conn,
-        "INSERT OR REPLACE INTO _watermarks (tier, last_bucket) VALUES (?1, ?2)",
-        [to_string(tier.name), up_to]
-      )
-    end)
+      if entries != [] do
+        Timeless.SegmentBuilder.write_tier_batch(builder, tier.name, entries)
+      end
+    end
+
+    # Advance watermark
+    Timeless.SegmentBuilder.write_watermark(builder, tier.name, up_to)
   end
 
   defp rollup_shard_from_tier(tier, source_tier, builder, watermark, up_to, _state) do
     # Read compressed chunks from source tier covering [watermark, up_to)
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_shard(
-        builder,
-        """
-        SELECT series_id, data
-        FROM #{source_tier.table_name}
-        WHERE chunk_end > ?1 AND chunk_start < ?2
-        ORDER BY series_id, chunk_start
-        """,
-        [watermark, up_to]
-      )
+      Timeless.SegmentBuilder.read_tier_for_rollup(builder, source_tier.name, watermark, up_to)
 
     # Decode chunks and filter buckets to range, group by series
     grouped =
@@ -227,9 +208,9 @@ defmodule Timeless.Rollup do
       end)
       |> Enum.group_by(& &1.series_id)
 
-    Timeless.SegmentBuilder.write_transaction_shard(builder, fn conn ->
-      if grouped != %{} do
-        Enum.each(grouped, fn {series_id, series_rows} ->
+    if grouped != %{} do
+      entries =
+        Enum.flat_map(grouped, fn {series_id, series_rows} ->
           # Re-aggregate into target tier resolution, then group by chunk boundary
           tier_buckets =
             series_rows
@@ -239,21 +220,20 @@ defmodule Timeless.Rollup do
               Map.put(aggs, :bucket, target_bucket)
             end)
 
-          write_tier_chunks(conn, tier, series_id, tier_buckets)
+          prepare_tier_entries(builder, tier, series_id, tier_buckets)
         end)
-      end
 
-      # Always advance watermark
-      Timeless.SegmentBuilder.execute(
-        conn,
-        "INSERT OR REPLACE INTO _watermarks (tier, last_bucket) VALUES (?1, ?2)",
-        [to_string(tier.name), up_to]
-      )
-    end)
+      if entries != [] do
+        Timeless.SegmentBuilder.write_tier_batch(builder, tier.name, entries)
+      end
+    end
+
+    # Advance watermark
+    Timeless.SegmentBuilder.write_watermark(builder, tier.name, up_to)
   end
 
-  defp write_tier_rows(conn, tier, points_by_series) do
-    Enum.each(points_by_series, fn {series_id, series_points} ->
+  defp collect_tier_entries(builder, tier, points_by_series) do
+    Enum.flat_map(points_by_series, fn {series_id, series_points} ->
       tier_buckets =
         series_points
         |> Enum.group_by(fn {_sid, ts, _val} -> bucket_floor(ts, tier.resolution_seconds) end)
@@ -263,11 +243,11 @@ defmodule Timeless.Rollup do
           Map.put(aggs, :bucket, bucket)
         end)
 
-      write_tier_chunks(conn, tier, series_id, tier_buckets)
+      prepare_tier_entries(builder, tier, series_id, tier_buckets)
     end)
   end
 
-  defp write_tier_chunks(conn, tier, series_id, tier_buckets) do
+  defp prepare_tier_entries(builder, tier, series_id, tier_buckets) do
     chunk_secs = tier.chunk_seconds || Timeless.Schema.chunk_seconds(nil, tier.resolution_seconds)
 
     # Group buckets by chunk boundary
@@ -276,32 +256,18 @@ defmodule Timeless.Rollup do
         div(b.bucket, chunk_secs) * chunk_secs
       end)
 
-    Enum.each(chunks, fn {chunk_start, new_buckets} ->
+    Enum.map(chunks, fn {chunk_start, new_buckets} ->
       chunk_end = chunk_start + chunk_secs
 
-      # Read existing chunk (read-modify-write)
-      {:ok, existing_rows} =
-        Timeless.SegmentBuilder.execute(
-          conn,
-          "SELECT data FROM #{tier.table_name} WHERE series_id = ?1 AND chunk_start = ?2",
-          [series_id, chunk_start]
-        )
-
+      # Read existing chunk (lock-free via ETS)
       existing_blob =
-        case existing_rows do
-          [[blob]] -> blob
-          [] -> nil
-        end
+        Timeless.SegmentBuilder.read_tier_chunk_for_merge(builder, tier.name, series_id, chunk_start)
 
       # Merge new buckets into existing (or create new)
       merged_blob = Timeless.TierChunk.merge(existing_blob, new_buckets, tier.aggregates)
       bucket_count = Timeless.TierChunk.bucket_count(merged_blob)
 
-      Timeless.SegmentBuilder.execute(
-        conn,
-        "INSERT OR REPLACE INTO #{tier.table_name} (series_id, chunk_start, chunk_end, bucket_count, data) VALUES (?1, ?2, ?3, ?4, ?5)",
-        [series_id, chunk_start, chunk_end, bucket_count, merged_blob]
-      )
+      {series_id, chunk_start, chunk_end, bucket_count, merged_blob}
     end)
   end
 
@@ -354,17 +320,7 @@ defmodule Timeless.Rollup do
   # --- Shard watermark helpers ---
 
   defp get_shard_watermark(builder, tier_name) do
-    {:ok, rows} =
-      Timeless.SegmentBuilder.read_shard(
-        builder,
-        "SELECT last_bucket FROM _watermarks WHERE tier = ?1",
-        [to_string(tier_name)]
-      )
-
-    case rows do
-      [[w]] -> w
-      [] -> 0
-    end
+    Timeless.SegmentBuilder.read_watermark(builder, tier_name)
   end
 
   # --- Aggregation ---
