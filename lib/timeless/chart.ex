@@ -18,7 +18,8 @@ defmodule Timeless.Chart do
   @default_width 800
   @default_height 300
   @padding %{top: 24, right: 10, bottom: 28, left: 45}
-  @legend_height 20
+  @legend_row_height 16
+  @legend_padding 8
   @colors ~w(#2563eb #dc2626 #16a34a #d97706 #7c3aed #0891b2 #be185d #65a30d)
 
   @themes %{
@@ -53,9 +54,11 @@ defmodule Timeless.Chart do
     anomaly_points = Keyword.get(opts, :anomalies, [])
 
     has_legend = length(series) > 1
-    legend_h = if has_legend, do: @legend_height, else: 0
+    label_key_val = label_key
+    legend_h = if has_legend, do: legend_height(series, label_key_val, width), else: 0
     plot_w = width - @padding.left - @padding.right
-    plot_h = height - @padding.top - @padding.bottom - legend_h
+    total_height = height + legend_h
+    plot_h = height - @padding.top - @padding.bottom
 
     # Compute global bounds across all series + forecast + anomaly points
     extra_points = forecast_data ++ anomaly_points
@@ -79,14 +82,14 @@ defmodule Timeless.Chart do
 
       lines = render_series(series, scale_x, scale_y, label_key)
       grid = render_grid(t_min, t_max, v_min, v_max, scale_x, scale_y, plot_w, plot_h, theme)
-      legend = render_legend(series, label_key, width, height, legend_h, theme)
+      legend = render_legend(series, label_key, width, height, theme)
       annotation_markers = render_annotations(annots, t_min, t_max, scale_x, plot_h, theme)
       forecast_line = render_forecast(forecast_data, scale_x, scale_y)
       anomaly_dots = render_anomaly_dots(anomaly_points, scale_x, scale_y)
 
       """
-      <svg xmlns="http://www.w3.org/2000/svg" width="#{width}" height="#{height}" viewBox="0 0 #{width} #{height}" style="font-family:-apple-system,system-ui,sans-serif;font-size:11px">
-        #{theme_style(theme)}<rect width="#{width}" height="#{height}" #{bg_attr(theme)}/>
+      <svg xmlns="http://www.w3.org/2000/svg" width="#{width}" height="#{total_height}" viewBox="0 0 #{width} #{total_height}" style="font-family:-apple-system,system-ui,sans-serif;font-size:11px">
+        #{theme_style(theme)}<rect width="#{width}" height="#{total_height}" #{bg_attr(theme)}/>
         <text x="#{div(width, 2)}" y="16" text-anchor="middle" #{text_attr(theme)} font-size="13" font-weight="600">#{escape(title)}</text>
         #{grid}
         #{lines}
@@ -164,7 +167,7 @@ defmodule Timeless.Chart do
 
   # --- Legend ---
 
-  defp render_legend(series, label_key, width, height, legend_h, theme) do
+  defp render_legend(series, label_key, width, height, theme) do
     if length(series) <= 1 do
       ""
     else
@@ -179,19 +182,67 @@ defmodule Timeless.Chart do
           {color, name}
         end)
 
-      # Render legend items centered at bottom, below the plot
-      item_width = 100
-      total_width = length(items) * item_width
-      start_x = div(width - total_width, 2)
-      legend_y = height - legend_h + 16
+      # Lay out legend items with wrapping
+      usable_width = width - 20
+      rows = layout_legend_rows(items, usable_width)
+      legend_y_start = height + @legend_padding
 
-      items
+      rows
       |> Enum.with_index()
-      |> Enum.map(fn {{color, name}, i} ->
-        x = start_x + i * item_width
-        ~s(<rect x="#{x}" y="#{legend_y - 3}" width="12" height="3" fill="#{color}"/><text x="#{x + 16}" y="#{legend_y}" #{ta} font-size="10">#{escape(name)}</text>)
+      |> Enum.flat_map(fn {row_items, row_idx} ->
+        row_total = Enum.reduce(row_items, 0, fn {_c, _n, w}, acc -> acc + w end)
+        start_x = div(width - row_total, 2)
+        y = legend_y_start + row_idx * @legend_row_height
+
+        {svgs, _} =
+          Enum.reduce(row_items, {[], start_x}, fn {color, name, _w}, {acc, x} ->
+            svg =
+              ~s(<rect x="#{x}" y="#{y - 3}" width="12" height="3" fill="#{color}"/>) <>
+                ~s(<text x="#{x + 16}" y="#{y}" #{ta} font-size="10">#{escape(name)}</text>)
+
+            item_w = 20 + String.length(name) * 6 + 12
+            {[svg | acc], x + item_w}
+          end)
+
+        Enum.reverse(svgs)
       end)
       |> Enum.join("\n    ")
+    end
+  end
+
+  defp layout_legend_rows(items, max_width) do
+    items_with_width =
+      Enum.map(items, fn {color, name} ->
+        w = 20 + String.length(name) * 6 + 12
+        {color, name, w}
+      end)
+
+    {rows, current_row, _current_width} =
+      Enum.reduce(items_with_width, {[], [], 0}, fn {_c, _n, w} = item, {rows, row, row_w} ->
+        if row == [] or row_w + w <= max_width do
+          {rows, [item | row], row_w + w}
+        else
+          {[Enum.reverse(row) | rows], [item], w}
+        end
+      end)
+
+    rows = if current_row != [], do: [Enum.reverse(current_row) | rows], else: rows
+    Enum.reverse(rows)
+  end
+
+  defp legend_height(series, label_key, width) do
+    if length(series) <= 1 do
+      0
+    else
+      items =
+        Enum.map(series, fn %{labels: labels} ->
+          name = Map.get(labels, label_key, "series")
+          {"", name}
+        end)
+
+      usable_width = width - 20
+      rows = layout_legend_rows(items, usable_width)
+      length(rows) * @legend_row_height + @legend_padding * 2
     end
   end
 
