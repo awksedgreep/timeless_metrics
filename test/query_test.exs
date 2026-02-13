@@ -20,11 +20,7 @@ defmodule TimelessMetrics.QueryTest do
     }
 
     start_supervised!(
-      {TimelessMetrics,
-       name: :query_test,
-       data_dir: @data_dir,
-       buffer_shards: 1,
-       schema: schema}
+      {TimelessMetrics, name: :query_test, data_dir: @data_dir, buffer_shards: 1, schema: schema}
     )
 
     on_exit(fn ->
@@ -87,8 +83,7 @@ defmodule TimelessMetrics.QueryTest do
     # Write monotonically increasing counter values: 100, 200, 300, 400, 500
     # 60-second intervals → rate should be ~1.67/sec (100 per 60s)
     for i <- 0..4 do
-      TimelessMetrics.write(:query_test, "bytes_total", %{"iface" => "eth0"},
-        (i + 1) * 100.0,
+      TimelessMetrics.write(:query_test, "bytes_total", %{"iface" => "eth0"}, (i + 1) * 100.0,
         timestamp: now - 240 + i * 60
       )
     end
@@ -118,8 +113,7 @@ defmodule TimelessMetrics.QueryTest do
     past_hour = div(now, 3600) * 3600 - 3600
 
     for i <- 0..9 do
-      TimelessMetrics.write(:query_test, "fallback_metric", %{"host" => "x"},
-        42.0 + i,
+      TimelessMetrics.write(:query_test, "fallback_metric", %{"host" => "x"}, 42.0 + i,
         timestamp: past_hour + i * 60
       )
     end
@@ -160,16 +154,14 @@ defmodule TimelessMetrics.QueryTest do
 
     # Write data in the "old" hour (will be covered by rollup)
     for i <- 0..4 do
-      TimelessMetrics.write(:query_test, "stitch_metric", %{"host" => "s"},
-        10.0 + i,
+      TimelessMetrics.write(:query_test, "stitch_metric", %{"host" => "s"}, 10.0 + i,
         timestamp: hour_start - 3600 + i * 60
       )
     end
 
     # Write data in the "current" hour (raw only)
     for i <- 0..4 do
-      TimelessMetrics.write(:query_test, "stitch_metric", %{"host" => "s"},
-        50.0 + i,
+      TimelessMetrics.write(:query_test, "stitch_metric", %{"host" => "s"}, 50.0 + i,
         timestamp: hour_start + i * 60
       )
     end

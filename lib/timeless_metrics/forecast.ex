@@ -84,9 +84,10 @@ defmodule TimelessMetrics.Forecast do
       t_range = max(Enum.max(timestamps) - t_min, 1)
 
       # Build design matrix with intercept column
-      x_rows = Enum.map(timestamps, fn ts ->
-        [1.0 | build_row(ts, t_min, t_range, periods)]
-      end)
+      x_rows =
+        Enum.map(timestamps, fn ts ->
+          [1.0 | build_row(ts, t_min, t_range, periods)]
+        end)
 
       coefficients = solve_ols(x_rows, values)
       {:ok, coefficients, t_min, t_range, periods}

@@ -89,8 +89,10 @@ defmodule PendingFlushTest do
     Process.sleep(500)
 
     info = TimelessMetrics.info(:pflush_store)
+
     assert info.total_points >= 3,
            "Expected at least 3 points in info, got #{info.total_points}"
+
     assert info.series_count >= 3
   end
 end

@@ -46,9 +46,12 @@ defmodule TimelessMetrics.TierChunk do
 
       blob = TimelessMetrics.TierChunk.encode(buckets, [:avg, :min, :max, :count, :sum, :last])
   """
-  def encode([], _aggregates), do: encode_raw(<<>>, 0, 0)
+  def encode(buckets, aggregates, compression_level \\ 9)
 
-  def encode(buckets, aggregates) when is_list(buckets) and is_list(aggregates) do
+  def encode([], _aggregates, compression_level), do: encode_raw(<<>>, 0, 0, compression_level)
+
+  def encode(buckets, aggregates, compression_level)
+      when is_list(buckets) and is_list(aggregates) do
     bitmask = to_bitmask(aggregates)
     ordered = ordered_aggregates(bitmask)
     sorted = Enum.sort_by(buckets, & &1.bucket)
@@ -59,11 +62,14 @@ defmodule TimelessMetrics.TierChunk do
       end)
       |> IO.iodata_to_binary()
 
-    encode_raw(body, bitmask, length(sorted))
+    encode_raw(body, bitmask, length(sorted), compression_level)
   end
 
-  defp encode_raw(body, bitmask, count) do
-    :ezstd.compress(<<@magic, @version::8, bitmask::8, count::16, body::binary>>)
+  defp encode_raw(body, bitmask, count, compression_level) do
+    :ezstd.compress(
+      <<@magic, @version::8, bitmask::8, count::16, body::binary>>,
+      compression_level
+    )
   end
 
   @doc """
@@ -85,11 +91,13 @@ defmodule TimelessMetrics.TierChunk do
   New buckets overwrite existing ones at the same timestamp. If `existing`
   is `nil`, equivalent to `encode/2`.
   """
-  def merge(nil, new_buckets, aggregates) do
-    encode(new_buckets, aggregates)
+  def merge(existing_blob, new_buckets, aggregates, compression_level \\ 9)
+
+  def merge(nil, new_buckets, aggregates, compression_level) do
+    encode(new_buckets, aggregates, compression_level)
   end
 
-  def merge(existing_blob, new_buckets, aggregates) do
+  def merge(existing_blob, new_buckets, aggregates, compression_level) do
     {_aggs, existing_buckets} = decode(existing_blob)
 
     merged =
@@ -102,7 +110,7 @@ defmodule TimelessMetrics.TierChunk do
       end)
       |> Map.values()
 
-    encode(merged, aggregates)
+    encode(merged, aggregates, compression_level)
   end
 
   @doc """
@@ -122,7 +130,7 @@ defmodule TimelessMetrics.TierChunk do
 
   defp encode_values(bucket, [agg | rest]) do
     val = Map.get(bucket, agg, 0.0)
-    [<<(val + 0.0)::float-64>> | encode_values(bucket, rest)]
+    [<<val + 0.0::float-64>> | encode_values(bucket, rest)]
   end
 
   defp encode_values(_bucket, []), do: []

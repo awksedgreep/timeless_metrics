@@ -66,12 +66,20 @@ defmodule Mix.Tasks.BenchRetention do
     IO.puts("  WITH indexes:")
     IO.puts("    Raw DELETE:    #{fmt_ms(with_results.raw_delete_us)}")
     IO.puts("    Tier DELETE:   #{fmt_ms(with_results.tier_delete_us)}")
-    IO.puts("    Total:         #{fmt_ms(with_results.raw_delete_us + with_results.tier_delete_us)}")
+
+    IO.puts(
+      "    Total:         #{fmt_ms(with_results.raw_delete_us + with_results.tier_delete_us)}"
+    )
+
     IO.puts("")
     IO.puts("  WITHOUT indexes:")
     IO.puts("    Raw DELETE:    #{fmt_ms(without_results.raw_delete_us)}")
     IO.puts("    Tier DELETE:   #{fmt_ms(without_results.tier_delete_us)}")
-    IO.puts("    Total:         #{fmt_ms(without_results.raw_delete_us + without_results.tier_delete_us)}")
+
+    IO.puts(
+      "    Total:         #{fmt_ms(without_results.raw_delete_us + without_results.tier_delete_us)}"
+    )
+
     IO.puts("")
 
     raw_speedup = safe_div(without_results.raw_delete_us, with_results.raw_delete_us)
@@ -148,24 +156,26 @@ defmodule Mix.Tasks.BenchRetention do
     IO.puts("  Deleting segments older than #{expire_pct}% mark (cutoff: #{cutoff})...")
 
     # Benchmark raw segment deletion
-    {raw_us, _} = :timer.tc(fn ->
-      for i <- 0..(shards - 1) do
-        builder = :"#{store}_builder_#{i}"
-        TimelessMetrics.SegmentBuilder.delete_raw_before(builder, cutoff)
-      end
-    end)
+    {raw_us, _} =
+      :timer.tc(fn ->
+        for i <- 0..(shards - 1) do
+          builder = :"#{store}_builder_#{i}"
+          TimelessMetrics.SegmentBuilder.delete_raw_before(builder, cutoff)
+        end
+      end)
 
     IO.puts("  Raw DELETE: #{fmt_ms(raw_us)}")
 
     # Benchmark tier deletion
-    {tier_us, _} = :timer.tc(fn ->
-      Enum.each(schema.tiers, fn tier ->
-        for i <- 0..(shards - 1) do
-          builder = :"#{store}_builder_#{i}"
-          TimelessMetrics.SegmentBuilder.delete_tier_before(builder, tier.name, cutoff)
-        end
+    {tier_us, _} =
+      :timer.tc(fn ->
+        Enum.each(schema.tiers, fn tier ->
+          for i <- 0..(shards - 1) do
+            builder = :"#{store}_builder_#{i}"
+            TimelessMetrics.SegmentBuilder.delete_tier_before(builder, tier.name, cutoff)
+          end
+        end)
       end)
-    end)
 
     IO.puts("  Tier DELETE: #{fmt_ms(tier_us)}")
 
@@ -246,11 +256,14 @@ defmodule Mix.Tasks.BenchRetention do
             {c, _, _} = TimelessMetrics.SegmentBuilder.read_tier_stats(builder, tier.name)
             acc + c
           end)
+
         {tier.name, count}
       end)
 
-    IO.puts("  Counts: #{fmt(total_raw)} raw segments" <>
-      Enum.map_join(tier_counts, "", fn {name, count} -> ", #{fmt(count)} #{name}" end))
+    IO.puts(
+      "  Counts: #{fmt(total_raw)} raw segments" <>
+        Enum.map_join(tier_counts, "", fn {name, count} -> ", #{fmt(count)} #{name}" end)
+    )
   end
 
   # --- Arg parsing ---

@@ -6,10 +6,7 @@ defmodule TimelessMetrics.PrometheusTest do
   setup do
     start_supervised!(
       {TimelessMetrics,
-       name: :prom_test,
-       data_dir: @data_dir,
-       buffer_shards: 1,
-       segment_duration: 3_600}
+       name: :prom_test, data_dir: @data_dir, buffer_shards: 1, segment_duration: 3_600}
     )
 
     on_exit(fn ->
@@ -40,7 +37,9 @@ defmodule TimelessMetrics.PrometheusTest do
 
     TimelessMetrics.flush(:prom_test)
 
-    {:ok, results} = TimelessMetrics.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
+    {:ok, results} =
+      TimelessMetrics.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
+
     assert length(results) == 2
 
     web1 = Enum.find(results, fn %{labels: l} -> l["host"] == "web-1" end)
@@ -64,7 +63,9 @@ defmodule TimelessMetrics.PrometheusTest do
 
     TimelessMetrics.flush(:prom_test)
 
-    {:ok, results} = TimelessMetrics.query_multi(:prom_test, "up", %{}, from: now_s - 60, to: now_s + 60)
+    {:ok, results} =
+      TimelessMetrics.query_multi(:prom_test, "up", %{}, from: now_s - 60, to: now_s + 60)
+
     assert length(results) == 1
     [{_ts, val}] = List.first(results).points
     assert_in_delta val, 1.0, 0.01
@@ -90,7 +91,9 @@ defmodule TimelessMetrics.PrometheusTest do
 
     TimelessMetrics.flush(:prom_test)
 
-    {:ok, results} = TimelessMetrics.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
+    {:ok, results} =
+      TimelessMetrics.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
+
     assert length(results) == 1
   end
 
@@ -107,7 +110,10 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.flush(:prom_test)
 
     now = System.os_time(:second)
-    {:ok, results} = TimelessMetrics.query_multi(:prom_test, "my_gauge", %{}, from: now - 10, to: now + 10)
+
+    {:ok, results} =
+      TimelessMetrics.query_multi(:prom_test, "my_gauge", %{}, from: now - 10, to: now + 10)
+
     assert length(results) == 1
   end
 
@@ -144,7 +150,10 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.flush(:prom_test)
 
     conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=60")
+      Plug.Test.conn(
+        :get,
+        "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=60"
+      )
       |> TimelessMetrics.HTTP.call(store: :prom_test)
 
     assert conn.status == 200
@@ -186,7 +195,10 @@ defmodule TimelessMetrics.PrometheusTest do
 
     # Query with PromQL-style label filter
     conn =
-      Plug.Test.conn(:get, ~s(/prometheus/api/v1/query_range?query=cpu_usage%7Bhost%3D%22web-1%22%7D&start=#{base}&end=#{base + 600}&step=60))
+      Plug.Test.conn(
+        :get,
+        ~s(/prometheus/api/v1/query_range?query=cpu_usage%7Bhost%3D%22web-1%22%7D&start=#{base}&end=#{base + 600}&step=60)
+      )
       |> TimelessMetrics.HTTP.call(store: :prom_test)
 
     assert conn.status == 200
@@ -209,7 +221,10 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.flush(:prom_test)
 
     conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=5m")
+      Plug.Test.conn(
+        :get,
+        "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=5m"
+      )
       |> TimelessMetrics.HTTP.call(store: :prom_test)
 
     assert conn.status == 200

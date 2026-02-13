@@ -72,7 +72,10 @@ defmodule TimelessMetrics.TierChunkTest do
   end
 
   test "round-trip preserves negative values" do
-    buckets = [%{bucket: 100, avg: -42.5, min: -100.0, max: -1.0, count: 5, sum: -212.5, last: -30.0}]
+    buckets = [
+      %{bucket: 100, avg: -42.5, min: -100.0, max: -1.0, count: 5, sum: -212.5, last: -30.0}
+    ]
+
     blob = TierChunk.encode(buckets, @all_aggregates)
     {_aggs, [decoded]} = TierChunk.decode(blob)
 
@@ -197,6 +200,7 @@ defmodule TimelessMetrics.TierChunkTest do
     buckets =
       for i <- 0..23 do
         base = 50.0 + :rand.uniform() * 40
+
         %{
           bucket: 1_706_000_000 + i * 3600,
           avg: base,
@@ -209,7 +213,8 @@ defmodule TimelessMetrics.TierChunkTest do
       end
 
     blob = TierChunk.encode(buckets, @all_aggregates)
-    uncompressed_size = 24 * (8 + 6 * 8)  # 24 buckets × (ts + 6 values) × 8 bytes
+    # 24 buckets × (ts + 6 values) × 8 bytes
+    uncompressed_size = 24 * (8 + 6 * 8)
     compressed_size = byte_size(blob)
     ratio = uncompressed_size / compressed_size
 
@@ -225,6 +230,7 @@ defmodule TimelessMetrics.TierChunkTest do
     buckets =
       for i <- 0..29 do
         base = 60.0 + :rand.uniform() * 30
+
         %{
           bucket: 1_706_000_000 + i * 86400,
           avg: base,
@@ -250,6 +256,7 @@ defmodule TimelessMetrics.TierChunkTest do
     buckets =
       for i <- 0..23 do
         base = 70.0 + :rand.uniform() * 20
+
         %{
           bucket: 1_706_000_000 + i * 3600,
           avg: base,

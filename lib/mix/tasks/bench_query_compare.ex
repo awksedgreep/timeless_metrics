@@ -73,10 +73,14 @@ defmodule Mix.Tasks.BenchQueryCompare do
 
     # Single-series benchmarks at various windows
     IO.puts("== Single-Series Query ==")
-    IO.puts(String.pad_trailing("  Window", 12) <>
-      String.pad_trailing("Old (rows)", 16) <>
-      String.pad_trailing("New (chunks)", 16) <>
-      "Diff")
+
+    IO.puts(
+      String.pad_trailing("  Window", 12) <>
+        String.pad_trailing("Old (rows)", 16) <>
+        String.pad_trailing("New (chunks)", 16) <>
+        "Diff"
+    )
+
     IO.puts("  " <> String.duplicate("-", 54))
 
     for {label, hours} <- [{"1h", 1}, {"6h", 6}, {"24h", 24}, {"7d", 168}, {"30d", 720}] do
@@ -104,13 +108,15 @@ defmodule Mix.Tasks.BenchQueryCompare do
     from = now - 86_400
     to = now
 
-    old_multi = bench_fn(@bench_rounds, fn ->
-      for sid <- 0..9, do: query_old(reader, sid, from, to)
-    end)
+    old_multi =
+      bench_fn(@bench_rounds, fn ->
+        for sid <- 0..9, do: query_old(reader, sid, from, to)
+      end)
 
-    new_multi = bench_fn(@bench_rounds, fn ->
-      for sid <- 0..9, do: query_new(reader, sid, from, to)
-    end)
+    new_multi =
+      bench_fn(@bench_rounds, fn ->
+        for sid <- 0..9, do: query_new(reader, sid, from, to)
+      end)
 
     diff = if old_multi > 0, do: new_multi / old_multi, else: 0.0
     IO.puts("  Old (rows):    #{fmt_ms(old_multi)}")
@@ -121,13 +127,15 @@ defmodule Mix.Tasks.BenchQueryCompare do
     # Full table scan comparison (all series, 24h — simulates dashboard)
     IO.puts("== Full Scan: All #{fmt(series_count)} series, 24h ==")
 
-    old_scan = bench_fn(max(div(@bench_rounds, 2), 3), fn ->
-      for sid <- 0..(series_count - 1), do: query_old(reader, sid, from, to)
-    end)
+    old_scan =
+      bench_fn(max(div(@bench_rounds, 2), 3), fn ->
+        for sid <- 0..(series_count - 1), do: query_old(reader, sid, from, to)
+      end)
 
-    new_scan = bench_fn(max(div(@bench_rounds, 2), 3), fn ->
-      for sid <- 0..(series_count - 1), do: query_new(reader, sid, from, to)
-    end)
+    new_scan =
+      bench_fn(max(div(@bench_rounds, 2), 3), fn ->
+        for sid <- 0..(series_count - 1), do: query_new(reader, sid, from, to)
+      end)
 
     diff = if old_scan > 0, do: new_scan / old_scan, else: 0.0
     IO.puts("  Old (rows):    #{fmt_ms(old_scan)}")
@@ -222,7 +230,18 @@ defmodule Mix.Tasks.BenchQueryCompare do
 
       # Insert into old table (one row per bucket)
       Enum.each(buckets, fn b ->
-        :ok = Exqlite.Sqlite3.bind(old_stmt, [sid, b.bucket, b.avg, b.min, b.max, b.count, b.sum, b.last])
+        :ok =
+          Exqlite.Sqlite3.bind(old_stmt, [
+            sid,
+            b.bucket,
+            b.avg,
+            b.min,
+            b.max,
+            b.count,
+            b.sum,
+            b.last
+          ])
+
         :done = Exqlite.Sqlite3.step(conn, old_stmt)
         :ok = Exqlite.Sqlite3.reset(old_stmt)
       end)
@@ -351,7 +370,9 @@ defmodule Mix.Tasks.BenchQueryCompare do
   end
 
   defp table_bytes(conn, "tier_new") do
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM tier_new")
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(conn, "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM tier_new")
+
     {:row, [val]} = Exqlite.Sqlite3.step(conn, stmt)
     Exqlite.Sqlite3.release(conn, stmt)
     val || 0

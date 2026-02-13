@@ -6,10 +6,7 @@ defmodule TimelessMetrics.AlertTest do
   setup do
     start_supervised!(
       {TimelessMetrics,
-       name: :alert_test,
-       data_dir: @data_dir,
-       buffer_shards: 1,
-       segment_duration: 3_600}
+       name: :alert_test, data_dir: @data_dir, buffer_shards: 1, segment_duration: 3_600}
     )
 
     on_exit(fn ->

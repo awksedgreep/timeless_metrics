@@ -12,10 +12,20 @@ defmodule TimelessMetrics.Rollup do
 
   require Logger
 
-  defstruct [:store, :schema, :compression, :tick_count, :late_lookback, :late_every_n_ticks]
+  defstruct [
+    :store,
+    :schema,
+    :compression,
+    :compression_level,
+    :tick_count,
+    :late_lookback,
+    :late_every_n_ticks
+  ]
 
-  @default_late_lookback 7_200       # 2 hours
-  @default_late_every_n_ticks 3      # every 3rd tick (15 min at default interval)
+  # 2 hours
+  @default_late_lookback 7_200
+  # every 3rd tick (15 min at default interval)
+  @default_late_every_n_ticks 3
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -39,6 +49,7 @@ defmodule TimelessMetrics.Rollup do
     store = Keyword.get(opts, :store)
     schema = Keyword.fetch!(opts, :schema)
     compression = Keyword.get(opts, :compression, :zstd)
+    compression_level = Keyword.get(opts, :compression_level, 9)
 
     late_lookback = Keyword.get(opts, :late_lookback, @default_late_lookback)
     late_every = Keyword.get(opts, :late_every_n_ticks, @default_late_every_n_ticks)
@@ -47,6 +58,7 @@ defmodule TimelessMetrics.Rollup do
       store: store,
       schema: schema,
       compression: compression,
+      compression_level: compression_level,
       tick_count: 0,
       late_lookback: late_lookback,
       late_every_n_ticks: late_every
@@ -152,9 +164,14 @@ defmodule TimelessMetrics.Rollup do
         end
 
       case result do
-        :ok -> :ok
-        {:ok, _} -> :ok
-        {:error, e} -> Logger.warning("Shard rollup failed for #{tier.name} on #{builder}: #{inspect(e)}")
+        :ok ->
+          :ok
+
+        {:ok, _} ->
+          :ok
+
+        {:error, e} ->
+          Logger.warning("Shard rollup failed for #{tier.name} on #{builder}: #{inspect(e)}")
       end
     end
   end
@@ -180,7 +197,7 @@ defmodule TimelessMetrics.Rollup do
 
     # Prepare tier entries (lock-free reads for merge)
     if points_by_series != %{} do
-      entries = collect_tier_entries(builder, tier, points_by_series)
+      entries = collect_tier_entries(builder, tier, points_by_series, state.compression_level)
 
       if entries != [] do
         TimelessMetrics.SegmentBuilder.write_tier_batch(builder, tier.name, entries)
@@ -191,10 +208,15 @@ defmodule TimelessMetrics.Rollup do
     TimelessMetrics.SegmentBuilder.write_watermark(builder, tier.name, up_to)
   end
 
-  defp rollup_shard_from_tier(tier, source_tier, builder, watermark, up_to, _state) do
+  defp rollup_shard_from_tier(tier, source_tier, builder, watermark, up_to, state) do
     # Read compressed chunks from source tier covering [watermark, up_to)
     {:ok, rows} =
-      TimelessMetrics.SegmentBuilder.read_tier_for_rollup(builder, source_tier.name, watermark, up_to)
+      TimelessMetrics.SegmentBuilder.read_tier_for_rollup(
+        builder,
+        source_tier.name,
+        watermark,
+        up_to
+      )
 
     # Decode chunks and filter buckets to range, group by series
     grouped =
@@ -220,7 +242,7 @@ defmodule TimelessMetrics.Rollup do
               Map.put(aggs, :bucket, target_bucket)
             end)
 
-          prepare_tier_entries(builder, tier, series_id, tier_buckets)
+          prepare_tier_entries(builder, tier, series_id, tier_buckets, state.compression_level)
         end)
 
       if entries != [] do
@@ -232,7 +254,7 @@ defmodule TimelessMetrics.Rollup do
     TimelessMetrics.SegmentBuilder.write_watermark(builder, tier.name, up_to)
   end
 
-  defp collect_tier_entries(builder, tier, points_by_series) do
+  defp collect_tier_entries(builder, tier, points_by_series, compression_level) do
     Enum.flat_map(points_by_series, fn {series_id, series_points} ->
       tier_buckets =
         series_points
@@ -243,12 +265,13 @@ defmodule TimelessMetrics.Rollup do
           Map.put(aggs, :bucket, bucket)
         end)
 
-      prepare_tier_entries(builder, tier, series_id, tier_buckets)
+      prepare_tier_entries(builder, tier, series_id, tier_buckets, compression_level)
     end)
   end
 
-  defp prepare_tier_entries(builder, tier, series_id, tier_buckets) do
-    chunk_secs = tier.chunk_seconds || TimelessMetrics.Schema.chunk_seconds(nil, tier.resolution_seconds)
+  defp prepare_tier_entries(builder, tier, series_id, tier_buckets, compression_level) do
+    chunk_secs =
+      tier.chunk_seconds || TimelessMetrics.Schema.chunk_seconds(nil, tier.resolution_seconds)
 
     # Group buckets by chunk boundary
     chunks =
@@ -261,10 +284,22 @@ defmodule TimelessMetrics.Rollup do
 
       # Read existing chunk (lock-free via ETS)
       existing_blob =
-        TimelessMetrics.SegmentBuilder.read_tier_chunk_for_merge(builder, tier.name, series_id, chunk_start)
+        TimelessMetrics.SegmentBuilder.read_tier_chunk_for_merge(
+          builder,
+          tier.name,
+          series_id,
+          chunk_start
+        )
 
       # Merge new buckets into existing (or create new)
-      merged_blob = TimelessMetrics.TierChunk.merge(existing_blob, new_buckets, tier.aggregates)
+      merged_blob =
+        TimelessMetrics.TierChunk.merge(
+          existing_blob,
+          new_buckets,
+          tier.aggregates,
+          compression_level
+        )
+
       bucket_count = TimelessMetrics.TierChunk.bucket_count(merged_blob)
 
       {series_id, chunk_start, chunk_end, bucket_count, merged_blob}

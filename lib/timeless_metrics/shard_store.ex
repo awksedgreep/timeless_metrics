@@ -36,13 +36,22 @@ defmodule TimelessMetrics.ShardStore do
       series_id:i64 | start:i64 | end:i64 | count:u32 | data_len:u32 | data:bytes
   """
 
-  defstruct [:raw_dir, :shard_id, :segment_duration, :tier_state, :watermark_table, :watermark_path, :seg_index_cache]
+  defstruct [
+    :raw_dir,
+    :shard_id,
+    :segment_duration,
+    :tier_state,
+    :watermark_table,
+    :watermark_path,
+    :seg_index_cache
+  ]
 
   @seg_magic "TS"
   @seg_version 1
   @header_size 15
   @index_entry_size 40
-  @entry_header_size 32  # 8+8+8+4+4
+  # 8+8+8+4+4
+  @entry_header_size 32
 
   # ========================================================================
   # Raw Segment API
@@ -53,7 +62,14 @@ defmodule TimelessMetrics.ShardStore do
     raw_dir = Path.join(data_dir, "shard_#{shard_id}/raw")
     File.mkdir_p!(raw_dir)
     cache = :ets.new(:"timeless_seg_cache_#{shard_id}", [:set, :public])
-    %__MODULE__{raw_dir: raw_dir, shard_id: shard_id, segment_duration: segment_duration, tier_state: %{}, seg_index_cache: cache}
+
+    %__MODULE__{
+      raw_dir: raw_dir,
+      shard_id: shard_id,
+      segment_duration: segment_duration,
+      tier_state: %{},
+      seg_index_cache: cache
+    }
   end
 
   @doc """
@@ -89,7 +105,8 @@ defmodule TimelessMetrics.ShardStore do
       # Append (not merge) — late arrivals for an already-sealed window must not
       # replace existing entries.  merge_entries replaces by {sid, start} key,
       # which would lose data when start == bucket_start for both old and new.
-      final = Enum.sort_by(existing_entries ++ sorted, fn {sid, start, _, _, _} -> {sid, start} end)
+      final =
+        Enum.sort_by(existing_entries ++ sorted, fn {sid, start, _, _, _} -> {sid, start} end)
 
       write_seg_file(seg_path, final)
       :ets.delete(store.seg_index_cache, seg_path)
@@ -127,7 +144,8 @@ defmodule TimelessMetrics.ShardStore do
       list_seg_files(store)
       |> Enum.filter(fn {ws, _path} -> window_overlaps?(ws, store.segment_duration, from, to) end)
       |> Enum.flat_map(fn {_ws, path} ->
-        read_seg_matching(store.seg_index_cache, path, fn {_sid, start, end_t, _count, _offset, _len} ->
+        read_seg_matching(store.seg_index_cache, path, fn {_sid, start, end_t, _count, _offset,
+                                                           _len} ->
           end_t > from and start < to
         end)
       end)
@@ -159,10 +177,13 @@ defmodule TimelessMetrics.ShardStore do
     all = merge_read_results(seg_results, wal_results)
 
     case all do
-      [] -> {:ok, []}
+      [] ->
+        {:ok, []}
+
       entries ->
         {_sid, _start, _end, _count, blob} =
           Enum.max_by(entries, fn {_sid, _start, end_t, _count, _blob} -> end_t end)
+
         {:ok, [[blob]]}
     end
   end
@@ -181,7 +202,8 @@ defmodule TimelessMetrics.ShardStore do
     entries = read_wal_entries(wal)
 
     if entries != [] do
-      remaining = Enum.reject(entries, fn {_sid, _start, end_t, _count, _blob} -> end_t < cutoff end)
+      remaining =
+        Enum.reject(entries, fn {_sid, _start, end_t, _count, _blob} -> end_t < cutoff end)
 
       cond do
         remaining == entries -> :ok
@@ -286,8 +308,10 @@ defmodule TimelessMetrics.ShardStore do
     {iodata, ets_entries, _} =
       Enum.reduce(entries, {[], [], file_offset}, fn {sid, cs, ce, bc, blob}, {io, idx, pos} ->
         data_len = byte_size(blob)
-        header = <<sid::signed-64, cs::signed-64, ce::signed-64,
-                   bc::unsigned-32, data_len::unsigned-32>>
+
+        header =
+          <<sid::signed-64, cs::signed-64, ce::signed-64, bc::unsigned-32, data_len::unsigned-32>>
+
         data_offset = pos + @entry_header_size
         entry_size = @entry_header_size + data_len
 
@@ -334,8 +358,7 @@ defmodule TimelessMetrics.ShardStore do
     matches =
       :ets.select(info.table, [
         {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"},
-         [{:==, :"$1", series_id}, {:>, :"$3", from}, {:<, :"$2", to}],
-         [{{:"$2", :"$5", :"$6"}}]}
+         [{:==, :"$1", series_id}, {:>, :"$3", from}, {:<, :"$2", to}], [{{:"$2", :"$5", :"$6"}}]}
       ])
 
     sorted = Enum.sort_by(matches, &elem(&1, 0))
@@ -358,8 +381,7 @@ defmodule TimelessMetrics.ShardStore do
 
     matches =
       :ets.select(info.table, [
-        {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"},
-         [{:>, :"$3", from}, {:<, :"$2", to}],
+        {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"}, [{:>, :"$3", from}, {:<, :"$2", to}],
          [{{:"$1", :"$2", :"$5", :"$6"}}]}
       ])
 
@@ -383,8 +405,7 @@ defmodule TimelessMetrics.ShardStore do
 
     matches =
       :ets.select(info.table, [
-        {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"},
-         [{:==, :"$1", series_id}],
+        {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"}, [{:==, :"$1", series_id}],
          [{{:"$2", :"$5", :"$6"}}]}
       ])
 
@@ -406,9 +427,7 @@ defmodule TimelessMetrics.ShardStore do
 
     to_delete =
       :ets.select(info.table, [
-        {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"},
-         [{:<, :"$3", cutoff}],
-         [{{:"$1", :"$2"}}]}
+        {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"}, [{:<, :"$3", cutoff}], [{{:"$1", :"$2"}}]}
       ])
 
     Enum.each(to_delete, fn key -> :ets.delete(info.table, key) end)
@@ -508,8 +527,10 @@ defmodule TimelessMetrics.ShardStore do
     {iodata, new_ets_entries, _} =
       Enum.reduce(entries, {[], [], 0}, fn {{sid, cs}, ce, bc, offset, len}, {io, idx, pos} ->
         blob = pread(info.chunks_path, offset, len)
-        header = <<sid::signed-64, cs::signed-64, ce::signed-64,
-                   bc::unsigned-32, len::unsigned-32>>
+
+        header =
+          <<sid::signed-64, cs::signed-64, ce::signed-64, bc::unsigned-32, len::unsigned-32>>
+
         new_offset = pos + @entry_header_size
         entry_size = @entry_header_size + len
         {[io, header, blob], [{{sid, cs}, ce, bc, new_offset, len} | idx], pos + entry_size}
@@ -623,8 +644,8 @@ defmodule TimelessMetrics.ShardStore do
   defp decode_watermark_entries(_bin, 0, acc), do: acc
 
   defp decode_watermark_entries(
-         <<name_len::unsigned-16, name::binary-size(name_len),
-           watermark::signed-64, rest::binary>>,
+         <<name_len::unsigned-16, name::binary-size(name_len), watermark::signed-64,
+           rest::binary>>,
          remaining,
          acc
        ) do
@@ -635,6 +656,7 @@ defmodule TimelessMetrics.ShardStore do
 
   defp encode_watermarks(entries) do
     count = length(entries)
+
     body =
       Enum.map(entries, fn {name, value} ->
         name_bin = to_string(name)
@@ -663,8 +685,7 @@ defmodule TimelessMetrics.ShardStore do
   defp scan_tier_entries(<<>>, _offset, _table), do: :ok
 
   defp scan_tier_entries(
-         <<sid::signed-64, cs::signed-64, ce::signed-64,
-           bc::unsigned-32, data_len::unsigned-32,
+         <<sid::signed-64, cs::signed-64, ce::signed-64, bc::unsigned-32, data_len::unsigned-32,
            _data::binary-size(data_len), rest::binary>>,
          offset,
          table
@@ -735,8 +756,8 @@ defmodule TimelessMetrics.ShardStore do
   defp encode_entry({sid, start, end_t, count, data}) do
     data_len = byte_size(data)
 
-    <<sid::signed-64, start::signed-64, end_t::signed-64,
-      count::unsigned-32, data_len::unsigned-32, data::binary>>
+    <<sid::signed-64, start::signed-64, end_t::signed-64, count::unsigned-32,
+      data_len::unsigned-32, data::binary>>
   end
 
   defp write_wal_file(wal_path, entries) do
@@ -750,7 +771,8 @@ defmodule TimelessMetrics.ShardStore do
 
   defp write_seg_file(path, sorted_entries) do
     {blobs, index_entries, data_size} =
-      Enum.reduce(sorted_entries, {[], [], 0}, fn {sid, start, end_t, count, blob}, {bs, idx, offset} ->
+      Enum.reduce(sorted_entries, {[], [], 0}, fn {sid, start, end_t, count, blob},
+                                                  {bs, idx, offset} ->
         abs_offset = @header_size + offset
         len = byte_size(blob)
         entry = {sid, start, end_t, count, abs_offset, len}
@@ -762,12 +784,13 @@ defmodule TimelessMetrics.ShardStore do
     entry_count = length(sorted_entries)
     index_offset = @header_size + data_size
 
-    header = <<@seg_magic::binary, @seg_version::8, entry_count::unsigned-32, index_offset::unsigned-64>>
+    header =
+      <<@seg_magic::binary, @seg_version::8, entry_count::unsigned-32, index_offset::unsigned-64>>
 
     index_bin =
       Enum.map(index_entries, fn {sid, start, end_t, count, offset, len} ->
-        <<sid::signed-64, start::signed-64, end_t::signed-64,
-          count::unsigned-32, offset::unsigned-64, len::unsigned-32>>
+        <<sid::signed-64, start::signed-64, end_t::signed-64, count::unsigned-32,
+          offset::unsigned-64, len::unsigned-32>>
       end)
 
     tmp = path <> ".tmp"
@@ -894,8 +917,8 @@ defmodule TimelessMetrics.ShardStore do
   defp collect_series(bin, target_sid, time_filter_fn, idx, count, acc) do
     offset = idx * @index_entry_size
 
-    <<sid::signed-64, start::signed-64, end_t::signed-64,
-      cnt::unsigned-32, data_offset::unsigned-64, len::unsigned-32>> =
+    <<sid::signed-64, start::signed-64, end_t::signed-64, cnt::unsigned-32,
+      data_offset::unsigned-64, len::unsigned-32>> =
       binary_part(bin, offset, @index_entry_size)
 
     cond do
@@ -915,9 +938,8 @@ defmodule TimelessMetrics.ShardStore do
   defp parse_index_entries(<<>>, acc), do: :lists.reverse(acc)
 
   defp parse_index_entries(
-         <<sid::signed-64, start::signed-64, end_t::signed-64,
-           count::unsigned-32, offset::unsigned-64, len::unsigned-32,
-           rest::binary>>,
+         <<sid::signed-64, start::signed-64, end_t::signed-64, count::unsigned-32,
+           offset::unsigned-64, len::unsigned-32, rest::binary>>,
          acc
        ) do
     parse_index_entries(rest, [{sid, start, end_t, count, offset, len} | acc])
@@ -967,9 +989,10 @@ defmodule TimelessMetrics.ShardStore do
 
   defp extract_stats(<<>>), do: []
 
-  defp extract_stats(<<_sid::signed-64, start::signed-64, end_t::signed-64,
-                       count::unsigned-32, _offset::unsigned-64, len::unsigned-32,
-                       rest::binary>>) do
+  defp extract_stats(
+         <<_sid::signed-64, start::signed-64, end_t::signed-64, count::unsigned-32,
+           _offset::unsigned-64, len::unsigned-32, rest::binary>>
+       ) do
     [{start, end_t, count, len} | extract_stats(rest)]
   end
 

@@ -11,8 +11,7 @@ if config_env() == :prod do
     data_dir: System.get_env("TIMELESS_DATA_DIR", "/data"),
     port: String.to_integer(System.get_env("TIMELESS_PORT", "8428")),
     buffer_shards: shards,
-    segment_duration:
-      String.to_integer(System.get_env("TIMELESS_SEGMENT_DURATION", "14400")),
+    segment_duration: String.to_integer(System.get_env("TIMELESS_SEGMENT_DURATION", "14400")),
     pending_flush_interval:
       String.to_integer(System.get_env("TIMELESS_PENDING_FLUSH_INTERVAL", "60")) * 1000,
     bearer_token: System.get_env("TIMELESS_BEARER_TOKEN")

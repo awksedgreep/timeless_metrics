@@ -157,7 +157,10 @@ this is not json
     seed_points(:http_test, "cpu_usage", %{"host" => "web-1"}, now, [73.2, 74.1, 75.0])
 
     conn =
-      Plug.Test.conn(:get, "/api/v1/export?metric=cpu_usage&host=web-1&from=#{now - 60}&to=#{now + 120}")
+      Plug.Test.conn(
+        :get,
+        "/api/v1/export?metric=cpu_usage&host=web-1&from=#{now - 60}&to=#{now + 120}"
+      )
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
@@ -345,10 +348,20 @@ this is not json
 
   test "GET /chart returns SVG image" do
     now = System.os_time(:second)
-    seed_points(:http_test, "chart_test", %{"host" => "web-1"}, now, [10.0, 20.0, 30.0, 25.0, 15.0])
+
+    seed_points(:http_test, "chart_test", %{"host" => "web-1"}, now, [
+      10.0,
+      20.0,
+      30.0,
+      25.0,
+      15.0
+    ])
 
     conn =
-      Plug.Test.conn(:get, "/chart?metric=chart_test&host=web-1&from=#{now - 1}&to=#{now + 10}&step=1")
+      Plug.Test.conn(
+        :get,
+        "/chart?metric=chart_test&host=web-1&from=#{now - 1}&to=#{now + 10}&step=1"
+      )
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
@@ -378,7 +391,10 @@ this is not json
     seed_points(:http_test, "sized_chart", %{"id" => "1"}, now, [1.0, 2.0, 3.0])
 
     conn =
-      Plug.Test.conn(:get, "/chart?metric=sized_chart&id=1&from=#{now - 1}&to=#{now + 10}&width=400&height=200&step=1")
+      Plug.Test.conn(
+        :get,
+        "/chart?metric=sized_chart&id=1&from=#{now - 1}&to=#{now + 10}&width=400&height=200&step=1"
+      )
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
@@ -524,7 +540,10 @@ this is not json
   @secret "test-secret-token"
 
   defp authed_call(conn, opts \\ []) do
-    TimelessMetrics.HTTP.call(conn, Keyword.merge([store: :http_test, bearer_token: @secret], opts))
+    TimelessMetrics.HTTP.call(
+      conn,
+      Keyword.merge([store: :http_test, bearer_token: @secret], opts)
+    )
   end
 
   test "auth disabled: requests work without token" do
@@ -618,7 +637,10 @@ this is not json
 
     # Query with divide:10 transform
     conn =
-      Plug.Test.conn(:get, "/api/v1/query_range?metric=snr&port=u0&from=#{now}&to=#{now + 120}&step=300&transform=divide:10")
+      Plug.Test.conn(
+        :get,
+        "/api/v1/query_range?metric=snr&port=u0&from=#{now}&to=#{now + 120}&step=300&transform=divide:10"
+      )
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
@@ -636,7 +658,10 @@ this is not json
     TimelessMetrics.flush(:http_test)
 
     conn =
-      Plug.Test.conn(:get, "/api/v1/query_range?metric=ratio&id=1&from=#{now}&to=#{now + 60}&step=300&transform=multiply:100")
+      Plug.Test.conn(
+        :get,
+        "/api/v1/query_range?metric=ratio&id=1&from=#{now}&to=#{now + 60}&step=300&transform=multiply:100"
+      )
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
@@ -654,7 +679,10 @@ this is not json
     TimelessMetrics.flush(:http_test)
 
     conn =
-      Plug.Test.conn(:get, "/chart?metric=snr_chart&port=u0&from=#{now}&to=#{now + 600}&transform=divide:10")
+      Plug.Test.conn(
+        :get,
+        "/chart?metric=snr_chart&port=u0&from=#{now}&to=#{now + 600}&transform=divide:10"
+      )
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
@@ -668,7 +696,10 @@ this is not json
     TimelessMetrics.flush(:http_test)
 
     conn =
-      Plug.Test.conn(:get, "/api/v1/query_range?metric=raw_val&id=1&from=#{now}&to=#{now + 60}&step=300")
+      Plug.Test.conn(
+        :get,
+        "/api/v1/query_range?metric=raw_val&id=1&from=#{now}&to=#{now + 60}&step=300"
+      )
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
@@ -679,11 +710,12 @@ this is not json
   end
 
   test "auth enabled: POST endpoint requires token" do
-    lines = Jason.encode!(%{
-      metric: %{__name__: "cpu", host: "web-1"},
-      values: [1.0],
-      timestamps: [1_700_000_000]
-    })
+    lines =
+      Jason.encode!(%{
+        metric: %{__name__: "cpu", host: "web-1"},
+        values: [1.0],
+        timestamps: [1_700_000_000]
+      })
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import", lines)

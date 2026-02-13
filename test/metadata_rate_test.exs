@@ -6,10 +6,7 @@ defmodule TimelessMetrics.MetadataRateTest do
   setup do
     start_supervised!(
       {TimelessMetrics,
-       name: :meta_test,
-       data_dir: @data_dir,
-       buffer_shards: 1,
-       segment_duration: 3_600}
+       name: :meta_test, data_dir: @data_dir, buffer_shards: 1, segment_duration: 3_600}
     )
 
     on_exit(fn ->
@@ -23,7 +20,11 @@ defmodule TimelessMetrics.MetadataRateTest do
   # --- Metadata ---
 
   test "register and retrieve metric metadata" do
-    TimelessMetrics.register_metric(:meta_test, "cpu_usage", :gauge, unit: "%", description: "CPU utilization")
+    TimelessMetrics.register_metric(:meta_test, "cpu_usage", :gauge,
+      unit: "%",
+      description: "CPU utilization"
+    )
+
     {:ok, meta} = TimelessMetrics.get_metadata(:meta_test, "cpu_usage")
 
     assert meta.type == :gauge
@@ -38,7 +39,11 @@ defmodule TimelessMetrics.MetadataRateTest do
 
   test "register_metric upserts" do
     TimelessMetrics.register_metric(:meta_test, "bytes_in", :counter, unit: "bytes")
-    TimelessMetrics.register_metric(:meta_test, "bytes_in", :counter, unit: "bytes/s", description: "Inbound traffic")
+
+    TimelessMetrics.register_metric(:meta_test, "bytes_in", :counter,
+      unit: "bytes/s",
+      description: "Inbound traffic"
+    )
 
     {:ok, meta} = TimelessMetrics.get_metadata(:meta_test, "bytes_in")
     assert meta.unit == "bytes/s"
@@ -49,12 +54,16 @@ defmodule TimelessMetrics.MetadataRateTest do
 
   test "POST and GET /api/v1/metadata via HTTP" do
     conn =
-      Plug.Test.conn(:post, "/api/v1/metadata", Jason.encode!(%{
-        metric: "disk_usage",
-        type: "gauge",
-        unit: "%",
-        description: "Disk utilization"
-      }))
+      Plug.Test.conn(
+        :post,
+        "/api/v1/metadata",
+        Jason.encode!(%{
+          metric: "disk_usage",
+          type: "gauge",
+          unit: "%",
+          description: "Disk utilization"
+        })
+      )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> TimelessMetrics.HTTP.call(store: :meta_test)
 
@@ -72,10 +81,14 @@ defmodule TimelessMetrics.MetadataRateTest do
 
   test "POST /api/v1/metadata rejects invalid type" do
     conn =
-      Plug.Test.conn(:post, "/api/v1/metadata", Jason.encode!(%{
-        metric: "foo",
-        type: "invalid"
-      }))
+      Plug.Test.conn(
+        :post,
+        "/api/v1/metadata",
+        Jason.encode!(%{
+          metric: "foo",
+          type: "invalid"
+        })
+      )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> TimelessMetrics.HTTP.call(store: :meta_test)
 
@@ -167,7 +180,10 @@ defmodule TimelessMetrics.MetadataRateTest do
     TimelessMetrics.flush(:meta_test)
 
     conn =
-      Plug.Test.conn(:get, "/api/v1/query_range?metric=http_rate&host=web-1&from=#{base}&to=#{base + 600}&step=600&aggregate=rate")
+      Plug.Test.conn(
+        :get,
+        "/api/v1/query_range?metric=http_rate&host=web-1&from=#{base}&to=#{base + 600}&step=600&aggregate=rate"
+      )
       |> TimelessMetrics.HTTP.call(store: :meta_test)
 
     assert conn.status == 200
@@ -184,9 +200,7 @@ defmodule TimelessMetrics.MetadataRateTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    TimelessMetrics.write(:meta_test, "single_point", %{"id" => "1"}, 42.0,
-      timestamp: base
-    )
+    TimelessMetrics.write(:meta_test, "single_point", %{"id" => "1"}, 42.0, timestamp: base)
 
     TimelessMetrics.flush(:meta_test)
 

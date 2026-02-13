@@ -5,7 +5,9 @@ defmodule TimelessMetrics.BackupTest do
   @backup_dir "/tmp/timeless_backup_target_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!({TimelessMetrics, name: :backup_test, data_dir: @data_dir, buffer_shards: 2})
+    start_supervised!(
+      {TimelessMetrics, name: :backup_test, data_dir: @data_dir, buffer_shards: 2}
+    )
 
     on_exit(fn ->
       File.rm_rf!(@data_dir)
@@ -60,7 +62,8 @@ defmodule TimelessMetrics.BackupTest do
     # 2 shards configured (directories, not .db files)
     assert "shard_0" in result.files
     assert "shard_1" in result.files
-    assert length(result.files) == 3  # metrics.db + 2 shards
+    # metrics.db + 2 shards
+    assert length(result.files) == 3
   end
 
   test "backed-up shard DB is independently queryable" do
@@ -80,13 +83,18 @@ defmodule TimelessMetrics.BackupTest do
     total_raw_files =
       Enum.reduce(0..1, 0, fn i, acc ->
         raw_dir = Path.join(@backup_dir, "shard_#{i}/raw")
+
         case File.ls(raw_dir) do
           {:ok, files} ->
-            raw_count = Enum.count(files, fn f ->
-              String.ends_with?(f, ".seg") or String.ends_with?(f, ".wal")
-            end)
+            raw_count =
+              Enum.count(files, fn f ->
+                String.ends_with?(f, ".seg") or String.ends_with?(f, ".wal")
+              end)
+
             acc + raw_count
-          _ -> acc
+
+          _ ->
+            acc
         end
       end)
 

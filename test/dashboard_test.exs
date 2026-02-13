@@ -6,10 +6,7 @@ defmodule TimelessMetrics.DashboardTest do
   setup do
     start_supervised!(
       {TimelessMetrics,
-       name: :dash_test,
-       data_dir: @data_dir,
-       buffer_shards: 1,
-       segment_duration: 3_600}
+       name: :dash_test, data_dir: @data_dir, buffer_shards: 1, segment_duration: 3_600}
     )
 
     on_exit(fn ->
@@ -110,9 +107,7 @@ defmodule TimelessMetrics.DashboardTest do
   test "dashboard passes label filters to chart URLs" do
     now = System.os_time(:second)
 
-    TimelessMetrics.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
-      timestamp: now
-    )
+    TimelessMetrics.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 50.0, timestamp: now)
 
     TimelessMetrics.flush(:dash_test)
 

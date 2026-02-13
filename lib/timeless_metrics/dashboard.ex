@@ -45,7 +45,9 @@ defmodule TimelessMetrics.Dashboard do
     chart_cards =
       metrics
       |> Enum.map(fn metric ->
-        qs = "metric=#{URI.encode_www_form(metric)}&from=#{from}&to=#{to}&theme=auto&width=#{chart_w}&height=#{chart_h}"
+        qs =
+          "metric=#{URI.encode_www_form(metric)}&from=#{from}&to=#{to}&theme=auto&width=#{chart_w}&height=#{chart_h}"
+
         qs = if label_qs != "", do: qs <> "&" <> label_qs, else: qs
 
         """

@@ -66,9 +66,9 @@ defmodule TimelessMetrics.HTTP do
 
   @max_body_bytes 10 * 1024 * 1024
 
-  plug :match
-  plug :authenticate
-  plug :dispatch
+  plug(:match)
+  plug(:authenticate)
+  plug(:dispatch)
 
   def child_spec(opts) do
     store = Keyword.fetch!(opts, :store)
@@ -155,11 +155,14 @@ defmodule TimelessMetrics.HTTP do
         if errors > 0 do
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(200, Jason.encode!(%{
-            samples: count,
-            errors: errors,
-            failed_lines: error_samples
-          }))
+          |> send_resp(
+            200,
+            Jason.encode!(%{
+              samples: count,
+              errors: errors,
+              failed_lines: error_samples
+            })
+          )
         else
           send_resp(conn, 204, "")
         end
@@ -222,12 +225,15 @@ defmodule TimelessMetrics.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{
-      status: "ok",
-      path: result.path,
-      files: result.files,
-      total_bytes: result.total_bytes
-    }))
+    |> send_resp(
+      200,
+      Jason.encode!(%{
+        status: "ok",
+        path: result.path,
+        files: result.files,
+        total_bytes: result.total_bytes
+      })
+    )
   end
 
   # Export raw points in VictoriaMetrics JSON line format (multi-series)
@@ -382,7 +388,8 @@ defmodule TimelessMetrics.HTTP do
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
         case Jason.decode(body) do
-          {:ok, %{"metric" => metric, "type" => type} = params} when type in ~w(gauge counter histogram) ->
+          {:ok, %{"metric" => metric, "type" => type} = params}
+          when type in ~w(gauge counter histogram) ->
             TimelessMetrics.register_metric(store, metric, String.to_existing_atom(type),
               unit: params["unit"],
               description: params["description"]
@@ -419,11 +426,22 @@ defmodule TimelessMetrics.HTTP do
         if meta do
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(200, Jason.encode!(%{metric: metric, type: meta.type, unit: meta.unit, description: meta.description}))
+          |> send_resp(
+            200,
+            Jason.encode!(%{
+              metric: metric,
+              type: meta.type,
+              unit: meta.unit,
+              description: meta.description
+            })
+          )
         else
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(200, Jason.encode!(%{metric: metric, type: "gauge", unit: nil, description: nil}))
+          |> send_resp(
+            200,
+            Jason.encode!(%{metric: metric, type: "gauge", unit: nil, description: nil})
+          )
         end
     end
   end
@@ -500,7 +518,13 @@ defmodule TimelessMetrics.HTTP do
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
         case Jason.decode(body) do
-          {:ok, %{"name" => name, "metric" => metric, "condition" => cond_str, "threshold" => threshold} = params}
+          {:ok,
+           %{
+             "name" => name,
+             "metric" => metric,
+             "condition" => cond_str,
+             "threshold" => threshold
+           } = params}
           when cond_str in ~w(above below) and is_number(threshold) ->
             opts = [
               name: name,
@@ -520,7 +544,11 @@ defmodule TimelessMetrics.HTTP do
             |> send_resp(201, Jason.encode!(%{id: id, status: "created"}))
 
           _ ->
-            json_error(conn, 400, "requires: name, metric, condition (above/below), threshold (number)")
+            json_error(
+              conn,
+              400,
+              "requires: name, metric, condition (above/below), threshold (number)"
+            )
         end
 
       {:error, reason} ->
@@ -740,11 +768,14 @@ defmodule TimelessMetrics.HTTP do
         if errors > 0 do
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(200, Jason.encode!(%{
-            samples: count,
-            errors: errors,
-            failed_lines: error_samples
-          }))
+          |> send_resp(
+            200,
+            Jason.encode!(%{
+              samples: count,
+              errors: errors,
+              failed_lines: error_samples
+            })
+          )
         else
           send_resp(conn, 204, "")
         end
@@ -870,16 +901,19 @@ defmodule TimelessMetrics.HTTP do
   end
 
   defp parse_int(nil, default), do: default
+
   defp parse_int(val, default) when is_binary(val) do
     case Integer.parse(val) do
       {n, _} -> n
       :error -> default
     end
   end
+
   defp parse_int(val, _default) when is_integer(val), do: val
 
   # Parse time values that can be absolute unix timestamps or relative durations
   defp parse_time(nil, default), do: default
+
   defp parse_time(val, default) when is_binary(val) do
     now = System.os_time(:second)
 
@@ -921,8 +955,10 @@ defmodule TimelessMetrics.HTTP do
   end
 
   defp parse_aggregate(nil), do: :avg
+
   defp parse_aggregate(agg) when agg in ~w(avg min max sum count last first rate),
     do: String.to_existing_atom(agg)
+
   defp parse_aggregate(_), do: :avg
 
   defp extract_chart_params(params) do
@@ -983,7 +1019,9 @@ defmodule TimelessMetrics.HTTP do
       end)
 
     if errors > 0 do
-      Logger.warning("Import: #{errors} line(s) failed to parse, sample: #{inspect(Enum.reverse(error_samples))}")
+      Logger.warning(
+        "Import: #{errors} line(s) failed to parse, sample: #{inspect(Enum.reverse(error_samples))}"
+      )
     end
 
     # One batch call for the entire body
@@ -1060,7 +1098,9 @@ defmodule TimelessMetrics.HTTP do
       end)
 
     if errors > 0 do
-      Logger.warning("Prometheus import: #{errors} line(s) failed to parse, sample: #{inspect(Enum.reverse(error_samples))}")
+      Logger.warning(
+        "Prometheus import: #{errors} line(s) failed to parse, sample: #{inspect(Enum.reverse(error_samples))}"
+      )
     end
 
     if all_entries != [] do

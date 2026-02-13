@@ -19,6 +19,7 @@ defmodule TimelessMetrics.Supervisor do
     segment_duration = Keyword.get(opts, :segment_duration, 14_400)
     pending_flush_interval = Keyword.get(opts, :pending_flush_interval, :timer.seconds(60))
     compression = Keyword.get(opts, :compression, :zstd)
+    compression_level = Keyword.get(opts, :compression_level, 9)
 
     schema =
       case Keyword.get(opts, :schema) do
@@ -55,6 +56,7 @@ defmodule TimelessMetrics.Supervisor do
                    segment_duration: segment_duration,
                    pending_flush_interval: pending_flush_interval,
                    compression: compression,
+                   compression_level: compression_level,
                    schema: schema
                  ]
                ]}
@@ -77,6 +79,7 @@ defmodule TimelessMetrics.Supervisor do
       end
       |> List.flatten()
 
+    # 3. Sharded segment builders + buffer shards (each buffer paired with its builder)
     children =
       [
         # 1. SQLite connection manager
@@ -85,7 +88,6 @@ defmodule TimelessMetrics.Supervisor do
         # 2. Series registry (depends on DB)
         {TimelessMetrics.SeriesRegistry, name: registry_name, db: db_name}
       ] ++
-        # 3. Sharded segment builders + buffer shards (each buffer paired with its builder)
         builder_and_buffer_shards ++
         [
           # 4. Rollup engine (depends on DB + data being written)
@@ -94,14 +96,12 @@ defmodule TimelessMetrics.Supervisor do
            db: db_name,
            store: name,
            schema: schema,
-           compression: compression},
+           compression: compression,
+           compression_level: compression_level},
 
           # 5. Retention enforcer (depends on DB)
           {TimelessMetrics.Retention,
-           name: retention_name,
-           db: db_name,
-           store: name,
-           schema: schema}
+           name: retention_name, db: db_name, store: name, schema: schema}
         ]
 
     Supervisor.init(children, strategy: :rest_for_one)

@@ -6,10 +6,7 @@ defmodule TimelessMetrics.RollupTest do
   setup do
     start_supervised!(
       {TimelessMetrics,
-       name: :rollup_test,
-       data_dir: @data_dir,
-       buffer_shards: 1,
-       segment_duration: 3_600}
+       name: :rollup_test, data_dir: @data_dir, buffer_shards: 1, segment_duration: 3_600}
     )
 
     on_exit(fn ->
@@ -208,9 +205,12 @@ defmodule TimelessMetrics.RollupTest do
     now = System.os_time(:second)
 
     # --- Old data: 3 complete past hours (will be rolled up) ---
-    old_hour_1 = div(now - 10800, 3600) * 3600  # 3 hours ago
-    old_hour_2 = old_hour_1 + 3600               # 2 hours ago
-    old_hour_3 = old_hour_2 + 3600               # 1 hour ago
+    # 3 hours ago
+    old_hour_1 = div(now - 10800, 3600) * 3600
+    # 2 hours ago
+    old_hour_2 = old_hour_1 + 3600
+    # 1 hour ago
+    old_hour_3 = old_hour_2 + 3600
 
     for {hour_start, base_val} <- [{old_hour_1, 10.0}, {old_hour_2, 20.0}, {old_hour_3, 30.0}] do
       for i <- 0..5 do

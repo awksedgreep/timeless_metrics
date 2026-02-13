@@ -4,22 +4,25 @@ defmodule TimelessMetrics.SchemaTest do
   defmodule TestSchema do
     use TimelessMetrics.Schema
 
-    raw_retention {3, :days}
+    raw_retention({3, :days})
 
-    tier :hourly,
+    tier(:hourly,
       resolution: :hour,
       aggregates: [:avg, :min, :max, :count],
       retention: {14, :days}
+    )
 
-    tier :daily,
+    tier(:daily,
       resolution: :day,
       aggregates: [:avg, :min, :max],
       retention: {90, :days}
+    )
 
-    tier :monthly,
+    tier(:monthly,
       resolution: {30, :days},
       aggregates: [:avg],
       retention: :forever
+    )
   end
 
   test "schema DSL produces correct config" do

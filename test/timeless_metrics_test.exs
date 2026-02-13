@@ -23,10 +23,11 @@ defmodule TimelessMetricsTest do
     TimelessMetrics.flush(:test_store)
 
     # Query them back
-    {:ok, points} = TimelessMetrics.query(:test_store, "cpu_usage", %{"host" => "web-1"},
-      from: now - 7200,
-      to: now
-    )
+    {:ok, points} =
+      TimelessMetrics.query(:test_store, "cpu_usage", %{"host" => "web-1"},
+        from: now - 7200,
+        to: now
+      )
 
     assert length(points) == 10
     assert {_, 50.0} = List.first(points)
@@ -44,10 +45,11 @@ defmodule TimelessMetricsTest do
     TimelessMetrics.write_batch(:test_store, entries)
     TimelessMetrics.flush(:test_store)
 
-    {:ok, points} = TimelessMetrics.query(:test_store, "memory_used", %{"host" => "db-1"},
-      from: now - 600,
-      to: now
-    )
+    {:ok, points} =
+      TimelessMetrics.query(:test_store, "memory_used", %{"host" => "db-1"},
+        from: now - 600,
+        to: now
+      )
 
     assert length(points) == 5
   end
@@ -65,12 +67,13 @@ defmodule TimelessMetricsTest do
 
     TimelessMetrics.flush(:test_store)
 
-    {:ok, buckets} = TimelessMetrics.query_aggregate(:test_store, "temp", %{"sensor" => "a"},
-      from: hour_start - 3600,
-      to: hour_start + 3600,
-      bucket: :hour,
-      aggregate: :avg
-    )
+    {:ok, buckets} =
+      TimelessMetrics.query_aggregate(:test_store, "temp", %{"sensor" => "a"},
+        from: hour_start - 3600,
+        to: hour_start + 3600,
+        bucket: :hour,
+        aggregate: :avg
+      )
 
     assert length(buckets) >= 1
     # Average of 20, 21, 22, 23, 24, 25 = 22.5
@@ -96,10 +99,11 @@ defmodule TimelessMetricsTest do
     TimelessMetrics.write(:test_store, "cpu", %{"host" => "b"}, 90.0, timestamp: now)
     TimelessMetrics.flush(:test_store)
 
-    {:ok, points_a} = TimelessMetrics.query(:test_store, "cpu", %{"host" => "a"},
-      from: now - 60, to: now + 60)
-    {:ok, points_b} = TimelessMetrics.query(:test_store, "cpu", %{"host" => "b"},
-      from: now - 60, to: now + 60)
+    {:ok, points_a} =
+      TimelessMetrics.query(:test_store, "cpu", %{"host" => "a"}, from: now - 60, to: now + 60)
+
+    {:ok, points_b} =
+      TimelessMetrics.query(:test_store, "cpu", %{"host" => "b"}, from: now - 60, to: now + 60)
 
     assert [{_, 10.0}] = points_a
     assert [{_, 90.0}] = points_b
@@ -166,8 +170,8 @@ defmodule TimelessMetricsTest do
 
     TimelessMetrics.flush(:test_store)
 
-    {:ok, actual} = TimelessMetrics.query(:test_store, "sine", %{"ch" => "0"},
-      from: now - 6000, to: now)
+    {:ok, actual} =
+      TimelessMetrics.query(:test_store, "sine", %{"ch" => "0"}, from: now - 6000, to: now)
 
     assert length(actual) == 100
 

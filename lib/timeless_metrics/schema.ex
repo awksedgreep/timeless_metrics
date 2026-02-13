@@ -39,13 +39,22 @@ defmodule TimelessMetrics.Schema do
 
   defmodule Tier do
     @moduledoc false
-    defstruct [:name, :resolution_seconds, :aggregates, :retention_seconds, :table_name, :chunk_seconds]
+    defstruct [
+      :name,
+      :resolution_seconds,
+      :aggregates,
+      :retention_seconds,
+      :table_name,
+      :chunk_seconds
+    ]
   end
 
   @doc false
   defmacro __using__(_opts) do
     quote do
-      import TimelessMetrics.Schema, only: [raw_retention: 1, tier: 2, rollup_interval: 1, retention_interval: 1]
+      import TimelessMetrics.Schema,
+        only: [raw_retention: 1, tier: 2, rollup_interval: 1, retention_interval: 1]
+
       Module.register_attribute(__MODULE__, :tiers, accumulate: true)
       Module.put_attribute(__MODULE__, :raw_retention, {7, :days})
       Module.put_attribute(__MODULE__, :rollup_interval_ms, :timer.minutes(5))
@@ -65,7 +74,8 @@ defmodule TimelessMetrics.Schema do
     quote do
       def __schema__ do
         %TimelessMetrics.Schema{
-          raw_retention_seconds: TimelessMetrics.Schema.duration_to_seconds(unquote(Macro.escape(raw_ret))),
+          raw_retention_seconds:
+            TimelessMetrics.Schema.duration_to_seconds(unquote(Macro.escape(raw_ret))),
           rollup_interval: unquote(rollup_int),
           retention_interval: unquote(retention_int),
           tiers:
@@ -78,7 +88,8 @@ defmodule TimelessMetrics.Schema do
                     name: name,
                     resolution_seconds: res,
                     aggregates: opts[:aggregates] || [:avg, :min, :max, :count, :sum, :last],
-                    retention_seconds: TimelessMetrics.Schema.duration_to_seconds(opts[:retention]),
+                    retention_seconds:
+                      TimelessMetrics.Schema.duration_to_seconds(opts[:retention]),
                     table_name: "tier_#{name}",
                     chunk_seconds: TimelessMetrics.Schema.chunk_seconds(opts[:chunk], res)
                   }
@@ -139,9 +150,12 @@ defmodule TimelessMetrics.Schema do
   """
   def chunk_seconds(nil, resolution_seconds) do
     cond do
-      resolution_seconds <= 3_600 -> 86_400       # 24 hours
-      resolution_seconds <= 86_400 -> 30 * 86_400  # 30 days
-      true -> 365 * 86_400                          # 1 year
+      # 24 hours
+      resolution_seconds <= 3_600 -> 86_400
+      # 30 days
+      resolution_seconds <= 86_400 -> 30 * 86_400
+      # 1 year
+      true -> 365 * 86_400
     end
   end
 

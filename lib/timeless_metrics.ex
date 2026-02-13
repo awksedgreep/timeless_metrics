@@ -364,14 +364,20 @@ defmodule TimelessMetrics do
 
           # Copy watermarks.bin
           File.mkdir_p!(shard_dst)
+
           wm_size =
-            case File.cp(Path.join(shard_src, "watermarks.bin"), Path.join(shard_dst, "watermarks.bin")) do
+            case File.cp(
+                   Path.join(shard_src, "watermarks.bin"),
+                   Path.join(shard_dst, "watermarks.bin")
+                 ) do
               :ok ->
                 case File.stat(Path.join(shard_dst, "watermarks.bin")) do
                   {:ok, %{size: s}} -> s
                   _ -> 0
                 end
-              _ -> 0
+
+              _ ->
+                0
             end
 
           {"shard_#{i}", raw_size + tier_size + wm_size}
@@ -406,20 +412,22 @@ defmodule TimelessMetrics do
         builder = :"#{store}_builder_#{i}"
         stats = TimelessMetrics.SegmentBuilder.raw_stats(builder)
 
-        merged_oldest = cond do
-          oldest == nil -> stats.oldest_ts
-          stats.oldest_ts == nil -> oldest
-          true -> min(oldest, stats.oldest_ts)
-        end
+        merged_oldest =
+          cond do
+            oldest == nil -> stats.oldest_ts
+            stats.oldest_ts == nil -> oldest
+            true -> min(oldest, stats.oldest_ts)
+          end
 
-        merged_newest = cond do
-          newest == nil -> stats.newest_ts
-          stats.newest_ts == nil -> newest
-          true -> max(newest, stats.newest_ts)
-        end
+        merged_newest =
+          cond do
+            newest == nil -> stats.newest_ts
+            stats.newest_ts == nil -> newest
+            true -> max(newest, stats.newest_ts)
+          end
 
-        {sc + stats.segment_count, tp + stats.total_points, rb + stats.raw_bytes,
-         merged_oldest, merged_newest}
+        {sc + stats.segment_count, tp + stats.total_points, rb + stats.raw_bytes, merged_oldest,
+         merged_newest}
       end)
 
     # Sum all storage files (.db + shard dirs with .seg/.wal) for true on-disk usage
@@ -475,18 +483,21 @@ defmodule TimelessMetrics do
     tier_stats =
       Enum.map(schema.tiers, fn tier ->
         {chunks, buckets, compressed_bytes, dead_bytes, min_watermark} =
-          Enum.reduce(0..(shard_count - 1), {0, 0, 0, 0, nil}, fn i, {ch_acc, bk_acc, cb_acc, db_acc, wm_acc} ->
+          Enum.reduce(0..(shard_count - 1), {0, 0, 0, 0, nil}, fn i,
+                                                                  {ch_acc, bk_acc, cb_acc, db_acc,
+                                                                   wm_acc} ->
             builder = :"#{store}_builder_#{i}"
             {c, b, cb} = TimelessMetrics.SegmentBuilder.read_tier_stats(builder, tier.name)
             {dead, _total} = TimelessMetrics.SegmentBuilder.tier_dead_bytes(builder, tier.name)
 
             wm = TimelessMetrics.SegmentBuilder.read_watermark(builder, tier.name)
 
-            merged_wm = cond do
-              wm_acc == nil -> wm
-              wm == 0 -> 0
-              true -> min(wm_acc, wm)
-            end
+            merged_wm =
+              cond do
+                wm_acc == nil -> wm
+                wm == 0 -> 0
+                true -> min(wm_acc, wm)
+              end
 
             {ch_acc + c, bk_acc + b, cb_acc + cb, db_acc + dead, merged_wm}
           end)
@@ -496,16 +507,17 @@ defmodule TimelessMetrics do
             do: "forever",
             else: "#{div(tier.retention_seconds, 86_400)}d"
 
-        {tier.name, %{
-          rows: buckets,
-          chunks: chunks,
-          buckets: buckets,
-          compressed_bytes: compressed_bytes,
-          dead_bytes: dead_bytes,
-          resolution_seconds: tier.resolution_seconds,
-          retention: retention_label,
-          watermark: min_watermark || 0
-        }}
+        {tier.name,
+         %{
+           rows: buckets,
+           chunks: chunks,
+           buckets: buckets,
+           compressed_bytes: compressed_bytes,
+           dead_bytes: dead_bytes,
+           resolution_seconds: tier.resolution_seconds,
+           retention: retention_label,
+           watermark: min_watermark || 0
+         }}
       end)
       |> Map.new()
 
@@ -587,6 +599,7 @@ defmodule TimelessMetrics do
           for i <- 0..(shard_count - 1), reduce: 0 do
             acc ->
               builder = :"#{store}_builder_#{i}"
+
               case TimelessMetrics.SegmentBuilder.compact_tier(builder, tier.name, opts) do
                 {:ok, bytes} -> acc + bytes
                 :noop -> acc
@@ -615,7 +628,10 @@ defmodule TimelessMetrics do
   """
   def list_metrics(store) do
     db = :"#{store}_db"
-    {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+
+    {:ok, rows} =
+      TimelessMetrics.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+
     {:ok, Enum.map(rows, fn [name] -> name end)}
   end
 
@@ -776,7 +792,9 @@ defmodule TimelessMetrics do
     results =
       rows
       |> Enum.map(fn [id, ts, title, desc, tags_str] ->
-        tags = if tags_str && tags_str != "", do: String.split(tags_str, ",", trim: true), else: []
+        tags =
+          if tags_str && tags_str != "", do: String.split(tags_str, ",", trim: true), else: []
+
         %{id: id, timestamp: ts, title: title, description: desc, tags: tags}
       end)
       |> then(fn results ->
@@ -784,6 +802,7 @@ defmodule TimelessMetrics do
           results
         else
           filter_set = MapSet.new(tag_filter)
+
           Enum.filter(results, fn %{tags: tags} ->
             tags |> MapSet.new() |> MapSet.intersection(filter_set) |> MapSet.size() > 0
           end)
@@ -983,16 +1002,20 @@ defmodule TimelessMetrics do
     case File.ls(src_dir) do
       {:ok, files} ->
         File.mkdir_p!(dst_dir)
+
         Enum.reduce(files, 0, fn f, acc ->
           src = Path.join(src_dir, f)
           dst = Path.join(dst_dir, f)
           File.cp!(src, dst)
+
           case File.stat(dst) do
             {:ok, %{size: s}} -> acc + s
             _ -> acc
           end
         end)
-      _ -> 0
+
+      _ ->
+        0
     end
   end
 
@@ -1005,7 +1028,9 @@ defmodule TimelessMetrics do
             _ -> acc
           end
         end)
-      _ -> 0
+
+      _ ->
+        0
     end
   end
 

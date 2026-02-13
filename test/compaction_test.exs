@@ -6,10 +6,7 @@ defmodule TimelessMetrics.CompactionTest do
   setup do
     start_supervised!(
       {TimelessMetrics,
-       name: :compact_test,
-       data_dir: @data_dir,
-       buffer_shards: 1,
-       segment_duration: 3_600}
+       name: :compact_test, data_dir: @data_dir, buffer_shards: 1, segment_duration: 3_600}
     )
 
     on_exit(fn ->
@@ -92,7 +89,9 @@ defmodule TimelessMetrics.CompactionTest do
     assert dead > 0
 
     # Force compaction with low threshold
-    {:ok, reclaimed} = TimelessMetrics.SegmentBuilder.compact_tier(builder, :hourly, threshold: 0.0)
+    {:ok, reclaimed} =
+      TimelessMetrics.SegmentBuilder.compact_tier(builder, :hourly, threshold: 0.0)
+
     assert reclaimed == dead
 
     # After compaction, dead space should be 0
@@ -127,7 +126,9 @@ defmodule TimelessMetrics.CompactionTest do
 
     # Compact
     builder = :compact_test_builder_0
-    {:ok, _reclaimed} = TimelessMetrics.SegmentBuilder.compact_tier(builder, :hourly, threshold: 0.0)
+
+    {:ok, _reclaimed} =
+      TimelessMetrics.SegmentBuilder.compact_tier(builder, :hourly, threshold: 0.0)
 
     # Query after compaction — same results
     {:ok, rows_after} =

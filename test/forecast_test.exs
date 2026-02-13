@@ -109,8 +109,7 @@ defmodule TimelessMetrics.ForecastTest do
 
     # All predictions should be close to 42.0
     Enum.each(predictions, fn {_ts, val} ->
-      assert_in_delta val, 42.0, 1.0,
-        "Constant series prediction #{val} too far from 42.0"
+      assert_in_delta val, 42.0, 1.0, "Constant series prediction #{val} too far from 42.0"
     end)
   end
 

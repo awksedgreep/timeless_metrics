@@ -6,26 +6,25 @@ defmodule TimelessMetrics.RetentionTest do
   setup do
     # Use very short retention for testing
     schema = %TimelessMetrics.Schema{
-      raw_retention_seconds: 3_600,  # 1 hour
-      rollup_interval: :timer.hours(1),  # won't auto-fire in tests
+      # 1 hour
+      raw_retention_seconds: 3_600,
+      # won't auto-fire in tests
+      rollup_interval: :timer.hours(1),
       retention_interval: :timer.hours(1),
       tiers: [
         %TimelessMetrics.Schema.Tier{
           name: :hourly,
           resolution_seconds: 3_600,
           aggregates: [:avg, :min, :max, :count, :sum, :last],
-          retention_seconds: 7_200,  # 2 hours
+          # 2 hours
+          retention_seconds: 7_200,
           table_name: "tier_hourly"
         }
       ]
     }
 
     start_supervised!(
-      {TimelessMetrics,
-       name: :ret_test,
-       data_dir: @data_dir,
-       buffer_shards: 1,
-       schema: schema}
+      {TimelessMetrics, name: :ret_test, data_dir: @data_dir, buffer_shards: 1, schema: schema}
     )
 
     on_exit(fn ->
@@ -83,9 +82,7 @@ defmodule TimelessMetrics.RetentionTest do
     now = System.os_time(:second)
 
     # Write only old data for this series
-    TimelessMetrics.write(:ret_test, "orphan", %{"id" => "1"}, 1.0,
-      timestamp: now - 7200
-    )
+    TimelessMetrics.write(:ret_test, "orphan", %{"id" => "1"}, 1.0, timestamp: now - 7200)
 
     TimelessMetrics.flush(:ret_test)
     TimelessMetrics.enforce_retention(:ret_test)

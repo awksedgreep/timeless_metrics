@@ -6,10 +6,7 @@ defmodule TimelessMetrics.AnnotationTest do
   setup do
     start_supervised!(
       {TimelessMetrics,
-       name: :annot_test,
-       data_dir: @data_dir,
-       buffer_shards: 1,
-       segment_duration: 3_600}
+       name: :annot_test, data_dir: @data_dir, buffer_shards: 1, segment_duration: 3_600}
     )
 
     on_exit(fn ->
@@ -23,14 +20,14 @@ defmodule TimelessMetrics.AnnotationTest do
   test "create and query annotations" do
     now = System.os_time(:second)
 
-    {:ok, id1} = TimelessMetrics.annotate(:annot_test, now - 1800, "Deploy v2.3",
-      tags: ["deploy", "web"],
-      description: "Rolling deploy of web tier"
-    )
+    {:ok, id1} =
+      TimelessMetrics.annotate(:annot_test, now - 1800, "Deploy v2.3",
+        tags: ["deploy", "web"],
+        description: "Rolling deploy of web tier"
+      )
 
-    {:ok, id2} = TimelessMetrics.annotate(:annot_test, now - 600, "Config change",
-      tags: ["config"]
-    )
+    {:ok, id2} =
+      TimelessMetrics.annotate(:annot_test, now - 600, "Config change", tags: ["config"])
 
     assert is_integer(id1)
     assert id2 > id1
@@ -50,7 +47,9 @@ defmodule TimelessMetrics.AnnotationTest do
     TimelessMetrics.annotate(:annot_test, now - 100, "Deploy", tags: ["deploy"])
     TimelessMetrics.annotate(:annot_test, now - 50, "Alert fired", tags: ["alert"])
 
-    {:ok, deploy_only} = TimelessMetrics.annotations(:annot_test, now - 3600, now, tags: ["deploy"])
+    {:ok, deploy_only} =
+      TimelessMetrics.annotations(:annot_test, now - 3600, now, tags: ["deploy"])
+
     assert length(deploy_only) == 1
     assert List.first(deploy_only).title == "Deploy"
 
@@ -76,12 +75,16 @@ defmodule TimelessMetrics.AnnotationTest do
 
     # Create
     conn =
-      Plug.Test.conn(:post, "/api/v1/annotations", Jason.encode!(%{
-        timestamp: now,
-        title: "HTTP Deploy",
-        description: "Deployed via CI",
-        tags: ["deploy", "ci"]
-      }))
+      Plug.Test.conn(
+        :post,
+        "/api/v1/annotations",
+        Jason.encode!(%{
+          timestamp: now,
+          title: "HTTP Deploy",
+          description: "Deployed via CI",
+          tags: ["deploy", "ci"]
+        })
+      )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> TimelessMetrics.HTTP.call(store: :annot_test)
 
@@ -154,9 +157,13 @@ defmodule TimelessMetrics.AnnotationTest do
 
   test "annotation with default timestamp" do
     conn =
-      Plug.Test.conn(:post, "/api/v1/annotations", Jason.encode!(%{
-        title: "Now annotation"
-      }))
+      Plug.Test.conn(
+        :post,
+        "/api/v1/annotations",
+        Jason.encode!(%{
+          title: "Now annotation"
+        })
+      )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> TimelessMetrics.HTTP.call(store: :annot_test)
 

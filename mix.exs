@@ -20,7 +20,7 @@ defmodule TimelessMetrics.MixProject do
 
   defp deps do
     [
-      {:gorilla_stream, "~> 1.3"},
+      {:gorilla_stream, path: "../gorilla_stream"},
       {:exqlite, "~> 0.27"},
       {:ezstd, "~> 1.2"},
       {:bandit, "~> 1.6"},

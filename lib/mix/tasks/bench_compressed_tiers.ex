@@ -92,9 +92,11 @@ defmodule Mix.Tasks.BenchCompressedTiers do
     IO.puts("  Raw segments:")
     IO.puts("    Rows:  #{fmt(raw_rows)}")
     IO.puts("    Bytes: #{fmt_bytes(raw_bytes)}")
+
     if raw_rows > 0 do
       IO.puts("    Avg:   #{Float.round(raw_bytes / raw_rows, 1)} bytes/segment")
     end
+
     IO.puts("")
 
     Enum.each(tier_stats, fn {tier, chunks, bucket_count, tier_bytes} ->
@@ -105,9 +107,11 @@ defmodule Mix.Tasks.BenchCompressedTiers do
       IO.puts("    Chunks:          #{fmt(chunks)}")
       IO.puts("    Total buckets:   #{fmt(bucket_count)}")
       IO.puts("    Bytes:           #{fmt_bytes(tier_bytes)}")
+
       if bucket_count > 0 do
         IO.puts("    Bytes/bucket:    #{Float.round(tier_bytes / bucket_count, 1)}")
       end
+
       IO.puts("    Old row est:     #{fmt_bytes(old_estimate)} (78 bytes/row)")
       IO.puts("    Savings:         #{Float.round(ratio, 1)}x")
       IO.puts("")
@@ -119,7 +123,11 @@ defmodule Mix.Tasks.BenchCompressedTiers do
     total_disk = measure_disk(data_dir)
     IO.puts("  Total on disk:     #{fmt_bytes(total_disk)}")
     IO.puts("  Raw data:          #{fmt_bytes(raw_bytes)} (#{pct(raw_bytes, total_disk)})")
-    IO.puts("  Tier data:         #{fmt_bytes(total_tier_bytes)} (#{pct(total_tier_bytes, total_disk)})")
+
+    IO.puts(
+      "  Tier data:         #{fmt_bytes(total_tier_bytes)} (#{pct(total_tier_bytes, total_disk)})"
+    )
+
     IO.puts("")
 
     # --- Query latency ---

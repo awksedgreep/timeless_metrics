@@ -23,12 +23,26 @@ defmodule Mix.Tasks.Bench do
   use Mix.Task
 
   @metrics [
-    "cpu_usage", "mem_usage", "disk_usage", "load_avg_1m",
-    "if_in_octets", "if_out_octets", "if_in_errors", "if_out_errors",
-    "if_in_packets", "if_out_packets", "temperature_c",
-    "signal_power_dbm", "signal_snr_db", "ping_latency_ms",
-    "packet_loss_pct", "uptime_seconds", "dns_queries_total",
-    "http_requests_total", "active_connections", "bandwidth_util_pct"
+    "cpu_usage",
+    "mem_usage",
+    "disk_usage",
+    "load_avg_1m",
+    "if_in_octets",
+    "if_out_octets",
+    "if_in_errors",
+    "if_out_errors",
+    "if_in_packets",
+    "if_out_packets",
+    "temperature_c",
+    "signal_power_dbm",
+    "signal_snr_db",
+    "ping_latency_ms",
+    "packet_loss_pct",
+    "uptime_seconds",
+    "dns_queries_total",
+    "http_requests_total",
+    "active_connections",
+    "bandwidth_util_pct"
   ]
 
   @interval 300
@@ -193,9 +207,19 @@ defmodule Mix.Tasks.Bench do
 
     IO.puts("")
     IO.puts("  " <> String.duplicate("-", 60))
-    IO.puts("  Ingest:  #{fmt_int(total_points)} pts  write=#{fmt_dur(write_total)}  [#{fmt_int(write_rate)} pts/sec]")
-    IO.puts("  Flush:   #{days} passes in #{fmt_dur(flush_total)}  [#{fmt_dur(div(flush_total, days))} avg/day]")
-    IO.puts("  Rollup:  #{days} passes in #{fmt_dur(rollup_total)}  [#{fmt_dur(div(rollup_total, days))} avg/day]")
+
+    IO.puts(
+      "  Ingest:  #{fmt_int(total_points)} pts  write=#{fmt_dur(write_total)}  [#{fmt_int(write_rate)} pts/sec]"
+    )
+
+    IO.puts(
+      "  Flush:   #{days} passes in #{fmt_dur(flush_total)}  [#{fmt_dur(div(flush_total, days))} avg/day]"
+    )
+
+    IO.puts(
+      "  Rollup:  #{days} passes in #{fmt_dur(rollup_total)}  [#{fmt_dur(div(rollup_total, days))} avg/day]"
+    )
+
     IO.puts("  Wall:    #{fmt_dur(wall_total)}  [#{fmt_int(wall_rate)} pts/sec effective]")
   end
 
@@ -214,7 +238,9 @@ defmodule Mix.Tasks.Bench do
     IO.puts("")
 
     Enum.each(info.tiers, fn {name, t} ->
-      IO.puts("  #{name}: #{fmt_int(t.rows)} rows  res=#{t.resolution_seconds}s  ret=#{t.retention}")
+      IO.puts(
+        "  #{name}: #{fmt_int(t.rows)} rows  res=#{t.resolution_seconds}s  ret=#{t.retention}"
+      )
     end)
 
     IO.puts("")
@@ -397,7 +423,10 @@ defmodule Mix.Tasks.Bench do
     # Concurrent batch writes (multiple callers, simulates real HTTP traffic)
     concurrent_writers = System.schedulers_online()
     IO.puts("")
-    IO.puts("  Concurrent batch write (#{concurrent_writers} writers × #{devices} devices × #{length(@metrics)} metrics):")
+
+    IO.puts(
+      "  Concurrent batch write (#{concurrent_writers} writers × #{devices} devices × #{length(@metrics)} metrics):"
+    )
 
     {us, _} =
       :timer.tc(fn ->
@@ -477,7 +506,13 @@ defmodule Mix.Tasks.Bench do
   defp parse_args(args) do
     {opts, _, _} =
       OptionParser.parse(args,
-        switches: [tier: :string, devices: :integer, days: :integer, segment_duration: :integer, data_dir: :string]
+        switches: [
+          tier: :string,
+          devices: :integer,
+          days: :integer,
+          segment_duration: :integer,
+          data_dir: :string
+        ]
       )
 
     seg_dur = opts[:segment_duration] || 14_400
@@ -485,15 +520,25 @@ defmodule Mix.Tasks.Bench do
 
     {tier_name, devices, days} =
       case opts[:tier] do
-        "medium" -> {:medium, 1_000, 90}
-        "stress" -> {:stress, 10_000, 7}
-        "fast-stress" -> {:"fast-stress", 5_000, 2}
-        "quick" -> {:quick, 100, 90}
+        "medium" ->
+          {:medium, 1_000, 90}
+
+        "stress" ->
+          {:stress, 10_000, 7}
+
+        "fast-stress" ->
+          {:"fast-stress", 5_000, 2}
+
+        "quick" ->
+          {:quick, 100, 90}
+
         nil ->
           devices = opts[:devices] || 100
           days = opts[:days] || 90
           {:custom, devices, days}
-        _ -> {:quick, 100, 90}
+
+        _ ->
+          {:quick, 100, 90}
       end
 
     {tier_name, devices, days, seg_dur, data_dir}
@@ -522,7 +567,9 @@ defmodule Mix.Tasks.Bench do
     case System.cmd("df", ["--output=fstype", path], stderr_to_stdout: true) do
       {output, 0} ->
         output |> String.split("\n", trim: true) |> List.last() |> String.trim()
-      _ -> "unknown"
+
+      _ ->
+        "unknown"
     end
   end
 
@@ -534,22 +581,37 @@ defmodule Mix.Tasks.Bench do
   defp bar, do: "  " <> String.duplicate("=", 60)
 
   defp fmt_int(n) when is_float(n), do: fmt_int(trunc(n))
-  defp fmt_int(n) when n >= 1_000_000_000, do: "#{:erlang.float_to_binary(n / 1_000_000_000, decimals: 2)}B"
-  defp fmt_int(n) when n >= 1_000_000, do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
+  defp fmt_int(n) when n >= 1_000_000_000,
+    do: "#{:erlang.float_to_binary(n / 1_000_000_000, decimals: 2)}B"
+
+  defp fmt_int(n) when n >= 1_000_000,
+    do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
   defp fmt_int(n) when n >= 1_000, do: "#{:erlang.float_to_binary(n / 1_000, decimals: 1)}K"
   defp fmt_int(n), do: Integer.to_string(n)
 
-  defp fmt_bytes(n) when n >= 1_073_741_824, do: "#{:erlang.float_to_binary(n / 1_073_741_824, decimals: 1)} GB"
-  defp fmt_bytes(n) when n >= 1_048_576, do: "#{:erlang.float_to_binary(n / 1_048_576, decimals: 1)} MB"
+  defp fmt_bytes(n) when n >= 1_073_741_824,
+    do: "#{:erlang.float_to_binary(n / 1_073_741_824, decimals: 1)} GB"
+
+  defp fmt_bytes(n) when n >= 1_048_576,
+    do: "#{:erlang.float_to_binary(n / 1_048_576, decimals: 1)} MB"
+
   defp fmt_bytes(n) when n >= 1_024, do: "#{:erlang.float_to_binary(n / 1_024, decimals: 1)} KB"
   defp fmt_bytes(n), do: "#{n} B"
 
-  defp fmt_dur(us) when us >= 60_000_000, do: "#{:erlang.float_to_binary(us / 60_000_000, decimals: 1)}m"
-  defp fmt_dur(us) when us >= 1_000_000, do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 1)}s"
+  defp fmt_dur(us) when us >= 60_000_000,
+    do: "#{:erlang.float_to_binary(us / 60_000_000, decimals: 1)}m"
+
+  defp fmt_dur(us) when us >= 1_000_000,
+    do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 1)}s"
+
   defp fmt_dur(us) when us >= 1_000, do: "#{:erlang.float_to_binary(us / 1_000, decimals: 1)}ms"
   defp fmt_dur(us), do: "#{us}us"
 
-  defp fmt_us(us) when us >= 1_000_000, do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 2)}s"
+  defp fmt_us(us) when us >= 1_000_000,
+    do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 2)}s"
+
   defp fmt_us(us) when us >= 1_000, do: "#{:erlang.float_to_binary(us / 1_000, decimals: 2)}ms"
   defp fmt_us(us), do: "#{:erlang.float_to_binary(us / 1, decimals: 0)}us"
 

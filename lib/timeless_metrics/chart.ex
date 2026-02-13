@@ -160,7 +160,8 @@ defmodule TimelessMetrics.Chart do
       |> Enum.join()
 
     # Plot border
-    border = ~s(<rect x="#{@padding.left}" y="#{@padding.top}" width="#{plot_w}" height="#{plot_h}" #{border_attr(theme)} stroke-width="1"/>)
+    border =
+      ~s(<rect x="#{@padding.left}" y="#{@padding.top}" width="#{plot_w}" height="#{plot_h}" #{border_attr(theme)} stroke-width="1"/>)
 
     border <> y_lines <> x_labels
   end
@@ -330,7 +331,7 @@ defmodule TimelessMetrics.Chart do
         raw_step <= 21600 -> 21600
         raw_step <= 43200 -> 43200
         raw_step <= 86400 -> 86400
-        true -> Float.ceil(raw_step / 86400) * 86400 |> trunc()
+        true -> (Float.ceil(raw_step / 86400) * 86400) |> trunc()
       end
 
     first = (div(t_min, step) + 1) * step
@@ -437,9 +438,12 @@ defmodule TimelessMetrics.Chart do
         keys = labels |> Map.keys()
 
         keys
-        |> Enum.max_by(fn k ->
-          all_labels |> Enum.map(&Map.get(&1, k)) |> Enum.uniq() |> length()
-        end, fn -> nil end)
+        |> Enum.max_by(
+          fn k ->
+            all_labels |> Enum.map(&Map.get(&1, k)) |> Enum.uniq() |> length()
+          end,
+          fn -> nil end
+        )
 
       _ ->
         nil

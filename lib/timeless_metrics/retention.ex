@@ -13,7 +13,8 @@ defmodule TimelessMetrics.Retention do
 
   defstruct [:db, :store, :schema, :vacuum_counter]
 
-  @vacuum_every 24  # Run vacuum every N retention cycles
+  # Run vacuum every N retention cycles
+  @vacuum_every 24
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -112,7 +113,9 @@ defmodule TimelessMetrics.Retention do
         # Tier tables (from ShardStore ETS)
         tier_ids =
           Enum.flat_map(state.schema.tiers, fn tier ->
-            {:ok, tier_rows} = TimelessMetrics.SegmentBuilder.read_tier_series_ids(builder, tier.name)
+            {:ok, tier_rows} =
+              TimelessMetrics.SegmentBuilder.read_tier_series_ids(builder, tier.name)
+
             Enum.map(tier_rows, fn [id] -> id end)
           end)
 
@@ -147,7 +150,10 @@ defmodule TimelessMetrics.Retention do
 
       case series_rows do
         [[0]] ->
-          Logger.info("Deleting orphaned alert rule #{rule.id} (#{rule.name}): metric '#{rule.metric}' has no series")
+          Logger.info(
+            "Deleting orphaned alert rule #{rule.id} (#{rule.name}): metric '#{rule.metric}' has no series"
+          )
+
           TimelessMetrics.Alert.delete_rule(state.db, rule.id)
 
         _ ->

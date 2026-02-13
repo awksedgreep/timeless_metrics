@@ -19,6 +19,7 @@ defmodule TimelessMetrics.SegmentBuilder do
     :segment_duration,
     :pending_flush_interval,
     :compression,
+    :compression_level,
     :shard_id,
     :data_dir,
     :name,
@@ -26,7 +27,8 @@ defmodule TimelessMetrics.SegmentBuilder do
     :shard_store
   ]
 
-  @default_segment_duration 14_400  # 4 hours in seconds
+  # 4 hours in seconds
+  @default_segment_duration 14_400
   @default_pending_flush_interval :timer.seconds(60)
 
   def start_link(opts) do
@@ -243,8 +245,12 @@ defmodule TimelessMetrics.SegmentBuilder do
     shard_id = Keyword.fetch!(opts, :shard_id)
     data_dir = Keyword.fetch!(opts, :data_dir)
     segment_duration = Keyword.get(opts, :segment_duration, @default_segment_duration)
-    pending_flush_interval = Keyword.get(opts, :pending_flush_interval, @default_pending_flush_interval)
+
+    pending_flush_interval =
+      Keyword.get(opts, :pending_flush_interval, @default_pending_flush_interval)
+
     compression = Keyword.get(opts, :compression, :zstd)
+    compression_level = Keyword.get(opts, :compression_level, 9)
     schema = Keyword.get(opts, :schema)
 
     Process.flag(:trap_exit, true)
@@ -277,6 +283,7 @@ defmodule TimelessMetrics.SegmentBuilder do
       segment_duration: segment_duration,
       pending_flush_interval: pending_flush_interval,
       compression: compression,
+      compression_level: compression_level,
       shard_id: shard_id,
       data_dir: data_dir,
       name: name,
@@ -451,7 +458,10 @@ defmodule TimelessMetrics.SegmentBuilder do
     Enum.flat_map(segments, fn seg ->
       sorted_points = Enum.sort_by(seg.points, &elem(&1, 0))
 
-      case GorillaStream.compress(sorted_points, compression: state.compression) do
+      case GorillaStream.compress(sorted_points,
+             compression: state.compression,
+             compression_level: state.compression_level
+           ) do
         {:ok, blob} ->
           point_count = length(sorted_points)
           {last_ts, _} = List.last(sorted_points)
@@ -468,7 +478,11 @@ defmodule TimelessMetrics.SegmentBuilder do
 
         {:error, reason} ->
           require Logger
-          Logger.warning("Failed to compress segment for series #{seg.series_id}: #{inspect(reason)}")
+
+          Logger.warning(
+            "Failed to compress segment for series #{seg.series_id}: #{inspect(reason)}"
+          )
+
           []
       end
     end)

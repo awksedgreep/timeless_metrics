@@ -167,11 +167,23 @@ defmodule TimelessMetrics.Query do
         # Query spans the boundary — stitch rollup + raw
         true ->
           {:ok, rollup_results} =
-            aggregate_from_rollup_tier(store, tier, series_id, from, watermark, bucket_seconds, agg_fn)
+            aggregate_from_rollup_tier(
+              store,
+              tier,
+              series_id,
+              from,
+              watermark,
+              bucket_seconds,
+              agg_fn
+            )
 
           {:ok, raw_results} =
             aggregate_from_raw(
-              store, series_id, [from: watermark, to: to], bucket_seconds, agg_fn
+              store,
+              series_id,
+              [from: watermark, to: to],
+              bucket_seconds,
+              agg_fn
             )
 
           # Merge: raw wins for any overlapping buckets (more precise)
@@ -325,7 +337,9 @@ defmodule TimelessMetrics.Query do
         {_aggs, buckets} = TimelessMetrics.TierChunk.decode(blob)
 
         case buckets do
-          [] -> {:ok, nil}
+          [] ->
+            {:ok, nil}
+
           _ ->
             latest = Enum.max_by(buckets, & &1.bucket)
             {:ok, {latest.bucket, latest.last}}

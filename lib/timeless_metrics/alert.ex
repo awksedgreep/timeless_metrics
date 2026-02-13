@@ -35,7 +35,17 @@ defmodule TimelessMetrics.Alert do
           INSERT INTO alert_rules (name, metric, labels, condition, threshold, duration, aggregate, webhook_url, enabled, created_at)
           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)
           """,
-          [name, metric, labels, condition, threshold, duration, aggregate, webhook_url, created_at]
+          [
+            name,
+            metric,
+            labels,
+            condition,
+            threshold,
+            duration,
+            aggregate,
+            webhook_url,
+            created_at
+          ]
         )
 
         {:ok, [[id]]} = TimelessMetrics.DB.execute(conn, "SELECT last_insert_rowid()", [])
@@ -56,7 +66,18 @@ defmodule TimelessMetrics.Alert do
       )
 
     rules =
-      Enum.map(rows, fn [id, name, metric, labels, condition, threshold, duration, aggregate, webhook_url, enabled] ->
+      Enum.map(rows, fn [
+                          id,
+                          name,
+                          metric,
+                          labels,
+                          condition,
+                          threshold,
+                          duration,
+                          aggregate,
+                          webhook_url,
+                          enabled
+                        ] ->
         # Get current state for this rule
         {:ok, state_rows} =
           TimelessMetrics.DB.read(
@@ -136,7 +157,9 @@ defmodule TimelessMetrics.Alert do
     Enum.each(results, fn %{labels: labels, data: buckets} ->
       value =
         case buckets do
-          [] -> nil
+          [] ->
+            nil
+
           _ ->
             {_ts, val} = List.last(buckets)
             val

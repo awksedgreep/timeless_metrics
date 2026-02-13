@@ -17,7 +17,9 @@ defmodule TimelessMetrics.DB.Migrations do
   end
 
   defp get_version(conn) do
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "SELECT value FROM _metadata WHERE key = 'schema_version'")
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(conn, "SELECT value FROM _metadata WHERE key = 'schema_version'")
+
     result = Exqlite.Sqlite3.step(conn, stmt)
     Exqlite.Sqlite3.release(conn, stmt)
 
@@ -28,7 +30,9 @@ defmodule TimelessMetrics.DB.Migrations do
   end
 
   defp set_version(conn, version) do
-    execute(conn, "INSERT OR REPLACE INTO _metadata (key, value) VALUES ('schema_version', ?1)", [to_string(version)])
+    execute(conn, "INSERT OR REPLACE INTO _metadata (key, value) VALUES ('schema_version', ?1)", [
+      to_string(version)
+    ])
   end
 
   defp run_from(conn, version) when version < 1 do

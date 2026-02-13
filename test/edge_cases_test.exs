@@ -41,7 +41,9 @@ defmodule TimelessMetrics.EdgeCasesTest do
     TimelessMetrics.write(:edge_test, "solo", %{"id" => "1"}, 42.0, timestamp: now)
     TimelessMetrics.flush(:edge_test)
 
-    {:ok, points} = TimelessMetrics.query(:edge_test, "solo", %{"id" => "1"}, from: now - 60, to: now + 60)
+    {:ok, points} =
+      TimelessMetrics.query(:edge_test, "solo", %{"id" => "1"}, from: now - 60, to: now + 60)
+
     assert [{^now, 42.0}] = points
   end
 
@@ -52,7 +54,9 @@ defmodule TimelessMetrics.EdgeCasesTest do
     TimelessMetrics.write(:edge_test, "dup", %{"id" => "1"}, 20.0, timestamp: now)
     TimelessMetrics.flush(:edge_test)
 
-    {:ok, points} = TimelessMetrics.query(:edge_test, "dup", %{"id" => "1"}, from: now - 60, to: now + 60)
+    {:ok, points} =
+      TimelessMetrics.query(:edge_test, "dup", %{"id" => "1"}, from: now - 60, to: now + 60)
+
     # Both points should be stored (gorilla allows duplicate timestamps)
     assert length(points) == 2
   end
@@ -65,7 +69,9 @@ defmodule TimelessMetrics.EdgeCasesTest do
     TimelessMetrics.write(:edge_test, "big", %{"id" => "1"}, 0.0, timestamp: now + 2)
     TimelessMetrics.flush(:edge_test)
 
-    {:ok, points} = TimelessMetrics.query(:edge_test, "big", %{"id" => "1"}, from: now - 60, to: now + 60)
+    {:ok, points} =
+      TimelessMetrics.query(:edge_test, "big", %{"id" => "1"}, from: now - 60, to: now + 60)
+
     assert length(points) == 3
     [{_, v1}, {_, v2}, {_, v3}] = points
     assert_in_delta v1, 1.0e15, 1.0e10
@@ -82,7 +88,9 @@ defmodule TimelessMetrics.EdgeCasesTest do
 
     TimelessMetrics.flush(:edge_test)
 
-    {:ok, points} = TimelessMetrics.query(:edge_test, "zeros", %{"id" => "1"}, from: now - 60, to: now + 60)
+    {:ok, points} =
+      TimelessMetrics.query(:edge_test, "zeros", %{"id" => "1"}, from: now - 60, to: now + 60)
+
     assert length(points) == 10
     assert Enum.all?(points, fn {_ts, v} -> v == 0.0 end)
   end
@@ -93,7 +101,9 @@ defmodule TimelessMetrics.EdgeCasesTest do
     TimelessMetrics.write(:edge_test, "no_labels", %{}, 99.0, timestamp: now)
     TimelessMetrics.flush(:edge_test)
 
-    {:ok, points} = TimelessMetrics.query(:edge_test, "no_labels", %{}, from: now - 60, to: now + 60)
+    {:ok, points} =
+      TimelessMetrics.query(:edge_test, "no_labels", %{}, from: now - 60, to: now + 60)
+
     assert [{^now, 99.0}] = points
   end
 
@@ -101,7 +111,9 @@ defmodule TimelessMetrics.EdgeCasesTest do
     now = System.os_time(:second)
 
     for i <- 1..100 do
-      TimelessMetrics.write(:edge_test, "shared_metric", %{"id" => "#{i}"}, i * 1.0, timestamp: now)
+      TimelessMetrics.write(:edge_test, "shared_metric", %{"id" => "#{i}"}, i * 1.0,
+        timestamp: now
+      )
     end
 
     TimelessMetrics.flush(:edge_test)
@@ -111,7 +123,12 @@ defmodule TimelessMetrics.EdgeCasesTest do
     assert info.series_count == 100
 
     # Query one specific series
-    {:ok, points} = TimelessMetrics.query(:edge_test, "shared_metric", %{"id" => "50"}, from: now - 60, to: now + 60)
+    {:ok, points} =
+      TimelessMetrics.query(:edge_test, "shared_metric", %{"id" => "50"},
+        from: now - 60,
+        to: now + 60
+      )
+
     assert [{^now, 50.0}] = points
   end
 
@@ -136,7 +153,12 @@ defmodule TimelessMetrics.EdgeCasesTest do
 
       TimelessMetrics.flush(:edge_test)
 
-      {:ok, actual} = TimelessMetrics.query(:edge_test, "pattern_#{name}", %{"t" => "1"}, from: now - 600, to: now)
+      {:ok, actual} =
+        TimelessMetrics.query(:edge_test, "pattern_#{name}", %{"t" => "1"},
+          from: now - 600,
+          to: now
+        )
+
       assert length(actual) == 100, "Pattern #{name}: expected 100 points, got #{length(actual)}"
 
       Enum.zip(expected, actual)
@@ -177,12 +199,18 @@ defmodule TimelessMetrics.EdgeCasesTest do
 
     # IEEE 754 extremes
     extreme_values = [
-      1.7976931348623157e+308,   # max float64
-      -1.7976931348623157e+308,  # min float64
-      5.0e-324,                  # smallest positive subnormal
-      1.0e-100,                  # small positive
-      -1.0e-200,                 # small negative
-      0.0                        # exact zero
+      # max float64
+      1.7976931348623157e+308,
+      # min float64
+      -1.7976931348623157e+308,
+      # smallest positive subnormal
+      5.0e-324,
+      # small positive
+      1.0e-100,
+      # small negative
+      -1.0e-200,
+      # exact zero
+      0.0
     ]
 
     for {val, i} <- Enum.with_index(extreme_values) do
@@ -202,7 +230,7 @@ defmodule TimelessMetrics.EdgeCasesTest do
     Enum.zip(extreme_values, Enum.map(points, &elem(&1, 1)))
     |> Enum.each(fn {expected, actual} ->
       assert actual == expected,
-        "Extreme float #{expected} not preserved: got #{actual}"
+             "Extreme float #{expected} not preserved: got #{actual}"
     end)
   end
 
@@ -264,8 +292,7 @@ defmodule TimelessMetrics.EdgeCasesTest do
       series = List.first(results)
       [{_ts, val}] = series.data
 
-      assert_in_delta val, expected, 0.01,
-        "#{agg} of negatives: expected #{expected}, got #{val}"
+      assert_in_delta val, expected, 0.01, "#{agg} of negatives: expected #{expected}, got #{val}"
     end
   end
 end

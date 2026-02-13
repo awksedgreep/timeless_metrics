@@ -12,12 +12,14 @@ defmodule TimelessMetrics.AnomalyTest do
 
     for i <- 0..(n - 1) do
       ts = t0 + i * interval
+
       val =
         if i in outlier_indices do
           outlier_value
         else
           100.0 + 20.0 * :math.sin(2 * :math.pi() * i / 288)
         end
+
       {ts, val}
     end
   end
