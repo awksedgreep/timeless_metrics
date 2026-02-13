@@ -45,7 +45,7 @@ IO.puts("\nForecasting 1 year ahead...")
 
 {us, {:ok, forecast}} =
   :timer.tc(fn ->
-    Timeless.Forecast.predict(data, horizon: one_year, bucket: 86_400)
+    TimelessMetrics.Forecast.predict(data, horizon: one_year, bucket: 86_400)
   end)
 
 IO.puts("  Forecast: #{length(forecast)} points in #{div(us, 1000)}ms")
@@ -54,7 +54,7 @@ IO.puts("  Predicted (6 months): ~#{Float.round(elem(Enum.at(forecast, 182), 1),
 IO.puts("  Predicted (12 months): ~#{Float.round(elem(List.last(forecast), 1), 1)} Gbps")
 
 # Show auto-detected periods
-periods = Timeless.Forecast.auto_periods(Enum.map(data, &elem(&1, 0)))
+periods = TimelessMetrics.Forecast.auto_periods(Enum.map(data, &elem(&1, 0)))
 period_names = Enum.map(periods, fn
   604_800 -> "weekly (7d)"
   31_536_000 -> "yearly (365d)"
@@ -65,7 +65,7 @@ IO.puts("  Auto-detected periods: #{Enum.join(period_names, ", ")}")
 # --- Anomaly detection on historical data ---
 IO.puts("\nRunning anomaly detection on historical data...")
 
-{us2, {:ok, analysis}} = :timer.tc(fn -> Timeless.Anomaly.detect(data, sensitivity: :medium) end)
+{us2, {:ok, analysis}} = :timer.tc(fn -> TimelessMetrics.Anomaly.detect(data, sensitivity: :medium) end)
 anomalies = Enum.filter(analysis, & &1.anomaly)
 IO.puts("  Anomaly detection: #{div(us2, 1000)}ms")
 IO.puts("  Flagged #{length(anomalies)} anomalous days out of #{length(data)}")
@@ -84,7 +84,7 @@ anomaly_points =
   |> Enum.map(fn a -> {a.timestamp, a.value} end)
 
 svg =
-  Timeless.Chart.render("Peak Bandwidth (Gbps) — 1yr history + 1yr forecast", series,
+  TimelessMetrics.Chart.render("Peak Bandwidth (Gbps) — 1yr history + 1yr forecast", series,
     width: 1000,
     height: 400,
     theme: :light,
@@ -96,7 +96,7 @@ File.write!(Path.join(output_dir, "chart_capacity_planning.svg"), svg)
 
 # --- Also render dark theme version ---
 svg_dark =
-  Timeless.Chart.render("Peak Bandwidth (Gbps) — 1yr history + 1yr forecast", series,
+  TimelessMetrics.Chart.render("Peak Bandwidth (Gbps) — 1yr history + 1yr forecast", series,
     width: 1000,
     height: 400,
     theme: :dark,

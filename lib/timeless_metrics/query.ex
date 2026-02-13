@@ -1,4 +1,4 @@
-defmodule Timeless.Query do
+defmodule TimelessMetrics.Query do
   @moduledoc """
   Query engine with automatic tier selection.
 
@@ -23,7 +23,7 @@ defmodule Timeless.Query do
     builder = builder_for_series(store, series_id)
 
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_raw_segments(builder, series_id, from, to)
+      TimelessMetrics.SegmentBuilder.read_raw_segments(builder, series_id, from, to)
 
     {us, points} =
       :timer.tc(fn ->
@@ -39,7 +39,7 @@ defmodule Timeless.Query do
       end)
 
     :telemetry.execute(
-      [:timeless, :query, :raw],
+      [:timeless_metrics, :query, :raw],
       %{duration_us: us, point_count: length(points), segment_count: length(rows)},
       %{series_id: series_id}
     )
@@ -79,12 +79,12 @@ defmodule Timeless.Query do
     builder = builder_for_series(store, series_id)
 
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_tier_chunks(builder, tier_name, series_id, from, to)
+      TimelessMetrics.SegmentBuilder.read_tier_chunks(builder, tier_name, series_id, from, to)
 
     results =
       rows
       |> Enum.flat_map(fn [blob] ->
-        {_aggs, buckets} = Timeless.TierChunk.decode(blob)
+        {_aggs, buckets} = TimelessMetrics.TierChunk.decode(blob)
         Enum.filter(buckets, fn b -> b.bucket >= from and b.bucket < to end)
       end)
 
@@ -103,7 +103,7 @@ defmodule Timeless.Query do
 
     # Try raw first (from shard storage)
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_raw_latest(builder, series_id)
+      TimelessMetrics.SegmentBuilder.read_raw_latest(builder, series_id)
 
     case rows do
       [[blob]] ->
@@ -130,7 +130,7 @@ defmodule Timeless.Query do
   # --- Shard routing ---
 
   defp builder_for_series(store, series_id) do
-    shard_count = :persistent_term.get({Timeless, store, :shard_count})
+    shard_count = :persistent_term.get({TimelessMetrics, store, :shard_count})
     shard_idx = rem(abs(series_id), shard_count)
     :"#{store}_builder_#{shard_idx}"
   end
@@ -188,7 +188,7 @@ defmodule Timeless.Query do
   end
 
   defp get_shard_watermark(builder, tier_name) do
-    Timeless.SegmentBuilder.read_watermark(builder, tier_name)
+    TimelessMetrics.SegmentBuilder.read_watermark(builder, tier_name)
   end
 
   defp aggregate_from_raw(store, series_id, opts, bucket_seconds, agg_fn) do
@@ -210,13 +210,13 @@ defmodule Timeless.Query do
     builder = builder_for_series(store, series_id)
 
     {:ok, chunk_rows} =
-      Timeless.SegmentBuilder.read_tier_chunks(builder, tier.name, series_id, from, to)
+      TimelessMetrics.SegmentBuilder.read_tier_chunks(builder, tier.name, series_id, from, to)
 
     # Decode chunks and filter to requested range
     tier_rows =
       chunk_rows
       |> Enum.flat_map(fn [blob] ->
-        {_aggs, buckets} = Timeless.TierChunk.decode(blob)
+        {_aggs, buckets} = TimelessMetrics.TierChunk.decode(blob)
         Enum.filter(buckets, fn b -> b.bucket >= from and b.bucket < to end)
       end)
 
@@ -318,11 +318,11 @@ defmodule Timeless.Query do
     builder = builder_for_series(store, series_id)
 
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_tier_latest(builder, tier_name, series_id)
+      TimelessMetrics.SegmentBuilder.read_tier_latest(builder, tier_name, series_id)
 
     case rows do
       [[blob]] ->
-        {_aggs, buckets} = Timeless.TierChunk.decode(blob)
+        {_aggs, buckets} = TimelessMetrics.TierChunk.decode(blob)
 
         case buckets do
           [] -> {:ok, nil}

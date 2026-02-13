@@ -1,4 +1,4 @@
-defmodule Timeless.DB do
+defmodule TimelessMetrics.DB do
   @moduledoc """
   SQLite connection manager with a single writer and pooled readers.
 
@@ -146,7 +146,7 @@ defmodule Timeless.DB do
   end
 
   defp run_migrations(conn) do
-    Timeless.DB.Migrations.run(conn)
+    TimelessMetrics.DB.Migrations.run(conn)
   end
 
   @doc false

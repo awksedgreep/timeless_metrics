@@ -1,11 +1,11 @@
-defmodule Timeless.CompactionTest do
+defmodule TimelessMetrics.CompactionTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_compaction_test_#{System.os_time(:millisecond)}"
 
   setup do
     start_supervised!(
-      {Timeless,
+      {TimelessMetrics,
        name: :compact_test,
        data_dir: @data_dir,
        buffer_shards: 1,
@@ -13,7 +13,7 @@ defmodule Timeless.CompactionTest do
     )
 
     on_exit(fn ->
-      :persistent_term.erase({Timeless, :compact_test, :schema})
+      :persistent_term.erase({TimelessMetrics, :compact_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -25,16 +25,16 @@ defmodule Timeless.CompactionTest do
     hour_start = div(now - 7200, 3600) * 3600
 
     for i <- 0..5 do
-      Timeless.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
+      TimelessMetrics.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    Timeless.flush(:compact_test)
-    Timeless.rollup(:compact_test)
+    TimelessMetrics.flush(:compact_test)
+    TimelessMetrics.rollup(:compact_test)
 
     builder = :compact_test_builder_0
-    {dead, total} = Timeless.SegmentBuilder.tier_dead_bytes(builder, :hourly)
+    {dead, total} = TimelessMetrics.SegmentBuilder.tier_dead_bytes(builder, :hourly)
 
     assert total > 0
     assert dead == 0
@@ -46,24 +46,24 @@ defmodule Timeless.CompactionTest do
 
     # Write points and rollup — this creates the initial chunk
     for i <- 0..11 do
-      Timeless.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
+      TimelessMetrics.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    Timeless.flush(:compact_test)
-    Timeless.rollup(:compact_test)
+    TimelessMetrics.flush(:compact_test)
+    TimelessMetrics.rollup(:compact_test)
 
     builder = :compact_test_builder_0
-    {dead_before, total_before} = Timeless.SegmentBuilder.tier_dead_bytes(builder, :hourly)
+    {dead_before, total_before} = TimelessMetrics.SegmentBuilder.tier_dead_bytes(builder, :hourly)
     assert dead_before == 0
     assert total_before > 0
 
     # catch_up re-reads [watermark - lookback, watermark) and merges into
     # existing chunks, creating dead space (new version appended, old stays)
-    Timeless.catch_up(:compact_test)
+    TimelessMetrics.catch_up(:compact_test)
 
-    {dead_after, total_after} = Timeless.SegmentBuilder.tier_dead_bytes(builder, :hourly)
+    {dead_after, total_after} = TimelessMetrics.SegmentBuilder.tier_dead_bytes(builder, :hourly)
 
     # File grew with the new version; old version is dead space
     assert total_after > total_before
@@ -76,27 +76,27 @@ defmodule Timeless.CompactionTest do
 
     # Create initial data and rollup
     for i <- 0..11 do
-      Timeless.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
+      TimelessMetrics.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    Timeless.flush(:compact_test)
-    Timeless.rollup(:compact_test)
+    TimelessMetrics.flush(:compact_test)
+    TimelessMetrics.rollup(:compact_test)
 
     # catch_up creates dead space
-    Timeless.catch_up(:compact_test)
+    TimelessMetrics.catch_up(:compact_test)
 
     builder = :compact_test_builder_0
-    {dead, _total} = Timeless.SegmentBuilder.tier_dead_bytes(builder, :hourly)
+    {dead, _total} = TimelessMetrics.SegmentBuilder.tier_dead_bytes(builder, :hourly)
     assert dead > 0
 
     # Force compaction with low threshold
-    {:ok, reclaimed} = Timeless.SegmentBuilder.compact_tier(builder, :hourly, threshold: 0.0)
+    {:ok, reclaimed} = TimelessMetrics.SegmentBuilder.compact_tier(builder, :hourly, threshold: 0.0)
     assert reclaimed == dead
 
     # After compaction, dead space should be 0
-    {dead_after, _total_after} = Timeless.SegmentBuilder.tier_dead_bytes(builder, :hourly)
+    {dead_after, _total_after} = TimelessMetrics.SegmentBuilder.tier_dead_bytes(builder, :hourly)
     assert dead_after == 0
   end
 
@@ -106,18 +106,18 @@ defmodule Timeless.CompactionTest do
 
     # Write 12 points and rollup, then catch_up to create dead space
     for i <- 0..11 do
-      Timeless.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
+      TimelessMetrics.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    Timeless.flush(:compact_test)
-    Timeless.rollup(:compact_test)
-    Timeless.catch_up(:compact_test)
+    TimelessMetrics.flush(:compact_test)
+    TimelessMetrics.rollup(:compact_test)
+    TimelessMetrics.catch_up(:compact_test)
 
     # Query before compaction
     {:ok, rows_before} =
-      Timeless.query_tier(:compact_test, :hourly, "cpu", %{"host" => "a"},
+      TimelessMetrics.query_tier(:compact_test, :hourly, "cpu", %{"host" => "a"},
         from: hour_start - 3600,
         to: hour_start + 7200
       )
@@ -127,11 +127,11 @@ defmodule Timeless.CompactionTest do
 
     # Compact
     builder = :compact_test_builder_0
-    {:ok, _reclaimed} = Timeless.SegmentBuilder.compact_tier(builder, :hourly, threshold: 0.0)
+    {:ok, _reclaimed} = TimelessMetrics.SegmentBuilder.compact_tier(builder, :hourly, threshold: 0.0)
 
     # Query after compaction — same results
     {:ok, rows_after} =
-      Timeless.query_tier(:compact_test, :hourly, "cpu", %{"host" => "a"},
+      TimelessMetrics.query_tier(:compact_test, :hourly, "cpu", %{"host" => "a"},
         from: hour_start - 3600,
         to: hour_start + 7200
       )
@@ -151,42 +151,42 @@ defmodule Timeless.CompactionTest do
     hour_start = div(now - 7200, 3600) * 3600
 
     for i <- 0..5 do
-      Timeless.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
+      TimelessMetrics.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    Timeless.flush(:compact_test)
-    Timeless.rollup(:compact_test)
+    TimelessMetrics.flush(:compact_test)
+    TimelessMetrics.rollup(:compact_test)
 
     builder = :compact_test_builder_0
-    result = Timeless.SegmentBuilder.compact_tier(builder, :hourly)
+    result = TimelessMetrics.SegmentBuilder.compact_tier(builder, :hourly)
     assert result == :noop
   end
 
   test "compact_tier returns :noop on empty tier" do
     builder = :compact_test_builder_0
-    result = Timeless.SegmentBuilder.compact_tier(builder, :hourly)
+    result = TimelessMetrics.SegmentBuilder.compact_tier(builder, :hourly)
     assert result == :noop
   end
 
-  test "Timeless.compact/2 compacts all tiers across all shards" do
+  test "TimelessMetrics.compact/2 compacts all tiers across all shards" do
     now = System.os_time(:second)
     hour_start = div(now - 7200, 3600) * 3600
 
     # Create data, rollup, then catch_up to create dead space
     for i <- 0..11 do
-      Timeless.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
+      TimelessMetrics.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    Timeless.flush(:compact_test)
-    Timeless.rollup(:compact_test)
-    Timeless.catch_up(:compact_test)
+    TimelessMetrics.flush(:compact_test)
+    TimelessMetrics.rollup(:compact_test)
+    TimelessMetrics.catch_up(:compact_test)
 
     # Compact with threshold 0 to force it
-    result = Timeless.compact(:compact_test, threshold: 0.0)
+    result = TimelessMetrics.compact(:compact_test, threshold: 0.0)
 
     assert is_map(result)
     assert Map.has_key?(result, :hourly)
@@ -198,21 +198,21 @@ defmodule Timeless.CompactionTest do
     hour_start = div(now - 7200, 3600) * 3600
 
     for i <- 0..5 do
-      Timeless.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
+      TimelessMetrics.write(:compact_test, "cpu", %{"host" => "a"}, 10.0 + i,
         timestamp: hour_start + i * 300
       )
     end
 
-    Timeless.flush(:compact_test)
-    Timeless.rollup(:compact_test)
+    TimelessMetrics.flush(:compact_test)
+    TimelessMetrics.rollup(:compact_test)
 
-    info = Timeless.info(:compact_test)
+    info = TimelessMetrics.info(:compact_test)
     assert info.tiers[:hourly].dead_bytes == 0
 
     # catch_up creates dead space
-    Timeless.catch_up(:compact_test)
+    TimelessMetrics.catch_up(:compact_test)
 
-    info = Timeless.info(:compact_test)
+    info = TimelessMetrics.info(:compact_test)
     assert info.tiers[:hourly].dead_bytes > 0
   end
 end

@@ -1,4 +1,4 @@
-defmodule Timeless.Retention do
+defmodule TimelessMetrics.Retention do
   @moduledoc """
   Tier-aware retention enforcer.
 
@@ -56,7 +56,7 @@ defmodule Timeless.Retention do
 
   defp do_enforce(state) do
     now = System.os_time(:second)
-    shard_count = :persistent_term.get({Timeless, state.store, :shard_count})
+    shard_count = :persistent_term.get({TimelessMetrics, state.store, :shard_count})
 
     # 1. Drop expired raw segments from all shards
     if state.schema.raw_retention_seconds != :forever do
@@ -64,7 +64,7 @@ defmodule Timeless.Retention do
 
       for i <- 0..(shard_count - 1) do
         builder = :"#{state.store}_builder_#{i}"
-        Timeless.SegmentBuilder.delete_raw_before(builder, raw_cutoff)
+        TimelessMetrics.SegmentBuilder.delete_raw_before(builder, raw_cutoff)
       end
     end
 
@@ -75,10 +75,10 @@ defmodule Timeless.Retention do
 
         for i <- 0..(shard_count - 1) do
           builder = :"#{state.store}_builder_#{i}"
-          Timeless.SegmentBuilder.delete_tier_before(builder, tier.name, cutoff)
+          TimelessMetrics.SegmentBuilder.delete_tier_before(builder, tier.name, cutoff)
 
           # Compact if deletion created significant dead space
-          Timeless.SegmentBuilder.compact_tier(builder, tier.name)
+          TimelessMetrics.SegmentBuilder.compact_tier(builder, tier.name)
         end
       end
     end)
@@ -93,7 +93,7 @@ defmodule Timeless.Retention do
     counter = state.vacuum_counter + 1
 
     if rem(counter, @vacuum_every) == 0 do
-      Timeless.DB.write(state.db, "PRAGMA incremental_vacuum(1000)", [])
+      TimelessMetrics.DB.write(state.db, "PRAGMA incremental_vacuum(1000)", [])
     end
 
     %{state | vacuum_counter: counter}
@@ -106,13 +106,13 @@ defmodule Timeless.Retention do
         builder = :"#{state.store}_builder_#{i}"
 
         # Raw segments
-        {:ok, raw_rows} = Timeless.SegmentBuilder.raw_series_ids(builder)
+        {:ok, raw_rows} = TimelessMetrics.SegmentBuilder.raw_series_ids(builder)
         raw_ids = Enum.map(raw_rows, fn [id] -> id end)
 
         # Tier tables (from ShardStore ETS)
         tier_ids =
           Enum.flat_map(state.schema.tiers, fn tier ->
-            {:ok, tier_rows} = Timeless.SegmentBuilder.read_tier_series_ids(builder, tier.name)
+            {:ok, tier_rows} = TimelessMetrics.SegmentBuilder.read_tier_series_ids(builder, tier.name)
             Enum.map(tier_rows, fn [id] -> id end)
           end)
 
@@ -122,7 +122,7 @@ defmodule Timeless.Retention do
       |> Enum.uniq()
 
     if all_active_ids == [] do
-      Timeless.DB.write(state.db, "DELETE FROM series", [])
+      TimelessMetrics.DB.write(state.db, "DELETE FROM series", [])
     else
       values =
         all_active_ids
@@ -130,16 +130,16 @@ defmodule Timeless.Retention do
         |> Enum.join(" UNION ALL ")
 
       sql = "DELETE FROM series WHERE id NOT IN (#{values})"
-      Timeless.DB.write(state.db, sql, [])
+      TimelessMetrics.DB.write(state.db, sql, [])
     end
   end
 
   defp cleanup_orphaned_alerts(state) do
-    {:ok, rules} = Timeless.Alert.list_rules(state.db)
+    {:ok, rules} = TimelessMetrics.Alert.list_rules(state.db)
 
     Enum.each(rules, fn rule ->
       {:ok, series_rows} =
-        Timeless.DB.read(
+        TimelessMetrics.DB.read(
           state.db,
           "SELECT COUNT(*) FROM series WHERE metric_name = ?1",
           [rule.metric]
@@ -148,7 +148,7 @@ defmodule Timeless.Retention do
       case series_rows do
         [[0]] ->
           Logger.info("Deleting orphaned alert rule #{rule.id} (#{rule.name}): metric '#{rule.metric}' has no series")
-          Timeless.Alert.delete_rule(state.db, rule.id)
+          TimelessMetrics.Alert.delete_rule(state.db, rule.id)
 
         _ ->
           :ok

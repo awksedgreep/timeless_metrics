@@ -1,4 +1,4 @@
-defmodule Timeless.HTTP do
+defmodule TimelessMetrics.HTTP do
   require Logger
 
   @moduledoc """
@@ -6,11 +6,11 @@ defmodule Timeless.HTTP do
 
   ## Usage
 
-  Add to your supervision tree alongside Timeless:
+  Add to your supervision tree alongside TimelessMetrics:
 
       children = [
-        {Timeless, name: :metrics, data_dir: "/var/lib/metrics"},
-        {Timeless.HTTP, store: :metrics, port: 8428}
+        {TimelessMetrics, name: :metrics, data_dir: "/var/lib/metrics"},
+        {TimelessMetrics.HTTP, store: :metrics, port: 8428}
       ]
 
   ## Endpoints
@@ -89,8 +89,8 @@ defmodule Timeless.HTTP do
   @impl Plug
   def call(conn, opts) do
     conn
-    |> Plug.Conn.put_private(:timeless, Keyword.get(opts, :store))
-    |> Plug.Conn.put_private(:timeless_token, Keyword.get(opts, :bearer_token))
+    |> Plug.Conn.put_private(:timeless_metrics, Keyword.get(opts, :store))
+    |> Plug.Conn.put_private(:timeless_metrics_token, Keyword.get(opts, :bearer_token))
     |> super(opts)
   end
 
@@ -100,7 +100,7 @@ defmodule Timeless.HTTP do
   defp authenticate(%{request_path: "/health"} = conn, _opts), do: conn
 
   defp authenticate(conn, _opts) do
-    case conn.private[:timeless_token] do
+    case conn.private[:timeless_metrics_token] do
       nil -> conn
       expected -> check_token(conn, expected)
     end
@@ -140,14 +140,14 @@ defmodule Timeless.HTTP do
 
   # VictoriaMetrics JSON line import
   post "/api/v1/import" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
 
     case Plug.Conn.read_body(conn, length: @max_body_bytes) do
       {:ok, body, conn} ->
         {count, errors, error_samples} = ingest_json_lines(store, body)
 
         :telemetry.execute(
-          [:timeless, :http, :import],
+          [:timeless_metrics, :http, :import],
           %{sample_count: count, error_count: errors},
           %{store: store}
         )
@@ -178,8 +178,8 @@ defmodule Timeless.HTTP do
 
   # Health check with store stats
   get "/health" do
-    store = conn.private.timeless
-    info = Timeless.info(store)
+    store = conn.private.timeless_metrics
+    info = TimelessMetrics.info(store)
 
     body =
       Jason.encode!(%{
@@ -198,7 +198,7 @@ defmodule Timeless.HTTP do
 
   # Online backup — creates consistent snapshot of all databases
   post "/api/v1/backup" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
 
     parsed_path =
       case Plug.Conn.read_body(conn, length: 64_000) do
@@ -218,7 +218,7 @@ defmodule Timeless.HTTP do
     target_dir =
       parsed_path || default_backup_dir(store)
 
-    {:ok, result} = Timeless.backup(store, target_dir)
+    {:ok, result} = TimelessMetrics.backup(store, target_dir)
 
     conn
     |> put_resp_content_type("application/json")
@@ -232,12 +232,12 @@ defmodule Timeless.HTTP do
 
   # Export raw points in VictoriaMetrics JSON line format (multi-series)
   get "/api/v1/export" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_query_params(conn.query_params) do
       {:ok, metric, labels, from, to} ->
-        {:ok, results} = Timeless.query_multi(store, metric, labels, from: from, to: to)
+        {:ok, results} = TimelessMetrics.query_multi(store, metric, labels, from: from, to: to)
 
         body =
           results
@@ -263,12 +263,12 @@ defmodule Timeless.HTTP do
 
   # Latest value for matching series
   get "/api/v1/query" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_metric_and_labels(conn.query_params) do
       {:ok, metric, labels} ->
-        {:ok, results} = Timeless.query_multi(store, metric, labels)
+        {:ok, results} = TimelessMetrics.query_multi(store, metric, labels)
 
         data =
           results
@@ -296,7 +296,7 @@ defmodule Timeless.HTTP do
 
   # Range query with bucketed aggregation (multi-series)
   get "/api/v1/query_range" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_query_params(conn.query_params) do
@@ -304,10 +304,10 @@ defmodule Timeless.HTTP do
         params = conn.query_params
         step = parse_int(params["step"], 60)
         agg = parse_aggregate(params["aggregate"])
-        transform = Timeless.Transform.parse(params["transform"])
+        transform = TimelessMetrics.Transform.parse(params["transform"])
 
         {:ok, results} =
-          Timeless.query_aggregate_multi(store, metric, labels,
+          TimelessMetrics.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
@@ -331,8 +331,8 @@ defmodule Timeless.HTTP do
 
   # List all metric names
   get "/api/v1/label/__name__/values" do
-    store = conn.private.timeless
-    {:ok, metrics} = Timeless.list_metrics(store)
+    store = conn.private.timeless_metrics
+    {:ok, metrics} = TimelessMetrics.list_metrics(store)
 
     conn
     |> put_resp_content_type("application/json")
@@ -341,13 +341,13 @@ defmodule Timeless.HTTP do
 
   # List values for a specific label key
   get "/api/v1/label/:name/values" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
     label_name = conn.path_params["name"]
     metric = conn.query_params["metric"]
 
     if metric do
-      {:ok, values} = Timeless.label_values(store, metric, label_name)
+      {:ok, values} = TimelessMetrics.label_values(store, metric, label_name)
 
       conn
       |> put_resp_content_type("application/json")
@@ -359,7 +359,7 @@ defmodule Timeless.HTTP do
 
   # List all series for a metric
   get "/api/v1/series" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
 
     case conn.query_params["metric"] do
@@ -367,7 +367,7 @@ defmodule Timeless.HTTP do
         json_error(conn, 400, "missing required parameter: metric")
 
       metric ->
-        {:ok, series} = Timeless.list_series(store, metric)
+        {:ok, series} = TimelessMetrics.list_series(store, metric)
 
         conn
         |> put_resp_content_type("application/json")
@@ -377,13 +377,13 @@ defmodule Timeless.HTTP do
 
   # Register or update metric metadata
   post "/api/v1/metadata" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
         case Jason.decode(body) do
           {:ok, %{"metric" => metric, "type" => type} = params} when type in ~w(gauge counter histogram) ->
-            Timeless.register_metric(store, metric, String.to_existing_atom(type),
+            TimelessMetrics.register_metric(store, metric, String.to_existing_atom(type),
               unit: params["unit"],
               description: params["description"]
             )
@@ -406,7 +406,7 @@ defmodule Timeless.HTTP do
 
   # Get metric metadata
   get "/api/v1/metadata" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
 
     case conn.query_params["metric"] do
@@ -414,7 +414,7 @@ defmodule Timeless.HTTP do
         json_error(conn, 400, "missing required parameter: metric")
 
       metric ->
-        {:ok, meta} = Timeless.get_metadata(store, metric)
+        {:ok, meta} = TimelessMetrics.get_metadata(store, metric)
 
         if meta do
           conn
@@ -430,7 +430,7 @@ defmodule Timeless.HTTP do
 
   # Create an annotation
   post "/api/v1/annotations" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
@@ -441,7 +441,7 @@ defmodule Timeless.HTTP do
             description = params["description"]
 
             {:ok, id} =
-              Timeless.annotate(store, timestamp, title,
+              TimelessMetrics.annotate(store, timestamp, title,
                 description: description,
                 tags: tags
               )
@@ -461,7 +461,7 @@ defmodule Timeless.HTTP do
 
   # Query annotations in a time range
   get "/api/v1/annotations" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
@@ -475,7 +475,7 @@ defmodule Timeless.HTTP do
         tags_str -> String.split(tags_str, ",", trim: true)
       end
 
-    {:ok, results} = Timeless.annotations(store, from, to, tags: tag_filter)
+    {:ok, results} = TimelessMetrics.annotations(store, from, to, tags: tag_filter)
 
     conn
     |> put_resp_content_type("application/json")
@@ -484,9 +484,9 @@ defmodule Timeless.HTTP do
 
   # Delete an annotation
   delete "/api/v1/annotations/:id" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     {id, _} = Integer.parse(conn.path_params["id"])
-    Timeless.delete_annotation(store, id)
+    TimelessMetrics.delete_annotation(store, id)
 
     conn
     |> put_resp_content_type("application/json")
@@ -495,7 +495,7 @@ defmodule Timeless.HTTP do
 
   # Create an alert rule
   post "/api/v1/alerts" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
@@ -513,7 +513,7 @@ defmodule Timeless.HTTP do
               webhook_url: params["webhook_url"]
             ]
 
-            {:ok, id} = Timeless.create_alert(store, opts)
+            {:ok, id} = TimelessMetrics.create_alert(store, opts)
 
             conn
             |> put_resp_content_type("application/json")
@@ -530,8 +530,8 @@ defmodule Timeless.HTTP do
 
   # List all alert rules with state
   get "/api/v1/alerts" do
-    store = conn.private.timeless
-    {:ok, rules} = Timeless.list_alerts(store)
+    store = conn.private.timeless_metrics
+    {:ok, rules} = TimelessMetrics.list_alerts(store)
 
     conn
     |> put_resp_content_type("application/json")
@@ -540,9 +540,9 @@ defmodule Timeless.HTTP do
 
   # Delete an alert rule
   delete "/api/v1/alerts/:id" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     {id, _} = Integer.parse(conn.path_params["id"])
-    Timeless.delete_alert(store, id)
+    TimelessMetrics.delete_alert(store, id)
 
     conn
     |> put_resp_content_type("application/json")
@@ -551,7 +551,7 @@ defmodule Timeless.HTTP do
 
   # Forecast future values
   get "/api/v1/forecast" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_query_params(conn.query_params) do
@@ -559,10 +559,10 @@ defmodule Timeless.HTTP do
         params = conn.query_params
         step = parse_int(params["step"], 300)
         horizon = parse_duration_param(params["horizon"], 3600)
-        transform = Timeless.Transform.parse(params["transform"])
+        transform = TimelessMetrics.Transform.parse(params["transform"])
 
         {:ok, results} =
-          Timeless.query_aggregate_multi(store, metric, labels,
+          TimelessMetrics.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
@@ -572,7 +572,7 @@ defmodule Timeless.HTTP do
 
         forecasts =
           Enum.map(results, fn %{labels: l, data: data} ->
-            case Timeless.Forecast.predict(data, horizon: horizon, bucket: step) do
+            case TimelessMetrics.Forecast.predict(data, horizon: horizon, bucket: step) do
               {:ok, predictions} ->
                 %{
                   labels: l,
@@ -596,7 +596,7 @@ defmodule Timeless.HTTP do
 
   # Anomaly detection
   get "/api/v1/anomalies" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_query_params(conn.query_params) do
@@ -604,10 +604,10 @@ defmodule Timeless.HTTP do
         params = conn.query_params
         step = parse_int(params["step"], 300)
         sensitivity = parse_sensitivity(params["sensitivity"])
-        transform = Timeless.Transform.parse(params["transform"])
+        transform = TimelessMetrics.Transform.parse(params["transform"])
 
         {:ok, results} =
-          Timeless.query_aggregate_multi(store, metric, labels,
+          TimelessMetrics.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
@@ -617,7 +617,7 @@ defmodule Timeless.HTTP do
 
         detections =
           Enum.map(results, fn %{labels: l, data: data} ->
-            case Timeless.Anomaly.detect(data, sensitivity: sensitivity) do
+            case TimelessMetrics.Anomaly.detect(data, sensitivity: sensitivity) do
               {:ok, analysis} -> %{labels: l, analysis: analysis}
               {:error, _} -> %{labels: l, analysis: []}
             end
@@ -635,16 +635,16 @@ defmodule Timeless.HTTP do
   # SVG chart — embeddable via <img src="http://host:port/chart?metric=cpu&host=web-1&from=-1h">
   # Optional: &forecast=1h for forecast overlay, &anomalies=medium for anomaly markers
   get "/chart" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
     case extract_chart_params(params) do
       {:ok, metric, labels, from, to, step, agg, width, height, theme} ->
-        transform = Timeless.Transform.parse(params["transform"])
+        transform = TimelessMetrics.Transform.parse(params["transform"])
 
         {:ok, results} =
-          Timeless.query_aggregate_multi(store, metric, labels,
+          TimelessMetrics.query_aggregate_multi(store, metric, labels,
             from: from,
             to: to,
             bucket: {step, :seconds},
@@ -652,7 +652,7 @@ defmodule Timeless.HTTP do
             transform: transform
           )
 
-        {:ok, annots} = Timeless.annotations(store, from, to)
+        {:ok, annots} = TimelessMetrics.annotations(store, from, to)
 
         # Optional forecast overlay
         forecast_data =
@@ -665,7 +665,7 @@ defmodule Timeless.HTTP do
 
               case results do
                 [%{data: data} | _] ->
-                  case Timeless.Forecast.predict(data, horizon: horizon, bucket: step) do
+                  case TimelessMetrics.Forecast.predict(data, horizon: horizon, bucket: step) do
                     {:ok, predictions} ->
                       last_point = List.last(data)
                       if last_point, do: [last_point | predictions], else: predictions
@@ -690,7 +690,7 @@ defmodule Timeless.HTTP do
 
               results
               |> Enum.flat_map(fn %{data: data} ->
-                case Timeless.Anomaly.detect(data, sensitivity: sensitivity) do
+                case TimelessMetrics.Anomaly.detect(data, sensitivity: sensitivity) do
                   {:ok, analysis} ->
                     analysis
                     |> Enum.filter(& &1.anomaly)
@@ -703,7 +703,7 @@ defmodule Timeless.HTTP do
           end
 
         svg =
-          Timeless.Chart.render(metric, results,
+          TimelessMetrics.Chart.render(metric, results,
             width: width,
             height: height,
             theme: theme,
@@ -725,14 +725,14 @@ defmodule Timeless.HTTP do
   # Prometheus text exposition format import
   # Each line: metric_name{label1="val1",label2="val2"} value [timestamp_ms]
   post "/api/v1/import/prometheus" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
 
     case Plug.Conn.read_body(conn, length: @max_body_bytes) do
       {:ok, body, conn} ->
         {count, errors, error_samples} = ingest_prometheus_text(store, body)
 
         :telemetry.execute(
-          [:timeless, :http, :import],
+          [:timeless_metrics, :http, :import],
           %{sample_count: count, error_count: errors},
           %{store: store, format: :prometheus}
         )
@@ -761,7 +761,7 @@ defmodule Timeless.HTTP do
 
   # Prometheus-compatible query_range endpoint (for Grafana)
   get "/prometheus/api/v1/query_range" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
@@ -778,7 +778,7 @@ defmodule Timeless.HTTP do
         step = parse_prom_step(params["step"], 60)
 
         {:ok, results} =
-          Timeless.query_aggregate_multi(store, metric, labels,
+          TimelessMetrics.query_aggregate_multi(store, metric, labels,
             from: start_ts,
             to: end_ts,
             bucket: {step, :seconds},
@@ -814,7 +814,7 @@ defmodule Timeless.HTTP do
 
   # Dashboard — zero-dependency HTML overview page
   get "/" do
-    store = conn.private.timeless
+    store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
@@ -823,7 +823,7 @@ defmodule Timeless.HTTP do
     filter = label_params(params)
 
     html =
-      Timeless.Dashboard.render(
+      TimelessMetrics.Dashboard.render(
         store: store,
         from: from,
         to: to,
@@ -944,7 +944,7 @@ defmodule Timeless.HTTP do
   end
 
   defp default_backup_dir(store) do
-    db_path = Timeless.DB.db_path(:"#{store}_db")
+    db_path = TimelessMetrics.DB.db_path(:"#{store}_db")
     data_dir = Path.dirname(db_path)
     Path.join([data_dir, "backups", to_string(System.os_time(:second))])
   end
@@ -990,7 +990,7 @@ defmodule Timeless.HTTP do
     flat_entries = List.flatten(all_entries)
 
     if flat_entries != [] do
-      Timeless.write_batch(store, flat_entries)
+      TimelessMetrics.write_batch(store, flat_entries)
     end
 
     {length(flat_entries), errors, Enum.reverse(error_samples)}
@@ -1064,7 +1064,7 @@ defmodule Timeless.HTTP do
     end
 
     if all_entries != [] do
-      Timeless.write_batch(store, all_entries)
+      TimelessMetrics.write_batch(store, all_entries)
     end
 
     {length(all_entries), errors, Enum.reverse(error_samples)}

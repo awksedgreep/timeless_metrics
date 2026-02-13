@@ -1,4 +1,4 @@
-defmodule Timeless.SegmentBuilder do
+defmodule TimelessMetrics.SegmentBuilder do
   @moduledoc """
   Accumulates points per series and writes gorilla-compressed segments to
   file-based storage (ShardStore).
@@ -63,7 +63,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_raw_segments(builder_name, series_id, from, to) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.read_segments(store, series_id, from, to)
+    TimelessMetrics.ShardStore.read_segments(store, series_id, from, to)
   end
 
   @doc """
@@ -73,7 +73,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_raw_for_rollup(builder_name, from, to) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.read_all_segments(store, from, to)
+    TimelessMetrics.ShardStore.read_all_segments(store, from, to)
   end
 
   @doc """
@@ -83,7 +83,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_raw_latest(builder_name, series_id) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.read_latest(store, series_id)
+    TimelessMetrics.ShardStore.read_latest(store, series_id)
   end
 
   @doc """
@@ -100,7 +100,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def raw_series_ids(builder_name) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.distinct_series_ids(store)
+    TimelessMetrics.ShardStore.distinct_series_ids(store)
   end
 
   @doc """
@@ -110,7 +110,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def raw_stats(builder_name) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.stats(store)
+    TimelessMetrics.ShardStore.stats(store)
   end
 
   # --- Tier chunk APIs (Phase 2: file-based storage) ---
@@ -122,7 +122,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_tier_chunks(builder_name, tier_name, series_id, from, to) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.read_tier_range(store, tier_name, series_id, from, to)
+    TimelessMetrics.ShardStore.read_tier_range(store, tier_name, series_id, from, to)
   end
 
   @doc """
@@ -132,7 +132,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_tier_chunk_for_merge(builder_name, tier_name, series_id, chunk_start) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.read_tier_chunk(store, tier_name, series_id, chunk_start)
+    TimelessMetrics.ShardStore.read_tier_chunk(store, tier_name, series_id, chunk_start)
   end
 
   @doc """
@@ -142,7 +142,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_tier_latest(builder_name, tier_name, series_id) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.read_tier_latest(store, tier_name, series_id)
+    TimelessMetrics.ShardStore.read_tier_latest(store, tier_name, series_id)
   end
 
   @doc """
@@ -152,7 +152,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_tier_for_rollup(builder_name, tier_name, from, to) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.read_tier_for_rollup(store, tier_name, from, to)
+    TimelessMetrics.ShardStore.read_tier_for_rollup(store, tier_name, from, to)
   end
 
   @doc """
@@ -162,7 +162,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_tier_series_ids(builder_name, tier_name) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.tier_series_ids(store, tier_name)
+    TimelessMetrics.ShardStore.tier_series_ids(store, tier_name)
   end
 
   @doc """
@@ -172,7 +172,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_tier_stats(builder_name, tier_name) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.tier_stats(store, tier_name)
+    TimelessMetrics.ShardStore.tier_stats(store, tier_name)
   end
 
   @doc """
@@ -200,7 +200,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def read_watermark(builder_name, tier_name) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.read_watermark(store, tier_name)
+    TimelessMetrics.ShardStore.read_watermark(store, tier_name)
   end
 
   @doc """
@@ -219,7 +219,7 @@ defmodule Timeless.SegmentBuilder do
   """
   def tier_dead_bytes(builder_name, tier_name) do
     store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    Timeless.ShardStore.tier_dead_bytes(store, tier_name)
+    TimelessMetrics.ShardStore.tier_dead_bytes(store, tier_name)
   end
 
   @doc """
@@ -252,7 +252,7 @@ defmodule Timeless.SegmentBuilder do
     File.mkdir_p!(data_dir)
 
     # Initialize file-based storage (raw segments + tiers + watermarks)
-    shard_store = Timeless.ShardStore.init(data_dir, shard_id, segment_duration)
+    shard_store = TimelessMetrics.ShardStore.init(data_dir, shard_id, segment_duration)
 
     shard_store =
       if schema do
@@ -261,10 +261,10 @@ defmodule Timeless.SegmentBuilder do
         shard_store
         |> then(fn ss ->
           Enum.reduce(schema.tiers, ss, fn tier, acc ->
-            Timeless.ShardStore.init_tier(acc, tier.name)
+            TimelessMetrics.ShardStore.init_tier(acc, tier.name)
           end)
         end)
-        |> Timeless.ShardStore.init_watermarks(tier_names)
+        |> TimelessMetrics.ShardStore.init_watermarks(tier_names)
       else
         shard_store
       end
@@ -354,27 +354,27 @@ defmodule Timeless.SegmentBuilder do
   end
 
   def handle_call({:delete_raw_before, cutoff}, _from, state) do
-    result = Timeless.ShardStore.delete_before(state.shard_store, cutoff)
+    result = TimelessMetrics.ShardStore.delete_before(state.shard_store, cutoff)
     {:reply, result, state}
   end
 
   def handle_call({:write_tier_batch, tier_name, entries}, _from, state) do
-    Timeless.ShardStore.write_tier_batch(state.shard_store, tier_name, entries)
+    TimelessMetrics.ShardStore.write_tier_batch(state.shard_store, tier_name, entries)
     {:reply, :ok, state}
   end
 
   def handle_call({:delete_tier_before, tier_name, cutoff}, _from, state) do
-    Timeless.ShardStore.delete_tier_before(state.shard_store, tier_name, cutoff)
+    TimelessMetrics.ShardStore.delete_tier_before(state.shard_store, tier_name, cutoff)
     {:reply, :ok, state}
   end
 
   def handle_call({:write_watermark, tier_name, value}, _from, state) do
-    Timeless.ShardStore.write_watermark(state.shard_store, tier_name, value)
+    TimelessMetrics.ShardStore.write_watermark(state.shard_store, tier_name, value)
     {:reply, :ok, state}
   end
 
   def handle_call({:compact_tier, tier_name, opts}, _from, state) do
-    result = Timeless.ShardStore.compact_tier(state.shard_store, tier_name, opts)
+    result = TimelessMetrics.ShardStore.compact_tier(state.shard_store, tier_name, opts)
     {:reply, result, state}
   end
 
@@ -413,12 +413,12 @@ defmodule Timeless.SegmentBuilder do
 
     # Persist tier ETS indexes and watermarks to disk
     if state.shard_store.tier_state != %{} do
-      Timeless.ShardStore.persist_tier_indexes(state.shard_store)
-      Timeless.ShardStore.cleanup_tiers(state.shard_store)
+      TimelessMetrics.ShardStore.persist_tier_indexes(state.shard_store)
+      TimelessMetrics.ShardStore.cleanup_tiers(state.shard_store)
     end
 
-    Timeless.ShardStore.persist_watermarks(state.shard_store)
-    Timeless.ShardStore.cleanup_watermarks(state.shard_store)
+    TimelessMetrics.ShardStore.persist_watermarks(state.shard_store)
+    TimelessMetrics.ShardStore.cleanup_watermarks(state.shard_store)
 
     # Clean up persistent_term
     :persistent_term.erase({__MODULE__, state.name, :shard_store})
@@ -457,7 +457,7 @@ defmodule Timeless.SegmentBuilder do
           {last_ts, _} = List.last(sorted_points)
 
           :telemetry.execute(
-            [:timeless, :segment, :write],
+            [:timeless_metrics, :segment, :write],
             %{point_count: point_count, compressed_bytes: byte_size(blob)},
             %{series_id: seg.series_id}
           )
@@ -479,7 +479,7 @@ defmodule Timeless.SegmentBuilder do
     compressed = compress_segments(segments, state)
 
     if compressed != [] do
-      Timeless.ShardStore.write_wal(state.shard_store, compressed)
+      TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
     end
   end
 
@@ -488,14 +488,14 @@ defmodule Timeless.SegmentBuilder do
     compressed = compress_segments(segments, state)
 
     if compressed != [] do
-      Timeless.ShardStore.write_wal(state.shard_store, compressed)
+      TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
 
       # Seal each completed window
       compressed
       |> Enum.map(fn {_sid, start, _, _, _} -> segment_bucket(start, state.segment_duration) end)
       |> Enum.uniq()
       |> Enum.each(fn window ->
-        Timeless.ShardStore.seal_window(state.shard_store, window)
+        TimelessMetrics.ShardStore.seal_window(state.shard_store, window)
       end)
     end
   end

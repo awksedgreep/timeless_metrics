@@ -1,4 +1,4 @@
-defmodule Timeless.Buffer do
+defmodule TimelessMetrics.Buffer do
   @moduledoc """
   Sharded ETS write buffer.
 
@@ -56,7 +56,7 @@ defmodule Timeless.Buffer do
 
       {:error, :backpressure} = err ->
         :telemetry.execute(
-          [:timeless, :write, :backpressure],
+          [:timeless_metrics, :write, :backpressure],
           %{count: 1},
           %{shard: shard_name}
         )
@@ -95,7 +95,7 @@ defmodule Timeless.Buffer do
 
       {:error, :backpressure} = err ->
         :telemetry.execute(
-          [:timeless, :write, :backpressure],
+          [:timeless_metrics, :write, :backpressure],
           %{count: 1},
           %{shard: shard_name}
         )
@@ -211,12 +211,12 @@ defmodule Timeless.Buffer do
       grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
 
       :telemetry.execute(
-        [:timeless, :buffer, :flush],
+        [:timeless_metrics, :buffer, :flush],
         %{point_count: length(points), series_count: map_size(grouped)},
         %{shard: state.shard_id}
       )
 
-      Timeless.SegmentBuilder.ingest(state.segment_builder, grouped)
+      TimelessMetrics.SegmentBuilder.ingest(state.segment_builder, grouped)
     end
   end
 
@@ -227,7 +227,7 @@ defmodule Timeless.Buffer do
 
     if points != [] do
       grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
-      Timeless.SegmentBuilder.ingest_sync(state.segment_builder, grouped)
+      TimelessMetrics.SegmentBuilder.ingest_sync(state.segment_builder, grouped)
     end
   end
 

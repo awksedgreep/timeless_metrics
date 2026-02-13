@@ -1,7 +1,7 @@
-defmodule Timeless.ForecastTest do
+defmodule TimelessMetrics.ForecastTest do
   use ExUnit.Case, async: true
 
-  alias Timeless.Forecast
+  alias TimelessMetrics.Forecast
 
   # Helper: generate sinusoidal data at a given interval
   defp sinusoidal_data(opts) do

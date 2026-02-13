@@ -1,7 +1,7 @@
 defmodule Mix.Tasks.BenchCompressedTiers do
   @shortdoc "Benchmark compressed tier storage, rollup speed, and query latency"
   @moduledoc """
-  Populates a Timeless store, triggers rollup, and measures:
+  Populates a TimelessMetrics store, triggers rollup, and measures:
 
   1. Storage: bytes on disk for raw vs tier data, bytes per bucket
   2. Rollup speed: time to roll up raw → hourly → daily
@@ -53,10 +53,10 @@ defmodule Mix.Tasks.BenchCompressedTiers do
     data_dir = "/tmp/timeless_bench_#{System.os_time(:millisecond)}"
     File.mkdir_p!(data_dir)
 
-    schema = Timeless.Schema.default()
+    schema = TimelessMetrics.Schema.default()
 
     {:ok, sup} =
-      Timeless.Supervisor.start_link(
+      TimelessMetrics.Supervisor.start_link(
         name: :bench_ct,
         data_dir: data_dir,
         buffer_shards: shards,
@@ -75,15 +75,15 @@ defmodule Mix.Tasks.BenchCompressedTiers do
     # --- Rollup ---
     IO.puts("== Rollup ==")
 
-    {rollup1_us, _} = :timer.tc(fn -> Timeless.rollup(:bench_ct, :all) end)
+    {rollup1_us, _} = :timer.tc(fn -> TimelessMetrics.rollup(:bench_ct, :all) end)
     IO.puts("  First rollup:  #{fmt_ms(rollup1_us)}")
 
-    {rollup2_us, _} = :timer.tc(fn -> Timeless.rollup(:bench_ct, :all) end)
+    {rollup2_us, _} = :timer.tc(fn -> TimelessMetrics.rollup(:bench_ct, :all) end)
     IO.puts("  Second rollup: #{fmt_ms(rollup2_us)} (idempotent, no new data)")
     IO.puts("")
 
     # Flush everything
-    Timeless.flush(:bench_ct)
+    TimelessMetrics.flush(:bench_ct)
 
     # --- Storage ---
     IO.puts("== Storage ==")
@@ -129,7 +129,7 @@ defmodule Mix.Tasks.BenchCompressedTiers do
     registry = :bench_ct_registry
     metric = hd(@metrics)
     labels = %{"host" => "dev_0"}
-    _series_id = Timeless.SeriesRegistry.get_or_create(registry, metric, labels)
+    _series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric, labels)
 
     now = System.os_time(:second)
 
@@ -137,7 +137,7 @@ defmodule Mix.Tasks.BenchCompressedTiers do
       if from >= now - days * 86_400 do
         {us, {:ok, results}} =
           :timer.tc(fn ->
-            Timeless.query_aggregate(:bench_ct, metric, labels,
+            TimelessMetrics.query_aggregate(:bench_ct, metric, labels,
               from: from,
               to: now,
               bucket: :hour,
@@ -197,7 +197,7 @@ defmodule Mix.Tasks.BenchCompressedTiers do
             {metric, elem(labels_for, dev), value, ts}
           end
 
-        Timeless.write_batch(store, batch)
+        TimelessMetrics.write_batch(store, batch)
       end)
 
       if rem(day + 1, 5) == 0 do
@@ -205,7 +205,7 @@ defmodule Mix.Tasks.BenchCompressedTiers do
       end
     end
 
-    Timeless.flush(store)
+    TimelessMetrics.flush(store)
     total_points
   end
 
@@ -215,7 +215,7 @@ defmodule Mix.Tasks.BenchCompressedTiers do
     {raw_segs, raw_bytes} =
       Enum.reduce(0..(shards - 1), {0, 0}, fn i, {s_acc, b_acc} ->
         builder = :"#{store}_builder_#{i}"
-        stats = Timeless.SegmentBuilder.raw_stats(builder)
+        stats = TimelessMetrics.SegmentBuilder.raw_stats(builder)
         {s_acc + stats.segment_count, b_acc + stats.raw_bytes}
       end)
 
@@ -224,7 +224,7 @@ defmodule Mix.Tasks.BenchCompressedTiers do
         {chunks, bucket_count, tier_bytes} =
           Enum.reduce(0..(shards - 1), {0, 0, 0}, fn i, {c_acc, b_acc, tb_acc} ->
             builder = :"#{store}_builder_#{i}"
-            {c, b, tb} = Timeless.SegmentBuilder.read_tier_stats(builder, tier.name)
+            {c, b, tb} = TimelessMetrics.SegmentBuilder.read_tier_stats(builder, tier.name)
             {c_acc + c, b_acc + b, tb_acc + tb}
           end)
 

@@ -1,13 +1,13 @@
-defmodule Timeless.HTTPTest do
+defmodule TimelessMetrics.HTTPTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_http_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!({Timeless, name: :http_test, data_dir: @data_dir, buffer_shards: 1})
+    start_supervised!({TimelessMetrics, name: :http_test, data_dir: @data_dir, buffer_shards: 1})
 
     on_exit(fn ->
-      :persistent_term.erase({Timeless, :http_test, :schema})
+      :persistent_term.erase({TimelessMetrics, :http_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -36,14 +36,14 @@ defmodule Timeless.HTTPTest do
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import", lines)
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 204
 
-    Timeless.flush(:http_test)
+    TimelessMetrics.flush(:http_test)
 
     {:ok, cpu_points} =
-      Timeless.query(:http_test, "cpu_usage", %{"host" => "web-1"},
+      TimelessMetrics.query(:http_test, "cpu_usage", %{"host" => "web-1"},
         from: now - 60,
         to: now + 120
       )
@@ -53,7 +53,7 @@ defmodule Timeless.HTTPTest do
     assert_in_delta v1, 73.2, 0.01
 
     {:ok, mem_points} =
-      Timeless.query(:http_test, "mem_usage", %{"host" => "web-1"},
+      TimelessMetrics.query(:http_test, "mem_usage", %{"host" => "web-1"},
         from: now - 60,
         to: now + 60
       )
@@ -76,13 +76,13 @@ defmodule Timeless.HTTPTest do
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import", lines)
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 204
 
-    Timeless.flush(:http_test)
+    TimelessMetrics.flush(:http_test)
 
-    info = Timeless.info(:http_test)
+    info = TimelessMetrics.info(:http_test)
     assert info.series_count == 50
   end
 
@@ -93,7 +93,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import", body)
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     # Returns 200 with error count when there are partial failures
     assert conn.status == 200
@@ -105,7 +105,7 @@ this is not json
   test "POST /api/v1/import with empty body" do
     conn =
       Plug.Test.conn(:post, "/api/v1/import", "")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 204
   end
@@ -120,7 +120,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import", body)
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     # Entire line treated as error
     assert conn.status == 200
@@ -132,7 +132,7 @@ this is not json
   test "GET /health returns store stats" do
     conn =
       Plug.Test.conn(:get, "/health")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     body = Jason.decode!(conn.resp_body)
@@ -145,7 +145,7 @@ this is not json
   test "unknown route returns 404" do
     conn =
       Plug.Test.conn(:get, "/nonexistent")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 404
   end
@@ -158,7 +158,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/api/v1/export?metric=cpu_usage&host=web-1&from=#{now - 60}&to=#{now + 120}")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -171,7 +171,7 @@ this is not json
   test "GET /api/v1/export returns empty body for no data" do
     conn =
       Plug.Test.conn(:get, "/api/v1/export?metric=nonexistent&from=0&to=9999999999")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     assert conn.resp_body == ""
@@ -180,7 +180,7 @@ this is not json
   test "GET /api/v1/export requires metric param" do
     conn =
       Plug.Test.conn(:get, "/api/v1/export?from=0&to=9999999999")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 400
     assert Jason.decode!(conn.resp_body)["error"] =~ "metric"
@@ -192,7 +192,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/api/v1/query?metric=mem_usage&host=db-1")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -203,7 +203,7 @@ this is not json
   test "GET /api/v1/query returns null for missing series" do
     conn =
       Plug.Test.conn(:get, "/api/v1/query?metric=nonexistent")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -224,7 +224,7 @@ this is not json
         :get,
         "/api/v1/query_range?metric=req_rate&svc=api&from=#{now - 1}&to=#{now + 10}&step=5&aggregate=avg"
       )
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -245,7 +245,7 @@ this is not json
           :get,
           "/api/v1/query_range?metric=latency&ep=/health&from=#{now - 1}&to=#{now + 10}&step=3600&aggregate=#{agg}"
         )
-        |> Timeless.HTTP.call(store: :http_test)
+        |> TimelessMetrics.HTTP.call(store: :http_test)
 
       assert conn.status == 200
       result = Jason.decode!(conn.resp_body)
@@ -258,7 +258,7 @@ this is not json
   test "GET /api/v1/query_range requires metric param" do
     conn =
       Plug.Test.conn(:get, "/api/v1/query_range?from=0&to=9999999999&step=60")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 400
   end
@@ -274,7 +274,7 @@ this is not json
     # Filter by dc=us only — should match 2 series
     conn =
       Plug.Test.conn(:get, "/api/v1/export?metric=cpu&dc=us&from=#{now - 60}&to=#{now + 60}")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     lines = String.split(conn.resp_body, "\n", trim: true)
@@ -289,7 +289,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/api/v1/export?metric=mem&from=#{now - 60}&to=#{now + 60}")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     lines = String.split(conn.resp_body, "\n", trim: true)
@@ -308,7 +308,7 @@ this is not json
         :get,
         "/api/v1/query_range?metric=req&svc=api&from=#{now - 1}&to=#{now + 10}&step=3600&aggregate=avg"
       )
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -323,7 +323,7 @@ this is not json
 
     # Filter host=a — 2 series
     {:ok, results} =
-      Timeless.query_multi(:http_test, "disk", %{"host" => "a"},
+      TimelessMetrics.query_multi(:http_test, "disk", %{"host" => "a"},
         from: now - 60,
         to: now + 60
       )
@@ -333,7 +333,7 @@ this is not json
 
     # No filter — all 3 series
     {:ok, all_results} =
-      Timeless.query_multi(:http_test, "disk", %{},
+      TimelessMetrics.query_multi(:http_test, "disk", %{},
         from: now - 60,
         to: now + 60
       )
@@ -349,7 +349,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/chart?metric=chart_test&host=web-1&from=#{now - 1}&to=#{now + 10}&step=1")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     assert {"content-type", "image/svg+xml; charset=utf-8"} in conn.resp_headers
@@ -365,7 +365,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/chart?metric=multi_chart&from=#{now - 1}&to=#{now + 10}&step=1")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     assert conn.resp_body =~ "<svg"
@@ -379,7 +379,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/chart?metric=sized_chart&id=1&from=#{now - 1}&to=#{now + 10}&width=400&height=200&step=1")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     assert conn.resp_body =~ ~s(width="400")
@@ -389,7 +389,7 @@ this is not json
   test "GET /chart with no data renders empty state" do
     conn =
       Plug.Test.conn(:get, "/chart?metric=nonexistent&from=0&to=9999999999&step=60")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     assert conn.resp_body =~ "No data"
@@ -401,7 +401,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/chart?metric=rel_chart&id=1&from=-1h&to=now")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     assert conn.resp_body =~ "<polyline"
@@ -410,7 +410,7 @@ this is not json
   test "GET /chart requires metric param" do
     conn =
       Plug.Test.conn(:get, "/chart?from=-1h")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 400
   end
@@ -425,7 +425,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/api/v1/label/__name__/values")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -443,7 +443,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/api/v1/label/host/values?metric=cpu")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -461,7 +461,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:get, "/api/v1/series?metric=net_rx")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -471,13 +471,13 @@ this is not json
   test "discovery endpoints require metric param where needed" do
     conn =
       Plug.Test.conn(:get, "/api/v1/label/host/values")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 400
 
     conn =
       Plug.Test.conn(:get, "/api/v1/series")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 400
   end
@@ -488,10 +488,10 @@ this is not json
     values
     |> Enum.with_index()
     |> Enum.each(fn {val, i} ->
-      Timeless.write(store, metric, labels, val, timestamp: base_ts + i)
+      TimelessMetrics.write(store, metric, labels, val, timestamp: base_ts + i)
     end)
 
-    Timeless.flush(store)
+    TimelessMetrics.flush(store)
   end
 
   test "labels without __name__ default to 'unknown'" do
@@ -504,14 +504,14 @@ this is not json
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import", body)
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 204
 
-    Timeless.flush(:http_test)
+    TimelessMetrics.flush(:http_test)
 
     {:ok, points} =
-      Timeless.query(:http_test, "unknown", %{"host" => "web-1"},
+      TimelessMetrics.query(:http_test, "unknown", %{"host" => "web-1"},
         from: 1_699_999_900,
         to: 1_700_000_100
       )
@@ -524,13 +524,13 @@ this is not json
   @secret "test-secret-token"
 
   defp authed_call(conn, opts \\ []) do
-    Timeless.HTTP.call(conn, Keyword.merge([store: :http_test, bearer_token: @secret], opts))
+    TimelessMetrics.HTTP.call(conn, Keyword.merge([store: :http_test, bearer_token: @secret], opts))
   end
 
   test "auth disabled: requests work without token" do
     conn =
       Plug.Test.conn(:get, "/health")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
   end
@@ -612,14 +612,14 @@ this is not json
     now = 1_700_000_000
 
     # Write values in tenths of dBmV
-    Timeless.write(:http_test, "snr", %{"port" => "u0"}, 380.0, timestamp: now)
-    Timeless.write(:http_test, "snr", %{"port" => "u0"}, 400.0, timestamp: now + 60)
-    Timeless.flush(:http_test)
+    TimelessMetrics.write(:http_test, "snr", %{"port" => "u0"}, 380.0, timestamp: now)
+    TimelessMetrics.write(:http_test, "snr", %{"port" => "u0"}, 400.0, timestamp: now + 60)
+    TimelessMetrics.flush(:http_test)
 
     # Query with divide:10 transform
     conn =
       Plug.Test.conn(:get, "/api/v1/query_range?metric=snr&port=u0&from=#{now}&to=#{now + 120}&step=300&transform=divide:10")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -632,12 +632,12 @@ this is not json
   test "transform: multiply via query_range" do
     now = 1_700_000_000
 
-    Timeless.write(:http_test, "ratio", %{"id" => "1"}, 0.95, timestamp: now)
-    Timeless.flush(:http_test)
+    TimelessMetrics.write(:http_test, "ratio", %{"id" => "1"}, 0.95, timestamp: now)
+    TimelessMetrics.flush(:http_test)
 
     conn =
       Plug.Test.conn(:get, "/api/v1/query_range?metric=ratio&id=1&from=#{now}&to=#{now + 60}&step=300&transform=multiply:100")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -649,13 +649,13 @@ this is not json
   test "transform: works on chart endpoint" do
     now = 1_700_000_000
 
-    Timeless.write(:http_test, "snr_chart", %{"port" => "u0"}, 380.0, timestamp: now)
-    Timeless.write(:http_test, "snr_chart", %{"port" => "u0"}, 400.0, timestamp: now + 300)
-    Timeless.flush(:http_test)
+    TimelessMetrics.write(:http_test, "snr_chart", %{"port" => "u0"}, 380.0, timestamp: now)
+    TimelessMetrics.write(:http_test, "snr_chart", %{"port" => "u0"}, 400.0, timestamp: now + 300)
+    TimelessMetrics.flush(:http_test)
 
     conn =
       Plug.Test.conn(:get, "/chart?metric=snr_chart&port=u0&from=#{now}&to=#{now + 600}&transform=divide:10")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     assert {"content-type", "image/svg+xml; charset=utf-8"} in conn.resp_headers
@@ -664,12 +664,12 @@ this is not json
   test "transform: no transform when param absent" do
     now = 1_700_000_000
 
-    Timeless.write(:http_test, "raw_val", %{"id" => "1"}, 42.0, timestamp: now)
-    Timeless.flush(:http_test)
+    TimelessMetrics.write(:http_test, "raw_val", %{"id" => "1"}, 42.0, timestamp: now)
+    TimelessMetrics.flush(:http_test)
 
     conn =
       Plug.Test.conn(:get, "/api/v1/query_range?metric=raw_val&id=1&from=#{now}&to=#{now + 60}&step=300")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -709,17 +709,17 @@ this is not json
     for i <- 0..99 do
       ts = now - (99 - i) * 300
       val = 50.0 + 20.0 * :math.sin(2 * :math.pi() * i / 50)
-      Timeless.write(:http_test, "forecast_test", %{"host" => "a"}, val, timestamp: ts)
+      TimelessMetrics.write(:http_test, "forecast_test", %{"host" => "a"}, val, timestamp: ts)
     end
 
-    Timeless.flush(:http_test)
+    TimelessMetrics.flush(:http_test)
 
     conn =
       Plug.Test.conn(
         :get,
         "/api/v1/forecast?metric=forecast_test&host=a&from=#{now - 100 * 300}&to=#{now}&step=300&horizon=3600"
       )
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -735,15 +735,15 @@ this is not json
   test "GET /api/v1/forecast with insufficient data returns empty forecast" do
     now = System.os_time(:second)
 
-    Timeless.write(:http_test, "sparse_fc", %{"id" => "1"}, 42.0, timestamp: now)
-    Timeless.flush(:http_test)
+    TimelessMetrics.write(:http_test, "sparse_fc", %{"id" => "1"}, 42.0, timestamp: now)
+    TimelessMetrics.flush(:http_test)
 
     conn =
       Plug.Test.conn(
         :get,
         "/api/v1/forecast?metric=sparse_fc&id=1&from=#{now - 60}&to=#{now + 60}&step=300&horizon=3600"
       )
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -760,17 +760,17 @@ this is not json
     for i <- 0..49 do
       ts = now - (49 - i) * 300
       val = if i == 25, do: 999.0, else: 50.0 + 5.0 * :math.sin(2 * :math.pi() * i / 25)
-      Timeless.write(:http_test, "anom_test", %{"host" => "b"}, val, timestamp: ts)
+      TimelessMetrics.write(:http_test, "anom_test", %{"host" => "b"}, val, timestamp: ts)
     end
 
-    Timeless.flush(:http_test)
+    TimelessMetrics.flush(:http_test)
 
     conn =
       Plug.Test.conn(
         :get,
         "/api/v1/anomalies?metric=anom_test&host=b&from=#{now - 50 * 300}&to=#{now}&step=300&sensitivity=high"
       )
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -793,17 +793,17 @@ this is not json
     for i <- 0..99 do
       ts = now - (99 - i) * 300
       val = 50.0 + 20.0 * :math.sin(2 * :math.pi() * i / 50)
-      Timeless.write(:http_test, "chart_fc", %{"id" => "1"}, val, timestamp: ts)
+      TimelessMetrics.write(:http_test, "chart_fc", %{"id" => "1"}, val, timestamp: ts)
     end
 
-    Timeless.flush(:http_test)
+    TimelessMetrics.flush(:http_test)
 
     conn =
       Plug.Test.conn(
         :get,
         "/chart?metric=chart_fc&id=1&from=#{now - 100 * 300}&to=#{now}&step=300&forecast=1h"
       )
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     assert conn.resp_body =~ "<svg"
@@ -817,17 +817,17 @@ this is not json
     for i <- 0..49 do
       ts = now - (49 - i) * 300
       val = if i == 25, do: 999.0, else: 50.0 + 5.0 * :math.sin(2 * :math.pi() * i / 25)
-      Timeless.write(:http_test, "chart_anom", %{"id" => "1"}, val, timestamp: ts)
+      TimelessMetrics.write(:http_test, "chart_anom", %{"id" => "1"}, val, timestamp: ts)
     end
 
-    Timeless.flush(:http_test)
+    TimelessMetrics.flush(:http_test)
 
     conn =
       Plug.Test.conn(
         :get,
         "/chart?metric=chart_anom&id=1&from=#{now - 50 * 300}&to=#{now}&step=300&anomalies=high"
       )
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     assert conn.resp_body =~ "<svg"
@@ -850,7 +850,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:post, "/api/v1/annotations", body)
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 201
     result = Jason.decode!(conn.resp_body)
@@ -860,7 +860,7 @@ this is not json
     # Verify annotation was stored
     conn =
       Plug.Test.conn(:get, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}")
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -874,7 +874,7 @@ this is not json
 
     conn =
       Plug.Test.conn(:post, "/api/v1/annotations", body)
-      |> Timeless.HTTP.call(store: :http_test)
+      |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 400
   end

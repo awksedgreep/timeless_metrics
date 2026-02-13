@@ -1,7 +1,7 @@
-defmodule Timeless.AnomalyTest do
+defmodule TimelessMetrics.AnomalyTest do
   use ExUnit.Case, async: true
 
-  alias Timeless.Anomaly
+  alias TimelessMetrics.Anomaly
 
   # Helper: generate smooth sine wave with optional outliers
   defp smooth_data(n, opts \\ []) do

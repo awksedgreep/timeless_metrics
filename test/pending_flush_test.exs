@@ -6,7 +6,7 @@ defmodule PendingFlushTest do
   setup do
     # Use very short flush intervals so tests run fast
     start_supervised!(
-      {Timeless,
+      {TimelessMetrics,
        name: :pflush_store,
        data_dir: @data_dir,
        buffer_shards: 2,
@@ -23,18 +23,18 @@ defmodule PendingFlushTest do
 
     # Write points — these land in the current 4-hour segment bucket
     for i <- 0..4 do
-      Timeless.write(:pflush_store, "pending_metric", %{"host" => "a"}, 10.0 + i,
+      TimelessMetrics.write(:pflush_store, "pending_metric", %{"host" => "a"}, 10.0 + i,
         timestamp: now - 300 + i * 60
       )
     end
 
-    # Do NOT call Timeless.flush — wait for the pending flush timer instead
+    # Do NOT call TimelessMetrics.flush — wait for the pending flush timer instead
     # Buffer flushes to SegmentBuilder in 5s, pending flush writes to SQLite in 200ms
     # Give it enough time for both stages
     Process.sleep(500)
 
     {:ok, points} =
-      Timeless.query(:pflush_store, "pending_metric", %{"host" => "a"},
+      TimelessMetrics.query(:pflush_store, "pending_metric", %{"host" => "a"},
         from: now - 600,
         to: now + 60
       )
@@ -48,7 +48,7 @@ defmodule PendingFlushTest do
 
     # Write first batch
     for i <- 0..2 do
-      Timeless.write(:pflush_store, "accum_metric", %{"host" => "b"}, i * 1.0,
+      TimelessMetrics.write(:pflush_store, "accum_metric", %{"host" => "b"}, i * 1.0,
         timestamp: now - 200 + i * 60
       )
     end
@@ -58,7 +58,7 @@ defmodule PendingFlushTest do
 
     # Write second batch (same series, same segment bucket)
     for i <- 3..5 do
-      Timeless.write(:pflush_store, "accum_metric", %{"host" => "b"}, i * 1.0,
+      TimelessMetrics.write(:pflush_store, "accum_metric", %{"host" => "b"}, i * 1.0,
         timestamp: now - 200 + i * 60
       )
     end
@@ -67,7 +67,7 @@ defmodule PendingFlushTest do
     Process.sleep(500)
 
     {:ok, points} =
-      Timeless.query(:pflush_store, "accum_metric", %{"host" => "b"},
+      TimelessMetrics.query(:pflush_store, "accum_metric", %{"host" => "b"},
         from: now - 600,
         to: now + 600
       )
@@ -80,7 +80,7 @@ defmodule PendingFlushTest do
     now = System.os_time(:second)
 
     for i <- 1..3 do
-      Timeless.write(:pflush_store, "info_metric_#{i}", %{"id" => "1"}, i * 1.0,
+      TimelessMetrics.write(:pflush_store, "info_metric_#{i}", %{"id" => "1"}, i * 1.0,
         timestamp: now
       )
     end
@@ -88,7 +88,7 @@ defmodule PendingFlushTest do
     # Wait for pending flush
     Process.sleep(500)
 
-    info = Timeless.info(:pflush_store)
+    info = TimelessMetrics.info(:pflush_store)
     assert info.total_points >= 3,
            "Expected at least 3 points in info, got #{info.total_points}"
     assert info.series_count >= 3

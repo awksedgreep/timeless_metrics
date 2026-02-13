@@ -1,18 +1,18 @@
-defmodule Timeless.ConcurrencyTest do
+defmodule TimelessMetrics.ConcurrencyTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_concurrency_test_#{System.os_time(:millisecond)}"
 
   setup do
     start_supervised!(
-      {Timeless,
+      {TimelessMetrics,
        name: :conc_test,
        data_dir: @data_dir,
        buffer_shards: 4}
     )
 
     on_exit(fn ->
-      :persistent_term.erase({Timeless, :conc_test, :schema})
+      :persistent_term.erase({TimelessMetrics, :conc_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -29,7 +29,7 @@ defmodule Timeless.ConcurrencyTest do
       for s <- 1..series_count do
         Task.async(fn ->
           for i <- 0..(points_per_series - 1) do
-            Timeless.write(:conc_test, "metric_#{s}", %{"id" => "#{s}"},
+            TimelessMetrics.write(:conc_test, "metric_#{s}", %{"id" => "#{s}"},
               s * 1.0 + i * 0.01,
               timestamp: now + i
             )
@@ -38,12 +38,12 @@ defmodule Timeless.ConcurrencyTest do
       end
 
     Task.await_many(tasks, 30_000)
-    Timeless.flush(:conc_test)
+    TimelessMetrics.flush(:conc_test)
 
     # Verify each series has exactly the expected number of points
     for s <- 1..series_count do
       {:ok, points} =
-        Timeless.query(:conc_test, "metric_#{s}", %{"id" => "#{s}"},
+        TimelessMetrics.query(:conc_test, "metric_#{s}", %{"id" => "#{s}"},
           from: now - 1,
           to: now + points_per_series + 1
         )
@@ -52,7 +52,7 @@ defmodule Timeless.ConcurrencyTest do
         "series #{s} has #{length(points)} points, expected #{points_per_series}"
     end
 
-    info = Timeless.info(:conc_test)
+    info = TimelessMetrics.info(:conc_test)
     assert info.series_count == series_count
   end
 
@@ -61,19 +61,19 @@ defmodule Timeless.ConcurrencyTest do
 
     # Pre-seed some data so queries have something to return
     for i <- 0..9 do
-      Timeless.write(:conc_test, "live_metric", %{"host" => "a"},
+      TimelessMetrics.write(:conc_test, "live_metric", %{"host" => "a"},
         100.0 + i,
         timestamp: now - 100 + i
       )
     end
 
-    Timeless.flush(:conc_test)
+    TimelessMetrics.flush(:conc_test)
 
     # Start a writer that continuously pushes data
     writer =
       Task.async(fn ->
         for i <- 0..99 do
-          Timeless.write(:conc_test, "live_metric", %{"host" => "a"},
+          TimelessMetrics.write(:conc_test, "live_metric", %{"host" => "a"},
             200.0 + i,
             timestamp: now + i
           )
@@ -87,7 +87,7 @@ defmodule Timeless.ConcurrencyTest do
       for _ <- 1..10 do
         Task.async(fn ->
           {:ok, points} =
-            Timeless.query(:conc_test, "live_metric", %{"host" => "a"},
+            TimelessMetrics.query(:conc_test, "live_metric", %{"host" => "a"},
               from: now - 200,
               to: now + 200
             )
@@ -115,7 +115,7 @@ defmodule Timeless.ConcurrencyTest do
     writer =
       Task.async(fn ->
         for i <- 0..(total_points - 1) do
-          Timeless.write(:conc_test, "flush_race", %{"id" => "1"},
+          TimelessMetrics.write(:conc_test, "flush_race", %{"id" => "1"},
             i * 1.0,
             timestamp: now + i
           )
@@ -129,7 +129,7 @@ defmodule Timeless.ConcurrencyTest do
       Task.async(fn ->
         for _ <- 1..5 do
           Process.sleep(5)
-          Timeless.flush(:conc_test)
+          TimelessMetrics.flush(:conc_test)
         end
       end)
 
@@ -137,10 +137,10 @@ defmodule Timeless.ConcurrencyTest do
     Task.await(flusher, 30_000)
 
     # Final flush to capture any remaining buffered data
-    Timeless.flush(:conc_test)
+    TimelessMetrics.flush(:conc_test)
 
     {:ok, points} =
-      Timeless.query(:conc_test, "flush_race", %{"id" => "1"},
+      TimelessMetrics.query(:conc_test, "flush_race", %{"id" => "1"},
         from: now - 1,
         to: now + total_points + 1
       )

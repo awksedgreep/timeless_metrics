@@ -232,7 +232,7 @@ defmodule Mix.Tasks.BenchQueryCompare do
       |> Enum.group_by(fn b -> div(b.bucket, chunk_seconds) * chunk_seconds end)
       |> Enum.each(fn {cs, chunk_buckets} ->
         ce = cs + chunk_seconds
-        blob = Timeless.TierChunk.encode(chunk_buckets, aggregates)
+        blob = TimelessMetrics.TierChunk.encode(chunk_buckets, aggregates)
         bc = length(chunk_buckets)
         :ok = Exqlite.Sqlite3.bind(new_stmt, [sid, cs, ce, bc, blob])
         :done = Exqlite.Sqlite3.step(conn, new_stmt)
@@ -279,7 +279,7 @@ defmodule Mix.Tasks.BenchQueryCompare do
 
     # Decompress and filter
     Enum.flat_map(chunks, fn [blob] ->
-      {_aggs, buckets} = Timeless.TierChunk.decode(blob)
+      {_aggs, buckets} = TimelessMetrics.TierChunk.decode(blob)
       Enum.filter(buckets, fn b -> b.bucket >= from and b.bucket < to end)
     end)
   end

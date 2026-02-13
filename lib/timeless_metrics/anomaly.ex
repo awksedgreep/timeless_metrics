@@ -1,8 +1,8 @@
-defmodule Timeless.Anomaly do
+defmodule TimelessMetrics.Anomaly do
   @moduledoc """
   Anomaly detection via z-score analysis on residuals from a trend model.
 
-  Fits the same polynomial + seasonal model as `Timeless.Forecast`, computes
+  Fits the same polynomial + seasonal model as `TimelessMetrics.Forecast`, computes
   residuals (actual - predicted), and flags points where the z-score exceeds
   a threshold based on the chosen sensitivity level.
 
@@ -31,7 +31,7 @@ defmodule Timeless.Anomaly do
     threshold = Map.get(@thresholds, sensitivity, 2.5)
     forecast_opts = Keyword.take(opts, [:periods])
 
-    case Timeless.Forecast.fit_predict(data, forecast_opts) do
+    case TimelessMetrics.Forecast.fit_predict(data, forecast_opts) do
       {:ok, expected_values} ->
         {timestamps, values} = Enum.unzip(data)
 

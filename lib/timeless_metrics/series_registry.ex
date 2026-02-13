@@ -1,4 +1,4 @@
-defmodule Timeless.SeriesRegistry do
+defmodule TimelessMetrics.SeriesRegistry do
   @moduledoc """
   Hybrid persistent_term + ETS series ID lookup and registration.
 
@@ -117,7 +117,7 @@ defmodule Timeless.SeriesRegistry do
             now = System.os_time(:second)
 
             result =
-              Timeless.DB.write(
+              TimelessMetrics.DB.write(
                 state.db,
                 "INSERT INTO series (metric_name, labels, created_at) VALUES (?1, ?2, ?3) ON CONFLICT(metric_name, labels) DO UPDATE SET created_at = created_at RETURNING id",
                 [metric_name, labels_json, now]
@@ -178,7 +178,7 @@ defmodule Timeless.SeriesRegistry do
   end
 
   defp load_from_db(fwd_key, rev_key, db) do
-    {:ok, rows} = Timeless.DB.read(db, "SELECT id, metric_name, labels FROM series")
+    {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT id, metric_name, labels FROM series")
 
     {forward_map, reverse_map} =
       Enum.reduce(rows, {%{}, %{}}, fn [id, metric_name, labels_json], {fwd, rev} ->

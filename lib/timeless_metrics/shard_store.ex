@@ -1,4 +1,4 @@
-defmodule Timeless.ShardStore do
+defmodule TimelessMetrics.ShardStore do
   @moduledoc """
   File-based storage backend for raw time series segments and tier chunks.
 

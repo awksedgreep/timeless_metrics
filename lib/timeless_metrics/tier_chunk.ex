@@ -1,4 +1,4 @@
-defmodule Timeless.TierChunk do
+defmodule TimelessMetrics.TierChunk do
   @moduledoc """
   Codec for compressed tier segments.
 
@@ -44,7 +44,7 @@ defmodule Timeless.TierChunk do
         %{bucket: 1706003600, avg: 68.1, min: 45.0, max: 89.7, count: 12, sum: 817.2, last: 65.3}
       ]
 
-      blob = Timeless.TierChunk.encode(buckets, [:avg, :min, :max, :count, :sum, :last])
+      blob = TimelessMetrics.TierChunk.encode(buckets, [:avg, :min, :max, :count, :sum, :last])
   """
   def encode([], _aggregates), do: encode_raw(<<>>, 0, 0)
 

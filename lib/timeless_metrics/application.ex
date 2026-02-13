@@ -1,9 +1,9 @@
-defmodule Timeless.Application do
+defmodule TimelessMetrics.Application do
   use Application
 
   @impl true
   def start(_type, _args) do
-    config = Application.get_all_env(:timeless)
+    config = Application.get_all_env(:timeless_metrics)
 
     children =
       case Keyword.fetch(config, :data_dir) do
@@ -16,13 +16,13 @@ defmodule Timeless.Application do
           bearer_token = Keyword.get(config, :bearer_token)
 
           [
-            {Timeless,
-             name: :timeless,
+            {TimelessMetrics,
+             name: :timeless_metrics,
              data_dir: data_dir,
              buffer_shards: shards,
              segment_duration: segment_duration,
              pending_flush_interval: pending_flush_interval},
-            {Timeless.HTTP, store: :timeless, port: port, bearer_token: bearer_token}
+            {TimelessMetrics.HTTP, store: :timeless_metrics, port: port, bearer_token: bearer_token}
           ]
 
         :error ->
@@ -30,6 +30,6 @@ defmodule Timeless.Application do
           []
       end
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: Timeless.AppSupervisor)
+    Supervisor.start_link(children, strategy: :one_for_one, name: TimelessMetrics.AppSupervisor)
   end
 end

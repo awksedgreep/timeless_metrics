@@ -1,15 +1,15 @@
-defmodule Timeless.QueryTest do
+defmodule TimelessMetrics.QueryTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_query_test_#{System.os_time(:millisecond)}"
 
   setup do
-    schema = %Timeless.Schema{
+    schema = %TimelessMetrics.Schema{
       raw_retention_seconds: 86_400,
       rollup_interval: :timer.hours(1),
       retention_interval: :timer.hours(1),
       tiers: [
-        %Timeless.Schema.Tier{
+        %TimelessMetrics.Schema.Tier{
           name: :hourly,
           resolution_seconds: 3_600,
           aggregates: [:avg, :min, :max, :count, :sum, :last],
@@ -20,7 +20,7 @@ defmodule Timeless.QueryTest do
     }
 
     start_supervised!(
-      {Timeless,
+      {TimelessMetrics,
        name: :query_test,
        data_dir: @data_dir,
        buffer_shards: 1,
@@ -28,7 +28,7 @@ defmodule Timeless.QueryTest do
     )
 
     on_exit(fn ->
-      :persistent_term.erase({Timeless, :query_test, :schema})
+      :persistent_term.erase({TimelessMetrics, :query_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -40,16 +40,16 @@ defmodule Timeless.QueryTest do
 
     for host <- ["web-1", "web-2", "web-3"] do
       for i <- 0..4 do
-        Timeless.write(:query_test, "cpu", %{"host" => host}, 50.0 + i,
+        TimelessMetrics.write(:query_test, "cpu", %{"host" => host}, 50.0 + i,
           timestamp: now - 300 + i * 60
         )
       end
     end
 
-    Timeless.flush(:query_test)
+    TimelessMetrics.flush(:query_test)
 
     {:ok, results} =
-      Timeless.query_aggregate_multi(:query_test, "cpu", %{},
+      TimelessMetrics.query_aggregate_multi(:query_test, "cpu", %{},
         from: now - 600,
         to: now + 60,
         bucket: {3600, :seconds},
@@ -69,11 +69,11 @@ defmodule Timeless.QueryTest do
   test "query with from > to returns empty" do
     now = System.os_time(:second)
 
-    Timeless.write(:query_test, "mem", %{"host" => "a"}, 42.0, timestamp: now)
-    Timeless.flush(:query_test)
+    TimelessMetrics.write(:query_test, "mem", %{"host" => "a"}, 42.0, timestamp: now)
+    TimelessMetrics.flush(:query_test)
 
     {:ok, points} =
-      Timeless.query(:query_test, "mem", %{"host" => "a"},
+      TimelessMetrics.query(:query_test, "mem", %{"host" => "a"},
         from: now + 1000,
         to: now - 1000
       )
@@ -87,16 +87,16 @@ defmodule Timeless.QueryTest do
     # Write monotonically increasing counter values: 100, 200, 300, 400, 500
     # 60-second intervals → rate should be ~1.67/sec (100 per 60s)
     for i <- 0..4 do
-      Timeless.write(:query_test, "bytes_total", %{"iface" => "eth0"},
+      TimelessMetrics.write(:query_test, "bytes_total", %{"iface" => "eth0"},
         (i + 1) * 100.0,
         timestamp: now - 240 + i * 60
       )
     end
 
-    Timeless.flush(:query_test)
+    TimelessMetrics.flush(:query_test)
 
     {:ok, results} =
-      Timeless.query_aggregate_multi(:query_test, "bytes_total", %{"iface" => "eth0"},
+      TimelessMetrics.query_aggregate_multi(:query_test, "bytes_total", %{"iface" => "eth0"},
         from: now - 300,
         to: now + 60,
         bucket: {86_400, :seconds},
@@ -118,20 +118,20 @@ defmodule Timeless.QueryTest do
     past_hour = div(now, 3600) * 3600 - 3600
 
     for i <- 0..9 do
-      Timeless.write(:query_test, "fallback_metric", %{"host" => "x"},
+      TimelessMetrics.write(:query_test, "fallback_metric", %{"host" => "x"},
         42.0 + i,
         timestamp: past_hour + i * 60
       )
     end
 
-    Timeless.flush(:query_test)
+    TimelessMetrics.flush(:query_test)
 
     # Force a rollup to populate tier data from the completed hour
-    Timeless.rollup(:query_test)
+    TimelessMetrics.rollup(:query_test)
 
     # Verify tier data was created
     {:ok, tier_data} =
-      Timeless.query_tier(:query_test, :hourly, "fallback_metric", %{"host" => "x"},
+      TimelessMetrics.query_tier(:query_test, :hourly, "fallback_metric", %{"host" => "x"},
         from: past_hour - 1,
         to: past_hour + 3600
       )
@@ -139,15 +139,15 @@ defmodule Timeless.QueryTest do
     assert length(tier_data) >= 1, "Rollup did not produce tier data"
 
     # Delete all raw segments to simulate retention expiry
-    shard_count = :persistent_term.get({Timeless, :query_test, :shard_count})
+    shard_count = :persistent_term.get({TimelessMetrics, :query_test, :shard_count})
 
     for i <- 0..(shard_count - 1) do
       builder = :"query_test_builder_#{i}"
-      Timeless.SegmentBuilder.delete_raw_before(builder, now + 86_400)
+      TimelessMetrics.SegmentBuilder.delete_raw_before(builder, now + 86_400)
     end
 
     # latest should fall back to tier data
-    {:ok, result} = Timeless.latest(:query_test, "fallback_metric", %{"host" => "x"})
+    {:ok, result} = TimelessMetrics.latest(:query_test, "fallback_metric", %{"host" => "x"})
     assert result != nil
     {_ts, val} = result
     assert is_number(val)
@@ -160,7 +160,7 @@ defmodule Timeless.QueryTest do
 
     # Write data in the "old" hour (will be covered by rollup)
     for i <- 0..4 do
-      Timeless.write(:query_test, "stitch_metric", %{"host" => "s"},
+      TimelessMetrics.write(:query_test, "stitch_metric", %{"host" => "s"},
         10.0 + i,
         timestamp: hour_start - 3600 + i * 60
       )
@@ -168,20 +168,20 @@ defmodule Timeless.QueryTest do
 
     # Write data in the "current" hour (raw only)
     for i <- 0..4 do
-      Timeless.write(:query_test, "stitch_metric", %{"host" => "s"},
+      TimelessMetrics.write(:query_test, "stitch_metric", %{"host" => "s"},
         50.0 + i,
         timestamp: hour_start + i * 60
       )
     end
 
-    Timeless.flush(:query_test)
+    TimelessMetrics.flush(:query_test)
 
     # Run rollup — this will process the old hour into tier data
-    Timeless.rollup(:query_test)
+    TimelessMetrics.rollup(:query_test)
 
     # Query spanning both: old tier data + new raw data
     {:ok, results} =
-      Timeless.query_aggregate_multi(:query_test, "stitch_metric", %{"host" => "s"},
+      TimelessMetrics.query_aggregate_multi(:query_test, "stitch_metric", %{"host" => "s"},
         from: hour_start - 3600,
         to: hour_start + 3600,
         bucket: {3600, :seconds},

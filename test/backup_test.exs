@@ -1,11 +1,11 @@
-defmodule Timeless.BackupTest do
+defmodule TimelessMetrics.BackupTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_backup_test_#{System.os_time(:millisecond)}"
   @backup_dir "/tmp/timeless_backup_target_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!({Timeless, name: :backup_test, data_dir: @data_dir, buffer_shards: 2})
+    start_supervised!({TimelessMetrics, name: :backup_test, data_dir: @data_dir, buffer_shards: 2})
 
     on_exit(fn ->
       File.rm_rf!(@data_dir)
@@ -19,14 +19,14 @@ defmodule Timeless.BackupTest do
     now = System.os_time(:second)
 
     for i <- 0..4 do
-      Timeless.write(:backup_test, "cpu", %{"host" => "h1"}, 50.0 + i,
+      TimelessMetrics.write(:backup_test, "cpu", %{"host" => "h1"}, 50.0 + i,
         timestamp: now - 300 + i * 60
       )
     end
 
-    Timeless.flush(:backup_test)
+    TimelessMetrics.flush(:backup_test)
 
-    {:ok, result} = Timeless.backup(:backup_test, @backup_dir)
+    {:ok, result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
     assert result.path == @backup_dir
     assert "metrics.db" in result.files
@@ -48,14 +48,14 @@ defmodule Timeless.BackupTest do
 
     # Write to multiple series to spread across shards
     for i <- 0..9 do
-      Timeless.write(:backup_test, "metric_#{i}", %{"k" => "v"}, i * 1.0,
+      TimelessMetrics.write(:backup_test, "metric_#{i}", %{"k" => "v"}, i * 1.0,
         timestamp: now - 60
       )
     end
 
-    Timeless.flush(:backup_test)
+    TimelessMetrics.flush(:backup_test)
 
-    {:ok, result} = Timeless.backup(:backup_test, @backup_dir)
+    {:ok, result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
     # 2 shards configured (directories, not .db files)
     assert "shard_0" in result.files
@@ -67,14 +67,14 @@ defmodule Timeless.BackupTest do
     now = System.os_time(:second)
 
     for i <- 0..4 do
-      Timeless.write(:backup_test, "temp", %{"sensor" => "s1"}, 20.0 + i,
+      TimelessMetrics.write(:backup_test, "temp", %{"sensor" => "s1"}, 20.0 + i,
         timestamp: now - 300 + i * 60
       )
     end
 
-    Timeless.flush(:backup_test)
+    TimelessMetrics.flush(:backup_test)
 
-    {:ok, _result} = Timeless.backup(:backup_test, @backup_dir)
+    {:ok, _result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
     # Verify raw segment files were backed up (WAL or .seg files)
     total_raw_files =
@@ -100,7 +100,7 @@ defmodule Timeless.BackupTest do
     writer =
       Task.async(fn ->
         for i <- 0..99 do
-          Timeless.write(:backup_test, "load", %{"id" => "w1"}, i * 1.0,
+          TimelessMetrics.write(:backup_test, "load", %{"id" => "w1"}, i * 1.0,
             timestamp: now - 1000 + i * 10
           )
         end
@@ -110,7 +110,7 @@ defmodule Timeless.BackupTest do
     Process.sleep(10)
 
     # Backup while writes are happening
-    {:ok, result} = Timeless.backup(:backup_test, @backup_dir)
+    {:ok, result} = TimelessMetrics.backup(:backup_test, @backup_dir)
     assert result.total_bytes > 0
 
     Task.await(writer)
@@ -119,8 +119,8 @@ defmodule Timeless.BackupTest do
   test "HTTP POST /api/v1/backup triggers backup with custom path" do
     now = System.os_time(:second)
 
-    Timeless.write(:backup_test, "http_metric", %{"x" => "y"}, 42.0, timestamp: now - 60)
-    Timeless.flush(:backup_test)
+    TimelessMetrics.write(:backup_test, "http_metric", %{"x" => "y"}, 42.0, timestamp: now - 60)
+    TimelessMetrics.flush(:backup_test)
 
     http_backup_dir = @backup_dir <> "_http"
 
@@ -131,7 +131,7 @@ defmodule Timeless.BackupTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/backup", body)
       |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> Timeless.HTTP.call(store: :backup_test)
+      |> TimelessMetrics.HTTP.call(store: :backup_test)
 
     assert conn.status == 200
     resp = Jason.decode!(conn.resp_body)
@@ -145,12 +145,12 @@ defmodule Timeless.BackupTest do
   test "HTTP POST /api/v1/backup uses default path when no body" do
     now = System.os_time(:second)
 
-    Timeless.write(:backup_test, "default_path", %{"a" => "b"}, 1.0, timestamp: now - 60)
-    Timeless.flush(:backup_test)
+    TimelessMetrics.write(:backup_test, "default_path", %{"a" => "b"}, 1.0, timestamp: now - 60)
+    TimelessMetrics.flush(:backup_test)
 
     conn =
       Plug.Test.conn(:post, "/api/v1/backup", "")
-      |> Timeless.HTTP.call(store: :backup_test)
+      |> TimelessMetrics.HTTP.call(store: :backup_test)
 
     assert conn.status == 200
     resp = Jason.decode!(conn.resp_body)

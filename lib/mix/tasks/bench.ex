@@ -1,7 +1,7 @@
 defmodule Mix.Tasks.Bench do
-  @shortdoc "Run Timeless benchmarks with realistic ISP data"
+  @shortdoc "Run TimelessMetrics benchmarks with realistic ISP data"
   @moduledoc """
-  Benchmarks Timeless with realistic ISP/network metric data.
+  Benchmarks TimelessMetrics with realistic ISP/network metric data.
 
   ## Usage
 
@@ -49,15 +49,15 @@ defmodule Mix.Tasks.Bench do
     banner(tier_name, devices, metrics_count, days, series_count, total_points, seg_dur, data_dir)
 
     # Schema with disabled background ticks
-    schema = %Timeless.Schema{
+    schema = %TimelessMetrics.Schema{
       raw_retention_seconds: (days + 7) * 86_400,
       rollup_interval: :timer.hours(999),
       retention_interval: :timer.hours(999),
-      tiers: Timeless.Schema.default().tiers
+      tiers: TimelessMetrics.Schema.default().tiers
     }
 
     {:ok, _} =
-      Timeless.Supervisor.start_link(
+      TimelessMetrics.Supervisor.start_link(
         name: :bench,
         data_dir: data_dir,
         # Use default shard count (cores/2, min 2)
@@ -93,7 +93,7 @@ defmodule Mix.Tasks.Bench do
     IO.puts("")
     IO.puts(bar())
     IO.puts("  Data: #{data_dir}")
-    IO.puts("  DB:   #{Timeless.DB.db_path(:bench_db)}")
+    IO.puts("  DB:   #{TimelessMetrics.DB.db_path(:bench_db)}")
     IO.puts("  Cleanup: rm -rf #{data_dir}")
     IO.puts(bar())
   end
@@ -108,7 +108,7 @@ defmodule Mix.Tasks.Bench do
         registry = :bench_registry
 
         for dev <- 0..(devices - 1), metric <- @metrics do
-          Timeless.SeriesRegistry.get_or_create(registry, metric, elem(labels_for, dev))
+          TimelessMetrics.SeriesRegistry.get_or_create(registry, metric, elem(labels_for, dev))
         end
       end)
 
@@ -149,7 +149,7 @@ defmodule Mix.Tasks.Bench do
                     {metric, elem(labels_for, dev), gen(metric, ts, dev, start_ts), ts}
                   end
 
-                Timeless.write_batch(:bench, entries)
+                TimelessMetrics.write_batch(:bench, entries)
               end)
             end)
           end)
@@ -160,11 +160,11 @@ defmodule Mix.Tasks.Bench do
       :counters.add(total_ingested, 1, pts_per_day)
 
       # Flush
-      {flush_us, _} = :timer.tc(fn -> Timeless.flush(:bench) end)
+      {flush_us, _} = :timer.tc(fn -> TimelessMetrics.flush(:bench) end)
       :counters.add(total_flush_us, 1, flush_us)
 
       # Incremental rollup (processes only this day since watermark advanced)
-      {rollup_us, _} = :timer.tc(fn -> Timeless.rollup(:bench, :all) end)
+      {rollup_us, _} = :timer.tc(fn -> TimelessMetrics.rollup(:bench, :all) end)
       :counters.add(total_rollup_us, 1, rollup_us)
 
       # Progress
@@ -204,7 +204,7 @@ defmodule Mix.Tasks.Bench do
   defp phase2_storage do
     header("Phase 2: Storage Report")
 
-    info = Timeless.info(:bench)
+    info = TimelessMetrics.info(:bench)
 
     IO.puts("  Series:      #{fmt_int(info.series_count)}")
     IO.puts("  Raw segments: #{fmt_int(info.segment_count)}")
@@ -233,15 +233,15 @@ defmodule Mix.Tasks.Bench do
     queries = [
       {"raw (1h)",
        fn ->
-         Timeless.query(:bench, "cpu_usage", test_labels, from: now - 3600, to: now)
+         TimelessMetrics.query(:bench, "cpu_usage", test_labels, from: now - 3600, to: now)
        end},
       {"raw (24h)",
        fn ->
-         Timeless.query(:bench, "cpu_usage", test_labels, from: now - 86_400, to: now)
+         TimelessMetrics.query(:bench, "cpu_usage", test_labels, from: now - 86_400, to: now)
        end},
       {"agg (1h, 60s buckets)",
        fn ->
-         Timeless.query_aggregate(:bench, "cpu_usage", test_labels,
+         TimelessMetrics.query_aggregate(:bench, "cpu_usage", test_labels,
            from: now - 3600,
            to: now,
            bucket: {60, :seconds},
@@ -250,7 +250,7 @@ defmodule Mix.Tasks.Bench do
        end},
       {"agg (24h, 5m buckets)",
        fn ->
-         Timeless.query_aggregate(:bench, "cpu_usage", test_labels,
+         TimelessMetrics.query_aggregate(:bench, "cpu_usage", test_labels,
            from: now - 86_400,
            to: now,
            bucket: {300, :seconds},
@@ -259,7 +259,7 @@ defmodule Mix.Tasks.Bench do
        end},
       {"multi (#{devices} hosts, 1h)",
        fn ->
-         Timeless.query_aggregate_multi(:bench, "cpu_usage", %{},
+         TimelessMetrics.query_aggregate_multi(:bench, "cpu_usage", %{},
            from: now - 3600,
            to: now,
            bucket: {60, :seconds},
@@ -268,18 +268,18 @@ defmodule Mix.Tasks.Bench do
        end},
       {"latest value",
        fn ->
-         Timeless.latest(:bench, "cpu_usage", test_labels)
+         TimelessMetrics.latest(:bench, "cpu_usage", test_labels)
        end},
       {"tier hourly (7d)",
        fn ->
-         Timeless.query_tier(:bench, :hourly, "cpu_usage", test_labels,
+         TimelessMetrics.query_tier(:bench, :hourly, "cpu_usage", test_labels,
            from: now - 7 * 86_400,
            to: now
          )
        end},
       {"tier daily (90d)",
        fn ->
-         Timeless.query_tier(:bench, :daily, "cpu_usage", test_labels,
+         TimelessMetrics.query_tier(:bench, :daily, "cpu_usage", test_labels,
            from: start_ts,
            to: now
          )
@@ -330,7 +330,7 @@ defmodule Mix.Tasks.Bench do
     {us, _} =
       :timer.tc(fn ->
         for _ <- 1..n do
-          Timeless.write(:bench, "cpu_usage", labels, 42.0)
+          TimelessMetrics.write(:bench, "cpu_usage", labels, 42.0)
         end
       end)
 
@@ -340,12 +340,12 @@ defmodule Mix.Tasks.Bench do
     # Single series, pre-resolved (no registry overhead)
     IO.puts("")
     IO.puts("  Single series, pre-resolved (100K writes):")
-    sid = Timeless.resolve_series(:bench, "cpu_usage", labels)
+    sid = TimelessMetrics.resolve_series(:bench, "cpu_usage", labels)
 
     {us, _} =
       :timer.tc(fn ->
         for _ <- 1..n do
-          Timeless.write_resolved(:bench, sid, 42.0)
+          TimelessMetrics.write_resolved(:bench, sid, 42.0)
         end
       end)
 
@@ -365,7 +365,7 @@ defmodule Mix.Tasks.Bench do
     {us, _} =
       :timer.tc(fn ->
         for _ <- 1..batch_iters do
-          Timeless.write_batch(:bench, entries_per)
+          TimelessMetrics.write_batch(:bench, entries_per)
         end
       end)
 
@@ -379,14 +379,14 @@ defmodule Mix.Tasks.Bench do
 
     resolved_entries_per =
       for dev <- 0..(devices - 1), metric <- @metrics do
-        sid = Timeless.resolve_series(:bench, metric, elem(labels_for, dev))
+        sid = TimelessMetrics.resolve_series(:bench, metric, elem(labels_for, dev))
         {sid, 42.0}
       end
 
     {us, _} =
       :timer.tc(fn ->
         for _ <- 1..batch_iters do
-          Timeless.write_batch_resolved(:bench, resolved_entries_per)
+          TimelessMetrics.write_batch_resolved(:bench, resolved_entries_per)
         end
       end)
 
@@ -405,7 +405,7 @@ defmodule Mix.Tasks.Bench do
         |> Enum.map(fn _ ->
           Task.async(fn ->
             for _ <- 1..batch_iters do
-              Timeless.write_batch(:bench, entries_per)
+              TimelessMetrics.write_batch(:bench, entries_per)
             end
           end)
         end)
@@ -426,7 +426,7 @@ defmodule Mix.Tasks.Bench do
         |> Enum.map(fn _ ->
           Task.async(fn ->
             for _ <- 1..batch_iters do
-              Timeless.write_batch_resolved(:bench, resolved_entries_per)
+              TimelessMetrics.write_batch_resolved(:bench, resolved_entries_per)
             end
           end)
         end)
@@ -505,7 +505,7 @@ defmodule Mix.Tasks.Bench do
     fs_type = detect_fs_type(data_dir)
     IO.puts("")
     IO.puts(bar())
-    IO.puts("  Timeless Benchmark — #{tier}")
+    IO.puts("  TimelessMetrics Benchmark — #{tier}")
     IO.puts(bar())
     IO.puts("  Devices:    #{fmt_int(devices)}")
     IO.puts("  Metrics:    #{metrics} per device")

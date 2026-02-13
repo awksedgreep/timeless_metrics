@@ -1,4 +1,4 @@
-defmodule Timeless.Supervisor do
+defmodule TimelessMetrics.Supervisor do
   @moduledoc false
 
   use Supervisor
@@ -22,9 +22,9 @@ defmodule Timeless.Supervisor do
 
     schema =
       case Keyword.get(opts, :schema) do
-        nil -> Timeless.Schema.default()
+        nil -> TimelessMetrics.Schema.default()
         mod when is_atom(mod) -> mod.__schema__()
-        %Timeless.Schema{} = s -> s
+        %TimelessMetrics.Schema{} = s -> s
       end
 
     db_name = :"#{name}_db"
@@ -33,8 +33,8 @@ defmodule Timeless.Supervisor do
     retention_name = :"#{name}_retention"
 
     # Store schema and shard count in persistent_term for fast access
-    :persistent_term.put({Timeless, name, :schema}, schema)
-    :persistent_term.put({Timeless, name, :shard_count}, shard_count)
+    :persistent_term.put({TimelessMetrics, name, :schema}, schema)
+    :persistent_term.put({TimelessMetrics, name, :shard_count}, shard_count)
 
     # Each buffer shard gets its own SegmentBuilder for parallel compression
     builder_and_buffer_shards =
@@ -46,7 +46,7 @@ defmodule Timeless.Supervisor do
           %{
             id: builder_name,
             start:
-              {Timeless.SegmentBuilder, :start_link,
+              {TimelessMetrics.SegmentBuilder, :start_link,
                [
                  [
                    name: builder_name,
@@ -62,7 +62,7 @@ defmodule Timeless.Supervisor do
           %{
             id: shard_name,
             start:
-              {Timeless.Buffer, :start_link,
+              {TimelessMetrics.Buffer, :start_link,
                [
                  [
                    name: shard_name,
@@ -80,16 +80,16 @@ defmodule Timeless.Supervisor do
     children =
       [
         # 1. SQLite connection manager
-        {Timeless.DB, name: db_name, data_dir: data_dir},
+        {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
 
         # 2. Series registry (depends on DB)
-        {Timeless.SeriesRegistry, name: registry_name, db: db_name}
+        {TimelessMetrics.SeriesRegistry, name: registry_name, db: db_name}
       ] ++
         # 3. Sharded segment builders + buffer shards (each buffer paired with its builder)
         builder_and_buffer_shards ++
         [
           # 4. Rollup engine (depends on DB + data being written)
-          {Timeless.Rollup,
+          {TimelessMetrics.Rollup,
            name: rollup_name,
            db: db_name,
            store: name,
@@ -97,7 +97,7 @@ defmodule Timeless.Supervisor do
            compression: compression},
 
           # 5. Retention enforcer (depends on DB)
-          {Timeless.Retention,
+          {TimelessMetrics.Retention,
            name: retention_name,
            db: db_name,
            store: name,

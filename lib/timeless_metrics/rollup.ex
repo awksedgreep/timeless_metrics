@@ -1,4 +1,4 @@
-defmodule Timeless.Rollup do
+defmodule TimelessMetrics.Rollup do
   @moduledoc """
   Sharded rollup engine.
 
@@ -74,7 +74,7 @@ defmodule Timeless.Rollup do
     # Evaluate alert rules after rollup
     if state.store do
       try do
-        Timeless.Alert.evaluate(state.store)
+        TimelessMetrics.Alert.evaluate(state.store)
       rescue
         e -> Logger.warning("Alert evaluation failed: #{inspect(e)}")
       end
@@ -115,7 +115,7 @@ defmodule Timeless.Rollup do
   end
 
   defp run_tier(tier, state) do
-    shard_count = :persistent_term.get({Timeless, state.store, :shard_count})
+    shard_count = :persistent_term.get({TimelessMetrics, state.store, :shard_count})
     source = source_for_tier(tier, state.schema.tiers)
 
     {us, _} =
@@ -130,7 +130,7 @@ defmodule Timeless.Rollup do
       end)
 
     :telemetry.execute(
-      [:timeless, :rollup, :complete],
+      [:timeless_metrics, :rollup, :complete],
       %{duration_us: us},
       %{tier: tier.name}
     )
@@ -161,7 +161,7 @@ defmodule Timeless.Rollup do
 
   defp rollup_shard_from_raw(tier, builder, watermark, up_to, state) do
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_raw_for_rollup(builder, watermark, up_to)
+      TimelessMetrics.SegmentBuilder.read_raw_for_rollup(builder, watermark, up_to)
 
     # Decompress all segments and gather points
     points_by_series =
@@ -183,24 +183,24 @@ defmodule Timeless.Rollup do
       entries = collect_tier_entries(builder, tier, points_by_series)
 
       if entries != [] do
-        Timeless.SegmentBuilder.write_tier_batch(builder, tier.name, entries)
+        TimelessMetrics.SegmentBuilder.write_tier_batch(builder, tier.name, entries)
       end
     end
 
     # Advance watermark
-    Timeless.SegmentBuilder.write_watermark(builder, tier.name, up_to)
+    TimelessMetrics.SegmentBuilder.write_watermark(builder, tier.name, up_to)
   end
 
   defp rollup_shard_from_tier(tier, source_tier, builder, watermark, up_to, _state) do
     # Read compressed chunks from source tier covering [watermark, up_to)
     {:ok, rows} =
-      Timeless.SegmentBuilder.read_tier_for_rollup(builder, source_tier.name, watermark, up_to)
+      TimelessMetrics.SegmentBuilder.read_tier_for_rollup(builder, source_tier.name, watermark, up_to)
 
     # Decode chunks and filter buckets to range, group by series
     grouped =
       rows
       |> Enum.flat_map(fn [series_id, blob] ->
-        {_aggs, buckets} = Timeless.TierChunk.decode(blob)
+        {_aggs, buckets} = TimelessMetrics.TierChunk.decode(blob)
 
         buckets
         |> Enum.filter(fn b -> b.bucket >= watermark and b.bucket < up_to end)
@@ -224,12 +224,12 @@ defmodule Timeless.Rollup do
         end)
 
       if entries != [] do
-        Timeless.SegmentBuilder.write_tier_batch(builder, tier.name, entries)
+        TimelessMetrics.SegmentBuilder.write_tier_batch(builder, tier.name, entries)
       end
     end
 
     # Advance watermark
-    Timeless.SegmentBuilder.write_watermark(builder, tier.name, up_to)
+    TimelessMetrics.SegmentBuilder.write_watermark(builder, tier.name, up_to)
   end
 
   defp collect_tier_entries(builder, tier, points_by_series) do
@@ -248,7 +248,7 @@ defmodule Timeless.Rollup do
   end
 
   defp prepare_tier_entries(builder, tier, series_id, tier_buckets) do
-    chunk_secs = tier.chunk_seconds || Timeless.Schema.chunk_seconds(nil, tier.resolution_seconds)
+    chunk_secs = tier.chunk_seconds || TimelessMetrics.Schema.chunk_seconds(nil, tier.resolution_seconds)
 
     # Group buckets by chunk boundary
     chunks =
@@ -261,11 +261,11 @@ defmodule Timeless.Rollup do
 
       # Read existing chunk (lock-free via ETS)
       existing_blob =
-        Timeless.SegmentBuilder.read_tier_chunk_for_merge(builder, tier.name, series_id, chunk_start)
+        TimelessMetrics.SegmentBuilder.read_tier_chunk_for_merge(builder, tier.name, series_id, chunk_start)
 
       # Merge new buckets into existing (or create new)
-      merged_blob = Timeless.TierChunk.merge(existing_blob, new_buckets, tier.aggregates)
-      bucket_count = Timeless.TierChunk.bucket_count(merged_blob)
+      merged_blob = TimelessMetrics.TierChunk.merge(existing_blob, new_buckets, tier.aggregates)
+      bucket_count = TimelessMetrics.TierChunk.bucket_count(merged_blob)
 
       {series_id, chunk_start, chunk_end, bucket_count, merged_blob}
     end)
@@ -275,7 +275,7 @@ defmodule Timeless.Rollup do
   # Re-processes a lookback window behind each tier's watermark per shard.
 
   defp catch_up_late_arrivals(state) do
-    shard_count = :persistent_term.get({Timeless, state.store, :shard_count})
+    shard_count = :persistent_term.get({TimelessMetrics, state.store, :shard_count})
 
     Enum.each(state.schema.tiers, fn tier ->
       source = source_for_tier(tier, state.schema.tiers)
@@ -309,7 +309,7 @@ defmodule Timeless.Rollup do
           end)
 
         :telemetry.execute(
-          [:timeless, :rollup, :late_catch_up],
+          [:timeless_metrics, :rollup, :late_catch_up],
           %{duration_us: us},
           %{tier: tier.name}
         )
@@ -320,7 +320,7 @@ defmodule Timeless.Rollup do
   # --- Shard watermark helpers ---
 
   defp get_shard_watermark(builder, tier_name) do
-    Timeless.SegmentBuilder.read_watermark(builder, tier_name)
+    TimelessMetrics.SegmentBuilder.read_watermark(builder, tier_name)
   end
 
   # --- Aggregation ---

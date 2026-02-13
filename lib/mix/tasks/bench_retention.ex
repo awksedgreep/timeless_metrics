@@ -1,7 +1,7 @@
 defmodule Mix.Tasks.BenchRetention do
   @shortdoc "Benchmark retention DELETE with and without end_time/bucket indexes"
   @moduledoc """
-  Populates a Timeless store with a configurable dataset, then benchmarks
+  Populates a TimelessMetrics store with a configurable dataset, then benchmarks
   retention deletion with and without the secondary indexes on `end_time`
   and tier `bucket` columns.
 
@@ -98,17 +98,17 @@ defmodule Mix.Tasks.BenchRetention do
     shards = System.schedulers_online()
     seg_dur = 7200
 
-    schema = %Timeless.Schema{
+    schema = %TimelessMetrics.Schema{
       raw_retention_seconds: (days + 30) * 86_400,
       rollup_interval: :timer.hours(999),
       retention_interval: :timer.hours(999),
-      tiers: Timeless.Schema.default().tiers
+      tiers: TimelessMetrics.Schema.default().tiers
     }
 
     store = :"bench_ret_#{mode}"
 
     {:ok, sup} =
-      Timeless.Supervisor.start_link(
+      TimelessMetrics.Supervisor.start_link(
         name: store,
         data_dir: data_dir,
         buffer_shards: shards,
@@ -125,11 +125,11 @@ defmodule Mix.Tasks.BenchRetention do
 
     # Trigger rollup so tier tables have data
     IO.puts("  Running rollup...")
-    {rollup_us, _} = :timer.tc(fn -> Timeless.rollup(store, :all) end)
+    {rollup_us, _} = :timer.tc(fn -> TimelessMetrics.rollup(store, :all) end)
     IO.puts("  Rollup in #{fmt_ms(rollup_us)}")
 
     # Flush everything to disk
-    Timeless.flush(store)
+    TimelessMetrics.flush(store)
 
     # Report segment counts
     report_counts(store, shards, schema)
@@ -151,7 +151,7 @@ defmodule Mix.Tasks.BenchRetention do
     {raw_us, _} = :timer.tc(fn ->
       for i <- 0..(shards - 1) do
         builder = :"#{store}_builder_#{i}"
-        Timeless.SegmentBuilder.delete_raw_before(builder, cutoff)
+        TimelessMetrics.SegmentBuilder.delete_raw_before(builder, cutoff)
       end
     end)
 
@@ -162,7 +162,7 @@ defmodule Mix.Tasks.BenchRetention do
       Enum.each(schema.tiers, fn tier ->
         for i <- 0..(shards - 1) do
           builder = :"#{store}_builder_#{i}"
-          Timeless.SegmentBuilder.delete_tier_before(builder, tier.name, cutoff)
+          TimelessMetrics.SegmentBuilder.delete_tier_before(builder, tier.name, cutoff)
         end
       end)
     end)
@@ -188,7 +188,7 @@ defmodule Mix.Tasks.BenchRetention do
     # Pre-register all series
     for dev <- 0..(devices - 1), metric <- @metrics do
       labels = %{"host" => "dev_#{dev}"}
-      Timeless.SeriesRegistry.get_or_create(registry, metric, labels)
+      TimelessMetrics.SeriesRegistry.get_or_create(registry, metric, labels)
     end
 
     # Write day by day using batch writes
@@ -210,7 +210,7 @@ defmodule Mix.Tasks.BenchRetention do
             {metric, elem(labels_for, dev), value, ts}
           end
 
-        Timeless.write_batch(store, batch)
+        TimelessMetrics.write_batch(store, batch)
       end)
 
       if rem(day + 1, 5) == 0 do
@@ -218,7 +218,7 @@ defmodule Mix.Tasks.BenchRetention do
       end
     end
 
-    Timeless.flush(store)
+    TimelessMetrics.flush(store)
   end
 
   # --- Index management ---
@@ -234,7 +234,7 @@ defmodule Mix.Tasks.BenchRetention do
     total_raw =
       Enum.reduce(0..(shards - 1), 0, fn i, acc ->
         builder = :"#{store}_builder_#{i}"
-        stats = Timeless.SegmentBuilder.raw_stats(builder)
+        stats = TimelessMetrics.SegmentBuilder.raw_stats(builder)
         acc + stats.segment_count
       end)
 
@@ -243,7 +243,7 @@ defmodule Mix.Tasks.BenchRetention do
         count =
           Enum.reduce(0..(shards - 1), 0, fn i, acc ->
             builder = :"#{store}_builder_#{i}"
-            {c, _, _} = Timeless.SegmentBuilder.read_tier_stats(builder, tier.name)
+            {c, _, _} = TimelessMetrics.SegmentBuilder.read_tier_stats(builder, tier.name)
             acc + c
           end)
         {tier.name, count}

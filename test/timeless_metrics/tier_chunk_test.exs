@@ -1,7 +1,7 @@
-defmodule Timeless.TierChunkTest do
+defmodule TimelessMetrics.TierChunkTest do
   use ExUnit.Case, async: true
 
-  alias Timeless.TierChunk
+  alias TimelessMetrics.TierChunk
 
   @all_aggregates [:avg, :min, :max, :count, :sum, :last]
 

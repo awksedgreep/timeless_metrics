@@ -1,11 +1,11 @@
-defmodule Timeless.Schema do
+defmodule TimelessMetrics.Schema do
   @moduledoc """
   Declarative DSL for defining metric storage tiers, retention, and rollup schedules.
 
   ## Example
 
       defmodule MyApp.MetricSchema do
-        use Timeless.Schema
+        use TimelessMetrics.Schema
 
         raw_retention {7, :days}
 
@@ -25,9 +25,9 @@ defmodule Timeless.Schema do
           retention: :forever
       end
 
-  Then pass it to Timeless:
+  Then pass it to TimelessMetrics:
 
-      {Timeless, name: :metrics, data_dir: "/data", schema: MyApp.MetricSchema}
+      {TimelessMetrics, name: :metrics, data_dir: "/data", schema: MyApp.MetricSchema}
   """
 
   defstruct [
@@ -45,13 +45,13 @@ defmodule Timeless.Schema do
   @doc false
   defmacro __using__(_opts) do
     quote do
-      import Timeless.Schema, only: [raw_retention: 1, tier: 2, rollup_interval: 1, retention_interval: 1]
+      import TimelessMetrics.Schema, only: [raw_retention: 1, tier: 2, rollup_interval: 1, retention_interval: 1]
       Module.register_attribute(__MODULE__, :tiers, accumulate: true)
       Module.put_attribute(__MODULE__, :raw_retention, {7, :days})
       Module.put_attribute(__MODULE__, :rollup_interval_ms, :timer.minutes(5))
       Module.put_attribute(__MODULE__, :retention_interval_ms, :timer.hours(1))
 
-      @before_compile Timeless.Schema
+      @before_compile TimelessMetrics.Schema
     end
   end
 
@@ -64,23 +64,23 @@ defmodule Timeless.Schema do
 
     quote do
       def __schema__ do
-        %Timeless.Schema{
-          raw_retention_seconds: Timeless.Schema.duration_to_seconds(unquote(Macro.escape(raw_ret))),
+        %TimelessMetrics.Schema{
+          raw_retention_seconds: TimelessMetrics.Schema.duration_to_seconds(unquote(Macro.escape(raw_ret))),
           rollup_interval: unquote(rollup_int),
           retention_interval: unquote(retention_int),
           tiers:
             unquote(
               Macro.escape(
                 Enum.map(tiers, fn {name, opts} ->
-                  res = Timeless.Schema.resolution_to_seconds(opts[:resolution])
+                  res = TimelessMetrics.Schema.resolution_to_seconds(opts[:resolution])
 
-                  %Timeless.Schema.Tier{
+                  %TimelessMetrics.Schema.Tier{
                     name: name,
                     resolution_seconds: res,
                     aggregates: opts[:aggregates] || [:avg, :min, :max, :count, :sum, :last],
-                    retention_seconds: Timeless.Schema.duration_to_seconds(opts[:retention]),
+                    retention_seconds: TimelessMetrics.Schema.duration_to_seconds(opts[:retention]),
                     table_name: "tier_#{name}",
-                    chunk_seconds: Timeless.Schema.chunk_seconds(opts[:chunk], res)
+                    chunk_seconds: TimelessMetrics.Schema.chunk_seconds(opts[:chunk], res)
                   }
                 end)
               )

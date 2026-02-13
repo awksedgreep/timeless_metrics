@@ -1,7 +1,7 @@
-defmodule Timeless.TransformTest do
+defmodule TimelessMetrics.TransformTest do
   use ExUnit.Case, async: true
 
-  alias Timeless.Transform
+  alias TimelessMetrics.Transform
 
   # --- parse ---
 

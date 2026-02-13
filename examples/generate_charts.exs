@@ -57,7 +57,7 @@ series = [%{labels: %{"host" => "web-1"}, data: data}]
 IO.puts("Rendering basic chart...")
 
 svg_basic =
-  Timeless.Chart.render("cpu_usage", series,
+  TimelessMetrics.Chart.render("cpu_usage", series,
     width: 900,
     height: 350,
     theme: :light,
@@ -70,14 +70,14 @@ File.write!(Path.join(output_dir, "chart_basic.svg"), svg_basic)
 # --- Chart 2: With Forecast ---
 IO.puts("Rendering forecast chart...")
 
-{:ok, forecast_points} = Timeless.Forecast.predict(data, horizon: 6 * 3600, bucket: 300)
+{:ok, forecast_points} = TimelessMetrics.Forecast.predict(data, horizon: 6 * 3600, bucket: 300)
 
 # Connect forecast to last data point
 last_point = List.last(data)
 forecast_with_connection = [last_point | forecast_points]
 
 svg_forecast =
-  Timeless.Chart.render("cpu_usage — 6h forecast", series,
+  TimelessMetrics.Chart.render("cpu_usage — 6h forecast", series,
     width: 900,
     height: 350,
     theme: :light,
@@ -92,7 +92,7 @@ IO.puts("  Forecast: #{length(forecast_points)} predicted points")
 # --- Chart 3: With Anomaly Detection ---
 IO.puts("Rendering anomaly detection chart...")
 
-{:ok, analysis} = Timeless.Anomaly.detect(data, sensitivity: :medium)
+{:ok, analysis} = TimelessMetrics.Anomaly.detect(data, sensitivity: :medium)
 
 anomalies =
   analysis
@@ -100,7 +100,7 @@ anomalies =
   |> Enum.map(fn a -> {a.timestamp, a.value} end)
 
 svg_anomalies =
-  Timeless.Chart.render("cpu_usage — anomaly detection", series,
+  TimelessMetrics.Chart.render("cpu_usage — anomaly detection", series,
     width: 900,
     height: 350,
     theme: :light,
@@ -121,7 +121,7 @@ deploy_annotation = %{
 }
 
 svg_full =
-  Timeless.Chart.render("cpu_usage — full analysis", series,
+  TimelessMetrics.Chart.render("cpu_usage — full analysis", series,
     width: 900,
     height: 350,
     theme: :light,
@@ -136,7 +136,7 @@ File.write!(Path.join(output_dir, "chart_full_analysis.svg"), svg_full)
 IO.puts("Rendering dark theme chart...")
 
 svg_dark =
-  Timeless.Chart.render("cpu_usage — dark theme", series,
+  TimelessMetrics.Chart.render("cpu_usage — dark theme", series,
     width: 900,
     height: 350,
     theme: :dark,

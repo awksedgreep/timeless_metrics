@@ -1,4 +1,4 @@
-defmodule Timeless.Forecast do
+defmodule TimelessMetrics.Forecast do
   @moduledoc """
   Time series forecasting using linear regression with seasonal features.
 

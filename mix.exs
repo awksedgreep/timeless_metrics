@@ -1,9 +1,9 @@
-defmodule Timeless.MixProject do
+defmodule TimelessMetrics.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :timeless,
+      app: :timeless_metrics,
       version: "0.6.1",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
@@ -13,7 +13,7 @@ defmodule Timeless.MixProject do
 
   def application do
     [
-      mod: {Timeless.Application, []},
+      mod: {TimelessMetrics.Application, []},
       extra_applications: [:logger]
     ]
   end

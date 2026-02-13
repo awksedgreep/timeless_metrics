@@ -1,11 +1,11 @@
-defmodule Timeless.AnnotationTest do
+defmodule TimelessMetrics.AnnotationTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_annot_test_#{System.os_time(:millisecond)}"
 
   setup do
     start_supervised!(
-      {Timeless,
+      {TimelessMetrics,
        name: :annot_test,
        data_dir: @data_dir,
        buffer_shards: 1,
@@ -13,7 +13,7 @@ defmodule Timeless.AnnotationTest do
     )
 
     on_exit(fn ->
-      :persistent_term.erase({Timeless, :annot_test, :schema})
+      :persistent_term.erase({TimelessMetrics, :annot_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -23,19 +23,19 @@ defmodule Timeless.AnnotationTest do
   test "create and query annotations" do
     now = System.os_time(:second)
 
-    {:ok, id1} = Timeless.annotate(:annot_test, now - 1800, "Deploy v2.3",
+    {:ok, id1} = TimelessMetrics.annotate(:annot_test, now - 1800, "Deploy v2.3",
       tags: ["deploy", "web"],
       description: "Rolling deploy of web tier"
     )
 
-    {:ok, id2} = Timeless.annotate(:annot_test, now - 600, "Config change",
+    {:ok, id2} = TimelessMetrics.annotate(:annot_test, now - 600, "Config change",
       tags: ["config"]
     )
 
     assert is_integer(id1)
     assert id2 > id1
 
-    {:ok, results} = Timeless.annotations(:annot_test, now - 3600, now)
+    {:ok, results} = TimelessMetrics.annotations(:annot_test, now - 3600, now)
     assert length(results) == 2
 
     first = List.first(results)
@@ -47,27 +47,27 @@ defmodule Timeless.AnnotationTest do
   test "filter annotations by tags" do
     now = System.os_time(:second)
 
-    Timeless.annotate(:annot_test, now - 100, "Deploy", tags: ["deploy"])
-    Timeless.annotate(:annot_test, now - 50, "Alert fired", tags: ["alert"])
+    TimelessMetrics.annotate(:annot_test, now - 100, "Deploy", tags: ["deploy"])
+    TimelessMetrics.annotate(:annot_test, now - 50, "Alert fired", tags: ["alert"])
 
-    {:ok, deploy_only} = Timeless.annotations(:annot_test, now - 3600, now, tags: ["deploy"])
+    {:ok, deploy_only} = TimelessMetrics.annotations(:annot_test, now - 3600, now, tags: ["deploy"])
     assert length(deploy_only) == 1
     assert List.first(deploy_only).title == "Deploy"
 
-    {:ok, all} = Timeless.annotations(:annot_test, now - 3600, now)
+    {:ok, all} = TimelessMetrics.annotations(:annot_test, now - 3600, now)
     assert length(all) == 2
   end
 
   test "delete annotation" do
     now = System.os_time(:second)
 
-    {:ok, id} = Timeless.annotate(:annot_test, now, "Temp annotation")
-    {:ok, before} = Timeless.annotations(:annot_test, now - 60, now + 60)
+    {:ok, id} = TimelessMetrics.annotate(:annot_test, now, "Temp annotation")
+    {:ok, before} = TimelessMetrics.annotations(:annot_test, now - 60, now + 60)
     assert length(before) == 1
 
-    Timeless.delete_annotation(:annot_test, id)
+    TimelessMetrics.delete_annotation(:annot_test, id)
 
-    {:ok, after_delete} = Timeless.annotations(:annot_test, now - 60, now + 60)
+    {:ok, after_delete} = TimelessMetrics.annotations(:annot_test, now - 60, now + 60)
     assert length(after_delete) == 0
   end
 
@@ -83,7 +83,7 @@ defmodule Timeless.AnnotationTest do
         tags: ["deploy", "ci"]
       }))
       |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> Timeless.HTTP.call(store: :annot_test)
+      |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     assert conn.status == 201
     result = Jason.decode!(conn.resp_body)
@@ -93,7 +93,7 @@ defmodule Timeless.AnnotationTest do
     # List
     conn =
       Plug.Test.conn(:get, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}")
-      |> Timeless.HTTP.call(store: :annot_test)
+      |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -103,7 +103,7 @@ defmodule Timeless.AnnotationTest do
     # Filter by tags
     conn =
       Plug.Test.conn(:get, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}&tags=deploy")
-      |> Timeless.HTTP.call(store: :annot_test)
+      |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -112,14 +112,14 @@ defmodule Timeless.AnnotationTest do
     # Delete
     conn =
       Plug.Test.conn(:delete, "/api/v1/annotations/#{id}")
-      |> Timeless.HTTP.call(store: :annot_test)
+      |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     assert conn.status == 200
 
     # Verify deleted
     conn =
       Plug.Test.conn(:get, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}")
-      |> Timeless.HTTP.call(store: :annot_test)
+      |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     result = Jason.decode!(conn.resp_body)
     assert length(result["data"]) == 0
@@ -131,20 +131,20 @@ defmodule Timeless.AnnotationTest do
 
     # Write some data
     for i <- 0..9 do
-      Timeless.write(:annot_test, "cpu", %{"host" => "web-1"}, 50.0 + i,
+      TimelessMetrics.write(:annot_test, "cpu", %{"host" => "web-1"}, 50.0 + i,
         timestamp: base + i * 60
       )
     end
 
-    Timeless.flush(:annot_test)
+    TimelessMetrics.flush(:annot_test)
 
     # Create an annotation in the middle of the data range
-    Timeless.annotate(:annot_test, base + 300, "Deploy v3")
+    TimelessMetrics.annotate(:annot_test, base + 300, "Deploy v3")
 
     # Render chart
     conn =
       Plug.Test.conn(:get, "/chart?metric=cpu&from=#{base}&to=#{base + 600}")
-      |> Timeless.HTTP.call(store: :annot_test)
+      |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     assert conn.status == 200
     assert String.contains?(conn.resp_body, "Deploy v3")
@@ -158,12 +158,12 @@ defmodule Timeless.AnnotationTest do
         title: "Now annotation"
       }))
       |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> Timeless.HTTP.call(store: :annot_test)
+      |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     assert conn.status == 201
 
     now = System.os_time(:second)
-    {:ok, results} = Timeless.annotations(:annot_test, now - 5, now + 5)
+    {:ok, results} = TimelessMetrics.annotations(:annot_test, now - 5, now + 5)
     assert length(results) == 1
   end
 end

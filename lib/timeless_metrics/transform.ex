@@ -1,4 +1,4 @@
-defmodule Timeless.Transform do
+defmodule TimelessMetrics.Transform do
   @moduledoc """
   Post-query value transforms for unit conversion.
 

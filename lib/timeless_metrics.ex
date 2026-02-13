@@ -1,4 +1,4 @@
-defmodule Timeless do
+defmodule TimelessMetrics do
   @moduledoc """
   Embedded time series storage for Elixir.
 
@@ -9,14 +9,14 @@ defmodule Timeless do
 
       # Add to your supervision tree
       children = [
-        {Timeless, name: :metrics, data_dir: "/tmp/metrics"}
+        {TimelessMetrics, name: :metrics, data_dir: "/tmp/metrics"}
       ]
 
       # Write metrics
-      Timeless.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2)
+      TimelessMetrics.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2)
 
       # Query
-      Timeless.query(:metrics, "cpu_usage", %{"host" => "web-1"},
+      TimelessMetrics.query(:metrics, "cpu_usage", %{"host" => "web-1"},
         from: System.os_time(:second) - 3600,
         to: System.os_time(:second)
       )
@@ -25,13 +25,13 @@ defmodule Timeless do
   # Batch sizes above this threshold use parallel resolution + shard writes
   @parallel_batch_threshold 1_000
 
-  @doc "Start a Timeless instance as part of a supervision tree."
+  @doc "Start a TimelessMetrics instance as part of a supervision tree."
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
 
     %{
       id: {__MODULE__, name},
-      start: {Timeless.Supervisor, :start_link, [opts]},
+      start: {TimelessMetrics.Supervisor, :start_link, [opts]},
       type: :supervisor
     }
   end
@@ -51,11 +51,11 @@ defmodule Timeless do
   def write(store, metric_name, labels, value, opts \\ []) do
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
     registry = :"#{store}_registry"
-    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
     shard_count = buffer_shard_count(store)
     shard_idx = rem(abs(series_id), shard_count)
     shard_name = :"#{store}_shard_#{shard_idx}"
-    Timeless.Buffer.write(shard_name, series_id, timestamp, value)
+    TimelessMetrics.Buffer.write(shard_name, series_id, timestamp, value)
   end
 
   @doc """
@@ -68,7 +68,7 @@ defmodule Timeless do
   """
   def resolve_series(store, metric_name, labels) do
     registry = :"#{store}_registry"
-    Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
   end
 
   @doc """
@@ -86,7 +86,7 @@ defmodule Timeless do
     shard_count = buffer_shard_count(store)
     shard_idx = rem(abs(series_id), shard_count)
     shard_name = :"#{store}_shard_#{shard_idx}"
-    Timeless.Buffer.write(shard_name, series_id, timestamp, value)
+    TimelessMetrics.Buffer.write(shard_name, series_id, timestamp, value)
   end
 
   @doc """
@@ -130,16 +130,16 @@ defmodule Timeless do
           chunk
           |> Enum.map(fn
             {metric_name, labels, value} ->
-              sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+              sid = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
               {sid, System.os_time(:second), value}
 
             {metric_name, labels, value, ts} ->
-              sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+              sid = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
               {sid, ts, value}
           end)
           |> Enum.group_by(fn {sid, _, _} -> rem(abs(sid), shard_count) end)
           |> Enum.each(fn {shard_idx, points} ->
-            Timeless.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+            TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
           end)
         end)
       end)
@@ -150,11 +150,11 @@ defmodule Timeless do
       entries
       |> Enum.map(fn
         {metric_name, labels, value} ->
-          sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+          sid = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
           {sid, System.os_time(:second), value}
 
         {metric_name, labels, value, ts} ->
-          sid = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
+          sid = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
           {sid, ts, value}
       end)
       |> group_and_write_shards(store, shard_count)
@@ -173,8 +173,8 @@ defmodule Timeless do
   """
   def query(store, metric_name, labels, opts \\ []) do
     registry = :"#{store}_registry"
-    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    Timeless.Query.raw(store, series_id, opts)
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    TimelessMetrics.Query.raw(store, series_id, opts)
   end
 
   @doc """
@@ -192,7 +192,7 @@ defmodule Timeless do
       matching
       |> Task.async_stream(
         fn {series_id, labels} ->
-          {:ok, points} = Timeless.Query.raw(store, series_id, opts)
+          {:ok, points} = TimelessMetrics.Query.raw(store, series_id, opts)
           %{labels: labels, points: points}
         end,
         max_concurrency: System.schedulers_online(),
@@ -219,8 +219,8 @@ defmodule Timeless do
   def query_aggregate(store, metric_name, labels, opts) do
     registry = :"#{store}_registry"
     schema = get_schema(store)
-    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    Timeless.Query.aggregate(store, series_id, Keyword.put(opts, :schema, schema))
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    TimelessMetrics.Query.aggregate(store, series_id, Keyword.put(opts, :schema, schema))
   end
 
   @doc """
@@ -247,9 +247,9 @@ defmodule Timeless do
       |> Task.async_stream(
         fn {_shard_idx, shard_series} ->
           Enum.flat_map(shard_series, fn {series_id, labels} ->
-            {:ok, buckets} = Timeless.Query.aggregate(store, series_id, query_opts)
+            {:ok, buckets} = TimelessMetrics.Query.aggregate(store, series_id, query_opts)
 
-            case Timeless.Transform.apply(buckets, transform) do
+            case TimelessMetrics.Transform.apply(buckets, transform) do
               [] -> []
               data -> [%{labels: labels, data: data}]
             end
@@ -270,8 +270,8 @@ defmodule Timeless do
   """
   def query_tier(store, tier_name, metric_name, labels, opts \\ []) do
     registry = :"#{store}_registry"
-    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    Timeless.Query.read_tier(store, tier_name, series_id, opts)
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    TimelessMetrics.Query.read_tier(store, tier_name, series_id, opts)
   end
 
   @doc """
@@ -282,8 +282,8 @@ defmodule Timeless do
   def latest(store, metric_name, labels) do
     registry = :"#{store}_registry"
     schema = get_schema(store)
-    series_id = Timeless.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    Timeless.Query.latest(store, series_id, schema: schema)
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    TimelessMetrics.Query.latest(store, series_id, schema: schema)
   end
 
   @doc """
@@ -303,7 +303,7 @@ defmodule Timeless do
     tasks =
       for i <- 0..(shard_count - 1) do
         builder = :"#{store}_builder_#{i}"
-        Task.async(fn -> Timeless.SegmentBuilder.flush(builder) end)
+        Task.async(fn -> TimelessMetrics.SegmentBuilder.flush(builder) end)
       end
 
     Task.await_many(tasks, :infinity)
@@ -339,10 +339,10 @@ defmodule Timeless do
 
     # Backup main DB
     main_target = Path.join(target_dir, "metrics.db")
-    {:ok, _} = Timeless.DB.backup(db, main_target)
+    {:ok, _} = TimelessMetrics.DB.backup(db, main_target)
 
     # Backup all shard directories in parallel
-    data_dir = Path.dirname(Timeless.DB.db_path(db))
+    data_dir = Path.dirname(TimelessMetrics.DB.db_path(db))
     schema = get_schema(store)
 
     tasks =
@@ -398,13 +398,13 @@ defmodule Timeless do
     schema = get_schema(store)
     shard_count = buffer_shard_count(store)
 
-    {:ok, [[series_count]]} = Timeless.DB.read(db, "SELECT COUNT(*) FROM series")
+    {:ok, [[series_count]]} = TimelessMetrics.DB.read(db, "SELECT COUNT(*) FROM series")
 
     # Aggregate raw segment stats from all shards
     {segment_count, total_points, raw_bytes, oldest_ts, newest_ts} =
       Enum.reduce(0..(shard_count - 1), {0, 0, 0, nil, nil}, fn i, {sc, tp, rb, oldest, newest} ->
         builder = :"#{store}_builder_#{i}"
-        stats = Timeless.SegmentBuilder.raw_stats(builder)
+        stats = TimelessMetrics.SegmentBuilder.raw_stats(builder)
 
         merged_oldest = cond do
           oldest == nil -> stats.oldest_ts
@@ -423,7 +423,7 @@ defmodule Timeless do
       end)
 
     # Sum all storage files (.db + shard dirs with .seg/.wal) for true on-disk usage
-    db_path = Timeless.DB.db_path(db)
+    db_path = TimelessMetrics.DB.db_path(db)
     data_dir = Path.dirname(db_path)
 
     storage_bytes =
@@ -477,10 +477,10 @@ defmodule Timeless do
         {chunks, buckets, compressed_bytes, dead_bytes, min_watermark} =
           Enum.reduce(0..(shard_count - 1), {0, 0, 0, 0, nil}, fn i, {ch_acc, bk_acc, cb_acc, db_acc, wm_acc} ->
             builder = :"#{store}_builder_#{i}"
-            {c, b, cb} = Timeless.SegmentBuilder.read_tier_stats(builder, tier.name)
-            {dead, _total} = Timeless.SegmentBuilder.tier_dead_bytes(builder, tier.name)
+            {c, b, cb} = TimelessMetrics.SegmentBuilder.read_tier_stats(builder, tier.name)
+            {dead, _total} = TimelessMetrics.SegmentBuilder.tier_dead_bytes(builder, tier.name)
 
-            wm = Timeless.SegmentBuilder.read_watermark(builder, tier.name)
+            wm = TimelessMetrics.SegmentBuilder.read_watermark(builder, tier.name)
 
             merged_wm = cond do
               wm_acc == nil -> wm
@@ -514,8 +514,8 @@ defmodule Timeless do
 
     {buffer_total, pending_total} =
       Enum.reduce(0..(shard_count - 1), {0, 0}, fn i, {buf_acc, pend_acc} ->
-        buf = Timeless.Buffer.buffer_size(:"#{store}_shard_#{i}")
-        pend = Timeless.SegmentBuilder.pending_point_count(:"#{store}_builder_#{i}")
+        buf = TimelessMetrics.Buffer.buffer_size(:"#{store}_shard_#{i}")
+        pend = TimelessMetrics.SegmentBuilder.pending_point_count(:"#{store}_builder_#{i}")
         {buf_acc + buf, pend_acc + pend}
       end)
 
@@ -551,7 +551,7 @@ defmodule Timeless do
   Force a rollup of all tiers (or a specific tier).
   """
   def rollup(store, tier \\ :all) do
-    Timeless.Rollup.run(:"#{store}_rollup", tier)
+    TimelessMetrics.Rollup.run(:"#{store}_rollup", tier)
   end
 
   @doc """
@@ -561,7 +561,7 @@ defmodule Timeless do
   data points that arrived after rollup had already advanced past their timestamps.
   """
   def catch_up(store) do
-    Timeless.Rollup.catch_up(:"#{store}_rollup")
+    TimelessMetrics.Rollup.catch_up(:"#{store}_rollup")
   end
 
   @doc """
@@ -587,7 +587,7 @@ defmodule Timeless do
           for i <- 0..(shard_count - 1), reduce: 0 do
             acc ->
               builder = :"#{store}_builder_#{i}"
-              case Timeless.SegmentBuilder.compact_tier(builder, tier.name, opts) do
+              case TimelessMetrics.SegmentBuilder.compact_tier(builder, tier.name, opts) do
                 {:ok, bytes} -> acc + bytes
                 :noop -> acc
               end
@@ -605,7 +605,7 @@ defmodule Timeless do
   Force retention enforcement now.
   """
   def enforce_retention(store) do
-    Timeless.Retention.enforce(:"#{store}_retention")
+    TimelessMetrics.Retention.enforce(:"#{store}_retention")
   end
 
   @doc """
@@ -615,7 +615,7 @@ defmodule Timeless do
   """
   def list_metrics(store) do
     db = :"#{store}_db"
-    {:ok, rows} = Timeless.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+    {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
     {:ok, Enum.map(rows, fn [name] -> name end)}
   end
 
@@ -628,7 +628,7 @@ defmodule Timeless do
     db = :"#{store}_db"
 
     {:ok, rows} =
-      Timeless.DB.read(
+      TimelessMetrics.DB.read(
         db,
         "SELECT labels FROM series WHERE metric_name = ?1 ORDER BY labels",
         [metric_name]
@@ -651,7 +651,7 @@ defmodule Timeless do
     db = :"#{store}_db"
 
     {:ok, rows} =
-      Timeless.DB.read(
+      TimelessMetrics.DB.read(
         db,
         "SELECT labels FROM series WHERE metric_name = ?1",
         [metric_name]
@@ -685,7 +685,7 @@ defmodule Timeless do
     unit = Keyword.get(opts, :unit)
     description = Keyword.get(opts, :description)
 
-    Timeless.DB.write(
+    TimelessMetrics.DB.write(
       db,
       "INSERT OR REPLACE INTO metric_metadata (metric_name, metric_type, unit, description) VALUES (?1, ?2, ?3, ?4)",
       [metric_name, type_str, unit, description]
@@ -701,7 +701,7 @@ defmodule Timeless do
     db = :"#{store}_db"
 
     {:ok, rows} =
-      Timeless.DB.read(
+      TimelessMetrics.DB.read(
         db,
         "SELECT metric_type, unit, description FROM metric_metadata WHERE metric_name = ?1",
         [metric_name]
@@ -737,15 +737,15 @@ defmodule Timeless do
     created_at = System.os_time(:second)
 
     {:ok, id} =
-      Timeless.DB.write_transaction(db, fn conn ->
-        Timeless.DB.execute(
+      TimelessMetrics.DB.write_transaction(db, fn conn ->
+        TimelessMetrics.DB.execute(
           conn,
           "INSERT INTO annotations (timestamp, title, description, tags, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
           [timestamp, title, description, tags, created_at]
         )
 
         {:ok, [[id]]} =
-          Timeless.DB.execute(conn, "SELECT last_insert_rowid()", [])
+          TimelessMetrics.DB.execute(conn, "SELECT last_insert_rowid()", [])
 
         id
       end)
@@ -767,7 +767,7 @@ defmodule Timeless do
     tag_filter = Keyword.get(opts, :tags, [])
 
     {:ok, rows} =
-      Timeless.DB.read(
+      TimelessMetrics.DB.read(
         db,
         "SELECT id, timestamp, title, description, tags FROM annotations WHERE timestamp >= ?1 AND timestamp <= ?2 ORDER BY timestamp",
         [from, to]
@@ -798,7 +798,7 @@ defmodule Timeless do
   """
   def delete_annotation(store, id) do
     db = :"#{store}_db"
-    Timeless.DB.write(db, "DELETE FROM annotations WHERE id = ?1", [id])
+    TimelessMetrics.DB.write(db, "DELETE FROM annotations WHERE id = ?1", [id])
     :ok
   end
 
@@ -823,31 +823,31 @@ defmodule Timeless do
   """
   def create_alert(store, opts) do
     db = :"#{store}_db"
-    Timeless.Alert.create_rule(db, opts)
+    TimelessMetrics.Alert.create_rule(db, opts)
   end
 
   @doc "List all alert rules with current state."
   def list_alerts(store) do
     db = :"#{store}_db"
-    Timeless.Alert.list_rules(db)
+    TimelessMetrics.Alert.list_rules(db)
   end
 
   @doc "Delete an alert rule."
   def delete_alert(store, rule_id) do
     db = :"#{store}_db"
-    Timeless.Alert.delete_rule(db, rule_id)
+    TimelessMetrics.Alert.delete_rule(db, rule_id)
   end
 
   @doc "Evaluate all alert rules against current data."
   def evaluate_alerts(store) do
-    Timeless.Alert.evaluate(store)
+    TimelessMetrics.Alert.evaluate(store)
   end
 
   @doc """
   Get the schema configuration for a store.
   """
   def get_schema(store) do
-    :persistent_term.get({Timeless, store, :schema}, Timeless.Schema.default())
+    :persistent_term.get({TimelessMetrics, store, :schema}, TimelessMetrics.Schema.default())
   end
 
   @doc """
@@ -882,7 +882,7 @@ defmodule Timeless do
 
     forecasts =
       Enum.map(results, fn %{labels: l, data: data} ->
-        case Timeless.Forecast.predict(data, horizon: horizon, bucket: bucket_seconds) do
+        case TimelessMetrics.Forecast.predict(data, horizon: horizon, bucket: bucket_seconds) do
           {:ok, predictions} -> %{labels: l, data: data, forecast: predictions}
           {:error, _} -> %{labels: l, data: data, forecast: []}
         end
@@ -921,7 +921,7 @@ defmodule Timeless do
 
     detections =
       Enum.map(results, fn %{labels: l, data: data} ->
-        case Timeless.Anomaly.detect(data, sensitivity: sensitivity) do
+        case TimelessMetrics.Anomaly.detect(data, sensitivity: sensitivity) do
           {:ok, analysis} -> %{labels: l, analysis: analysis}
           {:error, _} -> %{labels: l, analysis: []}
         end
@@ -939,7 +939,7 @@ defmodule Timeless do
   # --- Internals ---
 
   defp buffer_shard_count(store) do
-    :persistent_term.get({Timeless, store, :shard_count})
+    :persistent_term.get({TimelessMetrics, store, :shard_count})
   end
 
   defp group_and_write_shards(resolved, store, shard_count) do
@@ -949,13 +949,13 @@ defmodule Timeless do
       by_shard
       |> Enum.map(fn {shard_idx, points} ->
         Task.async(fn ->
-          Timeless.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+          TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
         end)
       end)
       |> Task.await_many()
     else
       Enum.each(by_shard, fn {shard_idx, points} ->
-        Timeless.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+        TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
       end)
     end
 
@@ -966,7 +966,7 @@ defmodule Timeless do
     db = :"#{store}_db"
 
     {:ok, rows} =
-      Timeless.DB.read(
+      TimelessMetrics.DB.read(
         db,
         "SELECT id, labels FROM series WHERE metric_name = ?1",
         [metric_name]

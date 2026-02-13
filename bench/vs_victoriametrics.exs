@@ -1,11 +1,11 @@
-# Comparison benchmark: Timeless vs VictoriaMetrics
+# Comparison benchmark: TimelessMetrics vs VictoriaMetrics
 #
 # Usage: mix run bench/vs_victoriametrics.exs [--devices N] [--days N]
 #
 # Requires VictoriaMetrics running on localhost:8428
-# Note: Timeless uses native Elixir API (in-process), VM uses HTTP.
+# Note: TimelessMetrics uses native Elixir API (in-process), VM uses HTTP.
 # Query comparison is apples-to-apples (both measured end-to-end).
-# Ingest comparison favors Timeless (native vs HTTP) — noted in output.
+# Ingest comparison favors TimelessMetrics (native vs HTTP) — noted in output.
 
 defmodule VsBench do
   @vm_url "http://localhost:8428"
@@ -25,7 +25,7 @@ defmodule VsBench do
     total_points = series_count * days * @intervals_per_day
 
     IO.puts("\n  " <> String.duplicate("=", 64))
-    IO.puts("  Timeless vs VictoriaMetrics")
+    IO.puts("  TimelessMetrics vs VictoriaMetrics")
     IO.puts("  " <> String.duplicate("=", 64))
     IO.puts("  Devices:  #{devices}")
     IO.puts("  Metrics:  #{metrics_count} per device")
@@ -45,19 +45,19 @@ defmodule VsBench do
 
     labels_for = 0..(devices - 1) |> Enum.map(&%{"host" => "dev_#{&1}"}) |> List.to_tuple()
 
-    # --- Phase 1: Ingest into Timeless ---
+    # --- Phase 1: Ingest into TimelessMetrics ---
     data_dir = "/tmp/timeless_vs_bench_#{System.os_time(:millisecond)}"
     File.mkdir_p!(data_dir)
 
-    schema = %Timeless.Schema{
+    schema = %TimelessMetrics.Schema{
       raw_retention_seconds: (days + 7) * 86_400,
       rollup_interval: :timer.hours(999),
       retention_interval: :timer.hours(999),
-      tiers: Timeless.Schema.default().tiers
+      tiers: TimelessMetrics.Schema.default().tiers
     }
 
     {:ok, _} =
-      Timeless.Supervisor.start_link(
+      TimelessMetrics.Supervisor.start_link(
         name: :vs_bench,
         data_dir: data_dir,
         buffer_shards: System.schedulers_online(),
@@ -69,7 +69,7 @@ defmodule VsBench do
 
     IO.puts("\n  Phase 1: Ingest")
     IO.puts("  " <> String.duplicate("-", 64))
-    IO.puts("  (Timeless = native API, VM = HTTP import — not apples-to-apples)")
+    IO.puts("  (TimelessMetrics = native API, VM = HTTP import — not apples-to-apples)")
     IO.puts("")
 
     {timeless_us, _} =
@@ -85,19 +85,19 @@ defmodule VsBench do
                 {metric, elem(labels_for, dev), gen(metric, ts, dev), ts}
               end
 
-            Timeless.write_batch(:vs_bench, entries)
+            TimelessMetrics.write_batch(:vs_bench, entries)
           end
 
-          Timeless.flush(:vs_bench)
+          TimelessMetrics.flush(:vs_bench)
 
           if rem(day + 1, 10) == 0 do
-            IO.write("\r    Timeless: day #{day + 1}/#{days}    ")
+            IO.write("\r    TimelessMetrics: day #{day + 1}/#{days}    ")
           end
         end
       end)
 
     timeless_rate = trunc(total_points / (timeless_us / 1_000_000))
-    IO.puts("\r    Timeless:          #{fmt_dur(timeless_us)}  [#{fmt_int(timeless_rate)} pts/sec]    ")
+    IO.puts("\r    TimelessMetrics:          #{fmt_dur(timeless_us)}  [#{fmt_int(timeless_rate)} pts/sec]    ")
 
     # --- Phase 1b: Ingest into VictoriaMetrics ---
     # Use Prometheus text exposition format via HTTP
@@ -143,8 +143,8 @@ defmodule VsBench do
     IO.puts("\n  Phase 2: Storage")
     IO.puts("  " <> String.duplicate("-", 64))
 
-    timeless_info = Timeless.info(:vs_bench)
-    IO.puts("    Timeless:")
+    timeless_info = TimelessMetrics.info(:vs_bench)
+    IO.puts("    TimelessMetrics:")
     IO.puts("      Segments:   #{fmt_int(timeless_info.segment_count)}")
     IO.puts("      Points:     #{fmt_int(timeless_info.total_points)}")
     IO.puts("      Compressed: #{fmt_bytes(timeless_info.raw_compressed_bytes)}")
@@ -169,7 +169,7 @@ defmodule VsBench do
     # --- Phase 3: Query comparison ---
     IO.puts("\n  Phase 3: Query Latency")
     IO.puts("  " <> String.duplicate("-", 64))
-    IO.puts("  (Both measured end-to-end: Timeless = native, VM = HTTP)")
+    IO.puts("  (Both measured end-to-end: TimelessMetrics = native, VM = HTTP)")
     IO.puts("")
 
     query_from = now - 3600
@@ -184,33 +184,33 @@ defmodule VsBench do
 
     queries = [
       {"raw 1h (single)", fn ->
-        Timeless.query(:vs_bench, "cpu_usage", test_labels, from: query_from, to: query_to)
+        TimelessMetrics.query(:vs_bench, "cpu_usage", test_labels, from: query_from, to: query_to)
       end, fn ->
         Req.get!(vm_req, url: "/api/v1/query_range",
           params: [query: q_single, start: query_from, end: query_to, step: 300])
       end},
       {"raw 24h (single)", fn ->
-        Timeless.query(:vs_bench, "cpu_usage", test_labels, from: now - 86_400, to: now)
+        TimelessMetrics.query(:vs_bench, "cpu_usage", test_labels, from: now - 86_400, to: now)
       end, fn ->
         Req.get!(vm_req, url: "/api/v1/query_range",
           params: [query: q_single, start: now - 86_400, end: now, step: 300])
       end},
       {"agg 1h avg (single)", fn ->
-        Timeless.query_aggregate(:vs_bench, "cpu_usage", test_labels,
+        TimelessMetrics.query_aggregate(:vs_bench, "cpu_usage", test_labels,
           from: query_from, to: query_to, bucket: {60, :seconds}, aggregate: :avg)
       end, fn ->
         Req.get!(vm_req, url: "/api/v1/query_range",
           params: [query: q_agg_single, start: query_from, end: query_to, step: 60])
       end},
       {"multi #{devices} hosts 1h", fn ->
-        Timeless.query_aggregate_multi(:vs_bench, "cpu_usage", %{},
+        TimelessMetrics.query_aggregate_multi(:vs_bench, "cpu_usage", %{},
           from: query_from, to: query_to, bucket: {60, :seconds}, aggregate: :avg)
       end, fn ->
         Req.get!(vm_req, url: "/api/v1/query_range",
           params: [query: q_agg_multi, start: query_from, end: query_to, step: 60])
       end},
       {"latest value", fn ->
-        Timeless.latest(:vs_bench, "cpu_usage", test_labels)
+        TimelessMetrics.latest(:vs_bench, "cpu_usage", test_labels)
       end, fn ->
         Req.get!(vm_req, url: "/api/v1/query",
           params: [query: q_single])
@@ -219,7 +219,7 @@ defmodule VsBench do
 
     IO.puts("  #{iterations} iterations each\n")
     IO.puts(
-      "  #{String.pad_trailing("Query", 28)} #{String.pad_leading("Timeless", 12)} #{String.pad_leading("VM", 12)} #{String.pad_leading("Ratio", 8)}"
+      "  #{String.pad_trailing("Query", 28)} #{String.pad_leading("TimelessMetrics", 12)} #{String.pad_leading("VM", 12)} #{String.pad_leading("Ratio", 8)}"
     )
     IO.puts("  " <> String.duplicate("-", 64))
 
@@ -252,9 +252,9 @@ defmodule VsBench do
     # --- Footer ---
     IO.puts("\n  " <> String.duplicate("=", 64))
     IO.puts("  Notes:")
-    IO.puts("    - Ingest: Timeless native API vs VM HTTP (not comparable)")
-    IO.puts("    - Queries: Timeless native vs VM HTTP (VM includes network overhead)")
-    IO.puts("    - VM query ratio >1x means Timeless is faster")
+    IO.puts("    - Ingest: TimelessMetrics native API vs VM HTTP (not comparable)")
+    IO.puts("    - Queries: TimelessMetrics native vs VM HTTP (VM includes network overhead)")
+    IO.puts("    - VM query ratio >1x means TimelessMetrics is faster")
     IO.puts("  Cleanup:")
     IO.puts("    rm -rf #{data_dir}")
     IO.puts("    curl -s 'http://localhost:8428/api/v1/admin/tsdb/delete_series?match[]={__name__=~\".*\"}' > /dev/null")

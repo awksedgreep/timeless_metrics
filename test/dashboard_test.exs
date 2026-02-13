@@ -1,11 +1,11 @@
-defmodule Timeless.DashboardTest do
+defmodule TimelessMetrics.DashboardTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_dash_test_#{System.os_time(:millisecond)}"
 
   setup do
     start_supervised!(
-      {Timeless,
+      {TimelessMetrics,
        name: :dash_test,
        data_dir: @data_dir,
        buffer_shards: 1,
@@ -13,7 +13,7 @@ defmodule Timeless.DashboardTest do
     )
 
     on_exit(fn ->
-      :persistent_term.erase({Timeless, :dash_test, :schema})
+      :persistent_term.erase({TimelessMetrics, :dash_test, :schema})
       File.rm_rf!(@data_dir)
     end)
 
@@ -23,11 +23,11 @@ defmodule Timeless.DashboardTest do
   test "dashboard renders HTML with no metrics" do
     conn =
       Plug.Test.conn(:get, "/")
-      |> Timeless.HTTP.call(store: :dash_test)
+      |> TimelessMetrics.HTTP.call(store: :dash_test)
 
     assert conn.status == 200
     assert String.contains?(conn.resp_body, "<!DOCTYPE html>")
-    assert String.contains?(conn.resp_body, "Timeless")
+    assert String.contains?(conn.resp_body, "TimelessMetrics")
     assert String.contains?(conn.resp_body, "No metrics yet")
   end
 
@@ -37,20 +37,20 @@ defmodule Timeless.DashboardTest do
 
     # Write data for two metrics
     for i <- 0..5 do
-      Timeless.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 50.0 + i,
+      TimelessMetrics.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 50.0 + i,
         timestamp: base + i * 60
       )
 
-      Timeless.write(:dash_test, "mem_usage", %{"host" => "web-1"}, 70.0 + i,
+      TimelessMetrics.write(:dash_test, "mem_usage", %{"host" => "web-1"}, 70.0 + i,
         timestamp: base + i * 60
       )
     end
 
-    Timeless.flush(:dash_test)
+    TimelessMetrics.flush(:dash_test)
 
     conn =
       Plug.Test.conn(:get, "/")
-      |> Timeless.HTTP.call(store: :dash_test)
+      |> TimelessMetrics.HTTP.call(store: :dash_test)
 
     assert conn.status == 200
     body = conn.resp_body
@@ -67,27 +67,27 @@ defmodule Timeless.DashboardTest do
 
     # Write high data
     for i <- 0..5 do
-      Timeless.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 95.0,
+      TimelessMetrics.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 95.0,
         timestamp: base + i * 60
       )
     end
 
-    Timeless.flush(:dash_test)
+    TimelessMetrics.flush(:dash_test)
 
     # Create alert rule and trigger it
     {:ok, _id} =
-      Timeless.create_alert(:dash_test,
+      TimelessMetrics.create_alert(:dash_test,
         name: "High CPU",
         metric: "cpu_usage",
         condition: :above,
         threshold: 90.0
       )
 
-    Timeless.evaluate_alerts(:dash_test)
+    TimelessMetrics.evaluate_alerts(:dash_test)
 
     conn =
       Plug.Test.conn(:get, "/")
-      |> Timeless.HTTP.call(store: :dash_test)
+      |> TimelessMetrics.HTTP.call(store: :dash_test)
 
     assert conn.status == 200
     body = conn.resp_body
@@ -99,7 +99,7 @@ defmodule Timeless.DashboardTest do
   test "dashboard respects from parameter" do
     conn =
       Plug.Test.conn(:get, "/?from=-6h")
-      |> Timeless.HTTP.call(store: :dash_test)
+      |> TimelessMetrics.HTTP.call(store: :dash_test)
 
     assert conn.status == 200
     body = conn.resp_body
@@ -110,15 +110,15 @@ defmodule Timeless.DashboardTest do
   test "dashboard passes label filters to chart URLs" do
     now = System.os_time(:second)
 
-    Timeless.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
+    TimelessMetrics.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
       timestamp: now
     )
 
-    Timeless.flush(:dash_test)
+    TimelessMetrics.flush(:dash_test)
 
     conn =
       Plug.Test.conn(:get, "/?host=web-1")
-      |> Timeless.HTTP.call(store: :dash_test)
+      |> TimelessMetrics.HTTP.call(store: :dash_test)
 
     assert conn.status == 200
     body = conn.resp_body
