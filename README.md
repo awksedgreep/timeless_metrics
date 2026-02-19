@@ -4,10 +4,46 @@ Embedded time series database for Elixir. Combines [Gorilla compression](https:/
 
 Run it as a library inside your Elixir app or as a standalone container.
 
+## Performance
+
+Benchmarked with realistic ISP/network data (100 devices, 20 metrics each, 90 days of 5-minute samples):
+
+### Write Throughput
+
+| Write Path | Throughput |
+|---|---|
+| Single series write | ~4M points/sec |
+| Pre-resolved write (bypass registry) | ~6M points/sec |
+| Batch write | ~4M points/sec |
+| Concurrent batch, pre-resolved | ~9.5M points/sec |
+
+### Query Latency (2K series, 5.2M points, 100 iterations)
+
+| Query | Avg | P50 | P99 |
+|---|---|---|---|
+| Raw points (1h) | <0.1ms | <0.1ms | <0.1ms |
+| Raw points (24h) | ~0.1ms | ~0.1ms | ~0.2ms |
+| Aggregation (1h, 60s buckets) | ~0.1ms | ~0.1ms | ~0.2ms |
+| Aggregation (24h, 5m buckets) | ~0.2ms | ~0.2ms | ~0.3ms |
+| Multi-series (100 hosts, 1h) | ~2ms | ~2ms | ~3ms |
+| Latest value | <0.1ms | <0.1ms | <0.1ms |
+| Tier query: hourly (7d) | <0.1ms | <0.1ms | <0.1ms |
+| Tier query: daily (90d) | <0.1ms | <0.1ms | <0.1ms |
+
+### Storage Efficiency
+
+| Metric | Value |
+|---|---|
+| Compression ratio | 11.5x (~95% reduction) |
+| Bytes per point | ~0.67 |
+| Compression engine | Gorilla (delta-of-delta + XOR) + zstd |
+
+Run `mix bench` to reproduce on your hardware. Use `--tier stress` for 10K devices.
+
 ## Features
 
 - **High throughput** — 4M+ points/sec ingest, 9.5M+ points/sec concurrent pre-resolved writes
-- **Compact storage** — Gorilla + zstd compression, ~0.67 bytes/point for real-world data
+- **Compact storage** — Gorilla + zstd compression, 11.5x ratio (~95% reduction)
 - **Sharded writes** — parallel buffer/builder shards across CPU cores
 - **Automatic rollups** — configurable tiers (hourly, daily, monthly) with retention policies
 - **VictoriaMetrics compatible** — JSON line import, works with Vector, Grafana, and existing VM tooling
