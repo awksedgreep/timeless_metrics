@@ -6,7 +6,7 @@ Run it as a library inside your Elixir app or as a standalone container.
 
 ## Features
 
-- **High throughput** — 400K+ points/sec single-writer, 2.5M+ points/sec over HTTP (parallel clients)
+- **High throughput** — 4M+ points/sec ingest, 9.5M+ points/sec concurrent pre-resolved writes
 - **Compact storage** — Gorilla + zstd compression, ~0.67 bytes/point for real-world data
 - **Sharded writes** — parallel buffer/builder shards across CPU cores
 - **Automatic rollups** — configurable tiers (hourly, daily, monthly) with retention policies
