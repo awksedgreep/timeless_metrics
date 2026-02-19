@@ -1,11 +1,11 @@
-# Timeless UI — Requirements
+# TimelessMetrics UI — Requirements
 
-Separate hex package (`timeless_ui`) providing a Phoenix LiveView admin panel for Timeless. Follows the `phoenix_live_dashboard` pattern — optional, pluggable, zero impact on the core library.
+Separate hex package (`timeless_ui`) providing a Phoenix LiveView admin panel for TimelessMetrics. Follows the `phoenix_live_dashboard` pattern — optional, pluggable, zero impact on the core library.
 
 ## Package Design
 
 - **Name**: `timeless_ui`
-- **Depends on**: `timeless` (core library), `phoenix_live_view`
+- **Depends on**: `timeless_metrics` (core library), `phoenix_live_view`
 - **Install**: `{:timeless_ui, "~> 0.1"}` — people who don't want it, don't add it
 - **Mount**: pluggable into any Phoenix router
 
@@ -72,8 +72,8 @@ The UI should never bypass the core library's token auth when making API calls i
 - LiveView for real-time updates (alert states, buffer backlog, health stats)
 - Server-rendered — no JS build step beyond LiveView's standard JS hooks
 - Tailwind CSS via CDN or inline styles (no build pipeline)
-- Charts: render using Timeless.Chart (the existing SVG renderer) embedded in LiveView
-- All data access through the public `Timeless` API — no direct DB access
+- Charts: render using TimelessMetrics.Chart (the existing SVG renderer) embedded in LiveView
+- All data access through the public `TimelessMetrics` API — no direct DB access
 
 ## API Surface Required from Core
 
@@ -81,24 +81,24 @@ The UI will need these functions from `timeless` (most already exist):
 
 | Function | Status | Notes |
 |---|---|---|
-| `Timeless.info/1` | Exists | Store health stats |
-| `Timeless.list_alerts/1` | Exists | Alert rules + states |
-| `Timeless.create_alert/2` | Exists | |
-| `Timeless.delete_alert/2` | Exists | |
-| `Timeless.evaluate_alerts/1` | Exists | Manual trigger |
-| `Timeless.annotations/3` | Exists | Query annotations |
-| `Timeless.annotate/3` | Exists | Create annotation |
-| `Timeless.get_metadata/2` | Exists | |
-| `Timeless.register_metric/4` | Exists | |
-| `Timeless.query_aggregate_multi/4` | Exists | For chart explorer |
-| `Timeless.forecast/4` | Exists | |
-| `Timeless.detect_anomalies/4` | Exists | |
-| `Timeless.get_schema/1` | Exists | Read schema config |
-| `Timeless.list_metrics/1` | **Needed** | List all metric names |
-| `Timeless.list_series/2` | **Needed** | List series for a metric with labels |
-| `Timeless.shard_stats/1` | **Needed** | Per-shard DB size, segment counts, watermarks |
-| `Timeless.rollup_status/1` | **Needed** | Last rollup time, duration, rows processed |
-| `Timeless.delete_annotation/2` | Exists | Via HTTP, may need Elixir API |
+| `TimelessMetrics.info/1` | Exists | Store health stats |
+| `TimelessMetrics.list_alerts/1` | Exists | Alert rules + states |
+| `TimelessMetrics.create_alert/2` | Exists | |
+| `TimelessMetrics.delete_alert/2` | Exists | |
+| `TimelessMetrics.evaluate_alerts/1` | Exists | Manual trigger |
+| `TimelessMetrics.annotations/3` | Exists | Query annotations |
+| `TimelessMetrics.annotate/3` | Exists | Create annotation |
+| `TimelessMetrics.get_metadata/2` | Exists | |
+| `TimelessMetrics.register_metric/4` | Exists | |
+| `TimelessMetrics.query_aggregate_multi/4` | Exists | For chart explorer |
+| `TimelessMetrics.forecast/4` | Exists | |
+| `TimelessMetrics.detect_anomalies/4` | Exists | |
+| `TimelessMetrics.get_schema/1` | Exists | Read schema config |
+| `TimelessMetrics.list_metrics/1` | **Needed** | List all metric names |
+| `TimelessMetrics.list_series/2` | **Needed** | List series for a metric with labels |
+| `TimelessMetrics.shard_stats/1` | **Needed** | Per-shard DB size, segment counts, watermarks |
+| `TimelessMetrics.rollup_status/1` | **Needed** | Last rollup time, duration, rows processed |
+| `TimelessMetrics.delete_annotation/2` | Exists | Via HTTP, may need Elixir API |
 
 Functions marked **Needed** would be added to the core library before building the UI.
 
@@ -106,12 +106,12 @@ Functions marked **Needed** would be added to the core library before building t
 
 - User management / RBAC (use reverse proxy or Phoenix auth)
 - Grafana datasource plugin (use the existing Prometheus-compatible endpoint)
-- Log viewer (Timeless is metrics only)
+- Log viewer (TimelessMetrics is metrics only)
 - Distributed cluster management (future — see `docs/timeless_global_registry.md`)
 
 ## Release Strategy
 
 - Separate hex package, separate git repo
-- Own version cadence independent of `timeless` core
-- Minimum `timeless` version pinned (e.g. `~> 0.3` once the needed API functions are added)
+- Own version cadence independent of `timeless_metrics` core
+- Minimum `timeless_metrics` version pinned (e.g. `~> 0.3` once the needed API functions are added)
 - Phoenix 1.7+ / LiveView 0.20+ required

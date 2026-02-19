@@ -1,11 +1,11 @@
-# Timeless Global Registry (Future Project)
+# TimelessMetrics Global Registry (Future Project)
 
 Design notes for a distributed ingest gateway that sits in front of a cluster
-of Timeless nodes. Separate project from Timeless itself.
+of TimelessMetrics nodes. Separate project from TimelessMetrics itself.
 
 ## Goal
 
-Single entry point for metric ingestion across a cluster of Timeless nodes.
+Single entry point for metric ingestion across a cluster of TimelessMetrics nodes.
 Pre-resolves series IDs at the gateway layer so every downstream node stays on
 the `write_batch_resolved/2` hot path (~4M+ pts/sec per node).
 
@@ -22,12 +22,12 @@ Load Balancer (round-robin)
          ┌───────────┼───────────┐
          ▼           ▼           ▼
       Node 1      Node 2      Node N
-      (Timeless)  (Timeless)  (Timeless)
+      (TimelessMetrics)  (Timeless)  (Timeless)
 ```
 
 ## Gateway Responsibilities
 
-1. **Ingest** — accept HTTP requests (same VM JSON / Prometheus endpoints as Timeless)
+1. **Ingest** — accept HTTP requests (same VM JSON / Prometheus endpoints as TimelessMetrics)
 2. **Resolve** — look up `{metric, labels} → {node, series_id}` in local ETS cache
 3. **Assign** — on cache miss, pick an owner node (consistent hash or least-loaded), call `resolve_series/3` on it, cache the result
 4. **Batch** — group entries by target node
@@ -44,9 +44,9 @@ in seconds. Run as many gateways as needed behind a load balancer.
 
 ### Nodes Are Independent
 
-Timeless nodes don't know about each other. No Erlang clustering between nodes.
+TimelessMetrics nodes don't know about each other. No Erlang clustering between nodes.
 Only gateways connect to nodes via Erlang distribution. Nodes are just standard
-Timeless containers.
+TimelessMetrics containers.
 
 ### No Query Fan-Out
 
@@ -98,14 +98,14 @@ At 50M pts/sec the bottleneck chain is:
 
 Separate Elixir project (`timeless_gateway`), likely structured as:
 
-- `TimelessGateway.Router` — HTTP endpoints (same API surface as Timeless.HTTP)
+- `TimelessGateway.Router` — HTTP endpoints (same API surface as TimelessMetrics.HTTP)
 - `TimelessGateway.Registry` — ETS cache of series → node mappings
 - `TimelessGateway.Discovery` — DNS-based node discovery + Erlang connect
 - `TimelessGateway.Forwarder` — batches and sends pre-resolved writes to nodes
 - `TimelessGateway.HealthCheck` — monitors node liveness, triggers failover
 
-Depends on Timeless as a library (for `resolve_series/3`, `write_batch_resolved/2`
-type specs) but does not start a local Timeless instance.
+Depends on TimelessMetrics as a library (for `resolve_series/3`, `write_batch_resolved/2`
+type specs) but does not start a local TimelessMetrics instance.
 
 ## Open Questions
 
@@ -116,4 +116,4 @@ type specs) but does not start a local Timeless instance.
 - Backpressure: if a node falls behind, should the gateway buffer, drop, or
   redirect to the replica?
 - Metrics about metrics: the gateway itself should expose throughput/latency
-  stats, probably via its own Timeless instance.
+  stats, probably via its own TimelessMetrics instance.

@@ -1,6 +1,6 @@
-# Capacity Planning with Timeless
+# Capacity Planning with TimelessMetrics
 
-Timeless includes built-in forecasting and anomaly detection that works at any time scale — from 5-minute operational monitoring to multi-year capacity planning. No external ML libraries required.
+TimelessMetrics includes built-in forecasting and anomaly detection that works at any time scale — from 5-minute operational monitoring to multi-year capacity planning. No external ML libraries required.
 
 ## How It Works
 
@@ -27,7 +27,7 @@ Given 1 year of daily peak bandwidth data, forecast the next year:
 ```elixir
 # Query 1 year of daily peak bandwidth
 {:ok, results} =
-  Timeless.query_aggregate(:my_store, "bandwidth_peak", %{"region" => "east"},
+  TimelessMetrics.query_aggregate(:my_store, "bandwidth_peak", %{"region" => "east"},
     from: now - 365 * 86_400,
     to: now,
     bucket: {:day, :days},
@@ -36,7 +36,7 @@ Given 1 year of daily peak bandwidth data, forecast the next year:
 
 # Forecast 1 year ahead
 {:ok, forecast} =
-  Timeless.Forecast.predict(results,
+  TimelessMetrics.Forecast.predict(results,
     horizon: 365 * 86_400,
     bucket: 86_400
   )
@@ -54,7 +54,7 @@ Use the forecast to find when you'll hit capacity limits:
 max_capacity = 100.0  # Gbps
 
 {:ok, forecast} =
-  Timeless.Forecast.predict(historical_data,
+  TimelessMetrics.Forecast.predict(historical_data,
     horizon: 365 * 86_400,
     bucket: 86_400
   )
@@ -129,14 +129,14 @@ Override auto-detection when you know your data's patterns:
 
 ```elixir
 # Monthly + quarterly seasonality for billing data
-Timeless.Forecast.predict(data,
+TimelessMetrics.Forecast.predict(data,
   horizon: 365 * 86_400,
   bucket: 86_400,
   periods: [30 * 86_400, 90 * 86_400]
 )
 
 # No seasonality — pure trend (polynomial only)
-Timeless.Forecast.predict(data,
+TimelessMetrics.Forecast.predict(data,
   horizon: 365 * 86_400,
   bucket: 86_400,
   periods: []
@@ -146,7 +146,7 @@ Timeless.Forecast.predict(data,
 The same `:periods` option works with anomaly detection:
 
 ```elixir
-Timeless.Anomaly.detect(data,
+TimelessMetrics.Anomaly.detect(data,
   sensitivity: :medium,
   periods: [7 * 86_400]  # weekly only
 )
@@ -159,7 +159,7 @@ Timeless.Anomaly.detect(data,
 ```elixir
 # Daily peak utilization per uplink port, forecast 1 year
 {:ok, forecasts} =
-  Timeless.forecast(:metrics, "port_utilization", %{"port" => "ae0"},
+  TimelessMetrics.forecast(:metrics, "port_utilization", %{"port" => "ae0"},
     from: now - 365 * 86_400,
     to: now,
     horizon: 365 * 86_400,
@@ -173,7 +173,7 @@ Timeless.Anomaly.detect(data,
 ```elixir
 # Weekly active subscriber count, forecast 2 years
 {:ok, forecasts} =
-  Timeless.forecast(:metrics, "active_subscribers", %{},
+  TimelessMetrics.forecast(:metrics, "active_subscribers", %{},
     from: now - 730 * 86_400,
     to: now,
     horizon: 730 * 86_400,
@@ -187,7 +187,7 @@ Timeless.Anomaly.detect(data,
 ```elixir
 # Daily peak lease count per pool
 {:ok, forecasts} =
-  Timeless.forecast(:metrics, "dhcp_leases", %{"pool" => "residential"},
+  TimelessMetrics.forecast(:metrics, "dhcp_leases", %{"pool" => "residential"},
     from: now - 180 * 86_400,
     to: now,
     horizon: 365 * 86_400,

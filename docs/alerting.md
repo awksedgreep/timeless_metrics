@@ -1,10 +1,10 @@
 # Alerting
 
-Timeless has a built-in alert engine that evaluates threshold rules against live metric data and delivers webhook notifications on state changes.
+TimelessMetrics has a built-in alert engine that evaluates threshold rules against live metric data and delivers webhook notifications on state changes.
 
 ## How It Works
 
-Alert evaluation piggybacks on the **rollup tick** — no extra timers or polling. Every rollup interval (default: 5 minutes), Timeless:
+Alert evaluation piggybacks on the **rollup tick** — no extra timers or polling. Every rollup interval (default: 5 minutes), TimelessMetrics:
 
 1. Queries the latest aggregated value for each rule's metric + labels
 2. Checks if the value breaches the rule's threshold condition
@@ -38,7 +38,7 @@ Alert **rules** persist until explicitly deleted. If you decommission devices or
 
 ```elixir
 {:ok, rule_id} =
-  Timeless.create_alert(:metrics,
+  TimelessMetrics.create_alert(:metrics,
     name: "High CPU",
     metric: "cpu_usage",
     labels: %{"host" => "web-1"},
@@ -71,7 +71,7 @@ Alert **rules** persist until explicitly deleted. If you decommission devices or
 ### List rules
 
 ```elixir
-{:ok, rules} = Timeless.list_alerts(:metrics)
+{:ok, rules} = TimelessMetrics.list_alerts(:metrics)
 
 # Each rule includes current state per series:
 # %{
@@ -95,7 +95,7 @@ Alert **rules** persist until explicitly deleted. If you decommission devices or
 ### Delete a rule
 
 ```elixir
-:ok = Timeless.delete_alert(:metrics, rule_id)
+:ok = TimelessMetrics.delete_alert(:metrics, rule_id)
 ```
 
 ### Manual evaluation
@@ -103,7 +103,7 @@ Alert **rules** persist until explicitly deleted. If you decommission devices or
 Alert rules are evaluated automatically on every rollup tick. To trigger evaluation manually:
 
 ```elixir
-Timeless.evaluate_alerts(:metrics)
+TimelessMetrics.evaluate_alerts(:metrics)
 ```
 
 ## HTTP API
@@ -174,7 +174,7 @@ curl -X DELETE http://localhost:8428/api/v1/alerts/1
 
 ## Webhook Payload
 
-When an alert transitions to `firing` or `resolved`, Timeless POSTs JSON to the configured `webhook_url`:
+When an alert transitions to `firing` or `resolved`, TimelessMetrics POSTs JSON to the configured `webhook_url`:
 
 ```json
 {
@@ -254,7 +254,7 @@ curl -X POST http://localhost:8428/api/v1/alerts \
 
 ### Connecting to ntfy.sh
 
-[ntfy](https://ntfy.sh) works out of the box — just point `webhook_url` at your topic. Since Timeless sends JSON, ntfy will accept it directly and you'll get push notifications on your phone or desktop:
+[ntfy](https://ntfy.sh) works out of the box — just point `webhook_url` at your topic. Since TimelessMetrics sends JSON, ntfy will accept it directly and you'll get push notifications on your phone or desktop:
 
 ```bash
 curl -X POST http://localhost:8428/api/v1/alerts \
@@ -320,7 +320,7 @@ Alerts are evaluated on every rollup tick. The default rollup interval is **5 mi
 
 ```elixir
 defmodule MySchema do
-  use Timeless.Schema
+  use TimelessMetrics.Schema
 
   rollup_interval :timer.minutes(1)  # evaluate alerts every minute
 

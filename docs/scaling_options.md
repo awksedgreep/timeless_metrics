@@ -1,4 +1,4 @@
-# Timeless Scaling Options
+# TimelessMetrics Scaling Options
 
 Current performance baseline (22-core laptop, thermal throttling):
 
@@ -208,7 +208,7 @@ compound further.
 **Aggressive target: 800K-1M pts/sec** with sharded builders.
 
 For reference, VictoriaMetrics achieves 782K pts/sec via HTTP on the same
-hardware, so reaching 700K+ with native API would make Timeless faster
+hardware, so reaching 700K+ with native API would make TimelessMetrics faster
 than VM for the embedded use case.
 
 ---

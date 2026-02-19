@@ -1,6 +1,6 @@
-# Timeless API Reference
+# TimelessMetrics API Reference
 
-Timeless is an embedded time series database for Elixir. It can run as a library
+TimelessMetrics is an embedded time series database for Elixir. It can run as a library
 inside your application or as a standalone containerized service. This document
 covers the Elixir API, the HTTP interface, and the SVG charting endpoint.
 
@@ -47,11 +47,11 @@ covers the Elixir API, the HTTP interface, and the SVG charting endpoint.
 
 ### Starting a Store
 
-Add Timeless to your supervision tree:
+Add TimelessMetrics to your supervision tree:
 
 ```elixir
 children = [
-  {Timeless, name: :metrics, data_dir: "/var/lib/metrics"}
+  {TimelessMetrics, name: :metrics, data_dir: "/var/lib/metrics"}
 ]
 ```
 
@@ -62,23 +62,23 @@ All subsequent API calls reference the store by its name (`:metrics` above).
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `:name` | atom | **required** | Store name used in all API calls |
-| `:data_dir` | string | **required** | Directory for SQLite databases |
-| `:buffer_shards` | integer | `System.schedulers_online()` | Number of write buffer shards |
+| `:data_dir` | string | **required** | Directory for segment files and metadata database |
+| `:buffer_shards` | integer | `schedulers / 2` (min 2) | Number of write buffer shards |
 | `:flush_interval` | integer | `5000` | Buffer flush interval in ms |
 | `:flush_threshold` | integer | `10_000` | Points per shard before forced flush |
 | `:segment_duration` | integer | `3600` | Raw segment duration in seconds |
 | `:compression` | atom | `:zstd` | Compression algorithm |
-| `:schema` | module/struct | `Timeless.Schema.default()` | Rollup tier configuration |
+| `:schema` | module/struct | `TimelessMetrics.Schema.default()` | Rollup tier configuration |
 
 ### Writing Data
 
 #### Single point
 
 ```elixir
-Timeless.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2)
+TimelessMetrics.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2)
 
 # With explicit timestamp (unix seconds)
-Timeless.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2,
+TimelessMetrics.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2,
   timestamp: 1_700_000_000)
 ```
 
@@ -87,7 +87,7 @@ Timeless.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2,
 Each entry is `{metric, labels, value}` or `{metric, labels, value, timestamp}`:
 
 ```elixir
-Timeless.write_batch(:metrics, [
+TimelessMetrics.write_batch(:metrics, [
   {"cpu_usage", %{"host" => "web-1"}, 73.2},
   {"cpu_usage", %{"host" => "web-2"}, 81.0},
   {"mem_usage", %{"host" => "web-1"}, 4_200_000, 1_700_000_000}
@@ -101,11 +101,11 @@ once at startup and bypass the registry on every write:
 
 ```elixir
 # Resolve once (e.g., at poller init)
-sid = Timeless.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
+sid = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
 
 # Write on the hot path — zero registry overhead
-Timeless.write_resolved(:metrics, sid, 73.2)
-Timeless.write_resolved(:metrics, sid, 74.1, timestamp: 1_700_000_060)
+TimelessMetrics.write_resolved(:metrics, sid, 73.2)
+TimelessMetrics.write_resolved(:metrics, sid, 74.1, timestamp: 1_700_000_060)
 ```
 
 #### Pre-resolved batch
@@ -113,7 +113,7 @@ Timeless.write_resolved(:metrics, sid, 74.1, timestamp: 1_700_000_060)
 Each entry is `{series_id, value}` or `{series_id, value, timestamp}`:
 
 ```elixir
-Timeless.write_batch_resolved(:metrics, [
+TimelessMetrics.write_batch_resolved(:metrics, [
   {sid_1, 73.2},
   {sid_2, 81.0, 1_700_000_000}
 ])
@@ -124,7 +124,7 @@ Timeless.write_batch_resolved(:metrics, [
 #### Raw points (single series, exact label match)
 
 ```elixir
-{:ok, points} = Timeless.query(:metrics, "cpu_usage", %{"host" => "web-1"},
+{:ok, points} = TimelessMetrics.query(:metrics, "cpu_usage", %{"host" => "web-1"},
   from: System.os_time(:second) - 3600,
   to: System.os_time(:second))
 
@@ -136,7 +136,7 @@ Timeless.write_batch_resolved(:metrics, [
 An empty label filter matches all series for the metric:
 
 ```elixir
-{:ok, results} = Timeless.query_multi(:metrics, "cpu_usage", %{})
+{:ok, results} = TimelessMetrics.query_multi(:metrics, "cpu_usage", %{})
 
 # results = [
 #   %{labels: %{"host" => "web-1"}, points: [{ts, val}, ...]},
@@ -147,7 +147,7 @@ An empty label filter matches all series for the metric:
 Filter by partial labels:
 
 ```elixir
-{:ok, results} = Timeless.query_multi(:metrics, "cpu_usage",
+{:ok, results} = TimelessMetrics.query_multi(:metrics, "cpu_usage",
   %{"region" => "us-east"},
   from: now - 7200, to: now)
 ```
@@ -155,8 +155,8 @@ Filter by partial labels:
 #### Latest value
 
 ```elixir
-{:ok, {timestamp, value}} = Timeless.latest(:metrics, "cpu_usage", %{"host" => "web-1"})
-{:ok, nil} = Timeless.latest(:metrics, "nonexistent", %{})
+{:ok, {timestamp, value}} = TimelessMetrics.latest(:metrics, "cpu_usage", %{"host" => "web-1"})
+{:ok, nil} = TimelessMetrics.latest(:metrics, "nonexistent", %{})
 ```
 
 ### Aggregation Queries
@@ -164,7 +164,7 @@ Filter by partial labels:
 Bucket data into time intervals with an aggregate function:
 
 ```elixir
-{:ok, buckets} = Timeless.query_aggregate(:metrics, "cpu_usage",
+{:ok, buckets} = TimelessMetrics.query_aggregate(:metrics, "cpu_usage",
   %{"host" => "web-1"},
   from: now - 86400,
   to: now,
@@ -177,7 +177,7 @@ Bucket data into time intervals with an aggregate function:
 #### Multi-series aggregation
 
 ```elixir
-{:ok, results} = Timeless.query_aggregate_multi(:metrics, "cpu_usage", %{},
+{:ok, results} = TimelessMetrics.query_aggregate_multi(:metrics, "cpu_usage", %{},
   from: now - 86400,
   to: now,
   bucket: :hour,
@@ -212,7 +212,7 @@ Bucket data into time intervals with an aggregate function:
 Read pre-computed rollup data directly from a tier:
 
 ```elixir
-{:ok, rows} = Timeless.query_tier(:metrics, :hourly, "cpu_usage",
+{:ok, rows} = TimelessMetrics.query_tier(:metrics, :hourly, "cpu_usage",
   %{"host" => "web-1"},
   from: now - 86400, to: now)
 
@@ -223,15 +223,15 @@ Read pre-computed rollup data directly from a tier:
 
 ```elixir
 # List all metric names
-{:ok, names} = Timeless.list_metrics(:metrics)
+{:ok, names} = TimelessMetrics.list_metrics(:metrics)
 # ["cpu_usage", "mem_usage", "disk_io"]
 
 # List all series for a metric
-{:ok, series} = Timeless.list_series(:metrics, "cpu_usage")
+{:ok, series} = TimelessMetrics.list_series(:metrics, "cpu_usage")
 # [%{labels: %{"host" => "web-1"}}, %{labels: %{"host" => "web-2"}}]
 
 # List distinct values for a label key
-{:ok, hosts} = Timeless.label_values(:metrics, "cpu_usage", "host")
+{:ok, hosts} = TimelessMetrics.label_values(:metrics, "cpu_usage", "host")
 # ["web-1", "web-2", "web-3"]
 ```
 
@@ -239,12 +239,12 @@ Read pre-computed rollup data directly from a tier:
 
 ```elixir
 # Register metadata
-Timeless.register_metric(:metrics, "cpu_usage", :gauge,
+TimelessMetrics.register_metric(:metrics, "cpu_usage", :gauge,
   unit: "%",
   description: "CPU utilization percentage")
 
 # Get metadata
-{:ok, meta} = Timeless.get_metadata(:metrics, "cpu_usage")
+{:ok, meta} = TimelessMetrics.get_metadata(:metrics, "cpu_usage")
 # %{type: :gauge, unit: "%", description: "CPU utilization percentage"}
 ```
 
@@ -256,23 +256,23 @@ Annotations are event markers that overlay on charts (deploys, incidents, etc.):
 
 ```elixir
 # Create
-{:ok, id} = Timeless.annotate(:metrics, System.os_time(:second), "Deploy v2.1",
+{:ok, id} = TimelessMetrics.annotate(:metrics, System.os_time(:second), "Deploy v2.1",
   description: "Rolled out new caching layer",
   tags: ["deploy", "prod"])
 
 # Query time range
-{:ok, annotations} = Timeless.annotations(:metrics, from, to, tags: ["deploy"])
+{:ok, annotations} = TimelessMetrics.annotations(:metrics, from, to, tags: ["deploy"])
 # [%{id: 1, timestamp: ts, title: "Deploy v2.1", description: "...", tags: ["deploy", "prod"]}]
 
 # Delete
-Timeless.delete_annotation(:metrics, id)
+TimelessMetrics.delete_annotation(:metrics, id)
 ```
 
 ### Alerts
 
 ```elixir
 # Create alert rule
-{:ok, rule_id} = Timeless.create_alert(:metrics,
+{:ok, rule_id} = TimelessMetrics.create_alert(:metrics,
   name: "High CPU",
   metric: "cpu_usage",
   condition: :above,
@@ -283,34 +283,34 @@ Timeless.delete_annotation(:metrics, id)
   webhook_url: "http://hooks.example.com/alert")
 
 # List all rules with current state
-{:ok, rules} = Timeless.list_alerts(:metrics)
+{:ok, rules} = TimelessMetrics.list_alerts(:metrics)
 
 # Evaluate all rules (also runs automatically on a timer)
-Timeless.evaluate_alerts(:metrics)
+TimelessMetrics.evaluate_alerts(:metrics)
 
 # Delete a rule
-Timeless.delete_alert(:metrics, rule_id)
+TimelessMetrics.delete_alert(:metrics, rule_id)
 ```
 
 ### Operational
 
 ```elixir
 # Flush all buffered data to disk
-Timeless.flush(:metrics)
+TimelessMetrics.flush(:metrics)
 
 # Get store statistics
-info = Timeless.info(:metrics)
+info = TimelessMetrics.info(:metrics)
 # %{series_count: 1000, total_points: 5_000_000, bytes_per_point: 0.78, ...}
 
 # Force rollup
-Timeless.rollup(:metrics)         # all tiers
-Timeless.rollup(:metrics, :hourly) # specific tier
+TimelessMetrics.rollup(:metrics)         # all tiers
+TimelessMetrics.rollup(:metrics, :hourly) # specific tier
 
 # Force late-arrival catch-up scan
-Timeless.catch_up(:metrics)
+TimelessMetrics.catch_up(:metrics)
 
 # Force retention enforcement
-Timeless.enforce_retention(:metrics)
+TimelessMetrics.enforce_retention(:metrics)
 ```
 
 #### Info fields
@@ -322,7 +322,7 @@ Timeless.enforce_retention(:metrics)
 | `total_points` | Total data points stored |
 | `raw_compressed_bytes` | Raw segment storage in bytes |
 | `bytes_per_point` | Compression efficiency |
-| `storage_bytes` | Total SQLite storage (main DB) |
+| `storage_bytes` | Total on-disk storage (segment files + metadata DB) |
 | `oldest_timestamp` | Earliest data point |
 | `newest_timestamp` | Latest data point |
 | `buffer_points` | Points still in write buffers |
@@ -335,12 +335,12 @@ Timeless.enforce_retention(:metrics)
 
 ## HTTP API
 
-Start the HTTP server alongside Timeless:
+Start the HTTP server alongside TimelessMetrics:
 
 ```elixir
 children = [
-  {Timeless, name: :metrics, data_dir: "/var/lib/metrics"},
-  {Timeless.HTTP, store: :metrics, port: 8428}
+  {TimelessMetrics, name: :metrics, data_dir: "/var/lib/metrics"},
+  {TimelessMetrics.HTTP, store: :metrics, port: 8428}
 ]
 ```
 
@@ -371,7 +371,7 @@ http://localhost:8428/?token=my-secret-token
 **Elixir library usage** (pass `:bearer_token` in HTTP opts):
 
 ```elixir
-{Timeless.HTTP, store: :metrics, port: 8428, bearer_token: "my-secret-token"}
+{TimelessMetrics.HTTP, store: :metrics, port: 8428, bearer_token: "my-secret-token"}
 ```
 
 | Response | Meaning |
@@ -782,7 +782,7 @@ curl http://localhost:8428/health
 
 ## SVG Charts
 
-Timeless generates pure SVG line charts with no JavaScript or external
+TimelessMetrics generates pure SVG line charts with no JavaScript or external
 dependencies. Charts can be embedded anywhere that renders images: HTML `<img>`
 tags, markdown, emails, Slack, notebooks, etc.
 
@@ -852,15 +852,15 @@ auto-generated legend.
 The chart module can be used directly from Elixir without the HTTP server:
 
 ```elixir
-{:ok, results} = Timeless.query_aggregate_multi(:metrics, "cpu_usage", %{},
+{:ok, results} = TimelessMetrics.query_aggregate_multi(:metrics, "cpu_usage", %{},
   from: now - 3600,
   to: now,
   bucket: {60, :seconds},
   aggregate: :avg)
 
-{:ok, annotations} = Timeless.annotations(:metrics, now - 3600, now)
+{:ok, annotations} = TimelessMetrics.annotations(:metrics, now - 3600, now)
 
-svg = Timeless.Chart.render("cpu_usage", results,
+svg = TimelessMetrics.Chart.render("cpu_usage", results,
   width: 800,
   height: 300,
   theme: :dark,
@@ -875,10 +875,10 @@ File.write!("chart.svg", svg)
 
 ### Store Options
 
-When starting Timeless as a library:
+When starting TimelessMetrics as a library:
 
 ```elixir
-{Timeless,
+{TimelessMetrics,
   name: :metrics,
   data_dir: "/var/lib/metrics",
   buffer_shards: 8,
@@ -895,7 +895,7 @@ Define custom rollup tiers:
 
 ```elixir
 defmodule MyApp.MetricsSchema do
-  use Timeless.Schema
+  use TimelessMetrics.Schema
 
   raw_retention {7, :days}
   rollup_interval {5, :minutes}
@@ -933,9 +933,9 @@ the store:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TIMELESS_DATA_DIR` | `/data` | SQLite storage directory (mount a volume here) |
+| `TIMELESS_DATA_DIR` | `/data` | Storage directory (mount a volume here) |
 | `TIMELESS_PORT` | `8428` | HTTP listen port |
-| `TIMELESS_SHARDS` | CPU count | Number of write buffer/builder shards |
+| `TIMELESS_SHARDS` | `schedulers / 2` | Number of write buffer/builder shards |
 | `TIMELESS_SEGMENT_DURATION` | `14400` | Raw segment duration in seconds |
 
 ```bash
