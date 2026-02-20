@@ -258,7 +258,7 @@ defmodule TimelessMetrics.SegmentBuilder do
     File.mkdir_p!(data_dir)
 
     # Initialize file-based storage (raw segments + tiers + watermarks)
-    shard_store = TimelessMetrics.ShardStore.init(data_dir, shard_id, segment_duration)
+    shard_store = TimelessMetrics.ShardStore.init(data_dir, shard_id, segment_duration, name)
 
     shard_store =
       if schema do

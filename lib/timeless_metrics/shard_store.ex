@@ -39,6 +39,7 @@ defmodule TimelessMetrics.ShardStore do
   defstruct [
     :raw_dir,
     :shard_id,
+    :store_name,
     :segment_duration,
     :tier_state,
     :watermark_table,
@@ -58,14 +59,16 @@ defmodule TimelessMetrics.ShardStore do
   # ========================================================================
 
   @doc "Initialize shard storage directory."
-  def init(data_dir, shard_id, segment_duration) do
+  def init(data_dir, shard_id, segment_duration, store_name \\ nil) do
     raw_dir = Path.join(data_dir, "shard_#{shard_id}/raw")
     File.mkdir_p!(raw_dir)
-    cache = :ets.new(:"timeless_seg_cache_#{shard_id}", [:set, :public])
+    prefix = store_name || "timeless"
+    cache = :ets.new(:"#{prefix}_seg_cache_#{shard_id}", [:set, :public])
 
     %__MODULE__{
       raw_dir: raw_dir,
       shard_id: shard_id,
+      store_name: prefix,
       segment_duration: segment_duration,
       tier_state: %{},
       seg_index_cache: cache
@@ -274,7 +277,7 @@ defmodule TimelessMetrics.ShardStore do
 
     chunks_path = Path.join(dir, "chunks.dat")
     index_path = Path.join(dir, "index.ets")
-    table_name = :"timeless_tier_#{store.shard_id}_#{tier_key}"
+    table_name = :"#{store.store_name}_tier_#{store.shard_id}_#{tier_key}"
 
     table =
       cond do
@@ -578,7 +581,7 @@ defmodule TimelessMetrics.ShardStore do
   def init_watermarks(store, tier_names) do
     shard_dir = Path.dirname(store.raw_dir)
     path = Path.join(shard_dir, "watermarks.bin")
-    table_name = :"timeless_watermarks_#{store.shard_id}"
+    table_name = :"#{store.store_name}_watermarks_#{store.shard_id}"
 
     table = :ets.new(table_name, [:set, :public, :named_table])
 

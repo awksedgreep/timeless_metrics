@@ -43,7 +43,11 @@ defmodule TimelessMetrics.Buffer do
 
     case check_backpressure(shard_name) do
       :ok ->
-        :ets.insert(table, {{series_id, timestamp, :erlang.unique_integer()}, value})
+        :ets.insert(
+          table,
+          {{series_id, timestamp, :erlang.unique_integer([:positive, :monotonic])}, value}
+        )
+
         [{:__counter__, counter}] = :ets.lookup(table, :__counter__)
         count = :atomics.add_get(counter, 1, 1)
 
@@ -78,7 +82,7 @@ defmodule TimelessMetrics.Buffer do
       :ok ->
         rows =
           Enum.map(points, fn {sid, ts, val} ->
-            {{sid, ts, :erlang.unique_integer()}, val}
+            {{sid, ts, :erlang.unique_integer([:positive, :monotonic])}, val}
           end)
 
         :ets.insert(table, rows)
@@ -196,16 +200,20 @@ defmodule TimelessMetrics.Buffer do
 
   # --- Internals ---
 
-  # Match spec: select data points as {series_id, timestamp, value}, skip metadata
-  @data_match_spec [{{{:"$1", :"$2", :_}, :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}]
-
   defp do_flush(state) do
-    # Select data points in one pass (skips metadata, strips unique ints)
-    points = :ets.select(state.table, @data_match_spec)
-    # Delete only data rows (3-tuple keys), metadata rows (atom keys) preserved
-    :ets.match_delete(state.table, {{:_, :_, :_}, :_})
-    # Reset atomics counter
-    :atomics.put(state.counter, 1, 0)
+    # Snapshot a monotonic cutoff — any write with seq > cutoff arrived after
+    # this flush started and must NOT be deleted.
+    cutoff = :erlang.unique_integer([:positive, :monotonic])
+
+    select_spec = [
+      {{{:"$1", :"$2", :"$3"}, :"$4"}, [{:"=<", :"$3", cutoff}], [{{:"$1", :"$2", :"$4"}}]}
+    ]
+
+    delete_spec = [{{{:_, :_, :"$1"}, :_}, [{:"=<", :"$1", cutoff}], [true]}]
+
+    points = :ets.select(state.table, select_spec)
+    :ets.select_delete(state.table, delete_spec)
+    :atomics.put(state.counter, 1, max(:ets.info(state.table, :size) - 3, 0))
 
     if points != [] do
       grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
@@ -221,9 +229,17 @@ defmodule TimelessMetrics.Buffer do
   end
 
   defp do_flush_sync(state) do
-    points = :ets.select(state.table, @data_match_spec)
-    :ets.match_delete(state.table, {{:_, :_, :_}, :_})
-    :atomics.put(state.counter, 1, 0)
+    cutoff = :erlang.unique_integer([:positive, :monotonic])
+
+    select_spec = [
+      {{{:"$1", :"$2", :"$3"}, :"$4"}, [{:"=<", :"$3", cutoff}], [{{:"$1", :"$2", :"$4"}}]}
+    ]
+
+    delete_spec = [{{{:_, :_, :"$1"}, :_}, [{:"=<", :"$1", cutoff}], [true]}]
+
+    points = :ets.select(state.table, select_spec)
+    :ets.select_delete(state.table, delete_spec)
+    :atomics.put(state.counter, 1, max(:ets.info(state.table, :size) - 3, 0))
 
     if points != [] do
       grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
