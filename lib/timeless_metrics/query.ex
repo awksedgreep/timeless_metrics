@@ -28,14 +28,13 @@ defmodule TimelessMetrics.Query do
     {us, points} =
       :timer.tc(fn ->
         rows
-        |> Enum.flat_map(fn [blob, _start, _end] ->
+        |> Enum.map(fn [blob, _start, _end] ->
           case GorillaStream.decompress(blob, compression: compression) do
-            {:ok, points} -> points
+            {:ok, pts} -> Enum.filter(pts, fn {ts, _} -> ts >= from and ts <= to end)
             {:error, _} -> []
           end
         end)
-        |> Enum.filter(fn {ts, _val} -> ts >= from and ts <= to end)
-        |> Enum.sort_by(&elem(&1, 0))
+        |> :lists.merge()
       end)
 
     :telemetry.execute(

@@ -246,14 +246,20 @@ defmodule TimelessMetrics do
       by_shard
       |> Task.async_stream(
         fn {_shard_idx, shard_series} ->
-          Enum.flat_map(shard_series, fn {series_id, labels} ->
-            {:ok, buckets} = TimelessMetrics.Query.aggregate(store, series_id, query_opts)
+          shard_series
+          |> Task.async_stream(
+            fn {series_id, labels} ->
+              {:ok, buckets} = TimelessMetrics.Query.aggregate(store, series_id, query_opts)
 
-            case TimelessMetrics.Transform.apply(buckets, transform) do
-              [] -> []
-              data -> [%{labels: labels, data: data}]
-            end
-          end)
+              case TimelessMetrics.Transform.apply(buckets, transform) do
+                [] -> nil
+                data -> %{labels: labels, data: data}
+              end
+            end,
+            max_concurrency: System.schedulers_online(),
+            ordered: false
+          )
+          |> Enum.flat_map(fn {:ok, nil} -> []; {:ok, result} -> [result] end)
         end,
         max_concurrency: shard_count,
         ordered: false
