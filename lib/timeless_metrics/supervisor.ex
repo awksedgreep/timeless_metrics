@@ -32,10 +32,12 @@ defmodule TimelessMetrics.Supervisor do
     registry_name = :"#{name}_registry"
     rollup_name = :"#{name}_rollup"
     retention_name = :"#{name}_retention"
+    dict_trainer_name = :"#{name}_dict_trainer"
 
-    # Store schema and shard count in persistent_term for fast access
+    # Store schema, shard count, and data_dir in persistent_term for fast access
     :persistent_term.put({TimelessMetrics, name, :schema}, schema)
     :persistent_term.put({TimelessMetrics, name, :shard_count}, shard_count)
+    :persistent_term.put({TimelessMetrics, name, :data_dir}, data_dir)
 
     # Each buffer shard gets its own SegmentBuilder for parallel compression
     builder_and_buffer_shards =
@@ -51,6 +53,7 @@ defmodule TimelessMetrics.Supervisor do
                [
                  [
                    name: builder_name,
+                   store: name,
                    shard_id: i,
                    data_dir: data_dir,
                    segment_duration: segment_duration,
@@ -86,7 +89,10 @@ defmodule TimelessMetrics.Supervisor do
         {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
 
         # 2. Series registry (depends on DB)
-        {TimelessMetrics.SeriesRegistry, name: registry_name, db: db_name}
+        {TimelessMetrics.SeriesRegistry, name: registry_name, db: db_name},
+
+        # 3. Dict trainer (loads existing dictionaries for compression/decompression)
+        {TimelessMetrics.DictTrainer, name: dict_trainer_name, store: name, data_dir: data_dir}
       ] ++
         builder_and_buffer_shards ++
         [

@@ -259,7 +259,10 @@ defmodule TimelessMetrics do
             max_concurrency: System.schedulers_online(),
             ordered: false
           )
-          |> Enum.flat_map(fn {:ok, nil} -> []; {:ok, result} -> [result] end)
+          |> Enum.flat_map(fn
+            {:ok, nil} -> []
+            {:ok, result} -> [result]
+          end)
         end,
         max_concurrency: shard_count,
         ordered: false

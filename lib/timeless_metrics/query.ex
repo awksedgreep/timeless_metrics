@@ -15,6 +15,9 @@ defmodule TimelessMetrics.Query do
 
   Returns `{:ok, [{timestamp, value}, ...]}` sorted by timestamp.
   """
+  # Dict-compressed blob prefix marker (matches segment_builder.ex)
+  @dict_marker 0xFF
+
   def raw(store, series_id, opts \\ []) do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
@@ -29,7 +32,7 @@ defmodule TimelessMetrics.Query do
       :timer.tc(fn ->
         rows
         |> Enum.map(fn [blob, _start, _end] ->
-          case GorillaStream.decompress(blob, compression: compression) do
+          case decompress_blob(blob, store, compression) do
             {:ok, pts} -> Enum.filter(pts, fn {ts, _} -> ts >= from and ts <= to end)
             {:error, _} -> []
           end
@@ -106,7 +109,7 @@ defmodule TimelessMetrics.Query do
 
     case rows do
       [[blob]] ->
-        case GorillaStream.decompress(blob, compression: compression) do
+        case decompress_blob(blob, store, compression) do
           {:ok, points} ->
             {ts, val} = List.last(Enum.sort_by(points, &elem(&1, 0)))
             {:ok, {ts, val}}
@@ -416,5 +419,28 @@ defmodule TimelessMetrics.Query do
       end)
 
     if total_dt > 0, do: total_delta / total_dt, else: 0.0
+  end
+
+  # Decompress a segment blob, auto-detecting dict-compressed vs standard format.
+  # Dict-compressed blobs start with <<0xFF, dict_version, data...>>
+  defp decompress_blob(
+         <<@dict_marker, _dict_version::8, compressed::binary>>,
+         store,
+         _compression
+       ) do
+    ddict = TimelessMetrics.DictTrainer.get_ddict(store)
+
+    if ddict do
+      with {:ok, gorilla_blob} <-
+             GorillaStream.Compression.Container.decompress_with_dict(compressed, ddict) do
+        GorillaStream.decompress(gorilla_blob, compression: :none)
+      end
+    else
+      {:error, "Dict-compressed blob but no dictionary loaded for store #{store}"}
+    end
+  end
+
+  defp decompress_blob(blob, _store, compression) do
+    GorillaStream.decompress(blob, compression: compression)
   end
 end

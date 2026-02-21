@@ -23,6 +23,7 @@ defmodule TimelessMetrics.SegmentBuilder do
     :shard_id,
     :data_dir,
     :name,
+    :store,
     :schema,
     :shard_store
   ]
@@ -244,6 +245,7 @@ defmodule TimelessMetrics.SegmentBuilder do
     name = Keyword.fetch!(opts, :name)
     shard_id = Keyword.fetch!(opts, :shard_id)
     data_dir = Keyword.fetch!(opts, :data_dir)
+    store = Keyword.get(opts, :store)
     segment_duration = Keyword.get(opts, :segment_duration, @default_segment_duration)
 
     pending_flush_interval =
@@ -287,6 +289,7 @@ defmodule TimelessMetrics.SegmentBuilder do
       shard_id: shard_id,
       data_dir: data_dir,
       name: name,
+      store: store,
       schema: schema,
       shard_store: shard_store
     }
@@ -454,14 +457,28 @@ defmodule TimelessMetrics.SegmentBuilder do
     {completed, pending}
   end
 
+  # Dict-compressed blob prefix: <<0xFF, dict_version>>
+  # Standard blobs start with zstd magic (0x28) or gorilla magic (0x47), never 0xFF
+  @dict_marker 0xFF
+
   defp compress_segments(segments, state) do
+    cdict = state.store && TimelessMetrics.DictTrainer.get_cdict(state.store)
+    dict_version = state.store && TimelessMetrics.DictTrainer.get_dict_version(state.store)
+
     Enum.flat_map(segments, fn seg ->
       sorted_points = Enum.sort_by(seg.points, &elem(&1, 0))
 
-      case GorillaStream.compress(sorted_points,
-             compression: state.compression,
-             compression_level: state.compression_level
-           ) do
+      result =
+        if cdict && dict_version > 0 do
+          compress_with_dict(sorted_points, cdict, dict_version)
+        else
+          GorillaStream.compress(sorted_points,
+            compression: state.compression,
+            compression_level: state.compression_level
+          )
+        end
+
+      case result do
         {:ok, blob} ->
           point_count = length(sorted_points)
           {last_ts, _} = List.last(sorted_points)
@@ -472,8 +489,6 @@ defmodule TimelessMetrics.SegmentBuilder do
             %{series_id: seg.series_id}
           )
 
-          # Use bucket start_time as entry key so WAL merge correctly deduplicates
-          # entries for the same series+window across multiple flushes
           [{seg.series_id, seg.start_time, last_ts, point_count, blob}]
 
         {:error, reason} ->
@@ -486,6 +501,15 @@ defmodule TimelessMetrics.SegmentBuilder do
           []
       end
     end)
+  end
+
+  defp compress_with_dict(sorted_points, cdict, dict_version) do
+    # Gorilla compress without container compression, then dict-compress
+    with {:ok, gorilla_blob} <- GorillaStream.compress(sorted_points, compression: :none),
+         {:ok, compressed} <-
+           GorillaStream.Compression.Container.compress_with_dict(gorilla_blob, cdict) do
+      {:ok, <<@dict_marker, dict_version::8, compressed::binary>>}
+    end
   end
 
   # Write segments to WAL (for in-progress / pending flush)

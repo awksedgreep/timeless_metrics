@@ -24,9 +24,7 @@ defmodule TimelessMetrics.AdaptiveFlushTest do
     now = System.os_time(:second)
 
     for i <- 1..100 do
-      TimelessMetrics.write(:adaptive_test, "low_rate", %{"h" => "a"}, 1.0,
-        timestamp: now + i
-      )
+      TimelessMetrics.write(:adaptive_test, "low_rate", %{"h" => "a"}, 1.0, timestamp: now + i)
     end
 
     # Wait so the rate calculation spans enough time to show a low rate
@@ -60,7 +58,9 @@ defmodule TimelessMetrics.AdaptiveFlushTest do
     Process.sleep(50)
 
     threshold = TimelessMetrics.Buffer.flush_threshold(shard)
-    assert threshold > 10_000, "Expected threshold to increase above default 10K, got #{threshold}"
+
+    assert threshold > 10_000,
+           "Expected threshold to increase above default 10K, got #{threshold}"
   end
 
   test "threshold resets back to default when rate drops" do
