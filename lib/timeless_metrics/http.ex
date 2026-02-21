@@ -823,7 +823,7 @@ defmodule TimelessMetrics.HTTP do
               "metric" => Map.put(l, "__name__", metric),
               "values" =>
                 Enum.map(buckets, fn {ts, val} ->
-                  [ts, Float.to_string(val * 1.0)]
+                  [ts, Float.to_string(ensure_float(val))]
                 end)
             }
           end)
@@ -996,19 +996,41 @@ defmodule TimelessMetrics.HTTP do
   end
 
   @max_error_samples 3
+  @parallel_parse_threshold 2_000
 
   defp ingest_json_lines(store, body) do
+    lines = String.split(body, "\n", trim: true)
+
     {all_entries, errors, error_samples} =
-      body
-      |> String.split("\n", trim: true)
-      |> Enum.reduce({[], 0, []}, fn line, {entries_acc, errors, samples} ->
+      if length(lines) >= @parallel_parse_threshold do
+        parse_json_lines_parallel(lines)
+      else
+        parse_json_lines_sequential(lines)
+      end
+
+    if errors > 0 do
+      Logger.warning(
+        "Import: #{errors} line(s) failed to parse, sample: #{inspect(error_samples)}"
+      )
+    end
+
+    if all_entries != [] do
+      TimelessMetrics.write_batch(store, all_entries)
+    end
+
+    {length(all_entries), errors, error_samples}
+  end
+
+  defp parse_json_lines_sequential(lines) do
+    {entries, errors, samples} =
+      Enum.reduce(lines, {[], 0, []}, fn line, {entries_acc, errors, samples} ->
         case parse_vm_line(line) do
           {:ok, entries} ->
-            {[entries | entries_acc], errors, samples}
+            {:lists.reverse(entries, entries_acc), errors, samples}
 
           :error ->
             samples =
-              if length(samples) < @max_error_samples do
+              if errors < @max_error_samples do
                 [String.slice(line, 0, 200) | samples]
               else
                 samples
@@ -1018,47 +1040,53 @@ defmodule TimelessMetrics.HTTP do
         end
       end)
 
-    if errors > 0 do
-      Logger.warning(
-        "Import: #{errors} line(s) failed to parse, sample: #{inspect(Enum.reverse(error_samples))}"
-      )
-    end
+    {entries, errors, Enum.take(Enum.reverse(samples), @max_error_samples)}
+  end
 
-    # One batch call for the entire body
-    flat_entries = List.flatten(all_entries)
+  defp parse_json_lines_parallel(lines) do
+    chunk_count = System.schedulers_online()
 
-    if flat_entries != [] do
-      TimelessMetrics.write_batch(store, flat_entries)
-    end
+    chunks =
+      lines
+      |> Enum.chunk_every(div(length(lines), chunk_count) + 1)
+      |> Enum.map(fn chunk ->
+        Task.async(fn -> parse_json_lines_sequential(chunk) end)
+      end)
 
-    {length(flat_entries), errors, Enum.reverse(error_samples)}
+    results = Task.await_many(chunks, :timer.seconds(30))
+    merge_parse_results(results)
   end
 
   defp parse_vm_line(line) do
-    decoded =
-      try do
-        {:ok, :json.decode(line)}
-      rescue
-        _ -> :error
-      end
-
-    case decoded do
-      {:ok, %{"metric" => metric_map, "values" => values, "timestamps" => timestamps}}
+    case safe_json_decode(line) do
+      %{"metric" => metric_map, "values" => values, "timestamps" => timestamps}
       when is_list(values) and is_list(timestamps) and length(values) == length(timestamps) ->
         {name, labels} = extract_metric(metric_map)
 
-        entries =
-          Enum.zip(timestamps, values)
-          |> Enum.map(fn {ts, val} when is_number(val) and is_integer(ts) ->
-            {name, labels, val * 1.0, ts}
-          end)
-
-        {:ok, entries}
+        try do
+          {:ok, zip_entries(name, labels, timestamps, values, [])}
+        catch
+          :throw, :bad_entry -> :error
+        end
 
       _ ->
         :error
     end
   end
+
+  defp safe_json_decode(bin) do
+    :json.decode(bin)
+  catch
+    :error, _ -> :error
+  end
+
+  defp zip_entries(_n, _l, [], [], acc), do: acc
+
+  defp zip_entries(n, l, [ts | tsr], [v | vr], acc) when is_integer(ts) and is_number(v) do
+    zip_entries(n, l, tsr, vr, [{n, l, ensure_float(v), ts} | acc])
+  end
+
+  defp zip_entries(_, _, _, _, _), do: throw(:bad_entry)
 
   defp extract_metric(metric_map) do
     {name, labels} = Map.pop(metric_map, "__name__", "unknown")
@@ -1072,9 +1100,49 @@ defmodule TimelessMetrics.HTTP do
 
   defp ingest_prometheus_text(store, body) do
     {all_entries, errors, error_samples} =
-      body
-      |> String.split("\n", trim: true)
-      |> Enum.reduce({[], 0, []}, fn line, {entries_acc, errors, samples} ->
+      if TimelessMetrics.PrometheusNif.available?() do
+        parse_prometheus_body_nif(body)
+      else
+        lines = String.split(body, "\n", trim: true)
+
+        if length(lines) >= @parallel_parse_threshold do
+          parse_prometheus_lines_parallel(lines)
+        else
+          parse_prometheus_lines_sequential(lines)
+        end
+      end
+
+    if errors > 0 do
+      Logger.warning(
+        "Prometheus import: #{errors} line(s) failed to parse, sample: #{inspect(error_samples)}"
+      )
+    end
+
+    if all_entries != [] do
+      TimelessMetrics.write_batch(store, all_entries)
+    end
+
+    {length(all_entries), errors, error_samples}
+  end
+
+  defp parse_prometheus_body_nif(body) do
+    {entries, error_count} = TimelessMetrics.PrometheusNif.parse(body)
+
+    now = System.os_time(:second)
+
+    converted =
+      Enum.map(entries, fn {name, labels_proplist, value, ts} ->
+        labels = Map.new(labels_proplist)
+        timestamp = if ts == 0, do: now, else: div(ts, 1000)
+        {name, labels, value, timestamp}
+      end)
+
+    {converted, error_count, []}
+  end
+
+  defp parse_prometheus_lines_sequential(lines) do
+    {entries, errors, samples} =
+      Enum.reduce(lines, {[], 0, []}, fn line, {entries_acc, errors, samples} ->
         line = String.trim(line)
 
         if line == "" or String.starts_with?(line, "#") do
@@ -1086,7 +1154,7 @@ defmodule TimelessMetrics.HTTP do
 
             :error ->
               samples =
-                if length(samples) < @max_error_samples do
+                if errors < @max_error_samples do
                   [String.slice(line, 0, 200) | samples]
                 else
                   samples
@@ -1097,17 +1165,30 @@ defmodule TimelessMetrics.HTTP do
         end
       end)
 
-    if errors > 0 do
-      Logger.warning(
-        "Prometheus import: #{errors} line(s) failed to parse, sample: #{inspect(Enum.reverse(error_samples))}"
-      )
-    end
+    {entries, errors, Enum.take(Enum.reverse(samples), @max_error_samples)}
+  end
 
-    if all_entries != [] do
-      TimelessMetrics.write_batch(store, all_entries)
-    end
+  defp parse_prometheus_lines_parallel(lines) do
+    chunk_count = System.schedulers_online()
 
-    {length(all_entries), errors, Enum.reverse(error_samples)}
+    chunks =
+      lines
+      |> Enum.chunk_every(div(length(lines), chunk_count) + 1)
+      |> Enum.map(fn chunk ->
+        Task.async(fn -> parse_prometheus_lines_sequential(chunk) end)
+      end)
+
+    results = Task.await_many(chunks, :timer.seconds(30))
+    merge_parse_results(results)
+  end
+
+  defp merge_parse_results(results) do
+    Enum.reduce(results, {[], 0, []}, fn {entries, errors, samples},
+                                         {all_entries, total_errors, all_samples} ->
+      merged_entries = :lists.reverse(entries, all_entries)
+      merged_samples = Enum.take(all_samples ++ samples, @max_error_samples)
+      {merged_entries, total_errors + errors, merged_samples}
+    end)
   end
 
   defp parse_prometheus_line(line) do
@@ -1156,22 +1237,28 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
+  defp ensure_float(v) when is_float(v), do: v
+  defp ensure_float(v) when is_integer(v), do: v / 1
+
   defp parse_prometheus_labels_bin(str) when byte_size(str) == 0, do: %{}
 
   defp parse_prometheus_labels_bin(str) do
     str
     |> :binary.split(<<",">>, [:global])
     |> Enum.reduce(%{}, fn pair, acc ->
-      case :binary.split(pair, <<"=">>, [:global]) do
-        [key, value] ->
-          v = value |> String.trim() |> String.trim("\"")
-          Map.put(acc, String.trim(key), v)
-
-        _ ->
-          acc
+      case :binary.split(pair, <<"=">>) do
+        [key, value] -> Map.put(acc, String.trim(key), strip_quotes(value))
+        _ -> acc
       end
     end)
   end
+
+  defp strip_quotes(<<?\", rest::binary>>) do
+    size = byte_size(rest) - 1
+    if size >= 0, do: :binary.part(rest, 0, size), else: rest
+  end
+
+  defp strip_quotes(v), do: String.trim(v)
 
   # Simple PromQL parser — handles metric_name{label="value",...}
   defp parse_promql_simple(query) do
