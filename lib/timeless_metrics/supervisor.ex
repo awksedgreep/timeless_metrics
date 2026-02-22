@@ -69,7 +69,7 @@ defmodule TimelessMetrics.Supervisor do
     ]
 
     scraper_children =
-      if Keyword.get(opts, :scraping, false) do
+      if Keyword.get(opts, :scraping, true) do
         [
           {DynamicSupervisor, name: scrape_sup_name, strategy: :one_for_one},
           {TimelessMetrics.Scraper,

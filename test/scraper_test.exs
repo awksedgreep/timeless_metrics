@@ -250,25 +250,31 @@ defmodule TimelessMetrics.ScraperTest do
   end
 
   describe "target lifecycle" do
-    test "scraping: false does not start scraper" do
-      # The default TimelessMetrics does not start scraper processes
+    test "scraping enabled by default" do
+      data_dir = "/tmp/timeless_default_scraper_#{System.os_time(:millisecond)}"
+
+      start_supervised!(
+        {TimelessMetrics, name: :default_scraper_test, data_dir: data_dir},
+        id: :default_scraper
+      )
+
+      on_exit(fn -> File.rm_rf!(data_dir) end)
+
+      assert Process.whereis(:default_scraper_test_scraper) != nil
+      assert Process.whereis(:default_scraper_test_scrape_sup) != nil
+    end
+
+    test "scraping: false disables scraper" do
       data_dir = "/tmp/timeless_no_scraper_#{System.os_time(:millisecond)}"
 
       start_supervised!(
-        {TimelessMetrics, name: :no_scraper_test, data_dir: data_dir},
+        {TimelessMetrics, name: :no_scraper_test, data_dir: data_dir, scraping: false},
         id: :no_scraper
       )
 
       on_exit(fn -> File.rm_rf!(data_dir) end)
 
-      # Scraper process should not exist
       assert Process.whereis(:no_scraper_test_scraper) == nil
-    end
-
-    test "scraping: true starts scraper processes" do
-      # Our setup starts with scraping: true
-      assert Process.whereis(:scraper_test_scraper) != nil
-      assert Process.whereis(:scraper_test_scrape_sup) != nil
     end
   end
 end
