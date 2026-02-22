@@ -38,3 +38,25 @@ Projected retention cost at scale (extrapolating from bench):
 - 10K series / 30 days: ~1s (benchmarked)
 - 100K series / 90 days: ~30-90s (linear in segment count)
 - 1M series / 90 days: table partitioning likely needed
+
+## Prometheus Scraper — Deferred Improvements
+
+### Counter Reset Detection
+- Detect counter resets at ingest time (value decreases → reset)
+- Not needed now — `rate()` handles resets at query time
+- Would enable `increase()` to be more accurate across long ranges
+
+### Stale Marker Handling
+- When a target disappears a series, inject NaN sentinel value
+- Allows dashboards to show "no data" instead of flat-lining at last value
+- Prometheus uses special NaN bit pattern for staleness
+
+### TYPE/HELP Metadata Extraction
+- NIF parser currently skips `# TYPE` and `# HELP` comment lines
+- Could extract and populate `metric_metadata` table automatically
+- Would auto-register gauge/counter/histogram/summary types
+
+### Histogram Bucket Semantic Awareness
+- Prometheus histograms use `_bucket{le="..."}`, `_sum`, `_count` convention
+- Could auto-detect histogram families and provide native histogram queries
+- Would enable `histogram_quantile()` PromQL function

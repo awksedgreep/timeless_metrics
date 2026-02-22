@@ -203,7 +203,49 @@ defmodule TimelessMetrics.DB.Migrations do
     run_from(conn, 5)
   end
 
-  defp run_from(_conn, 5), do: :ok
+  defp run_from(conn, 5) do
+    execute(conn, "BEGIN")
+
+    execute(conn, """
+    CREATE TABLE IF NOT EXISTS scrape_targets (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_name               TEXT NOT NULL,
+      scheme                 TEXT NOT NULL DEFAULT 'http',
+      address                TEXT NOT NULL,
+      metrics_path           TEXT NOT NULL DEFAULT '/metrics',
+      scrape_interval        INTEGER NOT NULL DEFAULT 30,
+      scrape_timeout         INTEGER NOT NULL DEFAULT 10,
+      labels                 TEXT NOT NULL DEFAULT '{}',
+      honor_labels           INTEGER NOT NULL DEFAULT 0,
+      honor_timestamps       INTEGER NOT NULL DEFAULT 1,
+      relabel_configs        TEXT,
+      metric_relabel_configs TEXT,
+      enabled                INTEGER NOT NULL DEFAULT 1,
+      created_at             INTEGER NOT NULL,
+      updated_at             INTEGER NOT NULL,
+      UNIQUE(job_name, address, metrics_path)
+    )
+    """)
+
+    execute(conn, """
+    CREATE TABLE IF NOT EXISTS scrape_health (
+      target_id          INTEGER PRIMARY KEY,
+      health             TEXT NOT NULL DEFAULT 'unknown',
+      last_scrape        INTEGER,
+      last_duration_ms   INTEGER,
+      last_error         TEXT,
+      samples_scraped    INTEGER DEFAULT 0,
+      FOREIGN KEY (target_id) REFERENCES scrape_targets(id) ON DELETE CASCADE
+    )
+    """)
+
+    set_version(conn, 6)
+    execute(conn, "COMMIT")
+
+    run_from(conn, 6)
+  end
+
+  defp run_from(_conn, 6), do: :ok
 
   defp execute(conn, sql, params \\ []) do
     {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, sql)

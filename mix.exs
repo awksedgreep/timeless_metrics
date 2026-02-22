@@ -55,7 +55,7 @@ defmodule TimelessMetrics.MixProject do
       {:bandit, "~> 1.6"},
       {:plug, "~> 1.16"},
       {:jason, "~> 1.4"},
-      {:req, "~> 0.5", only: [:dev, :test]},
+      {:req, "~> 0.5"},
       {:elixir_make, "~> 0.9", runtime: false},
       {:cc_precompiler, "~> 0.1", runtime: false}
     ]

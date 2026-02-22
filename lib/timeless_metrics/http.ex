@@ -984,6 +984,105 @@ defmodule TimelessMetrics.HTTP do
     |> send_resp(200, html)
   end
 
+  # --- Scrape Target CRUD ---
+
+  # Create a scrape target
+  post "/api/v1/scrape_targets" do
+    store = conn.private.timeless_metrics
+    scraper = :"#{store}_scraper"
+
+    case Plug.Conn.read_body(conn, length: 64_000) do
+      {:ok, body, conn} ->
+        case Jason.decode(body) do
+          {:ok, params} when is_map(params) ->
+            case TimelessMetrics.Scraper.add_target(scraper, params) do
+              {:ok, id} ->
+                conn
+                |> put_resp_content_type("application/json")
+                |> send_resp(201, Jason.encode!(%{id: id, status: "created"}))
+
+              {:error, reason} ->
+                json_error(conn, 400, to_string(reason))
+            end
+
+          _ ->
+            json_error(conn, 400, "invalid JSON")
+        end
+
+      {:error, reason} ->
+        json_error(conn, 400, to_string(reason))
+    end
+  end
+
+  # List all scrape targets with health
+  get "/api/v1/scrape_targets" do
+    store = conn.private.timeless_metrics
+    scraper = :"#{store}_scraper"
+    {:ok, targets} = TimelessMetrics.Scraper.list_targets(scraper)
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Jason.encode!(%{data: targets}))
+  end
+
+  # Get a single scrape target with health
+  get "/api/v1/scrape_targets/:id" do
+    store = conn.private.timeless_metrics
+    scraper = :"#{store}_scraper"
+    {target_id, _} = Integer.parse(conn.path_params["id"])
+
+    case TimelessMetrics.Scraper.get_target(scraper, target_id) do
+      {:ok, target} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, Jason.encode!(target))
+
+      {:error, :not_found} ->
+        json_error(conn, 404, "target not found")
+    end
+  end
+
+  # Update a scrape target
+  put "/api/v1/scrape_targets/:id" do
+    store = conn.private.timeless_metrics
+    scraper = :"#{store}_scraper"
+    {target_id, _} = Integer.parse(conn.path_params["id"])
+
+    case Plug.Conn.read_body(conn, length: 64_000) do
+      {:ok, body, conn} ->
+        case Jason.decode(body) do
+          {:ok, params} when is_map(params) ->
+            case TimelessMetrics.Scraper.update_target(scraper, target_id, params) do
+              :ok ->
+                conn
+                |> put_resp_content_type("application/json")
+                |> send_resp(200, Jason.encode!(%{status: "updated"}))
+
+              {:error, reason} ->
+                json_error(conn, 400, to_string(reason))
+            end
+
+          _ ->
+            json_error(conn, 400, "invalid JSON")
+        end
+
+      {:error, reason} ->
+        json_error(conn, 400, to_string(reason))
+    end
+  end
+
+  # Delete a scrape target
+  delete "/api/v1/scrape_targets/:id" do
+    store = conn.private.timeless_metrics
+    scraper = :"#{store}_scraper"
+    {target_id, _} = Integer.parse(conn.path_params["id"])
+    :ok = TimelessMetrics.Scraper.delete_target(scraper, target_id)
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Jason.encode!(%{status: "deleted"}))
+  end
+
   match _ do
     send_resp(conn, 404, "not found")
   end

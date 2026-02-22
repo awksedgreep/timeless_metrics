@@ -32,6 +32,9 @@ defmodule TimelessMetrics.Supervisor do
     dynamic_sup_name = :"#{name}_actor_sup"
     manager_name = :"#{name}_actor_manager"
 
+    scrape_sup_name = :"#{name}_scrape_sup"
+    scraper_name = :"#{name}_scraper"
+
     children = [
       {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
       {Registry, keys: :unique, name: registry_name},
@@ -65,6 +68,17 @@ defmodule TimelessMetrics.Supervisor do
        interval: retention_interval}
     ]
 
-    Supervisor.init(children, strategy: :rest_for_one)
+    scraper_children =
+      if Keyword.get(opts, :scraping, false) do
+        [
+          {DynamicSupervisor, name: scrape_sup_name, strategy: :one_for_one},
+          {TimelessMetrics.Scraper,
+           name: scraper_name, store: name, db: db_name, scrape_sup: scrape_sup_name}
+        ]
+      else
+        []
+      end
+
+    Supervisor.init(children ++ scraper_children, strategy: :rest_for_one)
   end
 end
