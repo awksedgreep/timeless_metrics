@@ -984,6 +984,25 @@ defmodule TimelessMetrics.HTTP do
     |> send_resp(200, html)
   end
 
+  # --- OpenAPI / API Docs ---
+
+  # Serve the OpenAPI JSON spec
+  get "/api/openapi.json" do
+    conn
+    |> put_resp_content_type("application/json")
+    |> put_resp_header("access-control-allow-origin", "*")
+    |> send_resp(200, TimelessMetrics.OpenAPI.spec_json())
+  end
+
+  # Serve the Scalar API reference UI
+  get "/api/docs" do
+    html = scalar_html()
+
+    conn
+    |> put_resp_content_type("text/html")
+    |> send_resp(200, html)
+  end
+
   # --- Scrape Target CRUD ---
 
   # Create a scrape target
@@ -1314,6 +1333,31 @@ defmodule TimelessMetrics.HTTP do
     conn
     |> put_resp_content_type("application/json")
     |> send_resp(status, Jason.encode!(%{error: msg}))
+  end
+
+  defp scalar_html do
+    """
+    <!doctype html>
+    <html>
+    <head>
+      <title>TimelessMetrics API</title>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+    </head>
+    <body>
+      <div id="app"></div>
+      <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+      <script>
+        Scalar.createApiReference('#app', {
+          url: '/api/openapi.json',
+          theme: 'kepler',
+          hideClientButton: false,
+          defaultHttpClient: { targetKey: 'shell', clientKey: 'curl' }
+        })
+      </script>
+    </body>
+    </html>
+    """
   end
 
   @max_error_samples 3

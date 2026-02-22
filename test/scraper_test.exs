@@ -219,6 +219,36 @@ defmodule TimelessMetrics.ScraperTest do
     end
   end
 
+  describe "OpenAPI" do
+    test "GET /api/openapi.json returns valid spec" do
+      conn =
+        Plug.Test.conn(:get, "/api/openapi.json")
+        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+
+      assert conn.status == 200
+      assert {"content-type", "application/json; charset=utf-8"} in conn.resp_headers
+
+      spec = Jason.decode!(conn.resp_body)
+      assert spec["openapi"] == "3.1.0"
+      assert spec["info"]["title"] == "TimelessMetrics API"
+      assert Map.has_key?(spec["paths"], "/api/v1/scrape_targets")
+      assert Map.has_key?(spec["paths"], "/api/v1/scrape_targets/{id}")
+      assert Map.has_key?(spec["components"]["schemas"], "ScrapeTargetCreate")
+      assert Map.has_key?(spec["components"]["schemas"], "RelabelConfig")
+    end
+
+    test "GET /api/docs returns Scalar HTML" do
+      conn =
+        Plug.Test.conn(:get, "/api/docs")
+        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+
+      assert conn.status == 200
+      assert {"content-type", "text/html; charset=utf-8"} in conn.resp_headers
+      assert conn.resp_body =~ "scalar"
+      assert conn.resp_body =~ "/api/openapi.json"
+    end
+  end
+
   describe "target lifecycle" do
     test "scraping: false does not start scraper" do
       # The default TimelessMetrics does not start scraper processes
