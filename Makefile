@@ -18,9 +18,9 @@ else
 	LDFLAGS = -shared
 endif
 
-# Sources
+# Sources — put .o in PRIV_DIR so each cross-compile target gets its own
 NIF_SRC = c_src/prometheus_nif.cpp
-NIF_OBJ = c_src/prometheus_nif.o
+NIF_OBJ = $(PRIV_DIR)/prometheus_nif.o
 
 .PHONY: all clean
 

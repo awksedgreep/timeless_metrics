@@ -1,7 +1,7 @@
 defmodule TimelessMetrics.MixProject do
   use Mix.Project
 
-  @version "1.0.0"
+  @version "1.0.1"
 
   def project do
     [
@@ -20,6 +20,7 @@ defmodule TimelessMetrics.MixProject do
 
         %{"ERTS_INCLUDE_DIR" => erts_include_dir}
       end,
+      make_clean: ["clean"],
       make_precompiler: {:nif, CCPrecompiler},
       make_precompiler_url:
         "https://github.com/awksedgreep/timeless_metrics/releases/download/v#{@version}/@{artefact_filename}",
