@@ -138,6 +138,52 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
+  # InfluxDB line protocol import (used by TSBS, compatible with VictoriaMetrics /write)
+  # Format: measurement,tag=val,tag=val field=value timestamp_ns
+  post "/write" do
+    store = conn.private.timeless_metrics
+
+    case Plug.Conn.read_body(conn, length: @max_body_bytes) do
+      {:ok, body, conn} ->
+        {count, errors, error_samples} = ingest_influx_lines(store, body)
+
+        :telemetry.execute(
+          [:timeless_metrics, :http, :import],
+          %{sample_count: count, error_count: errors},
+          %{store: store, format: :influx}
+        )
+
+        if errors > 0 do
+          Logger.warning(
+            "Influx import: #{errors} line(s) failed to parse, sample: #{inspect(error_samples)}"
+          )
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(
+            200,
+            Jason.encode!(%{
+              samples: count,
+              errors: errors,
+              failed_lines: error_samples
+            })
+          )
+        else
+          send_resp(conn, 204, "")
+        end
+
+      {:more, _partial, conn} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(413, Jason.encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
+
+      {:error, reason} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(400, Jason.encode!(%{error: to_string(reason)}))
+    end
+  end
+
   # VictoriaMetrics JSON line import
   post "/api/v1/import" do
     store = conn.private.timeless_metrics
@@ -190,7 +236,7 @@ defmodule TimelessMetrics.HTTP do
         series: info.series_count,
         points: info.total_points,
         storage_bytes: info.storage_bytes,
-        buffer_points: info.buffer_points,
+        buffer_points: info.raw_buffer_points,
         bytes_per_point: info.bytes_per_point
       })
 
@@ -301,37 +347,131 @@ defmodule TimelessMetrics.HTTP do
   end
 
   # Range query with bucketed aggregation (multi-series)
+  # When query= param is present, routes through PromQL parser (TSBS/Grafana compatible).
+  # Otherwise uses native params: metric=, metrics=, group_by=, cross_aggregate=, etc.
   get "/api/v1/query_range" do
     store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
+    params = conn.query_params
 
-    case extract_query_params(conn.query_params) do
-      {:ok, metric, labels, from, to} ->
+    # If query= param is present, treat as PromQL (TSBS sends PromQL here)
+    if params["query"] do
+      now = System.os_time(:second)
+      start_ts = parse_prom_time(params["start"], now - 3600)
+      end_ts = parse_prom_time(params["end"], now)
+      step = parse_prom_step(params["step"], 60)
+
+      case TimelessMetrics.PromQL.parse(params["query"]) do
+        {:ok, plan} ->
+          {:ok, response} =
+            TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, Jason.encode!(response))
+
+        {:error, reason} ->
+          json_error(conn, 400, "PromQL parse error: #{reason}")
+      end
+    else
+      case extract_query_params_extended(params) do
+      {:ok, query_spec} ->
         params = conn.query_params
         step = parse_int(params["step"], 60)
         agg = parse_aggregate(params["aggregate"])
         transform = TimelessMetrics.Transform.parse(params["transform"])
+        group_by = params["group_by"]
+        cross_agg = parse_aggregate_or_nil(params["cross_aggregate"])
+        threshold = parse_threshold_params(params)
+        limit = parse_int_or_nil(params["limit"])
 
-        {:ok, results} =
-          TimelessMetrics.query_aggregate_multi(store, metric, labels,
-            from: from,
-            to: to,
-            bucket: {step, :seconds},
-            aggregate: agg,
-            transform: transform
-          )
+        base_opts = [
+          from: query_spec.from,
+          to: query_spec.to,
+          bucket: {step, :seconds},
+          aggregate: agg,
+          transform: transform
+        ]
 
-        series =
-          Enum.map(results, fn %{labels: l, data: buckets} ->
-            %{labels: l, data: Enum.map(buckets, fn {ts, val} -> [ts, val] end)}
-          end)
+        {result_type, results} =
+          case {query_spec.metrics, group_by} do
+            {metrics, group_by} when is_list(metrics) and is_binary(group_by) ->
+              group_keys = String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
+
+              {:ok, grouped} =
+                TimelessMetrics.query_aggregate_grouped_metrics(
+                  store,
+                  metrics,
+                  query_spec.labels,
+                  Keyword.merge(base_opts,
+                    group_by: group_keys,
+                    cross_series_aggregate: cross_agg || :max
+                  )
+                )
+
+              {:grouped, grouped}
+
+            {metrics, _} when is_list(metrics) ->
+              {:ok, multi} =
+                TimelessMetrics.query_aggregate_multi_metrics(
+                  store,
+                  metrics,
+                  query_spec.labels,
+                  base_opts
+                )
+
+              {:multi, multi}
+
+            {_, group_by} when is_binary(group_by) ->
+              group_keys = String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
+
+              {:ok, grouped} =
+                TimelessMetrics.query_aggregate_grouped(
+                  store,
+                  query_spec.metric,
+                  query_spec.labels,
+                  Keyword.merge(base_opts,
+                    group_by: group_keys,
+                    cross_series_aggregate: cross_agg || :max
+                  )
+                )
+
+              {:grouped, grouped}
+
+            _ when threshold != nil ->
+              {:ok, filtered} =
+                TimelessMetrics.query_aggregate_multi_filtered(
+                  store,
+                  query_spec.metric,
+                  query_spec.labels,
+                  Keyword.put(base_opts, :threshold, threshold)
+                )
+
+              {:flat, filtered}
+
+            _ ->
+              {:ok, flat} =
+                TimelessMetrics.query_aggregate_multi(
+                  store,
+                  query_spec.metric,
+                  query_spec.labels,
+                  base_opts
+                )
+
+              {:flat, flat}
+          end
+
+        results = maybe_apply_limit(results, limit)
+
+        body = format_native_response(result_type, results, query_spec)
 
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(%{metric: metric, series: series}))
+        |> send_resp(200, Jason.encode!(body))
 
       {:error, msg} ->
         json_error(conn, 400, msg)
+      end
     end
   end
 
@@ -790,7 +930,7 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
-  # Prometheus-compatible query_range endpoint (for Grafana)
+  # Prometheus-compatible query_range endpoint (for Grafana + TSBS)
   get "/prometheus/api/v1/query_range" do
     store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
@@ -801,45 +941,23 @@ defmodule TimelessMetrics.HTTP do
         json_error(conn, 400, "missing required parameter: query")
 
       query ->
-        {metric, labels} = parse_promql_simple(query)
         now = System.os_time(:second)
-
         start_ts = parse_prom_time(params["start"], now - 3600)
         end_ts = parse_prom_time(params["end"], now)
         step = parse_prom_step(params["step"], 60)
 
-        {:ok, results} =
-          TimelessMetrics.query_aggregate_multi(store, metric, labels,
-            from: start_ts,
-            to: end_ts,
-            bucket: {step, :seconds},
-            aggregate: :avg
-          )
+        case TimelessMetrics.PromQL.parse(query) do
+          {:ok, plan} ->
+            {:ok, response} =
+              TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
 
-        # Format as Prometheus API response
-        prom_results =
-          Enum.map(results, fn %{labels: l, data: buckets} ->
-            %{
-              "metric" => Map.put(l, "__name__", metric),
-              "values" =>
-                Enum.map(buckets, fn {ts, val} ->
-                  [ts, Float.to_string(ensure_float(val))]
-                end)
-            }
-          end)
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, Jason.encode!(response))
 
-        body =
-          Jason.encode!(%{
-            "status" => "success",
-            "data" => %{
-              "resultType" => "matrix",
-              "result" => prom_results
-            }
-          })
-
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, body)
+          {:error, reason} ->
+            json_error(conn, 400, "PromQL parse error: #{reason}")
+        end
     end
   end
 
@@ -872,7 +990,7 @@ defmodule TimelessMetrics.HTTP do
 
   # --- Internals ---
 
-  @reserved_params ~w(metric from to start end step aggregate width height label_key theme transform token forecast anomalies sensitivity horizon)
+  @reserved_params ~w(metric metrics from to start end step aggregate width height label_key theme transform token forecast anomalies sensitivity horizon group_by cross_aggregate threshold_gt threshold_lt limit)
 
   defp extract_metric_and_labels(params) do
     case params["metric"] do
@@ -894,10 +1012,114 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
+  defp extract_query_params_extended(params) do
+    now = System.os_time(:second)
+    from = parse_time(params["start"], parse_time(params["from"], now - 3600))
+    to = parse_time(params["end"], parse_time(params["to"], now))
+
+    # Support =~ prefix for regex labels
+    labels = label_params_extended(params)
+
+    case {params["metric"], params["metrics"]} do
+      {nil, nil} ->
+        {:error, "missing required parameter: metric or metrics"}
+
+      {metric, nil} ->
+        {:ok, %{metric: metric, metrics: nil, labels: labels, from: from, to: to}}
+
+      {_, metrics_str} ->
+        metrics = String.split(metrics_str, ",", trim: true) |> Enum.map(&String.trim/1)
+        {:ok, %{metric: nil, metrics: metrics, labels: labels, from: from, to: to}}
+    end
+  end
+
   defp label_params(params) do
     params
     |> Map.drop(@reserved_params)
     |> Map.new(fn {k, v} -> {to_string(k), to_string(v)} end)
+  end
+
+  defp label_params_extended(params) do
+    params
+    |> Map.drop(@reserved_params)
+    |> Map.new(fn {k, v} ->
+      v = to_string(v)
+
+      if String.starts_with?(v, "=~") do
+        {to_string(k), {:regex, String.trim_leading(v, "=~")}}
+      else
+        {to_string(k), v}
+      end
+    end)
+  end
+
+  defp parse_aggregate_or_nil(nil), do: nil
+
+  defp parse_aggregate_or_nil(agg) when agg in ~w(avg min max sum count),
+    do: String.to_existing_atom(agg)
+
+  defp parse_aggregate_or_nil(_), do: nil
+
+  defp parse_threshold_params(params) do
+    cond do
+      params["threshold_gt"] ->
+        case Float.parse(params["threshold_gt"]) do
+          {n, _} -> {:gt, n}
+          :error -> nil
+        end
+
+      params["threshold_lt"] ->
+        case Float.parse(params["threshold_lt"]) do
+          {n, _} -> {:lt, n}
+          :error -> nil
+        end
+
+      true ->
+        nil
+    end
+  end
+
+  defp parse_int_or_nil(nil), do: nil
+
+  defp parse_int_or_nil(val) do
+    case Integer.parse(val) do
+      {n, _} -> n
+      :error -> nil
+    end
+  end
+
+  defp maybe_apply_limit(results, nil), do: results
+  defp maybe_apply_limit(results, limit), do: TimelessMetrics.top_n(results, limit)
+
+  defp format_native_response(:flat, results, query_spec) do
+    series =
+      Enum.map(results, fn %{labels: l, data: buckets} ->
+        %{labels: l, data: Enum.map(buckets, fn {ts, val} -> [ts, val] end)}
+      end)
+
+    %{metric: query_spec.metric, series: series}
+  end
+
+  defp format_native_response(:multi, results, _query_spec) do
+    series =
+      Enum.map(results, fn result ->
+        %{
+          metric: result.metric,
+          labels: result.labels,
+          data: Enum.map(result.data, fn {ts, val} -> [ts, val] end)
+        }
+      end)
+
+    %{series: series}
+  end
+
+  defp format_native_response(:grouped, results, query_spec) do
+    groups =
+      Enum.map(results, fn %{group: g, data: data} ->
+        %{group: g, data: Enum.map(data, fn {ts, val} -> [ts, val] end)}
+      end)
+
+    %{metric: query_spec.metric || query_spec.metrics, groups: groups}
   end
 
   defp parse_int(nil, default), do: default
@@ -1260,37 +1482,215 @@ defmodule TimelessMetrics.HTTP do
 
   defp strip_quotes(v), do: String.trim(v)
 
-  # Simple PromQL parser — handles metric_name{label="value",...}
-  defp parse_promql_simple(query) do
-    query = String.trim(query)
+  # --- InfluxDB line protocol parser ---
+  # Format: measurement,tag=val,tag=val field=value[,field=value] [timestamp_ns]
+  # TSBS uses this format for data loading via POST /write.
+  # Only numeric field values are ingested (string/bool fields skipped).
+  # Multi-field lines produce one entry per numeric field, using field name
+  # as part of the metric name: "measurement_fieldname".
 
-    case Regex.run(~r/^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?$/, query) do
-      [_, metric, labels_str] ->
-        labels = parse_promql_labels(labels_str)
-        {metric, labels}
+  defp ingest_influx_lines(store, body) do
+    lines = :binary.split(body, <<"\n">>, [:global])
 
-      [_, metric] ->
-        {metric, %{}}
+    {all_entries, errors, error_samples} =
+      if length(lines) >= @parallel_parse_threshold do
+        parse_influx_lines_parallel(lines)
+      else
+        parse_influx_lines_sequential(lines)
+      end
+
+    if all_entries != [] do
+      TimelessMetrics.write_batch(store, all_entries)
+    end
+
+    {length(all_entries), errors, error_samples}
+  end
+
+  defp parse_influx_lines_sequential(lines) do
+    now = System.os_time(:second)
+
+    {entries, errors, samples} =
+      Enum.reduce(lines, {[], 0, []}, fn line, {entries_acc, errors, samples} ->
+        line = String.trim(line)
+
+        if line == "" or String.starts_with?(line, "#") do
+          {entries_acc, errors, samples}
+        else
+          case parse_influx_line(line, now) do
+            {:ok, parsed_entries} ->
+              {:lists.reverse(parsed_entries, entries_acc), errors, samples}
+
+            :error ->
+              samples =
+                if errors < @max_error_samples do
+                  [String.slice(line, 0, 200) | samples]
+                else
+                  samples
+                end
+
+              {entries_acc, errors + 1, samples}
+          end
+        end
+      end)
+
+    {entries, errors, Enum.take(Enum.reverse(samples), @max_error_samples)}
+  end
+
+  defp parse_influx_lines_parallel(lines) do
+    chunk_count = System.schedulers_online()
+
+    chunks =
+      lines
+      |> Enum.chunk_every(div(length(lines), chunk_count) + 1)
+      |> Enum.map(fn chunk ->
+        Task.async(fn -> parse_influx_lines_sequential(chunk) end)
+      end)
+
+    results = Task.await_many(chunks, :timer.seconds(30))
+    merge_parse_results(results)
+  end
+
+  # Parse a single InfluxDB line protocol line.
+  # Returns {:ok, [{metric, labels, value, timestamp}, ...]} or :error.
+  #
+  # Line structure: measurement[,tag=val...] field=val[,field=val...] [timestamp_ns]
+  # The tricky part: spaces delimit sections, but tags use commas (no spaces).
+  defp parse_influx_line(line, now) do
+    # Split into: measurement+tags, fields, optional timestamp
+    # First space separates measurement+tags from fields
+    case :binary.split(line, <<" ">>) do
+      [measurement_tags, fields_and_ts] ->
+        # Second space (if present) separates fields from timestamp
+        {fields_str, timestamp} =
+          case :binary.split(fields_and_ts, <<" ">>) do
+            [fields, ts_str] ->
+              ts_str = String.trim(ts_str)
+
+              case Integer.parse(ts_str) do
+                {ts_ns, _} -> {fields, nanoseconds_to_seconds(ts_ns)}
+                :error -> {fields, now}
+              end
+
+            [fields] ->
+              {fields, now}
+          end
+
+        # Parse measurement,tag=val,tag=val
+        {measurement, tags} = parse_influx_measurement_tags(measurement_tags)
+
+        # Parse field=val,field=val — each numeric field becomes a separate entry
+        case parse_influx_fields(fields_str) do
+          [] ->
+            :error
+
+          fields ->
+            entries =
+              Enum.map(fields, fn {field_name, value} ->
+                # TSBS convention: measurement_field (e.g., cpu_usage_user)
+                # If only one field named "value", just use measurement name
+                metric =
+                  if field_name == "value" and length(fields) == 1 do
+                    measurement
+                  else
+                    measurement <> "_" <> field_name
+                  end
+
+                {metric, tags, value, timestamp}
+              end)
+
+            {:ok, entries}
+        end
 
       _ ->
-        {query, %{}}
+        :error
     end
   end
 
-  defp parse_promql_labels(""), do: %{}
+  defp parse_influx_measurement_tags(str) do
+    case :binary.split(str, <<",">>) do
+      [measurement] ->
+        {measurement, %{}}
 
-  defp parse_promql_labels(str) do
+      [measurement, tags_str] ->
+        tags =
+          tags_str
+          |> :binary.split(<<",">>, [:global])
+          |> Enum.reduce(%{}, fn pair, acc ->
+            case :binary.split(pair, <<"=">>) do
+              [k, v] -> Map.put(acc, k, v)
+              _ -> acc
+            end
+          end)
+
+        {measurement, tags}
+    end
+  end
+
+  defp parse_influx_fields(str) do
     str
-    |> String.split(",", trim: true)
-    |> Enum.map(fn pair ->
-      case Regex.run(~r/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"([^"]*)"\s*$/, pair) do
-        [_, k, v] -> {k, v}
-        _ -> nil
+    |> :binary.split(<<",">>, [:global])
+    |> Enum.flat_map(fn pair ->
+      case :binary.split(pair, <<"=">>) do
+        [key, value_str] ->
+          case parse_influx_field_value(value_str) do
+            {:ok, num} -> [{key, num}]
+            :skip -> []
+          end
+
+        _ ->
+          []
       end
     end)
-    |> Enum.reject(&is_nil/1)
-    |> Map.new()
   end
+
+  # Parse a field value — only accept numeric values.
+  # InfluxDB suffixes integers with "i" (e.g., 42i), floats are bare.
+  # String values are quoted ("foo"), booleans are t/f/true/false — skip these.
+  defp parse_influx_field_value(<<?\", _rest::binary>>), do: :skip
+  defp parse_influx_field_value("t"), do: :skip
+  defp parse_influx_field_value("f"), do: :skip
+  defp parse_influx_field_value("true"), do: :skip
+  defp parse_influx_field_value("false"), do: :skip
+  defp parse_influx_field_value("T"), do: :skip
+  defp parse_influx_field_value("F"), do: :skip
+  defp parse_influx_field_value("True"), do: :skip
+  defp parse_influx_field_value("False"), do: :skip
+  defp parse_influx_field_value("TRUE"), do: :skip
+  defp parse_influx_field_value("FALSE"), do: :skip
+
+  defp parse_influx_field_value(str) do
+    # Strip trailing "i" for InfluxDB integer notation
+    str =
+      if String.ends_with?(str, "i") do
+        :binary.part(str, 0, byte_size(str) - 1)
+      else
+        str
+      end
+
+    case Float.parse(str) do
+      {num, _} -> {:ok, num}
+      :error -> :skip
+    end
+  end
+
+  # InfluxDB timestamps are nanoseconds. Convert to seconds.
+  # Also handle microseconds (13 digits) and milliseconds (10-digit range).
+  defp nanoseconds_to_seconds(ts) when ts > 1_000_000_000_000_000_000 do
+    # Nanoseconds (19 digits)
+    div(ts, 1_000_000_000)
+  end
+
+  defp nanoseconds_to_seconds(ts) when ts > 1_000_000_000_000_000 do
+    # Microseconds (16 digits)
+    div(ts, 1_000_000)
+  end
+
+  defp nanoseconds_to_seconds(ts) when ts > 1_000_000_000_000 do
+    # Milliseconds (13 digits)
+    div(ts, 1_000)
+  end
+
+  defp nanoseconds_to_seconds(ts), do: ts
 
   # Parse Prometheus time params — can be unix timestamps (float or int)
   defp parse_prom_time(nil, default), do: default

@@ -1,0 +1,75 @@
+name: Precompile NIFs
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cross-compile toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: ${{ runner.os }}-precompile-mix-${{ hashFiles('**/mix.lock') }}
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Precompile NIFs
+        run: |
+          mkdir -p cache
+          MIX_ENV=prod ELIXIR_MAKE_CACHE_DIR=cache mix elixir_make.precompile
+
+      - name: Upload precompiled artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cache/*.tar.gz
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: ${{ runner.os }}-precompile-mix-${{ hashFiles('**/mix.lock') }}
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Precompile NIFs
+        run: |
+          mkdir -p cache
+          MIX_ENV=prod ELIXIR_MAKE_CACHE_DIR=cache mix elixir_make.precompile
+
+      - name: Upload precompiled artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cache/*.tar.gz

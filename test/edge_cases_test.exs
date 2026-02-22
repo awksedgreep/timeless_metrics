@@ -4,12 +4,9 @@ defmodule TimelessMetrics.EdgeCasesTest do
   @data_dir "/tmp/timeless_edge_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!({TimelessMetrics, name: :edge_test, data_dir: @data_dir, buffer_shards: 1})
+    start_supervised!({TimelessMetrics, name: :edge_test, data_dir: @data_dir, engine: :actor})
 
-    on_exit(fn ->
-      :persistent_term.erase({TimelessMetrics, :edge_test, :schema})
-      File.rm_rf!(@data_dir)
-    end)
+    on_exit(fn -> File.rm_rf!(@data_dir) end)
 
     :ok
   end
@@ -169,18 +166,16 @@ defmodule TimelessMetrics.EdgeCasesTest do
     end)
   end
 
-  test "info includes tier stats" do
+  test "info returns actor stats" do
     info = TimelessMetrics.info(:edge_test)
 
-    assert is_map(info.tiers)
-    assert Map.has_key?(info.tiers, :hourly)
-    assert Map.has_key?(info.tiers, :daily)
-    assert Map.has_key?(info.tiers, :monthly)
-    assert info.tiers.hourly.rows >= 0
-    assert is_integer(info.tiers.hourly.watermark)
-    assert info.buffer_shards >= 1
-    assert info.buffer_points >= 0
+    assert is_integer(info.series_count)
+    assert is_integer(info.total_points)
+    assert is_integer(info.block_count)
+    assert is_integer(info.raw_buffer_points)
     assert info.bytes_per_point >= 0
+    assert is_integer(info.storage_bytes)
+    assert is_integer(info.daily_rollup_rows)
   end
 
   test "rollup with no data is a no-op" do

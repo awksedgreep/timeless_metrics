@@ -3,12 +3,12 @@
 # Usage: mix run bench/vs_victoriametrics.exs [--devices N] [--days N]
 #
 # Requires VictoriaMetrics running on localhost:8428
-# Note: TimelessMetrics uses native Elixir API (in-process), VM uses HTTP.
-# Query comparison is apples-to-apples (both measured end-to-end).
-# Ingest comparison favors TimelessMetrics (native vs HTTP) — noted in output.
+# Measures native API, HTTP ingest (apples-to-apples), storage, and query latency.
 
 defmodule VsBench do
   @vm_url "http://localhost:8428"
+  @tm_http_port 19_428
+  @tm_http_url "http://localhost:#{@tm_http_port}"
   @metrics ~w(cpu_usage mem_usage disk_usage load_avg if_in_octets if_out_octets
               temperature signal_power ping_latency bandwidth_util)
   @interval 300
@@ -32,6 +32,7 @@ defmodule VsBench do
     IO.puts("  Series:   #{series_count}")
     IO.puts("  Days:     #{days}")
     IO.puts("  Points:   #{fmt_int(total_points)}")
+    IO.puts("  CPU:      #{System.schedulers_online()} cores")
     IO.puts("  " <> String.duplicate("=", 64))
 
     # Verify VM is reachable
@@ -45,7 +46,7 @@ defmodule VsBench do
 
     labels_for = 0..(devices - 1) |> Enum.map(&%{"host" => "dev_#{&1}"}) |> List.to_tuple()
 
-    # --- Phase 1: Ingest into TimelessMetrics ---
+    # --- Phase 1: Native API Ingest (for query data + reference speed) ---
     data_dir = "/tmp/timeless_vs_bench_#{System.os_time(:millisecond)}"
     File.mkdir_p!(data_dir)
 
@@ -63,93 +64,204 @@ defmodule VsBench do
         buffer_shards: System.schedulers_online(),
         segment_duration: 14_400,
         schema: schema,
-        flush_threshold: 50_000,
+        flush_threshold: 200_000,
         flush_interval: :timer.seconds(60)
       )
 
-    IO.puts("\n  Phase 1: Ingest")
+    IO.puts("\n  Phase 1: Native API Ingest (concurrent writers, with index lookup)")
     IO.puts("  " <> String.duplicate("-", 64))
-    IO.puts("  (TimelessMetrics = native API, VM = HTTP import — not apples-to-apples)")
     IO.puts("")
 
-    {timeless_us, _} =
-      :timer.tc(fn ->
-        for day <- 0..(days - 1) do
-          day_start = start_ts + day * 86_400
+    writers = min(System.schedulers_online(), @intervals_per_day)
+    total_write_us = :counters.new(1, [:atomics])
+    total_flush_us = :counters.new(1, [:atomics])
 
-          for interval <- 0..(@intervals_per_day - 1) do
-            ts = day_start + interval * @interval
+    wall_start = System.monotonic_time(:microsecond)
 
-            entries =
-              for dev <- 0..(devices - 1), metric <- @metrics do
-                {metric, elem(labels_for, dev), gen(metric, ts, dev), ts}
-              end
+    for day <- 0..(days - 1) do
+      day_start = start_ts + day * 86_400
 
-            TimelessMetrics.write_batch(:vs_bench, entries)
-          end
+      {write_us, _} =
+        :timer.tc(fn ->
+          0..(@intervals_per_day - 1)
+          |> Enum.chunk_every(max(div(@intervals_per_day, writers), 1))
+          |> Enum.map(fn intervals ->
+            Task.async(fn ->
+              Enum.each(intervals, fn interval ->
+                ts = day_start + interval * @interval
 
-          TimelessMetrics.flush(:vs_bench)
+                entries =
+                  for dev <- 0..(devices - 1), metric <- @metrics do
+                    {metric, elem(labels_for, dev), gen(metric, ts, dev), ts}
+                  end
 
-          if rem(day + 1, 10) == 0 do
-            IO.write("\r    TimelessMetrics: day #{day + 1}/#{days}    ")
-          end
-        end
-      end)
+                TimelessMetrics.write_batch(:vs_bench, entries)
+              end)
+            end)
+          end)
+          |> Task.await_many(:infinity)
+        end)
 
-    timeless_rate = trunc(total_points / (timeless_us / 1_000_000))
-    IO.puts("\r    TimelessMetrics:          #{fmt_dur(timeless_us)}  [#{fmt_int(timeless_rate)} pts/sec]    ")
+      :counters.add(total_write_us, 1, write_us)
 
-    # --- Phase 1b: Ingest into VictoriaMetrics ---
-    # Use Prometheus text exposition format via HTTP
-    # Build a persistent connection for reuse
+      {flush_us, _} = :timer.tc(fn -> TimelessMetrics.flush(:vs_bench) end)
+      :counters.add(total_flush_us, 1, flush_us)
+
+      if rem(day + 1, 10) == 0 do
+        IO.write("\r    TimelessMetrics: day #{day + 1}/#{days}    ")
+      end
+    end
+
+    wall_end = System.monotonic_time(:microsecond)
+    wall_us = wall_end - wall_start
+    write_us = :counters.get(total_write_us, 1)
+    flush_us = :counters.get(total_flush_us, 1)
+
+    write_rate = trunc(total_points / (write_us / 1_000_000))
+    wall_rate = trunc(total_points / (wall_us / 1_000_000))
+
+    IO.puts("\r    Write only:   #{fmt_dur(write_us)}  [#{fmt_int(write_rate)} pts/sec] (#{writers} writers)      ")
+    IO.puts("    Flush+compress: #{fmt_dur(flush_us)}")
+    IO.puts("    Wall total:   #{fmt_dur(wall_us)}  [#{fmt_int(wall_rate)} pts/sec effective]")
+
+    # --- Phase 2: HTTP Ingest Comparison (apples-to-apples, sustained) ---
+    IO.puts("\n  Phase 2: HTTP Ingest (apples-to-apples, verified)")
+    IO.puts("  " <> String.duplicate("-", 64))
+    IO.puts("  Measures send + wait until data is queryable (no buffering tricks)")
+    IO.puts("")
+
+    # Start TM HTTP server on separate port
+    http_data_dir = "/tmp/timeless_vs_bench_http_#{System.os_time(:millisecond)}"
+    File.mkdir_p!(http_data_dir)
+
+    {:ok, _} =
+      TimelessMetrics.Supervisor.start_link(
+        name: :vs_http_bench,
+        data_dir: http_data_dir,
+        buffer_shards: System.schedulers_online(),
+        segment_duration: 14_400,
+        schema: schema,
+        flush_threshold: 200_000,
+        flush_interval: :timer.seconds(60)
+      )
+
+    {:ok, _http_pid} = Bandit.start_link(
+      plug: {TimelessMetrics.HTTP, [store: :vs_http_bench]},
+      port: @tm_http_port
+    )
+
+    # Verify TM HTTP is reachable
+    case Req.get("#{@tm_http_url}/health") do
+      {:ok, %{status: 200}} -> :ok
+      other -> IO.puts("  ERROR: TM HTTP not reachable at #{@tm_http_url}: #{inspect(other)}"); System.halt(1)
+    end
+
+    tm_req = Req.new(base_url: @tm_http_url, connect_options: [timeout: 30_000], receive_timeout: 60_000)
     vm_req = Req.new(base_url: @vm_url, connect_options: [timeout: 30_000], receive_timeout: 60_000)
 
-    {vm_us, _} =
-      :timer.tc(fn ->
-        for day <- 0..(days - 1) do
-          day_start = start_ts + day * 86_400
+    # Pre-build all day payloads (exclude from timing — measures server, not client serialization)
+    IO.write("    Building payloads...")
+    day_bodies =
+      for day <- 0..(days - 1) do
+        day_start = start_ts + day * 86_400
 
-          # Build all points for one day in Prometheus text format
-          lines =
-            for interval <- 0..(@intervals_per_day - 1) do
-              ts = day_start + interval * @interval
-              ts_ms = ts * 1000
+        lines =
+          for interval <- 0..(@intervals_per_day - 1) do
+            ts = day_start + interval * @interval
+            ts_ms = ts * 1000
 
-              for dev <- 0..(devices - 1), metric <- @metrics do
-                val = gen(metric, ts, dev)
-                host = "dev_#{dev}"
-                [metric, ~c'{host="', host, ~c'"} ', Float.to_string(val), ?\s, Integer.to_string(ts_ms), ?\n]
-              end
+            for dev <- 0..(devices - 1), metric <- @metrics do
+              val = gen(metric, ts, dev)
+              host = "dev_#{dev}"
+              [metric, ~c'{host="', host, ~c'"} ', Float.to_string(val), ?\s, Integer.to_string(ts_ms), ?\n]
             end
+          end
 
-          body = IO.iodata_to_binary(lines)
+        IO.iodata_to_binary(lines)
+      end
 
-          Req.post!(vm_req, url: "/api/v1/import/prometheus", body: body,
+    total_payload = Enum.reduce(day_bodies, 0, &(byte_size(&1) + &2))
+    IO.puts(" done (#{length(day_bodies)} days, #{fmt_bytes(total_payload)} total)")
+    IO.puts("")
+
+    # --- 2a: TimelessMetrics HTTP (synchronous — data available immediately after 204) ---
+    {tm_http_us, _} =
+      :timer.tc(fn ->
+        for {body, day} <- Enum.with_index(day_bodies, 1) do
+          Req.post!(tm_req, url: "/api/v1/import/prometheus", body: body,
             headers: [{"content-type", "text/plain"}])
 
-          if rem(day + 1, 10) == 0 do
-            IO.write("\r    VictoriaMetrics:   day #{day + 1}/#{days}    ")
+          if rem(day, 10) == 0 do
+            IO.write("\r    TimelessMetrics HTTP: day #{day}/#{days}    ")
           end
         end
       end)
 
-    vm_rate = trunc(total_points / (vm_us / 1_000_000))
-    IO.puts("\r    VictoriaMetrics:   #{fmt_dur(vm_us)}  [#{fmt_int(vm_rate)} pts/sec]    ")
+    # TM is synchronous — data is in buffer after response, verify via health endpoint
+    %{status: 200, body: tm_health} = Req.get!(tm_req, url: "/health")
+    tm_verified_points = tm_health["points"] + tm_health["buffer_points"]
 
-    # Let VM flush to disk
-    Process.sleep(3_000)
+    tm_http_rate = trunc(total_points / (tm_http_us / 1_000_000))
+    IO.puts("\r    TimelessMetrics HTTP: #{fmt_dur(tm_http_us)}  [#{fmt_int(tm_http_rate)} pts/sec]  (#{fmt_int(tm_verified_points)} pts verified)    ")
 
-    # --- Phase 2: Storage comparison ---
-    IO.puts("\n  Phase 2: Storage")
+    # --- 2b: VictoriaMetrics HTTP (may buffer — need to wait for data to land) ---
+    vm_send_start = System.monotonic_time(:microsecond)
+
+    for {body, day} <- Enum.with_index(day_bodies, 1) do
+      Req.post!(vm_req, url: "/api/v1/import/prometheus", body: body,
+        headers: [{"content-type", "text/plain"}])
+
+      if rem(day, 10) == 0 do
+        IO.write("\r    VictoriaMetrics HTTP:   day #{day}/#{days} (sending)    ")
+      end
+    end
+
+    vm_send_done = System.monotonic_time(:microsecond)
+    vm_send_us = vm_send_done - vm_send_start
+    vm_send_rate = trunc(total_points / (vm_send_us / 1_000_000))
+    IO.puts("\r    VictoriaMetrics send:   #{fmt_dur(vm_send_us)}  [#{fmt_int(vm_send_rate)} pts/sec] (HTTP accept only)    ")
+
+    # Now wait for VM to actually process the data — poll until series count stabilizes
+    IO.write("    Waiting for VM to process...")
+
+    # Force flush
+    Req.get(vm_req, url: "/internal/force_flush")
+
+    vm_verified_points = wait_for_vm_stable(vm_req, series_count)
+    vm_total_us = System.monotonic_time(:microsecond) - vm_send_start
+    vm_real_rate = trunc(total_points / (vm_total_us / 1_000_000))
+
+    IO.puts(" done")
+    IO.puts("    VictoriaMetrics real:   #{fmt_dur(vm_total_us)}  [#{fmt_int(vm_real_rate)} pts/sec] (send + process + verify)")
+    IO.puts("      VM series confirmed:  #{vm_verified_points}")
+
+    IO.puts("")
+    ratio = if tm_http_rate > 0, do: Float.round(vm_real_rate / tm_http_rate, 2), else: 0.0
+    winner = if tm_http_rate > vm_real_rate, do: "TM wins", else: "VM wins"
+    IO.puts("    Apples-to-apples ratio: #{ratio}x (#{winner})")
+
+    # Flush TM HTTP store
+    TimelessMetrics.flush(:vs_http_bench)
+
+    # --- Phase 3: Storage comparison ---
+    IO.puts("\n  Phase 3: Storage")
     IO.puts("  " <> String.duplicate("-", 64))
 
     timeless_info = TimelessMetrics.info(:vs_bench)
-    IO.puts("    TimelessMetrics:")
+    IO.puts("    TimelessMetrics (native):")
     IO.puts("      Segments:   #{fmt_int(timeless_info.segment_count)}")
     IO.puts("      Points:     #{fmt_int(timeless_info.total_points)}")
     IO.puts("      Compressed: #{fmt_bytes(timeless_info.raw_compressed_bytes)}")
     IO.puts("      Bytes/pt:   #{timeless_info.bytes_per_point}")
     IO.puts("      DB file:    #{fmt_bytes(timeless_info.storage_bytes)}")
+
+    http_info = TimelessMetrics.info(:vs_http_bench)
+    IO.puts("    TimelessMetrics (HTTP):")
+    IO.puts("      Segments:   #{fmt_int(http_info.segment_count)}")
+    IO.puts("      Points:     #{fmt_int(http_info.total_points)}")
+    IO.puts("      Compressed: #{fmt_bytes(http_info.raw_compressed_bytes)}")
+    IO.puts("      Bytes/pt:   #{http_info.bytes_per_point}")
+    IO.puts("      DB file:    #{fmt_bytes(http_info.storage_bytes)}")
 
     # VM storage via TSDB status API
     %{status: 200, body: vm_tsdb} = Req.get!(vm_req, url: "/api/v1/status/tsdb")
@@ -157,7 +269,6 @@ defmodule VsBench do
     IO.puts("    VictoriaMetrics:")
     IO.puts("      Series:     #{fmt_int(vm_series)}")
 
-    # Try to get VM data dir size
     case System.cmd("podman", ["exec", "victoriametrics", "du", "-sh", "/victoria-metrics-data"], stderr_to_stdout: true) do
       {output, 0} ->
         [size | _] = String.split(output)
@@ -166,8 +277,8 @@ defmodule VsBench do
         IO.puts("      (disk usage: check container filesystem)")
     end
 
-    # --- Phase 3: Query comparison ---
-    IO.puts("\n  Phase 3: Query Latency")
+    # --- Phase 4: Query comparison ---
+    IO.puts("\n  Phase 4: Query Latency")
     IO.puts("  " <> String.duplicate("-", 64))
     IO.puts("  (Both measured end-to-end: TimelessMetrics = native, VM = HTTP)")
     IO.puts("")
@@ -249,14 +360,23 @@ defmodule VsBench do
       )
     end)
 
-    # --- Footer ---
+    # --- Summary ---
     IO.puts("\n  " <> String.duplicate("=", 64))
-    IO.puts("  Notes:")
-    IO.puts("    - Ingest: TimelessMetrics native API vs VM HTTP (not comparable)")
-    IO.puts("    - Queries: TimelessMetrics native vs VM HTTP (VM includes network overhead)")
-    IO.puts("    - VM query ratio >1x means TimelessMetrics is faster")
+    IO.puts("  Ingest Summary")
+    IO.puts("  " <> String.duplicate("-", 64))
+    IO.puts("  #{String.pad_trailing("Method", 40)} #{String.pad_leading("pts/sec", 12)}")
+    IO.puts("  " <> String.duplicate("-", 64))
+    IO.puts("  #{String.pad_trailing("TM native write_batch (#{writers} writers)", 40)} #{String.pad_leading(fmt_int(write_rate), 12)}")
+    IO.puts("  #{String.pad_trailing("TM native wall (write+flush+compress)", 40)} #{String.pad_leading(fmt_int(wall_rate), 12)}")
+    IO.puts("  #{String.pad_trailing("TM HTTP (Prometheus, synchronous)", 40)} #{String.pad_leading(fmt_int(tm_http_rate), 12)}")
+    IO.puts("  #{String.pad_trailing("VM HTTP (Prometheus, accept only)", 40)} #{String.pad_leading(fmt_int(vm_send_rate), 12)}")
+    IO.puts("  #{String.pad_trailing("VM HTTP (Prometheus, sustained/verified)", 40)} #{String.pad_leading(fmt_int(vm_real_rate), 12)}")
+    IO.puts("  " <> String.duplicate("-", 64))
+    tm_vs_vm = if vm_real_rate > 0, do: Float.round(write_rate / vm_real_rate, 2), else: 0.0
+    IO.puts("  TM native vs VM HTTP sustained: #{tm_vs_vm}x")
+    IO.puts("  " <> String.duplicate("=", 64))
     IO.puts("  Cleanup:")
-    IO.puts("    rm -rf #{data_dir}")
+    IO.puts("    rm -rf #{data_dir} #{http_data_dir}")
     IO.puts("    curl -s 'http://localhost:8428/api/v1/admin/tsdb/delete_series?match[]={__name__=~\".*\"}' > /dev/null")
     IO.puts("  " <> String.duplicate("=", 64))
   end
@@ -301,6 +421,44 @@ defmodule VsBench do
   defp fmt_us(us) when us >= 1_000_000, do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 2)}s"
   defp fmt_us(us) when us >= 1_000, do: "#{:erlang.float_to_binary(us / 1_000, decimals: 2)}ms"
   defp fmt_us(us), do: "#{:erlang.float_to_binary(us / 1, decimals: 0)}us"
+
+  # Poll VM's TSDB status until totalSeries reaches expected count or stabilizes
+  defp wait_for_vm_stable(vm_req, expected_series) do
+    wait_for_vm_stable(vm_req, expected_series, 0, 0, 60)
+  end
+
+  defp wait_for_vm_stable(_vm_req, _expected, last_count, stable_checks, 0) do
+    IO.write(" (timeout, stable_checks=#{stable_checks})")
+    last_count
+  end
+
+  defp wait_for_vm_stable(vm_req, expected_series, last_count, stable_checks, retries) do
+    Process.sleep(500)
+
+    case Req.get(vm_req, url: "/api/v1/status/tsdb") do
+      {:ok, %{status: 200, body: %{"data" => %{"totalSeries" => count}}}} ->
+        cond do
+          count >= expected_series ->
+            # All series present
+            count
+
+          count == last_count and stable_checks >= 3 ->
+            # Series count stopped growing — VM is done
+            IO.write(" (stabilized at #{count}/#{expected_series} series)")
+            count
+
+          count == last_count ->
+            wait_for_vm_stable(vm_req, expected_series, count, stable_checks + 1, retries - 1)
+
+          true ->
+            IO.write(".")
+            wait_for_vm_stable(vm_req, expected_series, count, 0, retries - 1)
+        end
+
+      _ ->
+        wait_for_vm_stable(vm_req, expected_series, last_count, stable_checks, retries - 1)
+    end
+  end
 end
 
 VsBench.run()

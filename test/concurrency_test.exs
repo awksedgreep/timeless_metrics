@@ -4,12 +4,9 @@ defmodule TimelessMetrics.ConcurrencyTest do
   @data_dir "/tmp/timeless_concurrency_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!({TimelessMetrics, name: :conc_test, data_dir: @data_dir, buffer_shards: 4})
+    start_supervised!({TimelessMetrics, name: :conc_test, data_dir: @data_dir, engine: :actor})
 
-    on_exit(fn ->
-      :persistent_term.erase({TimelessMetrics, :conc_test, :schema})
-      File.rm_rf!(@data_dir)
-    end)
+    on_exit(fn -> File.rm_rf!(@data_dir) end)
 
     :ok
   end

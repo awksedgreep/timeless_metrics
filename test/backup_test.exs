@@ -6,7 +6,7 @@ defmodule TimelessMetrics.BackupTest do
 
   setup do
     start_supervised!(
-      {TimelessMetrics, name: :backup_test, data_dir: @data_dir, buffer_shards: 2}
+      {TimelessMetrics, name: :backup_test, data_dir: @data_dir, engine: :actor}
     )
 
     on_exit(fn ->
@@ -45,11 +45,10 @@ defmodule TimelessMetrics.BackupTest do
     Exqlite.Sqlite3.close(conn)
   end
 
-  test "backup includes all shard files" do
+  test "backup includes actor .dat files" do
     now = System.os_time(:second)
 
-    # Write to multiple series to spread across shards
-    for i <- 0..9 do
+    for i <- 0..4 do
       TimelessMetrics.write(:backup_test, "metric_#{i}", %{"k" => "v"}, i * 1.0,
         timestamp: now - 60
       )
@@ -59,14 +58,13 @@ defmodule TimelessMetrics.BackupTest do
 
     {:ok, result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
-    # 2 shards configured (directories, not .db files)
-    assert "shard_0" in result.files
-    assert "shard_1" in result.files
-    # metrics.db + 2 shards
-    assert length(result.files) == 3
+    # Should have metrics.db and actor/*.dat files
+    assert "metrics.db" in result.files
+    actor_files = Enum.filter(result.files, &String.starts_with?(&1, "actor/"))
+    assert length(actor_files) >= 1
   end
 
-  test "backed-up shard DB is independently queryable" do
+  test "backed-up actor files exist on disk" do
     now = System.os_time(:second)
 
     for i <- 0..4 do
@@ -79,26 +77,12 @@ defmodule TimelessMetrics.BackupTest do
 
     {:ok, _result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
-    # Verify raw segment files were backed up (WAL or .seg files)
-    total_raw_files =
-      Enum.reduce(0..1, 0, fn i, acc ->
-        raw_dir = Path.join(@backup_dir, "shard_#{i}/raw")
-
-        case File.ls(raw_dir) do
-          {:ok, files} ->
-            raw_count =
-              Enum.count(files, fn f ->
-                String.ends_with?(f, ".seg") or String.ends_with?(f, ".wal")
-              end)
-
-            acc + raw_count
-
-          _ ->
-            acc
-        end
-      end)
-
-    assert total_raw_files >= 1
+    # Verify .dat files were copied
+    actor_dir = Path.join(@backup_dir, "actor")
+    assert File.dir?(actor_dir)
+    {:ok, files} = File.ls(actor_dir)
+    dat_files = Enum.filter(files, &String.ends_with?(&1, ".dat"))
+    assert length(dat_files) >= 1
   end
 
   test "backup during active writes does not crash" do

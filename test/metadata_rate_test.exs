@@ -5,14 +5,10 @@ defmodule TimelessMetrics.MetadataRateTest do
 
   setup do
     start_supervised!(
-      {TimelessMetrics,
-       name: :meta_test, data_dir: @data_dir, buffer_shards: 1, segment_duration: 3_600}
+      {TimelessMetrics, name: :meta_test, data_dir: @data_dir, engine: :actor}
     )
 
-    on_exit(fn ->
-      :persistent_term.erase({TimelessMetrics, :meta_test, :schema})
-      File.rm_rf!(@data_dir)
-    end)
+    on_exit(fn -> File.rm_rf!(@data_dir) end)
 
     :ok
   end

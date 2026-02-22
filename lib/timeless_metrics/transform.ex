@@ -54,6 +54,25 @@ defmodule TimelessMetrics.Transform do
     end
   end
 
+  @doc """
+  Parse a threshold filter string.
+
+  ## Examples
+
+      parse_threshold("filter_gt:90")  #=> {:gt, 90.0}
+      parse_threshold("filter_lt:10")  #=> {:lt, 10.0}
+      parse_threshold(nil)             #=> nil
+  """
+  def parse_threshold(nil), do: nil
+
+  def parse_threshold(str) when is_binary(str) do
+    case String.split(str, ":", parts: 2) do
+      ["filter_gt", n] -> {:gt, parse_number(n)}
+      ["filter_lt", n] -> {:lt, parse_number(n)}
+      _ -> nil
+    end
+  end
+
   defp parse_number(str) do
     case Float.parse(str) do
       {n, _} -> n

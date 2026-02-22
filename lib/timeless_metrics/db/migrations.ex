@@ -193,7 +193,17 @@ defmodule TimelessMetrics.DB.Migrations do
     run_from(conn, 4)
   end
 
-  defp run_from(_conn, 4), do: :ok
+  defp run_from(conn, 4) do
+    execute(conn, "BEGIN")
+    execute(conn, "DROP TABLE IF EXISTS raw_segments")
+    execute(conn, "DROP TABLE IF EXISTS tier_hourly")
+    execute(conn, "DROP TABLE IF EXISTS tier_monthly")
+    set_version(conn, 5)
+    execute(conn, "COMMIT")
+    run_from(conn, 5)
+  end
+
+  defp run_from(_conn, 5), do: :ok
 
   defp execute(conn, sql, params \\ []) do
     {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, sql)

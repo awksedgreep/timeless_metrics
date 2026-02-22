@@ -4,7 +4,7 @@ defmodule TimelessMetricsTest do
   @data_dir "/tmp/timeless_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!({TimelessMetrics, name: :test_store, data_dir: @data_dir, buffer_shards: 2})
+    start_supervised!({TimelessMetrics, name: :test_store, data_dir: @data_dir, engine: :actor})
     on_exit(fn -> File.rm_rf!(@data_dir) end)
     :ok
   end
@@ -121,7 +121,6 @@ defmodule TimelessMetricsTest do
     info = TimelessMetrics.info(:test_store)
     assert info.series_count == 5
     assert info.total_points == 5
-    assert info.segment_count >= 1
     assert info.storage_bytes > 0
     assert is_binary(info.db_path)
   end
@@ -129,23 +128,27 @@ defmodule TimelessMetricsTest do
   test "buffer flushes data on shutdown" do
     now = System.os_time(:second)
 
-    # Write points but do NOT call flush — data sits in the ETS buffer
+    # Write points but do NOT call flush — data sits in the raw buffer
     for i <- 0..4 do
       TimelessMetrics.write(:test_store, "shutdown_test", %{"id" => "1"}, i * 10.0,
         timestamp: now + i
       )
     end
 
+    # Let async casts be processed by the SeriesServer
+    Process.sleep(50)
+
     # Stop the store (triggers terminate callbacks)
     stop_supervised!({TimelessMetrics, :test_store})
 
-    # Restart the store with the same data_dir
-    start_supervised!({TimelessMetrics, name: :test_store, data_dir: @data_dir, buffer_shards: 2})
+    # Clean up persistent_terms from old instance
+    :persistent_term.erase({TimelessMetrics.Actor.SeriesManager, :test_store_actor_manager})
 
-    # The builder should have received the flush from terminate
-    # Give the segment builder a moment to write to SQLite
-    Process.sleep(200)
-    TimelessMetrics.flush(:test_store)
+    # Restart the store with the same data_dir
+    start_supervised!({TimelessMetrics, name: :test_store, data_dir: @data_dir, engine: :actor})
+
+    # Give series processes a moment to recover from disk
+    Process.sleep(500)
 
     {:ok, points} =
       TimelessMetrics.query(:test_store, "shutdown_test", %{"id" => "1"},
