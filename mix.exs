@@ -1,7 +1,7 @@
 defmodule TimelessMetrics.MixProject do
   use Mix.Project
 
-  @version "1.0.1"
+  @version "1.0.2"
 
   def project do
     [
@@ -27,7 +27,16 @@ defmodule TimelessMetrics.MixProject do
       make_precompiler_filename: "prometheus_nif",
       make_precompiler_priv_paths: ["prometheus_nif.*"],
       make_precompiler_nif_versions: [versions: ["2.16", "2.17"]],
+      package: package(),
       deps: deps()
+    ]
+  end
+
+  defp package do
+    [
+      files: ~w(lib c_src Makefile mix.exs README* LICENSE* CHANGELOG*),
+      licenses: ["MIT"],
+      links: %{"GitHub" => "https://github.com/awksedgreep/timeless_metrics"}
     ]
   end
 

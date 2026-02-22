@@ -29,11 +29,14 @@ all: $(PRIV_DIR) $(NIF_SO)
 $(PRIV_DIR):
 	mkdir -p $(PRIV_DIR)
 
-$(NIF_OBJ): $(NIF_SRC)
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+# Always recompile — avoids stale cross-platform .o from Hex package or other arch
+$(NIF_OBJ): .FORCE $(NIF_SRC)
+	$(CXX) $(CXXFLAGS) -c -o $@ $(NIF_SRC)
 
 $(NIF_SO): $(NIF_OBJ) | $(PRIV_DIR)
 	$(CXX) $(LDFLAGS) -o $@ $(NIF_OBJ)
+
+.FORCE:
 
 clean:
 	rm -f $(NIF_SO) $(NIF_OBJ)
