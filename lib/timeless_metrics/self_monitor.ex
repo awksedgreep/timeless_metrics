@@ -34,7 +34,7 @@ defmodule TimelessMetrics.SelfMonitor do
   defp collect(store) do
     now = System.os_time(:second)
     mem = :erlang.memory()
-    {:ok, info} = TimelessMetrics.info(store)
+    info = TimelessMetrics.info(store)
     labels = %{}
 
     entries = [
