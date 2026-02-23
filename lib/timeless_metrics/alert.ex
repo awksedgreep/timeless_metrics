@@ -115,6 +115,53 @@ defmodule TimelessMetrics.Alert do
   end
 
   @doc """
+  Update an alert rule (partial update).
+
+  Supported fields: name, metric, labels, condition, threshold, duration, aggregate, webhook_url, enabled.
+  Only provided fields are updated.
+
+  Returns `:ok`.
+  """
+  @updatable_fields ~w(name metric labels condition threshold duration aggregate webhook_url enabled)
+
+  def update_rule(db, rule_id, opts) do
+    fields =
+      opts
+      |> Enum.filter(fn {k, _v} -> to_string(k) in @updatable_fields end)
+      |> Enum.map(fn {k, v} ->
+        key = to_string(k)
+
+        val =
+          case key do
+            "labels" -> Jason.encode!(v)
+            "condition" -> to_string(v)
+            "aggregate" -> to_string(v)
+            "threshold" -> v * 1.0
+            "enabled" -> if(v, do: 1, else: 0)
+            _ -> v
+          end
+
+        {key, val}
+      end)
+
+    if fields == [] do
+      :ok
+    else
+      set_clause = fields |> Enum.with_index(1) |> Enum.map_join(", ", fn {{k, _v}, i} -> "#{k} = ?#{i}" end)
+      values = Enum.map(fields, fn {_k, v} -> v end) ++ [rule_id]
+      id_placeholder = "?#{length(fields) + 1}"
+
+      TimelessMetrics.DB.write(
+        db,
+        "UPDATE alert_rules SET #{set_clause} WHERE id = #{id_placeholder}",
+        values
+      )
+
+      :ok
+    end
+  end
+
+  @doc """
   Delete an alert rule and its state.
   """
   def delete_rule(db, rule_id) do
@@ -261,9 +308,143 @@ defmodule TimelessMetrics.Alert do
       end
     end
 
-    if should_notify && rule.webhook_url do
-      deliver_webhook(rule, labels, value, new_state, now)
+    if should_notify do
+      log_history(db, rule, series_key, value, should_notify, now)
+
+      if rule.webhook_url do
+        deliver_webhook(rule, labels, value, new_state, now)
+      end
     end
+  end
+
+  defp log_history(db, rule, series_key, value, :fire, now) do
+    TimelessMetrics.DB.write(
+      db,
+      """
+      INSERT INTO alert_history (rule_id, rule_name, metric, series_labels, state, value, threshold, condition, triggered_at, created_at)
+      VALUES (?1, ?2, ?3, ?4, 'firing', ?5, ?6, ?7, ?8, ?8)
+      """,
+      [rule.id, rule.name, rule.metric, series_key, value, rule.threshold, rule.condition, now]
+    )
+  end
+
+  defp log_history(db, rule, series_key, value, :resolve, now) do
+    TimelessMetrics.DB.write(
+      db,
+      """
+      INSERT INTO alert_history (rule_id, rule_name, metric, series_labels, state, value, threshold, condition, triggered_at, resolved_at, created_at)
+      VALUES (?1, ?2, ?3, ?4, 'resolved', ?5, ?6, ?7, ?8, ?8, ?8)
+      """,
+      [rule.id, rule.name, rule.metric, series_key, value, rule.threshold, rule.condition, now]
+    )
+  end
+
+  @doc """
+  List recent alert history entries, newest first.
+
+  Options:
+    - `:limit` - max entries (default 50)
+    - `:rule_id` - filter by rule ID
+    - `:acknowledged` - filter: true, false, or nil (all)
+  """
+  def list_history(db, opts \\ []) do
+    limit = Keyword.get(opts, :limit, 50)
+    rule_id = Keyword.get(opts, :rule_id)
+    acknowledged = Keyword.get(opts, :acknowledged)
+
+    {where_clauses, params} = build_history_filters(rule_id, acknowledged)
+
+    where = if where_clauses == [], do: "", else: "WHERE " <> Enum.join(where_clauses, " AND ")
+
+    {:ok, rows} =
+      TimelessMetrics.DB.read(
+        db,
+        """
+        SELECT id, rule_id, rule_name, metric, series_labels, state, value, threshold, condition, triggered_at, resolved_at, acknowledged, created_at
+        FROM alert_history
+        #{where}
+        ORDER BY created_at DESC
+        LIMIT ?#{length(params) + 1}
+        """,
+        params ++ [limit]
+      )
+
+    entries =
+      Enum.map(rows, fn [id, rule_id, rule_name, metric, series_labels, state, value, threshold, condition, triggered_at, resolved_at, ack, created_at] ->
+        %{
+          id: id,
+          rule_id: rule_id,
+          rule_name: rule_name,
+          metric: metric,
+          series_labels: Jason.decode!(series_labels),
+          state: state,
+          value: value,
+          threshold: threshold,
+          condition: condition,
+          triggered_at: triggered_at,
+          resolved_at: resolved_at,
+          acknowledged: ack == 1,
+          created_at: created_at
+        }
+      end)
+
+    {:ok, entries}
+  end
+
+  defp build_history_filters(rule_id, acknowledged) do
+    {clauses, params, _idx} =
+      [{rule_id, "rule_id"}, {acknowledged, "acknowledged"}]
+      |> Enum.reduce({[], [], 1}, fn
+        {nil, _col}, acc ->
+          acc
+
+        {val, col}, {clauses, params, idx} ->
+          db_val = if is_boolean(val), do: (if val, do: 1, else: 0), else: val
+          {clauses ++ ["#{col} = ?#{idx}"], params ++ [db_val], idx + 1}
+      end)
+
+    {clauses, params}
+  end
+
+  @doc """
+  Acknowledge a history entry by ID.
+  """
+  def acknowledge_alert(db, history_id) do
+    TimelessMetrics.DB.write(
+      db,
+      "UPDATE alert_history SET acknowledged = 1 WHERE id = ?1",
+      [history_id]
+    )
+
+    :ok
+  end
+
+  @doc """
+  Clear history entries.
+
+  Options:
+    - `:acknowledged_only` - only delete acknowledged entries (default true)
+    - `:before` - delete entries older than this timestamp (default: 7 days ago)
+  """
+  def clear_history(db, opts \\ []) do
+    acknowledged_only = Keyword.get(opts, :acknowledged_only, true)
+    before = Keyword.get(opts, :before, System.os_time(:second) - 7 * 86_400)
+
+    if acknowledged_only do
+      TimelessMetrics.DB.write(
+        db,
+        "DELETE FROM alert_history WHERE acknowledged = 1 AND created_at < ?1",
+        [before]
+      )
+    else
+      TimelessMetrics.DB.write(
+        db,
+        "DELETE FROM alert_history WHERE created_at < ?1",
+        [before]
+      )
+    end
+
+    :ok
   end
 
   defp deliver_webhook(rule, labels, value, state, timestamp) do

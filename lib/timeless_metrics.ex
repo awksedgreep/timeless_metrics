@@ -380,6 +380,12 @@ defmodule TimelessMetrics do
     TimelessMetrics.Alert.list_rules(db)
   end
 
+  @doc "Update an alert rule (partial update). Returns `:ok`."
+  def update_alert(store, rule_id, opts) do
+    db = :"#{store}_db"
+    TimelessMetrics.Alert.update_rule(db, rule_id, opts)
+  end
+
   @doc "Delete an alert rule."
   def delete_alert(store, rule_id) do
     db = :"#{store}_db"
@@ -389,6 +395,32 @@ defmodule TimelessMetrics do
   @doc "Evaluate all alert rules against current data."
   def evaluate_alerts(store) do
     TimelessMetrics.Alert.evaluate(store)
+  end
+
+  @doc """
+  List recent alert history entries.
+
+  Options: `:limit`, `:rule_id`, `:acknowledged` (true/false/nil).
+  """
+  def alert_history(store, opts \\ []) do
+    db = :"#{store}_db"
+    TimelessMetrics.Alert.list_history(db, opts)
+  end
+
+  @doc "Acknowledge an alert history entry by ID."
+  def acknowledge_alert(store, history_id) do
+    db = :"#{store}_db"
+    TimelessMetrics.Alert.acknowledge_alert(db, history_id)
+  end
+
+  @doc """
+  Clear alert history entries.
+
+  Options: `:acknowledged_only` (default true), `:before` (timestamp cutoff).
+  """
+  def clear_alert_history(store, opts \\ []) do
+    db = :"#{store}_db"
+    TimelessMetrics.Alert.clear_history(db, opts)
   end
 
   @doc """

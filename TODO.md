@@ -1,8 +1,5 @@
 # Timeless TODO
 
-## Bugs
-- [ ] `info/1` `storage_bytes` only reports main DB (metrics.db) page count — doesn't include shard DBs where all the actual compressed data lives. Should sum across all shard files. Causes dashboard Storage tab to show ~256 KB when real on-disk usage is several MB.
-
 ## Performance — Retention
 
 ### Benchmarked: Secondary indexes on end_time/bucket HURT performance
@@ -20,18 +17,13 @@ Results at 10K series / 30 days (3.6M raw segments, 7.2M tier rows):
 **Decision:** No secondary indexes. The full table scan is the right approach.
 At 10K series / 30 days, 1 second for full retention enforcement is fine.
 
-### Shard DB vacuum
-- [ ] Remove `incremental_vacuum` on shard DBs — freed pages get reused by new INSERTs naturally. File stays at high-water-mark, no shrink/grow churn. Only vacuum main DB (small, metadata only).
-
 ## Future — Time Partitioning (if needed beyond 100K devices)
-Weekly table partitioning within each shard DB as a scaling path:
+Weekly table partitioning as a scaling path:
 - `raw_segments_2026_w05`, `raw_segments_2026_w06`, etc.
 - Writes go to current week's table
 - Queries fan out across tables covering the requested time range
 - Retention = `DROP TABLE` on expired weeks — instant, O(1), pages to freelist
-- Same DB file/mmap/connection, no ATTACH complexity
 - Typical dashboard queries (15m-7d) hit 1-2 tables, 90d query hits ~13
-- Key advantage over DB-per-time-window: shared page cache, single mmap, simpler connection mgmt
 - Only worth the complexity at 100K+ devices × 100 metrics (10M+ series)
 
 Projected retention cost at scale (extrapolating from bench):

@@ -245,7 +245,37 @@ defmodule TimelessMetrics.DB.Migrations do
     run_from(conn, 6)
   end
 
-  defp run_from(_conn, 6), do: :ok
+  defp run_from(conn, 6) do
+    execute(conn, "BEGIN")
+
+    execute(conn, """
+    CREATE TABLE IF NOT EXISTS alert_history (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      rule_id      INTEGER NOT NULL,
+      rule_name    TEXT NOT NULL,
+      metric       TEXT NOT NULL,
+      series_labels TEXT NOT NULL,
+      state        TEXT NOT NULL,
+      value        REAL,
+      threshold    REAL,
+      condition    TEXT,
+      triggered_at INTEGER NOT NULL,
+      resolved_at  INTEGER,
+      acknowledged INTEGER NOT NULL DEFAULT 0,
+      created_at   INTEGER NOT NULL
+    )
+    """)
+
+    execute(conn, "CREATE INDEX IF NOT EXISTS idx_alert_history_rule ON alert_history(rule_id)")
+    execute(conn, "CREATE INDEX IF NOT EXISTS idx_alert_history_created ON alert_history(created_at)")
+
+    set_version(conn, 7)
+    execute(conn, "COMMIT")
+
+    run_from(conn, 7)
+  end
+
+  defp run_from(_conn, 7), do: :ok
 
   defp execute(conn, sql, params \\ []) do
     {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, sql)
