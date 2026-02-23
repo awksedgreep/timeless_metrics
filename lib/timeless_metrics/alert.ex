@@ -157,6 +157,15 @@ defmodule TimelessMetrics.Alert do
         values
       )
 
+      # Clear alert state when disabling so re-enable starts fresh
+      if Enum.any?(fields, fn {k, v} -> k == "enabled" and v == 0 end) do
+        TimelessMetrics.DB.write(
+          db,
+          "DELETE FROM alert_state WHERE rule_id = ?1",
+          [rule_id]
+        )
+      end
+
       :ok
     end
   end
