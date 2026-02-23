@@ -16,6 +16,7 @@ Benchmarked with realistic ISP/network data (100 devices, 20 metrics each, 90 da
 | Pre-resolved write (bypass registry) | ~6M points/sec |
 | Batch write | ~4M points/sec |
 | Concurrent batch, pre-resolved | ~9.5M points/sec |
+| Concurrent saturation (28 cores, DDR5-5600) | 5.6M points/sec |
 
 ### Query Latency (2K series, 5.2M points, 100 iterations)
 
@@ -42,7 +43,7 @@ Run `mix bench` to reproduce on your hardware. Use `--tier stress` for 10K devic
 
 ## Features
 
-- **High throughput** — 4M+ points/sec ingest, 9.5M+ points/sec concurrent pre-resolved writes
+- **High throughput** — 4M+ points/sec ingest, 5.6M+ points/sec concurrent writes, 9.5M+ points/sec concurrent pre-resolved writes
 - **Compact storage** — Gorilla + zstd compression, 11.5x ratio (~95% reduction)
 - **Sharded writes** — parallel buffer/builder shards across CPU cores
 - **Automatic rollups** — configurable tiers (hourly, daily, monthly) with retention policies
