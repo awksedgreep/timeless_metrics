@@ -17,7 +17,8 @@ defmodule TimelessMetrics.Scraper.Worker do
     :last_duration_ms,
     :last_error,
     :samples_scraped,
-    :health_flush_counter
+    :health_flush_counter,
+    registered_names: MapSet.new()
   ]
 
   def start_link(opts) do
@@ -107,11 +108,12 @@ defmodule TimelessMetrics.Scraper.Worker do
             TimelessMetrics.write_batch(state.store, final_entries)
           end
 
-          write_self_metrics(state, 1, duration_ms, count, now)
+          registered = maybe_register_metadata(state, entries)
+          write_self_metrics(registered, 1, duration_ms, count, now)
 
-          prev_health = state.health
-          state = %{state | health: :up, last_error: nil, samples_scraped: count}
-          maybe_flush_health(state, prev_health)
+          prev_health = registered.health
+          registered = %{registered | health: :up, last_error: nil, samples_scraped: count}
+          maybe_flush_health(registered, prev_health)
 
         {:error, reason} ->
           Logger.warning("Scrape failed for #{target.job_name}/#{target.address}: #{reason}")
@@ -330,6 +332,38 @@ defmodule TimelessMetrics.Scraper.Worker do
           state.samples_scraped
         ]
       )
+    end
+  end
+
+  defp maybe_register_metadata(state, entries) do
+    new_names =
+      entries
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.uniq()
+      |> Enum.reject(&MapSet.member?(state.registered_names, &1))
+
+    if new_names == [] do
+      state
+    else
+      Enum.each(new_names, fn name ->
+        {type, unit} = infer_type_and_unit(name)
+        TimelessMetrics.register_metric(state.store, name, type, unit: unit)
+      end)
+
+      %{state | registered_names: Enum.reduce(new_names, state.registered_names, &MapSet.put(&2, &1))}
+    end
+  end
+
+  defp infer_type_and_unit(name) do
+    cond do
+      String.ends_with?(name, "_bytes") -> {:gauge, "byte"}
+      String.ends_with?(name, "_seconds") -> {:gauge, "second"}
+      String.ends_with?(name, "_milliseconds") -> {:gauge, "millisecond"}
+      String.ends_with?(name, "_total") -> {:counter, nil}
+      String.ends_with?(name, "_count") -> {:counter, nil}
+      String.ends_with?(name, "_ratio") -> {:gauge, "ratio"}
+      String.ends_with?(name, "_percent") -> {:gauge, "percent"}
+      true -> {:gauge, nil}
     end
   end
 
