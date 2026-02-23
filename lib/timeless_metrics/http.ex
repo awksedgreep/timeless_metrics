@@ -1102,6 +1102,59 @@ defmodule TimelessMetrics.HTTP do
     |> send_resp(200, Jason.encode!(%{status: "deleted"}))
   end
 
+  # Prometheus exposition format endpoint for self-scraping
+  get "/metrics" do
+    store = conn.private.timeless_metrics
+    info = TimelessMetrics.info(store)
+    mem = :erlang.memory()
+
+    lines = [
+      "# HELP vm_memory_total_bytes Total BEAM memory usage in bytes.",
+      "# TYPE vm_memory_total_bytes gauge",
+      "vm_memory_total_bytes #{mem[:total]}",
+      "# HELP vm_memory_processes_bytes BEAM process memory in bytes.",
+      "# TYPE vm_memory_processes_bytes gauge",
+      "vm_memory_processes_bytes #{mem[:processes]}",
+      "# HELP vm_memory_ets_bytes BEAM ETS table memory in bytes.",
+      "# TYPE vm_memory_ets_bytes gauge",
+      "vm_memory_ets_bytes #{mem[:ets]}",
+      "# HELP vm_memory_binary_bytes BEAM binary memory in bytes.",
+      "# TYPE vm_memory_binary_bytes gauge",
+      "vm_memory_binary_bytes #{mem[:binary]}",
+      "# HELP vm_memory_atom_bytes BEAM atom memory in bytes.",
+      "# TYPE vm_memory_atom_bytes gauge",
+      "vm_memory_atom_bytes #{mem[:atom]}",
+      "# HELP vm_memory_system_bytes BEAM system memory in bytes.",
+      "# TYPE vm_memory_system_bytes gauge",
+      "vm_memory_system_bytes #{mem[:system]}",
+      "# HELP vm_process_count Number of BEAM processes.",
+      "# TYPE vm_process_count gauge",
+      "vm_process_count #{:erlang.system_info(:process_count)}",
+      "# HELP vm_port_count Number of BEAM ports.",
+      "# TYPE vm_port_count gauge",
+      "vm_port_count #{:erlang.system_info(:port_count)}",
+      "# HELP vm_run_queue_length Total BEAM scheduler run queue length.",
+      "# TYPE vm_run_queue_length gauge",
+      "vm_run_queue_length #{:erlang.statistics(:total_run_queue_lengths_all)}",
+      "# HELP timeless_series_count Number of active metric series.",
+      "# TYPE timeless_series_count gauge",
+      "timeless_series_count #{info.series_count}",
+      "# HELP timeless_total_points Total stored data points.",
+      "# TYPE timeless_total_points gauge",
+      "timeless_total_points #{info.total_points}",
+      "# HELP timeless_storage_bytes Storage size in bytes.",
+      "# TYPE timeless_storage_bytes gauge",
+      "timeless_storage_bytes #{info.storage_bytes}",
+      "# HELP timeless_buffer_points Number of points in raw buffer.",
+      "# TYPE timeless_buffer_points gauge",
+      "timeless_buffer_points #{info.raw_buffer_points}"
+    ]
+
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(200, Enum.join(lines, "\n") <> "\n")
+  end
+
   match _ do
     send_resp(conn, 404, "not found")
   end
