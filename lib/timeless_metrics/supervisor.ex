@@ -68,6 +68,15 @@ defmodule TimelessMetrics.Supervisor do
        interval: retention_interval}
     ]
 
+    alert_interval = Keyword.get(opts, :alert_interval, :timer.seconds(60))
+
+    alert_children = [
+      {TimelessMetrics.AlertEvaluator,
+       name: :"#{name}_alert_evaluator",
+       store: name,
+       interval: alert_interval}
+    ]
+
     self_monitor_children =
       if Keyword.get(opts, :self_monitor, true) do
         [{TimelessMetrics.SelfMonitor, name: :"#{name}_self_monitor", store: name}]
@@ -86,6 +95,6 @@ defmodule TimelessMetrics.Supervisor do
         []
       end
 
-    Supervisor.init(children ++ self_monitor_children ++ scraper_children, strategy: :rest_for_one)
+    Supervisor.init(children ++ alert_children ++ self_monitor_children ++ scraper_children, strategy: :rest_for_one)
   end
 end
