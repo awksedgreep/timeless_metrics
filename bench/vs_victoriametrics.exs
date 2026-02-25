@@ -50,22 +50,16 @@ defmodule VsBench do
     data_dir = "/tmp/timeless_vs_bench_#{System.os_time(:millisecond)}"
     File.mkdir_p!(data_dir)
 
-    schema = %TimelessMetrics.Schema{
-      raw_retention_seconds: (days + 7) * 86_400,
-      rollup_interval: :timer.hours(999),
-      retention_interval: :timer.hours(999),
-      tiers: TimelessMetrics.Schema.default().tiers
-    }
-
     {:ok, _} =
       TimelessMetrics.Supervisor.start_link(
         name: :vs_bench,
         data_dir: data_dir,
-        buffer_shards: System.schedulers_online(),
-        segment_duration: 14_400,
-        schema: schema,
-        flush_threshold: 200_000,
-        flush_interval: :timer.seconds(60)
+        raw_retention_seconds: (days + 7) * 86_400,
+        rollup_interval: :timer.hours(999),
+        retention_interval: :timer.hours(999),
+        flush_interval: 60_000,
+        self_monitor: false,
+        scraping: false
       )
 
     IO.puts("\n  Phase 1: Native API Ingest (concurrent writers, with index lookup)")
@@ -138,11 +132,12 @@ defmodule VsBench do
       TimelessMetrics.Supervisor.start_link(
         name: :vs_http_bench,
         data_dir: http_data_dir,
-        buffer_shards: System.schedulers_online(),
-        segment_duration: 14_400,
-        schema: schema,
-        flush_threshold: 200_000,
-        flush_interval: :timer.seconds(60)
+        raw_retention_seconds: (days + 7) * 86_400,
+        rollup_interval: :timer.hours(999),
+        retention_interval: :timer.hours(999),
+        flush_interval: 60_000,
+        self_monitor: false,
+        scraping: false
       )
 
     {:ok, _http_pid} = Bandit.start_link(
@@ -249,19 +244,19 @@ defmodule VsBench do
 
     timeless_info = TimelessMetrics.info(:vs_bench)
     IO.puts("    TimelessMetrics (native):")
-    IO.puts("      Segments:   #{fmt_int(timeless_info.segment_count)}")
+    IO.puts("      Series:     #{fmt_int(timeless_info.series_count)}")
     IO.puts("      Points:     #{fmt_int(timeless_info.total_points)}")
-    IO.puts("      Compressed: #{fmt_bytes(timeless_info.raw_compressed_bytes)}")
+    IO.puts("      Compressed: #{fmt_bytes(timeless_info.compressed_bytes)}")
     IO.puts("      Bytes/pt:   #{timeless_info.bytes_per_point}")
-    IO.puts("      DB file:    #{fmt_bytes(timeless_info.storage_bytes)}")
+    IO.puts("      Storage:    #{fmt_bytes(timeless_info.storage_bytes)}")
 
     http_info = TimelessMetrics.info(:vs_http_bench)
     IO.puts("    TimelessMetrics (HTTP):")
-    IO.puts("      Segments:   #{fmt_int(http_info.segment_count)}")
+    IO.puts("      Series:     #{fmt_int(http_info.series_count)}")
     IO.puts("      Points:     #{fmt_int(http_info.total_points)}")
-    IO.puts("      Compressed: #{fmt_bytes(http_info.raw_compressed_bytes)}")
+    IO.puts("      Compressed: #{fmt_bytes(http_info.compressed_bytes)}")
     IO.puts("      Bytes/pt:   #{http_info.bytes_per_point}")
-    IO.puts("      DB file:    #{fmt_bytes(http_info.storage_bytes)}")
+    IO.puts("      Storage:    #{fmt_bytes(http_info.storage_bytes)}")
 
     # VM storage via TSDB status API
     %{status: 200, body: vm_tsdb} = Req.get!(vm_req, url: "/api/v1/status/tsdb")
