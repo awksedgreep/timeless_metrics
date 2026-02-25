@@ -30,7 +30,11 @@ defmodule TimelessMetrics.Supervisor do
 
     :persistent_term.put({TimelessMetrics, name, :data_dir}, data_dir)
     :persistent_term.put({TimelessMetrics, name, :raw_retention_seconds}, raw_retention_seconds)
-    :persistent_term.put({TimelessMetrics, name, :daily_retention_seconds}, daily_retention_seconds)
+
+    :persistent_term.put(
+      {TimelessMetrics, name, :daily_retention_seconds},
+      daily_retention_seconds
+    )
 
     db_name = :"#{name}_db"
     registry_name = :"#{name}_actor_registry"
@@ -81,9 +85,7 @@ defmodule TimelessMetrics.Supervisor do
 
     alert_children = [
       {TimelessMetrics.AlertEvaluator,
-       name: :"#{name}_alert_evaluator",
-       store: name,
-       interval: alert_interval}
+       name: :"#{name}_alert_evaluator", store: name, interval: alert_interval}
     ]
 
     self_monitor_children =
@@ -104,6 +106,8 @@ defmodule TimelessMetrics.Supervisor do
         []
       end
 
-    Supervisor.init(children ++ alert_children ++ self_monitor_children ++ scraper_children, strategy: :rest_for_one)
+    Supervisor.init(children ++ alert_children ++ self_monitor_children ++ scraper_children,
+      strategy: :rest_for_one
+    )
   end
 end

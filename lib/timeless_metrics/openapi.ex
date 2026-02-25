@@ -6,7 +6,8 @@ defmodule TimelessMetrics.OpenAPI do
       "openapi" => "3.1.0",
       "info" => %{
         "title" => "TimelessMetrics API",
-        "description" => "Embedded time series storage for Elixir. Compatible with Prometheus, VictoriaMetrics, and InfluxDB ingest formats.",
+        "description" =>
+          "Embedded time series storage for Elixir. Compatible with Prometheus, VictoriaMetrics, and InfluxDB ingest formats.",
         "version" => "1.0.2"
       },
       "servers" => [
@@ -55,7 +56,8 @@ defmodule TimelessMetrics.OpenAPI do
         "post" => %{
           "tags" => ["Scrape Targets"],
           "summary" => "Create scrape target",
-          "description" => "Add a new Prometheus scrape target. A worker process will begin scraping immediately.",
+          "description" =>
+            "Add a new Prometheus scrape target. A worker process will begin scraping immediately.",
           "operationId" => "createScrapeTarget",
           "requestBody" => %{
             "required" => true,
@@ -160,7 +162,8 @@ defmodule TimelessMetrics.OpenAPI do
         "put" => %{
           "tags" => ["Scrape Targets"],
           "summary" => "Update scrape target",
-          "description" => "Update a scrape target. The worker is restarted with the new configuration.",
+          "description" =>
+            "Update a scrape target. The worker is restarted with the new configuration.",
           "operationId" => "updateScrapeTarget",
           "parameters" => [target_id_param()],
           "requestBody" => %{
@@ -179,7 +182,8 @@ defmodule TimelessMetrics.OpenAPI do
         "delete" => %{
           "tags" => ["Scrape Targets"],
           "summary" => "Delete scrape target",
-          "description" => "Stop the scrape worker and remove the target. Health data is cascade-deleted.",
+          "description" =>
+            "Stop the scrape worker and remove the target. Health data is cascade-deleted.",
           "operationId" => "deleteScrapeTarget",
           "parameters" => [target_id_param()],
           "responses" => %{
@@ -198,10 +202,14 @@ defmodule TimelessMetrics.OpenAPI do
         "post" => %{
           "tags" => ["Ingest"],
           "summary" => "Import (VictoriaMetrics JSON lines)",
-          "description" => "Import metrics in VictoriaMetrics JSON line format. Each line: `{\"metric\":{\"__name__\":\"cpu\",\"host\":\"web-1\"},\"values\":[73.2],\"timestamps\":[1700000000]}`",
+          "description" =>
+            "Import metrics in VictoriaMetrics JSON line format. Each line: `{\"metric\":{\"__name__\":\"cpu\",\"host\":\"web-1\"},\"values\":[73.2],\"timestamps\":[1700000000]}`",
           "operationId" => "importJsonLines",
-          "requestBody" => text_body("VictoriaMetrics JSON lines",
-            "{\"metric\":{\"__name__\":\"cpu_usage\",\"host\":\"web-1\"},\"values\":[73.2,74.1],\"timestamps\":[1700000000,1700000060]}"),
+          "requestBody" =>
+            text_body(
+              "VictoriaMetrics JSON lines",
+              "{\"metric\":{\"__name__\":\"cpu_usage\",\"host\":\"web-1\"},\"values\":[73.2,74.1],\"timestamps\":[1700000000,1700000060]}"
+            ),
           "responses" => ingest_responses()
         }
       },
@@ -209,10 +217,14 @@ defmodule TimelessMetrics.OpenAPI do
         "post" => %{
           "tags" => ["Ingest"],
           "summary" => "Import (Prometheus text format)",
-          "description" => "Import metrics in Prometheus text exposition format. Uses NIF parser for high throughput.",
+          "description" =>
+            "Import metrics in Prometheus text exposition format. Uses NIF parser for high throughput.",
           "operationId" => "importPrometheus",
-          "requestBody" => text_body("Prometheus text format",
-            "http_requests_total{method=\"GET\",code=\"200\"} 1234 1700000000000\nnode_cpu_seconds_total{cpu=\"0\",mode=\"idle\"} 98765.43"),
+          "requestBody" =>
+            text_body(
+              "Prometheus text format",
+              "http_requests_total{method=\"GET\",code=\"200\"} 1234 1700000000000\nnode_cpu_seconds_total{cpu=\"0\",mode=\"idle\"} 98765.43"
+            ),
           "responses" => ingest_responses()
         }
       },
@@ -220,10 +232,14 @@ defmodule TimelessMetrics.OpenAPI do
         "post" => %{
           "tags" => ["Ingest"],
           "summary" => "Import (InfluxDB line protocol)",
-          "description" => "Import metrics in InfluxDB line protocol format. Compatible with TSBS and VictoriaMetrics /write.",
+          "description" =>
+            "Import metrics in InfluxDB line protocol format. Compatible with TSBS and VictoriaMetrics /write.",
           "operationId" => "importInflux",
-          "requestBody" => text_body("InfluxDB line protocol",
-            "cpu,host=web-1,region=us usage_user=73.2,usage_system=12.1 1700000000000000000"),
+          "requestBody" =>
+            text_body(
+              "InfluxDB line protocol",
+              "cpu,host=web-1,region=us usage_user=73.2,usage_system=12.1 1700000000000000000"
+            ),
           "responses" => ingest_responses()
         }
       }
@@ -245,9 +261,10 @@ defmodule TimelessMetrics.OpenAPI do
           "summary" => "Instant query",
           "description" => "Get the latest value for matching series.",
           "operationId" => "instantQuery",
-          "parameters" => [
-            query_param("metric", "string", "Metric name", true)
-          ] ++ time_params,
+          "parameters" =>
+            [
+              query_param("metric", "string", "Metric name", true)
+            ] ++ time_params,
           "responses" => %{
             "200" => %{
               "description" => "Latest values",
@@ -261,17 +278,29 @@ defmodule TimelessMetrics.OpenAPI do
         "get" => %{
           "tags" => ["Query"],
           "summary" => "Range query",
-          "description" => "Bucketed aggregation over a time range. Supports both native params and PromQL via `query` param.",
+          "description" =>
+            "Bucketed aggregation over a time range. Supports both native params and PromQL via `query` param.",
           "operationId" => "rangeQuery",
-          "parameters" => [
-            query_param("metric", "string", "Metric name (native mode)", false),
-            query_param("query", "string", "PromQL expression (alternative to metric param)", false),
-            query_param("step", "string", "Bucket size in seconds (default: 60)", false),
-            query_param("aggregate", "string", "Aggregate function: avg, min, max, sum, count, last, first (default: avg)", false),
-            query_param("group_by", "string", "Comma-separated label keys to group by", false),
-            query_param("transform", "string", "Transform: rate, delta, cumulative", false),
-            query_param("limit", "string", "Top N series by last value", false)
-          ] ++ time_params,
+          "parameters" =>
+            [
+              query_param("metric", "string", "Metric name (native mode)", false),
+              query_param(
+                "query",
+                "string",
+                "PromQL expression (alternative to metric param)",
+                false
+              ),
+              query_param("step", "string", "Bucket size in seconds (default: 60)", false),
+              query_param(
+                "aggregate",
+                "string",
+                "Aggregate function: avg, min, max, sum, count, last, first (default: avg)",
+                false
+              ),
+              query_param("group_by", "string", "Comma-separated label keys to group by", false),
+              query_param("transform", "string", "Transform: rate, delta, cumulative", false),
+              query_param("limit", "string", "Top N series by last value", false)
+            ] ++ time_params,
           "responses" => %{
             "200" => %{
               "description" => "Aggregated time series data",
@@ -287,9 +316,10 @@ defmodule TimelessMetrics.OpenAPI do
           "summary" => "Export raw points",
           "description" => "Export raw points in VictoriaMetrics JSON line format.",
           "operationId" => "exportData",
-          "parameters" => [
-            query_param("metric", "string", "Metric name", true)
-          ] ++ time_params,
+          "parameters" =>
+            [
+              query_param("metric", "string", "Metric name", true)
+            ] ++ time_params,
           "responses" => %{
             "200" => %{
               "description" => "JSON lines of raw data",
@@ -341,7 +371,10 @@ defmodule TimelessMetrics.OpenAPI do
                   "properties" => %{
                     "metric" => %{"type" => "string", "description" => "Metric name"},
                     "type" => %{"type" => "string", "enum" => ["gauge", "counter", "histogram"]},
-                    "unit" => %{"type" => "string", "description" => "Unit (e.g. bytes, seconds, %)"},
+                    "unit" => %{
+                      "type" => "string",
+                      "description" => "Unit (e.g. bytes, seconds, %)"
+                    },
                     "description" => %{"type" => "string"}
                   }
                 }
@@ -408,8 +441,13 @@ defmodule TimelessMetrics.OpenAPI do
           "description" => "List distinct values for a label key across all series of a metric.",
           "operationId" => "listLabelValues",
           "parameters" => [
-            %{"name" => "name", "in" => "path", "required" => true,
-              "schema" => %{"type" => "string"}, "description" => "Label key"},
+            %{
+              "name" => "name",
+              "in" => "path",
+              "required" => true,
+              "schema" => %{"type" => "string"},
+              "description" => "Label key"
+            },
             query_param("metric", "string", "Metric name", true)
           ],
           "responses" => %{
@@ -478,10 +516,27 @@ defmodule TimelessMetrics.OpenAPI do
                     "metric" => %{"type" => "string", "description" => "Metric to monitor"},
                     "condition" => %{"type" => "string", "enum" => ["above", "below"]},
                     "threshold" => %{"type" => "number", "description" => "Threshold value"},
-                    "labels" => %{"type" => "object", "additionalProperties" => %{"type" => "string"}, "description" => "Label filter (empty = all series)"},
-                    "duration" => %{"type" => "integer", "description" => "Seconds threshold must be breached before firing (0 = instant)", "default" => 0},
-                    "aggregate" => %{"type" => "string", "enum" => ["avg", "min", "max", "sum", "count"], "default" => "avg"},
-                    "webhook_url" => %{"type" => "string", "format" => "uri", "description" => "URL to POST when alert fires"}
+                    "labels" => %{
+                      "type" => "object",
+                      "additionalProperties" => %{"type" => "string"},
+                      "description" => "Label filter (empty = all series)"
+                    },
+                    "duration" => %{
+                      "type" => "integer",
+                      "description" =>
+                        "Seconds threshold must be breached before firing (0 = instant)",
+                      "default" => 0
+                    },
+                    "aggregate" => %{
+                      "type" => "string",
+                      "enum" => ["avg", "min", "max", "sum", "count"],
+                      "default" => "avg"
+                    },
+                    "webhook_url" => %{
+                      "type" => "string",
+                      "format" => "uri",
+                      "description" => "URL to POST when alert fires"
+                    }
                   }
                 },
                 "example" => %{
@@ -545,7 +600,10 @@ defmodule TimelessMetrics.OpenAPI do
                   "properties" => %{
                     "title" => %{"type" => "string"},
                     "description" => %{"type" => "string"},
-                    "timestamp" => %{"type" => "integer", "description" => "Unix seconds (default: now)"},
+                    "timestamp" => %{
+                      "type" => "integer",
+                      "description" => "Unix seconds (default: now)"
+                    },
                     "tags" => %{"type" => "array", "items" => %{"type" => "string"}}
                   }
                 },
@@ -609,9 +667,11 @@ defmodule TimelessMetrics.OpenAPI do
           "tags" => ["Analytics"],
           "summary" => "Forecast future values",
           "operationId" => "forecast",
-          "parameters" => metric_time_params ++ [
-            query_param("horizon", "string", "Forecast horizon (duration: 1h, 6h, 1d)", false)
-          ],
+          "parameters" =>
+            metric_time_params ++
+              [
+                query_param("horizon", "string", "Forecast horizon (duration: 1h, 6h, 1d)", false)
+              ],
           "responses" => %{
             "200" => %{
               "description" => "Historical data with forecast",
@@ -625,9 +685,16 @@ defmodule TimelessMetrics.OpenAPI do
           "tags" => ["Analytics"],
           "summary" => "Detect anomalies",
           "operationId" => "detectAnomalies",
-          "parameters" => metric_time_params ++ [
-            query_param("sensitivity", "string", "Sensitivity: low, medium, high (default: medium)", false)
-          ],
+          "parameters" =>
+            metric_time_params ++
+              [
+                query_param(
+                  "sensitivity",
+                  "string",
+                  "Sensitivity: low, medium, high (default: medium)",
+                  false
+                )
+              ],
           "responses" => %{
             "200" => %{
               "description" => "Anomaly analysis",
@@ -684,7 +751,10 @@ defmodule TimelessMetrics.OpenAPI do
                 "schema" => %{
                   "type" => "object",
                   "properties" => %{
-                    "path" => %{"type" => "string", "description" => "Target directory (default: auto-generated)"}
+                    "path" => %{
+                      "type" => "string",
+                      "description" => "Target directory (default: auto-generated)"
+                    }
                   }
                 }
               }
@@ -714,7 +784,8 @@ defmodule TimelessMetrics.OpenAPI do
         "get" => %{
           "tags" => ["Operational"],
           "summary" => "SVG chart",
-          "description" => "Embeddable SVG line chart. Use via `<img src=\"/chart?metric=cpu_usage\">`.",
+          "description" =>
+            "Embeddable SVG line chart. Use via `<img src=\"/chart?metric=cpu_usage\">`.",
           "operationId" => "chart",
           "parameters" => [
             query_param("metric", "string", "Metric name", true),
@@ -724,7 +795,12 @@ defmodule TimelessMetrics.OpenAPI do
             query_param("aggregate", "string", "Aggregate function (default: avg)", false),
             query_param("width", "string", "Image width in pixels (default: 800)", false),
             query_param("height", "string", "Image height in pixels (default: 300)", false),
-            query_param("theme", "string", "Color theme: light, dark, auto (default: auto)", false),
+            query_param(
+              "theme",
+              "string",
+              "Color theme: light, dark, auto (default: auto)",
+              false
+            ),
             query_param("forecast", "string", "Forecast horizon (e.g. 1h)", false),
             query_param("anomalies", "string", "Anomaly sensitivity (low/medium/high)", false)
           ],
@@ -788,12 +864,14 @@ defmodule TimelessMetrics.OpenAPI do
             "honor_labels" => %{
               "type" => "boolean",
               "default" => false,
-              "description" => "When true, scraped labels take precedence over target labels on conflict. When false, conflicting scraped labels are prefixed with 'exported_'."
+              "description" =>
+                "When true, scraped labels take precedence over target labels on conflict. When false, conflicting scraped labels are prefixed with 'exported_'."
             },
             "honor_timestamps" => %{
               "type" => "boolean",
               "default" => true,
-              "description" => "When true, use timestamps from scraped data. When false, use scrape time."
+              "description" =>
+                "When true, use timestamps from scraped data. When false, use scrape time."
             },
             "relabel_configs" => %{
               "type" => "array",
@@ -892,8 +970,16 @@ defmodule TimelessMetrics.OpenAPI do
             "labels" => %{"type" => "object", "additionalProperties" => %{"type" => "string"}},
             "honor_labels" => %{"type" => "boolean"},
             "honor_timestamps" => %{"type" => "boolean"},
-            "relabel_configs" => %{"type" => "array", "nullable" => true, "items" => %{"$ref" => "#/components/schemas/RelabelConfig"}},
-            "metric_relabel_configs" => %{"type" => "array", "nullable" => true, "items" => %{"$ref" => "#/components/schemas/RelabelConfig"}},
+            "relabel_configs" => %{
+              "type" => "array",
+              "nullable" => true,
+              "items" => %{"$ref" => "#/components/schemas/RelabelConfig"}
+            },
+            "metric_relabel_configs" => %{
+              "type" => "array",
+              "nullable" => true,
+              "items" => %{"$ref" => "#/components/schemas/RelabelConfig"}
+            },
             "enabled" => %{"type" => "boolean"},
             "created_at" => %{"type" => "integer"},
             "updated_at" => %{"type" => "integer"},
@@ -905,7 +991,8 @@ defmodule TimelessMetrics.OpenAPI do
         "bearerAuth" => %{
           "type" => "http",
           "scheme" => "bearer",
-          "description" => "Optional bearer token. Only required if the server is configured with bearer_token."
+          "description" =>
+            "Optional bearer token. Only required if the server is configured with bearer_token."
         }
       }
     }

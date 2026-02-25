@@ -283,13 +283,9 @@ defmodule TimelessMetrics.Actor.EngineTest do
     now = System.os_time(:second)
     min_start = div(now, 60) * 60
 
-    TimelessMetrics.write(:actor_test, "cpu_filt", %{"host" => "a"}, 90.0,
-      timestamp: min_start
-    )
+    TimelessMetrics.write(:actor_test, "cpu_filt", %{"host" => "a"}, 90.0, timestamp: min_start)
 
-    TimelessMetrics.write(:actor_test, "cpu_filt", %{"host" => "b"}, 30.0,
-      timestamp: min_start
-    )
+    TimelessMetrics.write(:actor_test, "cpu_filt", %{"host" => "b"}, 30.0, timestamp: min_start)
 
     Process.sleep(50)
 
@@ -310,13 +306,9 @@ defmodule TimelessMetrics.Actor.EngineTest do
     now = System.os_time(:second)
     min_start = div(now, 60) * 60
 
-    TimelessMetrics.write(:actor_test, "metric_x", %{"id" => "1"}, 10.0,
-      timestamp: min_start
-    )
+    TimelessMetrics.write(:actor_test, "metric_x", %{"id" => "1"}, 10.0, timestamp: min_start)
 
-    TimelessMetrics.write(:actor_test, "metric_y", %{"id" => "1"}, 20.0,
-      timestamp: min_start
-    )
+    TimelessMetrics.write(:actor_test, "metric_y", %{"id" => "1"}, 20.0, timestamp: min_start)
 
     Process.sleep(50)
 

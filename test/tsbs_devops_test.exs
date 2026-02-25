@@ -19,9 +19,7 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
   @base_ts 1_700_000_000
 
   setup do
-    start_supervised!(
-      {TimelessMetrics, name: :tsbs_test, data_dir: @data_dir, engine: :actor}
-    )
+    start_supervised!({TimelessMetrics, name: :tsbs_test, data_dir: @data_dir, engine: :actor})
 
     # Write TSBS-style data: 10 hosts x 10 CPU metrics x 100 points
     entries =
@@ -40,7 +38,6 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
     TimelessMetrics.flush(:tsbs_test)
 
     on_exit(fn ->
-
       File.rm_rf!(@data_dir)
     end)
 
@@ -50,7 +47,10 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
   describe "Phase 1: Regex label matching" do
     test "exact label match returns one host" do
       {:ok, results} =
-        TimelessMetrics.query_aggregate_multi(:tsbs_test, "cpu_usage_user", %{"hostname" => "host_0"},
+        TimelessMetrics.query_aggregate_multi(
+          :tsbs_test,
+          "cpu_usage_user",
+          %{"hostname" => "host_0"},
           from: @base_ts,
           to: @base_ts + 1000,
           bucket: {1000, :seconds},
@@ -215,8 +215,7 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
           :tsbs_test,
           @cpu_metrics,
           %{
-            "hostname" =>
-              {:regex, "host_0|host_1|host_2|host_3|host_4|host_5|host_6|host_7"}
+            "hostname" => {:regex, "host_0|host_1|host_2|host_3|host_4|host_5|host_6|host_7"}
           },
           from: @base_ts,
           to: @base_ts + 1000,

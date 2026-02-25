@@ -4,9 +4,7 @@ defmodule TimelessMetrics.DashboardTest do
   @data_dir "/tmp/timeless_dash_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!(
-      {TimelessMetrics, name: :dash_test, data_dir: @data_dir, engine: :actor}
-    )
+    start_supervised!({TimelessMetrics, name: :dash_test, data_dir: @data_dir, engine: :actor})
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
 

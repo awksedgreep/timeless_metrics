@@ -118,7 +118,10 @@ defmodule Mix.Tasks.Bench.Actor do
       :timer.tc(fn ->
         for n <- 0..(series_count - 1) do
           labels = %{"id" => Integer.to_string(n)}
-          TimelessMetrics.write(:bench_actor, "scale_metric", labels, gen_value(), timestamp: base_ts + 100)
+
+          TimelessMetrics.write(:bench_actor, "scale_metric", labels, gen_value(),
+            timestamp: base_ts + 100
+          )
         end
       end)
 
@@ -173,7 +176,11 @@ defmodule Mix.Tasks.Bench.Actor do
     if System.monotonic_time(:millisecond) < deadline do
       n = :rand.uniform(series_count) - 1
       labels = %{"id" => Integer.to_string(n)}
-      TimelessMetrics.write(:bench_actor, "scale_metric", labels, gen_value(), timestamp: base_ts + :rand.uniform(1000))
+
+      TimelessMetrics.write(:bench_actor, "scale_metric", labels, gen_value(),
+        timestamp: base_ts + :rand.uniform(1000)
+      )
+
       :counters.add(counter, 1, 1)
       saturate_loop(counter, deadline, series_count, base_ts)
     end
@@ -253,12 +260,20 @@ defmodule Mix.Tasks.Bench.Actor do
       {"agg single",
        fn ->
          TimelessMetrics.query_aggregate(:bench_actor, "scale_metric", test_labels,
-           from: from, to: to, bucket: {60, :seconds}, aggregate: :avg)
+           from: from,
+           to: to,
+           bucket: {60, :seconds},
+           aggregate: :avg
+         )
        end},
       {"agg fan-out ALL",
        fn ->
          TimelessMetrics.query_aggregate_multi(:bench_actor, "scale_metric", %{},
-           from: from, to: to, bucket: {60, :seconds}, aggregate: :avg)
+           from: from,
+           to: to,
+           bucket: {60, :seconds},
+           aggregate: :avg
+         )
        end},
       {"latest single",
        fn ->
@@ -336,7 +351,11 @@ defmodule Mix.Tasks.Bench.Actor do
     IO.puts("  Binary memory:    #{fmt_bytes(mem[:binary])}")
     IO.puts("  System memory:    #{fmt_bytes(mem[:system])}")
     IO.puts("")
-    IO.puts("  BEAM processes:   #{fmt_int(proc_count)} (#{fmt_int(proc_delta)} from actor engine)")
+
+    IO.puts(
+      "  BEAM processes:   #{fmt_int(proc_count)} (#{fmt_int(proc_delta)} from actor engine)"
+    )
+
     IO.puts("  Per-series est:   #{fmt_bytes(per_series)}")
     IO.puts("  Memory delta:     #{fmt_bytes(mem_delta)}")
 
@@ -479,22 +498,37 @@ defmodule Mix.Tasks.Bench.Actor do
   defp bar, do: "  " <> String.duplicate("=", 60)
 
   defp fmt_int(n) when is_float(n), do: fmt_int(trunc(n))
-  defp fmt_int(n) when n >= 1_000_000_000, do: "#{:erlang.float_to_binary(n / 1_000_000_000, decimals: 2)}B"
-  defp fmt_int(n) when n >= 1_000_000, do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
+  defp fmt_int(n) when n >= 1_000_000_000,
+    do: "#{:erlang.float_to_binary(n / 1_000_000_000, decimals: 2)}B"
+
+  defp fmt_int(n) when n >= 1_000_000,
+    do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
   defp fmt_int(n) when n >= 1_000, do: "#{:erlang.float_to_binary(n / 1_000, decimals: 1)}K"
   defp fmt_int(n), do: Integer.to_string(n)
 
-  defp fmt_bytes(n) when n >= 1_073_741_824, do: "#{:erlang.float_to_binary(n / 1_073_741_824, decimals: 1)} GB"
-  defp fmt_bytes(n) when n >= 1_048_576, do: "#{:erlang.float_to_binary(n / 1_048_576, decimals: 1)} MB"
+  defp fmt_bytes(n) when n >= 1_073_741_824,
+    do: "#{:erlang.float_to_binary(n / 1_073_741_824, decimals: 1)} GB"
+
+  defp fmt_bytes(n) when n >= 1_048_576,
+    do: "#{:erlang.float_to_binary(n / 1_048_576, decimals: 1)} MB"
+
   defp fmt_bytes(n) when n >= 1_024, do: "#{:erlang.float_to_binary(n / 1_024, decimals: 1)} KB"
   defp fmt_bytes(n), do: "#{n} B"
 
-  defp fmt_dur(us) when us >= 60_000_000, do: "#{:erlang.float_to_binary(us / 60_000_000, decimals: 1)}m"
-  defp fmt_dur(us) when us >= 1_000_000, do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 1)}s"
+  defp fmt_dur(us) when us >= 60_000_000,
+    do: "#{:erlang.float_to_binary(us / 60_000_000, decimals: 1)}m"
+
+  defp fmt_dur(us) when us >= 1_000_000,
+    do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 1)}s"
+
   defp fmt_dur(us) when us >= 1_000, do: "#{:erlang.float_to_binary(us / 1_000, decimals: 1)}ms"
   defp fmt_dur(us), do: "#{us}us"
 
-  defp fmt_us(us) when us >= 1_000_000, do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 2)}s"
+  defp fmt_us(us) when us >= 1_000_000,
+    do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 2)}s"
+
   defp fmt_us(us) when us >= 1_000, do: "#{:erlang.float_to_binary(us / 1_000, decimals: 2)}ms"
   defp fmt_us(us), do: "#{:erlang.float_to_binary(us / 1, decimals: 0)}us"
 

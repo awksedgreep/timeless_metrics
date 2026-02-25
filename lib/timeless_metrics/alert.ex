@@ -147,7 +147,9 @@ defmodule TimelessMetrics.Alert do
     if fields == [] do
       :ok
     else
-      set_clause = fields |> Enum.with_index(1) |> Enum.map_join(", ", fn {{k, _v}, i} -> "#{k} = ?#{i}" end)
+      set_clause =
+        fields |> Enum.with_index(1) |> Enum.map_join(", ", fn {{k, _v}, i} -> "#{k} = ?#{i}" end)
+
       values = Enum.map(fields, fn {_k, v} -> v end) ++ [rule_id]
       id_placeholder = "?#{length(fields) + 1}"
 
@@ -379,7 +381,21 @@ defmodule TimelessMetrics.Alert do
       )
 
     entries =
-      Enum.map(rows, fn [id, rule_id, rule_name, metric, series_labels, state, value, threshold, condition, triggered_at, resolved_at, ack, created_at] ->
+      Enum.map(rows, fn [
+                          id,
+                          rule_id,
+                          rule_name,
+                          metric,
+                          series_labels,
+                          state,
+                          value,
+                          threshold,
+                          condition,
+                          triggered_at,
+                          resolved_at,
+                          ack,
+                          created_at
+                        ] ->
         %{
           id: id,
           rule_id: rule_id,
@@ -408,7 +424,7 @@ defmodule TimelessMetrics.Alert do
           acc
 
         {val, col}, {clauses, params, idx} ->
-          db_val = if is_boolean(val), do: (if val, do: 1, else: 0), else: val
+          db_val = if is_boolean(val), do: if(val, do: 1, else: 0), else: val
           {clauses ++ ["#{col} = ?#{idx}"], params ++ [db_val], idx + 1}
       end)
 

@@ -8,9 +8,16 @@ defmodule TimelessMetrics.Actor.Retention do
 
   use GenServer
 
-  defstruct [:store, :db, :manager, :registry,
-             :raw_retention_seconds, :daily_retention_seconds,
-             :interval, :timer_ref]
+  defstruct [
+    :store,
+    :db,
+    :manager,
+    :registry,
+    :raw_retention_seconds,
+    :daily_retention_seconds,
+    :interval,
+    :timer_ref
+  ]
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)

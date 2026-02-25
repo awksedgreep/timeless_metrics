@@ -267,7 +267,11 @@ defmodule TimelessMetrics.DB.Migrations do
     """)
 
     execute(conn, "CREATE INDEX IF NOT EXISTS idx_alert_history_rule ON alert_history(rule_id)")
-    execute(conn, "CREATE INDEX IF NOT EXISTS idx_alert_history_created ON alert_history(created_at)")
+
+    execute(
+      conn,
+      "CREATE INDEX IF NOT EXISTS idx_alert_history_created ON alert_history(created_at)"
+    )
 
     set_version(conn, 7)
     execute(conn, "COMMIT")

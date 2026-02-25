@@ -11,10 +11,22 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
   alias TimelessMetrics.Actor.SeriesServer
 
-  defstruct [:store, :db, :data_dir, :registry, :dynamic_sup, :index,
-             :max_blocks, :block_size, :compression, :flush_interval,
-             :merge_block_min_count, :merge_block_max_points,
-             :merge_block_min_age_seconds, :merge_interval]
+  defstruct [
+    :store,
+    :db,
+    :data_dir,
+    :registry,
+    :dynamic_sup,
+    :index,
+    :max_blocks,
+    :block_size,
+    :compression,
+    :flush_interval,
+    :merge_block_min_count,
+    :merge_block_max_points,
+    :merge_block_min_age_seconds,
+    :merge_interval
+  ]
 
   # --- Client API ---
 

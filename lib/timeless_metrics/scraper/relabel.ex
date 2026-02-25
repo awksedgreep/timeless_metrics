@@ -104,7 +104,9 @@ defmodule TimelessMetrics.Scraper.Relabel do
     remapped =
       Enum.reduce(labels, %{}, fn {k, v}, acc ->
         case Regex.run(regex, k) do
-          nil -> Map.put(acc, k, v)
+          nil ->
+            Map.put(acc, k, v)
+
           captures ->
             new_key = apply_replacement(replacement, captures)
             Map.put(acc, new_key, v)

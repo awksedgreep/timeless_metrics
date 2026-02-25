@@ -47,9 +47,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     registry = Keyword.fetch!(opts, :registry)
     series_id = Keyword.fetch!(opts, :series_id)
 
-    GenServer.start_link(__MODULE__, opts,
-      name: {:via, Registry, {registry, series_id}}
-    )
+    GenServer.start_link(__MODULE__, opts, name: {:via, Registry, {registry, series_id}})
   end
 
   # --- Server ---
@@ -180,7 +178,9 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
     oldest_ts =
       case :queue.peek(state.blocks) do
-        {:value, block} -> block.start_ts
+        {:value, block} ->
+          block.start_ts
+
         :empty ->
           case state.raw_buffer do
             [] -> nil
@@ -195,6 +195,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
             {:value, block} -> block.end_ts
             :empty -> nil
           end
+
         buf ->
           buf |> Enum.map(&elem(&1, 0)) |> Enum.max()
       end

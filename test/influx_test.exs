@@ -8,9 +8,7 @@ defmodule TimelessMetrics.InfluxTest do
   @data_dir "/tmp/timeless_influx_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!(
-      {TimelessMetrics, name: :influx_test, data_dir: @data_dir, engine: :actor}
-    )
+    start_supervised!({TimelessMetrics, name: :influx_test, data_dir: @data_dir, engine: :actor})
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
 

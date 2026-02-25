@@ -4,9 +4,7 @@ defmodule TimelessMetrics.AnnotationTest do
   @data_dir "/tmp/timeless_annot_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!(
-      {TimelessMetrics, name: :annot_test, data_dir: @data_dir, engine: :actor}
-    )
+    start_supervised!({TimelessMetrics, name: :annot_test, data_dir: @data_dir, engine: :actor})
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
 

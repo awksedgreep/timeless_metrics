@@ -91,8 +91,10 @@ defmodule TimelessMetrics.Actor.BlockStore do
     end
   end
 
-  defp parse(<<@magic, @version::8, block_count::unsigned-32, raw_count::unsigned-32, _flags::8,
-               rest::binary>>) do
+  defp parse(
+         <<@magic, @version::8, block_count::unsigned-32, raw_count::unsigned-32, _flags::8,
+           rest::binary>>
+       ) do
     case parse_blocks(rest, block_count, :queue.new()) do
       {:ok, blocks, remaining} ->
         case parse_raw(remaining, raw_count, []) do

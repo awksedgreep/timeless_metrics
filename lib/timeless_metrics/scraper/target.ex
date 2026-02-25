@@ -19,9 +19,23 @@ defmodule TimelessMetrics.Scraper.Target do
     enabled: true
   ]
 
-  def from_row([id, job_name, scheme, address, metrics_path, scrape_interval, scrape_timeout,
-                labels_json, honor_labels, honor_timestamps, relabel_json, metric_relabel_json,
-                enabled, created_at, updated_at]) do
+  def from_row([
+        id,
+        job_name,
+        scheme,
+        address,
+        metrics_path,
+        scrape_interval,
+        scrape_timeout,
+        labels_json,
+        honor_labels,
+        honor_timestamps,
+        relabel_json,
+        metric_relabel_json,
+        enabled,
+        created_at,
+        updated_at
+      ]) do
     %__MODULE__{
       id: id,
       job_name: job_name,
@@ -103,7 +117,10 @@ defmodule TimelessMetrics.Scraper.Target do
 
   defp validate_interval(params) do
     interval = params["scrape_interval"] || 30
-    if is_integer(interval) and interval > 0, do: :ok, else: {:error, "scrape_interval must be > 0"}
+
+    if is_integer(interval) and interval > 0,
+      do: :ok,
+      else: {:error, "scrape_interval must be > 0"}
   end
 
   defp normalize_params(params) do
@@ -119,6 +136,7 @@ defmodule TimelessMetrics.Scraper.Target do
   end
 
   defp decode_json(nil, default), do: default
+
   defp decode_json(str, default) when is_binary(str) do
     case Jason.decode(str) do
       {:ok, val} -> val
@@ -127,6 +145,7 @@ defmodule TimelessMetrics.Scraper.Target do
   end
 
   defp decode_relabel_configs(nil), do: nil
+
   defp decode_relabel_configs(str) when is_binary(str) do
     case Jason.decode(str) do
       {:ok, configs} when is_list(configs) -> compile_relabel_configs(configs)
@@ -135,6 +154,7 @@ defmodule TimelessMetrics.Scraper.Target do
   end
 
   defp compile_relabel_configs(nil), do: nil
+
   defp compile_relabel_configs(configs) when is_list(configs) do
     Enum.map(configs, fn config ->
       regex = config["regex"] || ".*"
@@ -144,6 +164,7 @@ defmodule TimelessMetrics.Scraper.Target do
   end
 
   defp encode_relabel_configs(nil), do: nil
+
   defp encode_relabel_configs(configs) when is_list(configs) do
     cleaned = Enum.map(configs, &Map.delete(&1, "__compiled_regex__"))
     Jason.encode!(cleaned)

@@ -4,9 +4,7 @@ defmodule TimelessMetrics.ScraperTest do
   @data_dir "/tmp/timeless_scraper_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!(
-      {TimelessMetrics, name: :scraper_test, data_dir: @data_dir, scraping: true}
-    )
+    start_supervised!({TimelessMetrics, name: :scraper_test, data_dir: @data_dir, scraping: true})
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
 

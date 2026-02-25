@@ -98,7 +98,16 @@ defmodule TimelessMetrics.Actor.Rollup do
               TimelessMetrics.DB.execute(
                 conn,
                 "INSERT OR REPLACE INTO tier_daily (series_id, bucket, avg, min, max, count, sum, last) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                [series_id, day_start, aggs.avg, aggs.min, aggs.max, aggs.count, aggs.sum, aggs.last]
+                [
+                  series_id,
+                  day_start,
+                  aggs.avg,
+                  aggs.min,
+                  aggs.max,
+                  aggs.count,
+                  aggs.sum,
+                  aggs.last
+                ]
               )
             end)
           end)

@@ -26,8 +26,19 @@ defmodule TimelessMetrics.Actor.BlockStoreTest do
     path = Path.join(@data_dir, "full.dat")
 
     # Create some blocks
-    block1 = %{start_ts: 1000, end_ts: 1099, point_count: 100, data: :crypto.strong_rand_bytes(64)}
-    block2 = %{start_ts: 1100, end_ts: 1199, point_count: 100, data: :crypto.strong_rand_bytes(128)}
+    block1 = %{
+      start_ts: 1000,
+      end_ts: 1099,
+      point_count: 100,
+      data: :crypto.strong_rand_bytes(64)
+    }
+
+    block2 = %{
+      start_ts: 1100,
+      end_ts: 1199,
+      point_count: 100,
+      data: :crypto.strong_rand_bytes(128)
+    }
 
     blocks = :queue.from_list([block1, block2])
     raw_buffer = [{1200, 42.0}, {1201, 43.5}, {1202, 44.1}]

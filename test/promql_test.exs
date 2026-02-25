@@ -161,16 +161,24 @@ defmodule TimelessMetrics.PromQLTest do
     end
 
     test "SingleGroupby-5: TSBS actual format with single quotes and grouped regex" do
-      query = "max(max_over_time({__name__=~'cpu_(usage_user|usage_system|usage_idle|usage_nice|usage_iowait)', hostname='host_35'}[1m])) by (__name__)"
+      query =
+        "max(max_over_time({__name__=~'cpu_(usage_user|usage_system|usage_idle|usage_nice|usage_iowait)', hostname='host_35'}[1m])) by (__name__)"
+
       {:ok, plan} = PromQL.parse(query)
-      assert plan.metric_pattern == "cpu_(usage_user|usage_system|usage_idle|usage_nice|usage_iowait)"
+
+      assert plan.metric_pattern ==
+               "cpu_(usage_user|usage_system|usage_idle|usage_nice|usage_iowait)"
+
       assert plan.labels == %{"hostname" => "host_35"}
       assert plan.group_by == ["__name__"]
     end
 
     test "DoubleGroupby: 5-metrics-1-host-1-hr" do
-      query = "max(max_over_time({__name__=~\"cpu_usage_user|cpu_usage_system|cpu_usage_idle|cpu_usage_nice|cpu_usage_iowait\",hostname=~\"host_0\"}[1h])) by (hostname)"
+      query =
+        "max(max_over_time({__name__=~\"cpu_usage_user|cpu_usage_system|cpu_usage_idle|cpu_usage_nice|cpu_usage_iowait\",hostname=~\"host_0\"}[1h])) by (hostname)"
+
       {:ok, plan} = PromQL.parse(query)
+
       assert plan.metric_pattern ==
                "cpu_usage_user|cpu_usage_system|cpu_usage_idle|cpu_usage_nice|cpu_usage_iowait"
 
@@ -178,7 +186,9 @@ defmodule TimelessMetrics.PromQLTest do
     end
 
     test "MaxAllCPU: all-cpu-metrics-8-hosts-1-hr" do
-      query = "max(max_over_time({__name__=~\"cpu_.*\",hostname=~\"host_0|host_1|host_2|host_3|host_4|host_5|host_6|host_7\"}[1h])) by (hostname)"
+      query =
+        "max(max_over_time({__name__=~\"cpu_.*\",hostname=~\"host_0|host_1|host_2|host_3|host_4|host_5|host_6|host_7\"}[1h])) by (hostname)"
+
       {:ok, plan} = PromQL.parse(query)
       assert plan.metric_pattern == "cpu_.*"
       assert plan.outer_aggregate == :max

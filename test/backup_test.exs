@@ -5,9 +5,7 @@ defmodule TimelessMetrics.BackupTest do
   @backup_dir "/tmp/timeless_backup_target_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!(
-      {TimelessMetrics, name: :backup_test, data_dir: @data_dir, engine: :actor}
-    )
+    start_supervised!({TimelessMetrics, name: :backup_test, data_dir: @data_dir, engine: :actor})
 
     on_exit(fn ->
       File.rm_rf!(@data_dir)

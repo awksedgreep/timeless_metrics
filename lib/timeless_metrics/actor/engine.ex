@@ -358,7 +358,8 @@ defmodule TimelessMetrics.Actor.Engine do
             true -> max(newest, s.newest_ts)
           end
 
-        {bc + s.block_count, rp + s.raw_count, cb + s.compressed_bytes, merged_oldest, merged_newest}
+        {bc + s.block_count, rp + s.raw_count, cb + s.compressed_bytes, merged_oldest,
+         merged_newest}
       end)
 
     # Sum .dat file sizes + DB size for storage_bytes
@@ -401,6 +402,7 @@ defmodule TimelessMetrics.Actor.Engine do
         fn {_sid, pid} ->
           try do
             s = GenServer.call(pid, :state, :infinity)
+
             s.blocks
             |> :queue.to_list()
             |> Enum.reduce(0, fn b, acc -> acc + b.point_count end)

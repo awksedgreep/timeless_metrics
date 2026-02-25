@@ -350,7 +350,10 @@ defmodule TimelessMetrics.Scraper.Worker do
         TimelessMetrics.register_metric(state.store, name, type, unit: unit)
       end)
 
-      %{state | registered_names: Enum.reduce(new_names, state.registered_names, &MapSet.put(&2, &1))}
+      %{
+        state
+        | registered_names: Enum.reduce(new_names, state.registered_names, &MapSet.put(&2, &1))
+      }
     end
   end
 

@@ -14,7 +14,10 @@ defmodule TimelessMetrics.Scraper do
   end
 
   def add_target(scraper, params), do: GenServer.call(scraper, {:add_target, params})
-  def update_target(scraper, id, params), do: GenServer.call(scraper, {:update_target, id, params})
+
+  def update_target(scraper, id, params),
+    do: GenServer.call(scraper, {:update_target, id, params})
+
   def delete_target(scraper, id), do: GenServer.call(scraper, {:delete_target, id})
   def get_target(scraper, id), do: GenServer.call(scraper, {:get_target, id})
   def list_targets(scraper), do: GenServer.call(scraper, :list_targets)
@@ -217,7 +220,13 @@ defmodule TimelessMetrics.Scraper do
     health =
       case health_cols do
         [nil, _, _, _, _] ->
-          %{health: "unknown", last_scrape: nil, last_duration_ms: nil, last_error: nil, samples_scraped: 0}
+          %{
+            health: "unknown",
+            last_scrape: nil,
+            last_duration_ms: nil,
+            last_error: nil,
+            samples_scraped: 0
+          }
 
         [health, last_scrape, last_duration_ms, last_error, samples_scraped] ->
           %{
@@ -229,7 +238,13 @@ defmodule TimelessMetrics.Scraper do
           }
 
         _ ->
-          %{health: "unknown", last_scrape: nil, last_duration_ms: nil, last_error: nil, samples_scraped: 0}
+          %{
+            health: "unknown",
+            last_scrape: nil,
+            last_duration_ms: nil,
+            last_error: nil,
+            samples_scraped: 0
+          }
       end
 
     %{
@@ -253,6 +268,7 @@ defmodule TimelessMetrics.Scraper do
   end
 
   defp clean_configs(nil), do: nil
+
   defp clean_configs(configs) when is_list(configs) do
     Enum.map(configs, &Map.delete(&1, "__compiled_regex__"))
   end

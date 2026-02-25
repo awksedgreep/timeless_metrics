@@ -12,9 +12,7 @@ defmodule TimelessMetrics.Application do
           bearer_token = Keyword.get(config, :bearer_token)
 
           [
-            {TimelessMetrics,
-             name: :timeless_metrics,
-             data_dir: data_dir},
+            {TimelessMetrics, name: :timeless_metrics, data_dir: data_dir},
             {TimelessMetrics.HTTP,
              store: :timeless_metrics, port: port, bearer_token: bearer_token}
           ]

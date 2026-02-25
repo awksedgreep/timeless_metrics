@@ -375,102 +375,102 @@ defmodule TimelessMetrics.HTTP do
       end
     else
       case extract_query_params_extended(params) do
-      {:ok, query_spec} ->
-        params = conn.query_params
-        step = parse_int(params["step"], 60)
-        agg = parse_aggregate(params["aggregate"])
-        transform = TimelessMetrics.Transform.parse(params["transform"])
-        group_by = params["group_by"]
-        cross_agg = parse_aggregate_or_nil(params["cross_aggregate"])
-        threshold = parse_threshold_params(params)
-        limit = parse_int_or_nil(params["limit"])
+        {:ok, query_spec} ->
+          params = conn.query_params
+          step = parse_int(params["step"], 60)
+          agg = parse_aggregate(params["aggregate"])
+          transform = TimelessMetrics.Transform.parse(params["transform"])
+          group_by = params["group_by"]
+          cross_agg = parse_aggregate_or_nil(params["cross_aggregate"])
+          threshold = parse_threshold_params(params)
+          limit = parse_int_or_nil(params["limit"])
 
-        base_opts = [
-          from: query_spec.from,
-          to: query_spec.to,
-          bucket: {step, :seconds},
-          aggregate: agg,
-          transform: transform
-        ]
+          base_opts = [
+            from: query_spec.from,
+            to: query_spec.to,
+            bucket: {step, :seconds},
+            aggregate: agg,
+            transform: transform
+          ]
 
-        {result_type, results} =
-          case {query_spec.metrics, group_by} do
-            {metrics, group_by} when is_list(metrics) and is_binary(group_by) ->
-              group_keys = String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
+          {result_type, results} =
+            case {query_spec.metrics, group_by} do
+              {metrics, group_by} when is_list(metrics) and is_binary(group_by) ->
+                group_keys = String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
 
-              {:ok, grouped} =
-                TimelessMetrics.query_aggregate_grouped_metrics(
-                  store,
-                  metrics,
-                  query_spec.labels,
-                  Keyword.merge(base_opts,
-                    group_by: group_keys,
-                    cross_series_aggregate: cross_agg || :max
+                {:ok, grouped} =
+                  TimelessMetrics.query_aggregate_grouped_metrics(
+                    store,
+                    metrics,
+                    query_spec.labels,
+                    Keyword.merge(base_opts,
+                      group_by: group_keys,
+                      cross_series_aggregate: cross_agg || :max
+                    )
                   )
-                )
 
-              {:grouped, grouped}
+                {:grouped, grouped}
 
-            {metrics, _} when is_list(metrics) ->
-              {:ok, multi} =
-                TimelessMetrics.query_aggregate_multi_metrics(
-                  store,
-                  metrics,
-                  query_spec.labels,
-                  base_opts
-                )
-
-              {:multi, multi}
-
-            {_, group_by} when is_binary(group_by) ->
-              group_keys = String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
-
-              {:ok, grouped} =
-                TimelessMetrics.query_aggregate_grouped(
-                  store,
-                  query_spec.metric,
-                  query_spec.labels,
-                  Keyword.merge(base_opts,
-                    group_by: group_keys,
-                    cross_series_aggregate: cross_agg || :max
+              {metrics, _} when is_list(metrics) ->
+                {:ok, multi} =
+                  TimelessMetrics.query_aggregate_multi_metrics(
+                    store,
+                    metrics,
+                    query_spec.labels,
+                    base_opts
                   )
-                )
 
-              {:grouped, grouped}
+                {:multi, multi}
 
-            _ when threshold != nil ->
-              {:ok, filtered} =
-                TimelessMetrics.query_aggregate_multi_filtered(
-                  store,
-                  query_spec.metric,
-                  query_spec.labels,
-                  Keyword.put(base_opts, :threshold, threshold)
-                )
+              {_, group_by} when is_binary(group_by) ->
+                group_keys = String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
 
-              {:flat, filtered}
+                {:ok, grouped} =
+                  TimelessMetrics.query_aggregate_grouped(
+                    store,
+                    query_spec.metric,
+                    query_spec.labels,
+                    Keyword.merge(base_opts,
+                      group_by: group_keys,
+                      cross_series_aggregate: cross_agg || :max
+                    )
+                  )
 
-            _ ->
-              {:ok, flat} =
-                TimelessMetrics.query_aggregate_multi(
-                  store,
-                  query_spec.metric,
-                  query_spec.labels,
-                  base_opts
-                )
+                {:grouped, grouped}
 
-              {:flat, flat}
-          end
+              _ when threshold != nil ->
+                {:ok, filtered} =
+                  TimelessMetrics.query_aggregate_multi_filtered(
+                    store,
+                    query_spec.metric,
+                    query_spec.labels,
+                    Keyword.put(base_opts, :threshold, threshold)
+                  )
 
-        results = maybe_apply_limit(results, limit)
+                {:flat, filtered}
 
-        body = format_native_response(result_type, results, query_spec)
+              _ ->
+                {:ok, flat} =
+                  TimelessMetrics.query_aggregate_multi(
+                    store,
+                    query_spec.metric,
+                    query_spec.labels,
+                    base_opts
+                  )
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(body))
+                {:flat, flat}
+            end
 
-      {:error, msg} ->
-        json_error(conn, 400, msg)
+          results = maybe_apply_limit(results, limit)
+
+          body = format_native_response(result_type, results, query_spec)
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, Jason.encode!(body))
+
+        {:error, msg} ->
+          json_error(conn, 400, msg)
       end
     end
   end
