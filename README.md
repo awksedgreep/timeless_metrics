@@ -4,6 +4,22 @@ Embedded time series database for Elixir. Combines [Gorilla compression](https:/
 
 Run it as a library inside your Elixir app or as a standalone container.
 
+## Documentation
+
+- [Getting Started](docs/getting_started.md)
+- [Configuration Reference](docs/configuration.md)
+- [Architecture](docs/architecture.md)
+- [API Reference](docs/API.md)
+- [Alerting](docs/alerting.md)
+- [Scraping](docs/scraping.md)
+- [Annotations](docs/annotations.md)
+- [Forecasting & Anomaly Detection](docs/forecasting.md)
+- [Charts & Embedding](docs/charts.md)
+- [Grafana Integration](docs/grafana.md)
+- [Operations](docs/operations.md)
+- [Capacity Planning](docs/capacity_planning.md)
+- [Scaling](docs/scaling_options.md)
+
 ## Performance
 
 Benchmarked with realistic ISP/network data (100 devices, 20 metrics each, 90 days of 5-minute samples):
