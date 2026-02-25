@@ -1,0 +1,978 @@
+# TimelessMetrics User's Guide
+
+## Getting Started
+
+TimelessMetrics is an embedded time-series database for Elixir applications.
+Add the dependency, start the supervisor, and optionally enable the HTTP API.
+
+### Add the Dependency
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# mix.exs
+defp deps do
+  [
+    {:timeless_metrics, "~> 1.2"}
+  ]
+end
+```
+
+### Start the Supervisor
+
+Add `TimelessMetrics` to your application supervision tree:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# lib/my_app/application.ex
+children = [
+  {TimelessMetrics, name: :metrics, data_dir: "/tmp/metrics_data"}
+]
+
+Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+### Configuration Options
+
+All options are passed to the supervisor child spec:
+
+| Option                     | Default      | Description                               |
+| -------------------------- | ------------ | ----------------------------------------- |
+| `:name`                    | *required*   | Atom identifier for this store instance   |
+| `:data_dir`                | *required*   | Directory for persisted data              |
+| `:compression`             | `:zstd`      | Compression algorithm for data blocks     |
+| `:max_blocks`              | `100`        | Maximum data blocks in memory per series  |
+| `:block_size`              | `1000`       | Points per data block                     |
+| `:flush_interval`          | `60_000`     | Flush to disk interval (ms)               |
+| `:raw_retention_seconds`   | `604_800`    | Raw data retention (default 7 days)       |
+| `:daily_retention_seconds` | `31_536_000` | Daily rollup retention (default 1 year)   |
+| `:rollup_interval`         | `300_000`    | Daily rollup computation interval (ms)    |
+| `:retention_interval`      | `3_600_000`  | Retention cleanup interval (ms)           |
+| `:alert_interval`          | `60_000`     | Alert evaluation interval (ms)            |
+| `:self_monitor`            | `true`       | Emit internal performance metrics         |
+| `:scraping`                | `true`       | Enable Prometheus scrape target subsystem |
+
+### Full Configuration Example
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# lib/my_app/application.ex
+children = [
+  {TimelessMetrics,
+   name: :metrics,
+   data_dir: "/var/data/metrics",
+   compression: :zstd,
+   max_blocks: 200,
+   block_size: 2000,
+   flush_interval: 30_000,
+   raw_retention_seconds: 30 * 86_400,
+   daily_retention_seconds: 365 * 86_400,
+   rollup_interval: :timer.minutes(5),
+   retention_interval: :timer.hours(1),
+   alert_interval: :timer.seconds(30),
+   self_monitor: true,
+   scraping: true}
+]
+```
+
+### Start the HTTP Server
+
+The HTTP server is a separate Plug-based application. Add it to your supervision tree
+alongside the store:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# lib/my_app/application.ex
+children = [
+  {TimelessMetrics, name: :metrics, data_dir: "/tmp/metrics_data"},
+  {Bandit, plug: {TimelessMetrics.HTTP, store: :metrics}, port: 8428}
+]
+```
+
+The HTTP API is now available at `http://localhost:8428`.
+
+## Writing Metrics (Elixir)
+
+### Single Point
+
+Write a single metric data point with `write/4`. The current timestamp is used by default.
+
+```elixir
+TimelessMetrics.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2)
+```
+
+To specify an explicit timestamp (Unix seconds):
+
+```elixir
+TimelessMetrics.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 68.5,
+  timestamp: 1_700_000_000
+)
+```
+
+### Batch Write
+
+Write many points at once with `write_batch/2`. Each entry is a 3-tuple
+`{metric, labels, value}` or a 4-tuple `{metric, labels, value, timestamp}`:
+
+```elixir
+TimelessMetrics.write_batch(:metrics, [
+  {"cpu_usage", %{"host" => "web-1"}, 73.2},
+  {"cpu_usage", %{"host" => "web-2"}, 61.8},
+  {"mem_usage", %{"host" => "web-1"}, 4_200_000_000},
+  {"mem_usage", %{"host" => "web-2"}, 3_800_000_000, 1_700_000_000}
+])
+```
+
+## Writing Metrics (HTTP)
+
+Three ingest protocols are supported. All return `204 No Content` on success.
+
+### Prometheus Text Format
+
+```bash
+curl -X POST http://localhost:8428/api/v1/import/prometheus \
+  -H "Content-Type: text/plain" \
+  --data-binary '
+cpu_usage{host="web-1"} 73.2
+cpu_usage{host="web-2"} 61.8
+mem_usage{host="web-1"} 4200000000
+'
+```
+
+### VictoriaMetrics JSON Lines
+
+Each line is a JSON object with `metric`, `values`, and `timestamps` arrays:
+
+```bash
+curl -X POST http://localhost:8428/api/v1/import \
+  -H "Content-Type: application/json" \
+  --data-binary '
+{"metric":{"__name__":"cpu_usage","host":"web-1"},"values":[73.2,74.1],"timestamps":[1700000000,1700000060]}
+{"metric":{"__name__":"cpu_usage","host":"web-2"},"values":[61.8],"timestamps":[1700000000]}
+'
+```
+
+### InfluxDB Line Protocol
+
+```bash
+curl -X POST http://localhost:8428/write \
+  --data-binary '
+cpu_usage,host=web-1 value=73.2 1700000000000000000
+cpu_usage,host=web-2 value=61.8 1700000000000000000
+'
+```
+
+Timestamps in InfluxDB line protocol are nanoseconds.
+
+## Querying Data (Elixir)
+
+### Raw Points — Single Series
+
+`query/4` returns all points for an exact label match within a time range:
+
+```elixir
+{:ok, points} =
+  TimelessMetrics.query(:metrics, "cpu_usage", %{"host" => "web-1"},
+    from: System.os_time(:second) - 3600,
+    to: System.os_time(:second)
+  )
+```
+
+### Raw Points — Multiple Series
+
+`query_multi/4` matches all series whose labels are a superset of the filter.
+Pass an empty map to match all series for that metric:
+
+```elixir
+{:ok, series_list} =
+  TimelessMetrics.query_multi(:metrics, "cpu_usage", %{},
+    from: System.os_time(:second) - 3600
+  )
+```
+
+Filter by specific labels to narrow results:
+
+```elixir
+{:ok, series_list} =
+  TimelessMetrics.query_multi(:metrics, "cpu_usage", %{"host" => "web-1"},
+    from: System.os_time(:second) - 3600
+  )
+```
+
+### Aggregated Query — Single Series
+
+`query_aggregate/4` buckets points in time and applies an aggregate function.
+Supported aggregates: `:avg`, `:min`, `:max`, `:sum`, `:count`, `:last`, `:first`.
+Supported buckets: `:minute`, `:hour`, `:day`, or `{n, :seconds}`:
+
+```elixir
+{:ok, data} =
+  TimelessMetrics.query_aggregate(:metrics, "cpu_usage", %{"host" => "web-1"},
+    from: System.os_time(:second) - 86_400,
+    to: System.os_time(:second),
+    bucket: :hour,
+    aggregate: :avg
+  )
+```
+
+### Aggregated Query — Multiple Series
+
+`query_aggregate_multi/4` aggregates across all matching series:
+
+```elixir
+{:ok, series_list} =
+  TimelessMetrics.query_aggregate_multi(:metrics, "cpu_usage", %{},
+    from: System.os_time(:second) - 86_400,
+    bucket: {300, :seconds},
+    aggregate: :avg
+  )
+```
+
+### Grouped Aggregation
+
+`query_aggregate_grouped/4` aggregates across series and groups results by a label key.
+This is useful for dashboards that show one line per group:
+
+```elixir
+{:ok, groups} =
+  TimelessMetrics.query_aggregate_grouped(:metrics, "cpu_usage", %{},
+    from: System.os_time(:second) - 86_400,
+    bucket: :hour,
+    aggregate: :avg,
+    group_by: "host"
+  )
+```
+
+### Latest Value
+
+`latest/3` returns the most recent data point for a single series:
+
+```elixir
+{:ok, {timestamp, value}} =
+  TimelessMetrics.latest(:metrics, "cpu_usage", %{"host" => "web-1"})
+```
+
+`latest_multi/3` returns the latest value for all matching series:
+
+```elixir
+{:ok, results} = TimelessMetrics.latest_multi(:metrics, "cpu_usage")
+```
+
+### Top N Helper
+
+`top_n/3` sorts query results and returns the top N entries.
+It works on results from `query_aggregate_multi` or `latest_multi`:
+
+```elixir
+{:ok, series} =
+  TimelessMetrics.query_aggregate_multi(:metrics, "cpu_usage", %{},
+    from: System.os_time(:second) - 3600,
+    bucket: :hour,
+    aggregate: :avg
+  )
+
+top = TimelessMetrics.top_n(series, 5)
+```
+
+A custom ordering function can be provided as the third argument:
+
+```elixir
+# Sort by maximum value instead of last value
+{:ok, series} =
+  TimelessMetrics.query_aggregate_multi(:metrics, "cpu_usage", %{},
+    from: System.os_time(:second) - 3600,
+    bucket: :hour,
+    aggregate: :avg
+  )
+
+top = TimelessMetrics.top_n(series, 5, fn %{data: data} ->
+  data |> Enum.map(&elem(&1, 1)) |> Enum.max(fn -> 0 end)
+end)
+```
+
+## Querying Data (HTTP)
+
+### Raw Export
+
+Export raw points in VictoriaMetrics JSON lines format:
+
+```bash
+curl "http://localhost:8428/api/v1/export?metric=cpu_usage&host=web-1&from=-1h"
+```
+
+Response (one JSON object per line):
+
+```json
+{"metric":{"__name__":"cpu_usage","host":"web-1"},"values":[73.2,74.1],"timestamps":[1700000000,1700000060]}
+```
+
+### Latest Value
+
+```bash
+curl "http://localhost:8428/api/v1/query?metric=cpu_usage&host=web-1"
+```
+
+Response:
+
+```json
+{"labels":{"host":"web-1"},"timestamp":1700000120,"value":74.1}
+```
+
+Without a label filter, all matching series are returned:
+
+```bash
+curl "http://localhost:8428/api/v1/query?metric=cpu_usage"
+```
+
+```json
+{"data":[
+  {"labels":{"host":"web-1"},"timestamp":1700000120,"value":74.1},
+  {"labels":{"host":"web-2"},"timestamp":1700000120,"value":62.3}
+]}
+```
+
+### Query Range
+
+Query with time bucketing, aggregation, and optional grouping:
+
+```bash
+curl "http://localhost:8428/api/v1/query_range?\
+metric=cpu_usage&\
+start=-1h&\
+end=now&\
+step=60&\
+aggregate=avg"
+```
+
+Response:
+
+```json
+{
+  "metric": "cpu_usage",
+  "series": [
+    {"labels":{"host":"web-1"},"data":[[1700000000,73.2],[1700000060,74.1]]},
+    {"labels":{"host":"web-2"},"data":[[1700000000,61.8],[1700000060,62.3]]}
+  ]
+}
+```
+
+**With group_by:**
+
+```bash
+curl "http://localhost:8428/api/v1/query_range?\
+metric=cpu_usage&\
+start=-6h&\
+step=300&\
+aggregate=avg&\
+group_by=host"
+```
+
+```json
+{
+  "metric": "cpu_usage",
+  "groups": [
+    {"group":{"host":"web-1"},"data":[[1700000000,73.2],[1700000300,71.5]]},
+    {"group":{"host":"web-2"},"data":[[1700000000,61.8],[1700000300,63.1]]}
+  ]
+}
+```
+
+**Time parameters** accept Unix seconds or relative durations: `-1h`, `-30m`, `-5d`, `now`.
+
+### PromQL (Grafana Compatible)
+
+The Prometheus-compatible endpoint supports PromQL queries for use with Grafana:
+
+```bash
+curl "http://localhost:8428/prometheus/api/v1/query_range?\
+query=cpu_usage\{host=\"web-1\"\}&\
+start=1700000000&\
+end=1700003600&\
+step=60"
+```
+
+To configure Grafana, add a Prometheus data source pointing at
+`http://localhost:8428/prometheus`.
+
+## Series Discovery
+
+### Elixir API
+
+List all metric names in the store:
+
+```elixir
+{:ok, metrics} = TimelessMetrics.list_metrics(:metrics)
+```
+
+List all series for a given metric:
+
+```elixir
+{:ok, series} = TimelessMetrics.list_series(:metrics, "cpu_usage")
+```
+
+Get distinct values for a label key:
+
+```elixir
+{:ok, values} = TimelessMetrics.label_values(:metrics, "cpu_usage", "host")
+```
+
+### HTTP API
+
+List all metric names:
+
+```bash
+curl "http://localhost:8428/api/v1/label/__name__/values"
+```
+
+```json
+{"status":"success","data":["cpu_usage","mem_usage","disk_io"]}
+```
+
+List distinct values for a label:
+
+```bash
+curl "http://localhost:8428/api/v1/label/host/values?metric=cpu_usage"
+```
+
+```json
+{"status":"success","data":["web-1","web-2"]}
+```
+
+List all series for a metric:
+
+```bash
+curl "http://localhost:8428/api/v1/series?metric=cpu_usage"
+```
+
+```json
+{"status":"success","data":[{"host":"web-1"},{"host":"web-2"}]}
+```
+
+## Metric Metadata
+
+Register type, unit, and description metadata for a metric. Metadata is also
+auto-inferred from Prometheus naming conventions (e.g. `_total` → counter,
+`_bytes` → gauge with unit "bytes").
+
+### Elixir API
+
+```elixir
+TimelessMetrics.register_metric(:metrics, "cpu_usage", :gauge,
+  unit: "%",
+  description: "CPU utilization percentage"
+)
+```
+
+```elixir
+{:ok, meta} = TimelessMetrics.get_metadata(:metrics, "cpu_usage")
+```
+
+### HTTP API
+
+Register metadata:
+
+```bash
+curl -X POST http://localhost:8428/api/v1/metadata \
+  -H "Content-Type: application/json" \
+  -d '{
+    "metric": "cpu_usage",
+    "type": "gauge",
+    "unit": "%",
+    "description": "CPU utilization percentage"
+  }'
+```
+
+Retrieve metadata:
+
+```bash
+curl "http://localhost:8428/api/v1/metadata?metric=cpu_usage"
+```
+
+```json
+{"metric":"cpu_usage","type":"gauge","unit":"%","description":"CPU utilization percentage"}
+```
+
+## Annotations
+
+Annotations are event markers (deploys, incidents, config changes) that can be
+overlaid on charts.
+
+### Elixir API
+
+Create an annotation:
+
+```elixir
+{:ok, id} =
+  TimelessMetrics.annotate(:metrics, System.os_time(:second), "v2.1.0 deployed",
+    description: "Rolling deploy to production cluster",
+    tags: ["deploy", "production"]
+  )
+```
+
+Query annotations in a time range:
+
+```elixir
+{:ok, annotations} =
+  TimelessMetrics.annotations(
+    :metrics,
+    System.os_time(:second) - 86_400,
+    System.os_time(:second)
+  )
+```
+
+Filter by tags:
+
+```elixir
+{:ok, deploys} =
+  TimelessMetrics.annotations(
+    :metrics,
+    System.os_time(:second) - 86_400,
+    System.os_time(:second),
+    tags: ["deploy"]
+  )
+```
+
+Delete an annotation:
+
+```elixir
+TimelessMetrics.delete_annotation(:metrics, 1)
+```
+
+### HTTP API
+
+Create an annotation:
+
+```bash
+curl -X POST http://localhost:8428/api/v1/annotations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "v2.1.0 deployed",
+    "description": "Rolling deploy to production cluster",
+    "tags": ["deploy", "production"]
+  }'
+```
+
+```json
+{"id":1,"status":"created"}
+```
+
+Query annotations:
+
+```bash
+curl "http://localhost:8428/api/v1/annotations?from=-24h&to=now&tags=deploy"
+```
+
+Delete an annotation:
+
+```bash
+curl -X DELETE "http://localhost:8428/api/v1/annotations/1"
+```
+
+## Alerts
+
+Alert rules monitor metric values against thresholds. When a condition is met
+for the configured duration, the alert fires and optionally sends a webhook.
+
+### Alert State Machine
+
+An alert rule progresses through these states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> ok
+    ok --> pending : condition met
+    pending --> ok : condition cleared
+    pending --> firing : duration elapsed
+    firing --> resolved : condition cleared
+    resolved --> ok : next evaluation
+    resolved --> pending : condition met again
+```
+
+* **ok** — condition not met
+* **pending** — condition met, waiting for `:duration` seconds
+* **firing** — condition persisted, webhook sent
+* **resolved** — condition cleared after firing, webhook sent
+
+### Elixir API
+
+Create an alert rule:
+
+```elixir
+{:ok, rule_id} =
+  TimelessMetrics.create_alert(:metrics,
+    name: "High CPU",
+    metric: "cpu_usage",
+    condition: :above,
+    threshold: 90.0,
+    labels: %{"host" => "web-1"},
+    duration: 300,
+    aggregate: :avg,
+    webhook_url: "https://hooks.example.com/alerts"
+  )
+```
+
+List all alert rules with their current state:
+
+```elixir
+{:ok, alerts} = TimelessMetrics.list_alerts(:metrics)
+```
+
+Update an alert rule (partial update — only specified fields change):
+
+```elixir
+{:ok, alerts} = TimelessMetrics.list_alerts(:metrics)
+[first | _] = alerts
+
+TimelessMetrics.update_alert(:metrics, first.id,
+  threshold: 95.0,
+  duration: 600
+)
+```
+
+Delete an alert rule:
+
+```elixir
+{:ok, alerts} = TimelessMetrics.list_alerts(:metrics)
+[first | _] = alerts
+TimelessMetrics.delete_alert(:metrics, first.id)
+```
+
+View and acknowledge alert history:
+
+```elixir
+{:ok, history} = TimelessMetrics.alert_history(:metrics, limit: 10)
+```
+
+Manually trigger evaluation (normally runs on `:alert_interval`):
+
+```elixir
+TimelessMetrics.evaluate_alerts(:metrics)
+```
+
+### Webhook Payload
+
+When an alert fires or resolves, a JSON POST is sent to the configured `webhook_url`:
+
+```json
+{
+  "rule_id": 1,
+  "name": "High CPU",
+  "metric": "cpu_usage",
+  "labels": {"host": "web-1"},
+  "condition": "above",
+  "threshold": 90.0,
+  "value": 93.5,
+  "state": "firing",
+  "timestamp": 1700000300
+}
+```
+
+### HTTP API
+
+Create an alert:
+
+```bash
+curl -X POST http://localhost:8428/api/v1/alerts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "High CPU",
+    "metric": "cpu_usage",
+    "condition": "above",
+    "threshold": 90.0,
+    "labels": {"host": "web-1"},
+    "duration": 300,
+    "aggregate": "avg",
+    "webhook_url": "https://hooks.example.com/alerts"
+  }'
+```
+
+```json
+{"id":1,"status":"created"}
+```
+
+List alerts:
+
+```bash
+curl "http://localhost:8428/api/v1/alerts"
+```
+
+Delete an alert:
+
+```bash
+curl -X DELETE "http://localhost:8428/api/v1/alerts/1"
+```
+
+## Scrape Targets
+
+TimelessMetrics can scrape Prometheus-compatible `/metrics` endpoints on a
+configurable interval, similar to Prometheus itself. Scraping is enabled by
+default (`:scraping` option).
+
+Scrape targets are managed through the `TimelessMetrics.Scraper` GenServer or
+the HTTP API. The scraper process is named `:"#{store_name}_scraper"`.
+
+### Elixir API
+
+```elixir
+scraper = :metrics_scraper
+
+# Add a scrape target
+{:ok, id} =
+  TimelessMetrics.Scraper.add_target(scraper, %{
+    "job_name" => "my_app",
+    "address" => "localhost:4000",
+    "scheme" => "http",
+    "metrics_path" => "/metrics",
+    "scrape_interval" => 30,
+    "scrape_timeout" => 10,
+    "labels" => %{"env" => "production"},
+    "honor_labels" => false,
+    "honor_timestamps" => true
+  })
+```
+
+```elixir
+# List all targets
+{:ok, targets} = TimelessMetrics.Scraper.list_targets(:metrics_scraper)
+```
+
+```elixir
+# Delete a target (use an ID from list_targets above)
+TimelessMetrics.Scraper.delete_target(:metrics_scraper, 1)
+```
+
+### Scrape Target Options
+
+| Field                    | Default      | Description                               |
+| ------------------------ | ------------ | ----------------------------------------- |
+| `job_name`               | *required*   | Identifier for the scrape job             |
+| `address`                | *required*   | Host and port to scrape                   |
+| `scheme`                 | `"http"`     | `"http"` or `"https"`                     |
+| `metrics_path`           | `"/metrics"` | Path to the metrics endpoint              |
+| `scrape_interval`        | `30`         | Seconds between scrapes                   |
+| `scrape_timeout`         | `10`         | Timeout per scrape request (seconds)      |
+| `labels`                 | `%{}`        | Extra labels added to all scraped metrics |
+| `honor_labels`           | `false`      | If true, scraped labels take precedence   |
+| `honor_timestamps`       | `true`       | If true, use timestamps from scraped data |
+| `relabel_configs`        | `nil`        | Pre-scrape relabeling rules               |
+| `metric_relabel_configs` | `nil`        | Post-scrape metric relabeling rules       |
+| `enabled`                | `true`       | Enable or disable this target             |
+
+### Relabel Configs
+
+Relabel configs follow the Prometheus relabeling model. Each config is a map
+with a `"regex"` key:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+{:ok, id} = TimelessMetrics.Scraper.add_target(scraper, %{
+  "job_name" => "my_app",
+  "address" => "localhost:4000",
+  "metric_relabel_configs" => [
+    %{"regex" => "^go_.*"}
+  ]
+})
+```
+
+### HTTP API
+
+Create a scrape target:
+
+```bash
+curl -X POST http://localhost:8428/api/v1/scrape_targets \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_name": "my_app",
+    "address": "localhost:4000",
+    "scrape_interval": 30,
+    "labels": {"env": "production"}
+  }'
+```
+
+```json
+{"id":1,"status":"created"}
+```
+
+List all targets with health status:
+
+```bash
+curl "http://localhost:8428/api/v1/scrape_targets"
+```
+
+Update a target:
+
+```bash
+curl -X PUT "http://localhost:8428/api/v1/scrape_targets/1" \
+  -H "Content-Type: application/json" \
+  -d '{"scrape_interval": 15}'
+```
+
+Delete a target:
+
+```bash
+curl -X DELETE "http://localhost:8428/api/v1/scrape_targets/1"
+```
+
+## Operations
+
+### Store Info
+
+```elixir
+TimelessMetrics.info(:metrics)
+```
+
+### Flush to Disk
+
+Force all buffered data to be written to disk immediately:
+
+```elixir
+TimelessMetrics.flush(:metrics)
+```
+
+### Backup
+
+Create a consistent online backup of all data. The backup is a server-side
+snapshot — files are written to the target directory and the response tells you
+what was created:
+
+```elixir
+{:ok, result} = TimelessMetrics.backup(:metrics, "/tmp/metrics_backup")
+# result => %{path: "/tmp/metrics_backup", files: ["timeless.db", ...], total_bytes: 12345678}
+```
+
+Via HTTP (if no `path` is provided, a timestamped subdirectory under
+`<data_dir>/backups/` is created automatically):
+
+```bash
+curl -X POST http://localhost:8428/api/v1/backup \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/tmp/metrics_backup"}'
+```
+
+```json
+{"status":"ok","path":"/tmp/metrics_backup","files":["timeless.db"],"total_bytes":12345678}
+```
+
+To download the backup, archive it from the server filesystem:
+
+```bash
+tar czf metrics_backup.tar.gz -C /tmp/metrics_backup .
+```
+
+To restore, stop the store, replace the `data_dir` contents with the backup
+files, and restart.
+
+### Daily Rollup
+
+Force a daily rollup computation (normally runs on `:rollup_interval`):
+
+```elixir
+TimelessMetrics.rollup(:metrics)
+```
+
+### Retention Enforcement
+
+Force retention cleanup now (normally runs on `:retention_interval`):
+
+```elixir
+TimelessMetrics.enforce_retention(:metrics)
+```
+
+### Health Endpoint
+
+```bash
+curl "http://localhost:8428/health"
+```
+
+```json
+{
+  "status": "ok",
+  "series": 142,
+  "points": 1580000,
+  "storage_bytes": 12345678,
+  "buffer_points": 340,
+  "bytes_per_point": 7.81
+}
+```
+
+### Self-Monitoring
+
+When `:self_monitor` is `true` (the default), TimelessMetrics emits its own
+performance metrics. The `/metrics` endpoint exposes these in Prometheus format,
+allowing you to scrape TimelessMetrics with itself or any external Prometheus instance:
+
+```bash
+curl "http://localhost:8428/metrics"
+```
+
+```
+# HELP timeless_metrics_series_count Number of active series
+# TYPE timeless_metrics_series_count gauge
+timeless_metrics_series_count 142
+# HELP timeless_metrics_total_points Total stored points
+# TYPE timeless_metrics_total_points gauge
+timeless_metrics_total_points 1580000
+...
+```
+
+### Embedded SVG Charts
+
+The `/chart` endpoint renders a metric directly as an SVG image. This is useful
+for embedding in dashboards, Slack messages, or documentation:
+
+```bash
+curl "http://localhost:8428/chart?\
+metric=cpu_usage&\
+from=-6h&\
+step=300&\
+aggregate=avg&\
+width=800&\
+height=300&\
+theme=dark"
+```
+
+Query parameters:
+
+| Parameter   | Default    | Description                                  |
+| ----------- | ---------- | -------------------------------------------- |
+| `metric`    | *required* | Metric name                                  |
+| `from`      | `-1h`      | Start time                                   |
+| `to`        | `now`      | End time                                     |
+| `step`      | *auto*     | Bucket size in seconds                       |
+| `aggregate` | `avg`      | Aggregation function                         |
+| `width`     | `800`      | SVG width in pixels                          |
+| `height`    | `300`      | SVG height in pixels                         |
+| `theme`     | `auto`     | `dark`, `light`, or `auto`                   |
+| `forecast`  | —        | Forecast horizon duration                    |
+| `anomalies` | —        | Anomaly sensitivity: `low`, `medium`, `high` |
+
+Label filters can be added as additional query parameters (e.g. `&host=web-1`).
+
+Embed in HTML:
+
+```html
+<img src="http://localhost:8428/chart?metric=cpu_usage&from=-6h&theme=light" />
+```
+
+### API Documentation
+
+An interactive OpenAPI docs UI is available at `/api/docs`, and the raw
+OpenAPI 3.0 spec at `/api/openapi.json`.
+
+### Authentication
+
+All endpoints (except `/health`) support optional Bearer token authentication.
+Pass the token via header or query parameter:
+
+```bash
+# Via header
+curl -H "Authorization: Bearer my-secret-token" \
+  "http://localhost:8428/api/v1/query?metric=cpu_usage"
+
+# Via query parameter (useful for browser/img tags)
+curl "http://localhost:8428/chart?metric=cpu_usage&token=my-secret-token"
+```

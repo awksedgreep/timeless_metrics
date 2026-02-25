@@ -26,7 +26,14 @@ defmodule TimelessMetrics.AlertEvaluator do
   @impl true
   def handle_info(:tick, state) do
     TimelessMetrics.Alert.evaluate(state.store)
-    Process.send_after(self(), :tick, state.interval)
-    {:noreply, state}
+    timer_ref = schedule_next_tick(state.interval)
+    {:noreply, Map.put(state, :timer_ref, timer_ref)}
+  end
+
+  defp schedule_next_tick(interval) do
+    now = System.system_time(:millisecond)
+    next = div(now, interval) * interval + interval
+    delay = max(next - now, 1)
+    Process.send_after(self(), :tick, delay)
   end
 end

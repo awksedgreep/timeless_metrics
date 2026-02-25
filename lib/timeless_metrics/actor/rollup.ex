@@ -37,7 +37,7 @@ defmodule TimelessMetrics.Actor.Rollup do
       interval: interval
     }
 
-    timer_ref = Process.send_after(self(), :tick, interval)
+    timer_ref = schedule_next_tick(interval)
     {:ok, %{state | timer_ref: timer_ref}}
   end
 
@@ -50,7 +50,7 @@ defmodule TimelessMetrics.Actor.Rollup do
   @impl true
   def handle_info(:tick, state) do
     do_rollup(state)
-    timer_ref = Process.send_after(self(), :tick, state.interval)
+    timer_ref = schedule_next_tick(state.interval)
     {:noreply, %{state | timer_ref: timer_ref}}
   end
 
@@ -144,5 +144,12 @@ defmodule TimelessMetrics.Actor.Rollup do
 
   defp all_series_pids(registry) do
     Registry.select(registry, [{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
+  end
+
+  defp schedule_next_tick(interval) do
+    now = System.system_time(:millisecond)
+    next = div(now, interval) * interval + interval
+    delay = max(next - now, 1)
+    Process.send_after(self(), :tick, delay)
   end
 end
