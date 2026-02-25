@@ -110,6 +110,28 @@ Response:
 2. Replace the data directory contents with the backup files
 3. Start the instance -- it will load from the restored data
 
+## Merge compaction
+
+Each series actor periodically consolidates multiple small compressed blocks into fewer, larger blocks for better compression and faster large-range queries. This runs automatically (default: every 5 minutes) but can be triggered manually.
+
+### Manual trigger
+
+```elixir
+TimelessMetrics.merge_now(:metrics)
+# => :ok (if any series merged blocks) or :noop (if no merge was needed)
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `merge_block_min_count` | 4 | Min eligible blocks before merge triggers |
+| `merge_block_max_points` | 10,000 | Target points per merged block |
+| `merge_block_min_age_seconds` | 300 | Only merge blocks older than this |
+| `merge_interval` | 300,000 (5 min) | Merge check interval |
+
+See [Configuration Reference](configuration.md) for tuning guidance.
+
 ## Daily rollups
 
 Rollups compute daily aggregates (avg, min, max, sum, count, last) for each series. They run automatically on a configurable interval (default: every 5 minutes).
@@ -253,6 +275,7 @@ Self-monitoring metrics written per scrape target:
 - Multi-series queries fan out to all matching series actors. Use label filters to narrow the query.
 - Use aggregated queries (`query_aggregate_multi`) instead of raw queries for dashboards
 - For long time ranges, use daily rollups (`query_daily`) instead of raw data
+- Trigger merge compaction to consolidate small blocks: `TimelessMetrics.merge_now(:metrics)`
 - Check `vm_run_queue_length` -- sustained values > 0 indicate CPU saturation
 
 ### Disk space growing

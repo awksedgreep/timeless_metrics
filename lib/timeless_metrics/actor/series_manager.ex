@@ -12,7 +12,9 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   alias TimelessMetrics.Actor.SeriesServer
 
   defstruct [:store, :db, :data_dir, :registry, :dynamic_sup, :index,
-             :max_blocks, :block_size, :compression, :flush_interval]
+             :max_blocks, :block_size, :compression, :flush_interval,
+             :merge_block_min_count, :merge_block_max_points,
+             :merge_block_min_age_seconds, :merge_interval]
 
   # --- Client API ---
 
@@ -99,6 +101,28 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     Enum.map(rows, fn [labels_str] -> %{labels: decode_labels(labels_str)} end)
   end
 
+  @doc "Merge blocks in all series processes."
+  def merge_all(manager) do
+    state_info = :persistent_term.get({__MODULE__, manager})
+    registry = state_info.registry
+
+    results =
+      Registry.select(registry, [{{:_, :"$1", :_}, [], [:"$1"]}])
+      |> Enum.map(fn pid ->
+        try do
+          GenServer.call(pid, :merge_blocks, 60_000)
+        catch
+          :exit, _ -> :noop
+        end
+      end)
+
+    if Enum.any?(results, &(&1 == :ok)) do
+      :ok
+    else
+      :noop
+    end
+  end
+
   @doc "Flush all series to disk."
   def flush_all(manager) do
     state_info = :persistent_term.get({__MODULE__, manager})
@@ -147,6 +171,10 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     block_size = Keyword.get(opts, :block_size, 1000)
     compression = Keyword.get(opts, :compression, :zstd)
     flush_interval = Keyword.get(opts, :flush_interval, 60_000)
+    merge_block_min_count = Keyword.get(opts, :merge_block_min_count, 4)
+    merge_block_max_points = Keyword.get(opts, :merge_block_max_points, 10_000)
+    merge_block_min_age_seconds = Keyword.get(opts, :merge_block_min_age_seconds, 300)
+    merge_interval = Keyword.get(opts, :merge_interval, 300_000)
 
     # Create ETS index: {metric_name, encoded_labels} => series_id
     index = :"#{store}_actor_index"
@@ -168,7 +196,11 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       max_blocks: max_blocks,
       block_size: block_size,
       compression: compression,
-      flush_interval: flush_interval
+      flush_interval: flush_interval,
+      merge_block_min_count: merge_block_min_count,
+      merge_block_max_points: merge_block_max_points,
+      merge_block_min_age_seconds: merge_block_min_age_seconds,
+      merge_interval: merge_interval
     }
 
     # Store in persistent_term for fast client-side access
@@ -251,7 +283,11 @@ defmodule TimelessMetrics.Actor.SeriesManager do
              max_blocks: state.max_blocks,
              block_size: state.block_size,
              compression: state.compression,
-             flush_interval: state.flush_interval
+             flush_interval: state.flush_interval,
+             merge_block_min_count: state.merge_block_min_count,
+             merge_block_max_points: state.merge_block_max_points,
+             merge_block_min_age_seconds: state.merge_block_min_age_seconds,
+             merge_interval: state.merge_interval
            ]
          ]},
       restart: :transient

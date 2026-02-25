@@ -95,6 +95,9 @@ flowchart TD
         StaleTimer[":maybe_compress_stale every 30s"]
         StaleTimer --> StaleCheck{"raw_count > 0 AND<br/>idle > 30s?"}
         StaleCheck -->|yes| Compress
+        MergeTimer[":maybe_merge_blocks every 5min"]
+        MergeTimer --> MergeCheck{"old blocks ≥<br/>min_count?"}
+        MergeCheck -->|yes| MergeExec["Decompress → merge → recompress"]
     end
 ```
 
@@ -187,6 +190,45 @@ flowchart LR
     Ret["Actor.Retention"] -->|"DELETE old rows"| TierDaily
     Ret -->|"DELETE orphan series"| Series
 ```
+
+## Block Merge Compaction
+
+Each series actor accumulates many small compressed blocks over time (one per
+`block_size` points or stale-buffer flush). Merge compaction consolidates adjacent
+old blocks into fewer, larger blocks for better compression and faster large-range
+queries. Unlike TimelessLogs/Traces, merge runs inside each `SeriesServer` process
+-- there is no centralized compactor. It triggers on a periodic timer (default
+every 5 minutes) and can also be forced via `TimelessMetrics.merge_now(store)`,
+which fans out to all series processes.
+
+```mermaid
+flowchart TD
+    subgraph "Per-SeriesServer"
+        TIMER[":maybe_merge_blocks<br/>every 5 min"]
+        TIMER --> AGE["Filter: block.end_ts < now - min_age<br/><i>default: 300s</i>"]
+        AGE --> COUNT{"eligible blocks ≥<br/>min_count?<br/><i>default: 4</i>"}
+        COUNT -->|no| NOOP[":noop"]
+        COUNT -->|yes| GROUP["Group into batches<br/>≈ max_points each<br/><i>default: 10,000</i>"]
+
+        GROUP --> B1["Batch 1"]
+        GROUP --> BN["Batch N"]
+
+        B1 & BN --> DECOMP["GorillaStream.decompress<br/>each block in batch"]
+        DECOMP --> SORT["Concatenate + sort<br/>by timestamp"]
+        SORT --> RECOMP["GorillaStream.compress<br/>(Gorilla + zstd)"]
+        RECOMP --> REPLACE["Replace batch entries<br/>in :queue with<br/>single merged block"]
+        REPLACE --> DIRTY["Mark dirty for<br/>next disk flush"]
+    end
+
+    API["TimelessMetrics.merge_now(store)"] -->|"fan-out via<br/>SeriesManager.merge_all"| TIMER
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `merge_block_min_count` | 4 | Min eligible blocks before merge triggers |
+| `merge_block_max_points` | 10,000 | Target points per merged block |
+| `merge_block_min_age_seconds` | 300 | Only merge blocks older than this |
+| `merge_interval` | 300,000 | Merge check timer interval (ms) |
 
 ## HTTP Ingest and Query
 

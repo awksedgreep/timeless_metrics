@@ -15,6 +15,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
   @flush_interval_ms 60_000
   @stale_check_ms 30_000
+  @merge_check_ms 300_000
 
   defstruct [
     :series_id,
@@ -33,7 +34,11 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     dirty: false,
     flush_ref: nil,
     stale_ref: nil,
-    last_write_at: nil
+    merge_ref: nil,
+    last_write_at: nil,
+    merge_block_min_count: 4,
+    merge_block_max_points: 10_000,
+    merge_block_min_age_seconds: 300
   ]
 
   # --- Client API ---
@@ -62,6 +67,10 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     block_size = Keyword.get(opts, :block_size, 1000)
     compression = Keyword.get(opts, :compression, :zstd)
     flush_interval = Keyword.get(opts, :flush_interval, @flush_interval_ms)
+    merge_block_min_count = Keyword.get(opts, :merge_block_min_count, 4)
+    merge_block_max_points = Keyword.get(opts, :merge_block_max_points, 10_000)
+    merge_block_min_age_seconds = Keyword.get(opts, :merge_block_min_age_seconds, 300)
+    merge_interval = Keyword.get(opts, :merge_interval, @merge_check_ms)
 
     state = %__MODULE__{
       series_id: series_id,
@@ -72,17 +81,21 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       registry: registry,
       max_blocks: max_blocks,
       block_size: block_size,
-      compression: compression
+      compression: compression,
+      merge_block_min_count: merge_block_min_count,
+      merge_block_max_points: merge_block_max_points,
+      merge_block_min_age_seconds: merge_block_min_age_seconds
     }
 
     # Load existing data from disk
     state = load_from_disk(state)
 
-    # Schedule periodic flush and stale check
+    # Schedule periodic flush, stale check, and merge check
     flush_ref = Process.send_after(self(), :flush_to_disk, flush_interval)
     stale_ref = Process.send_after(self(), :maybe_compress_stale, @stale_check_ms)
+    merge_ref = Process.send_after(self(), :maybe_merge_blocks, merge_interval)
 
-    {:ok, %{state | flush_ref: flush_ref, stale_ref: stale_ref}}
+    {:ok, %{state | flush_ref: flush_ref, stale_ref: stale_ref, merge_ref: merge_ref}}
   end
 
   @impl true
@@ -148,6 +161,11 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   def handle_call(:flush, _from_pid, state) do
     state = flush_to_disk(state)
     {:reply, :ok, state}
+  end
+
+  def handle_call(:merge_blocks, _from_pid, state) do
+    {result, state} = maybe_merge_blocks(state)
+    {:reply, result, state}
   end
 
   def handle_call(:state, _from_pid, state) do
@@ -255,6 +273,12 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     {:noreply, %{state | stale_ref: stale_ref}}
   end
 
+  def handle_info(:maybe_merge_blocks, state) do
+    {_result, state} = maybe_merge_blocks(state)
+    merge_ref = Process.send_after(self(), :maybe_merge_blocks, @merge_check_ms)
+    {:noreply, %{state | merge_ref: merge_ref}}
+  end
+
   @impl true
   def terminate(_reason, state) do
     flush_to_disk(state)
@@ -267,6 +291,115 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     case state.last_write_at do
       nil -> false
       last -> System.monotonic_time(:millisecond) - last > @stale_check_ms
+    end
+  end
+
+  defp maybe_merge_blocks(state) do
+    blocks_list = :queue.to_list(state.blocks)
+
+    if length(blocks_list) < state.merge_block_min_count do
+      {:noop, state}
+    else
+      now = System.os_time(:second)
+      cutoff = now - state.merge_block_min_age_seconds
+
+      # Find eligible blocks: those whose end_ts is before the age cutoff
+      {eligible, recent} =
+        Enum.split_while(blocks_list, fn block -> block.end_ts < cutoff end)
+
+      if length(eligible) < state.merge_block_min_count do
+        {:noop, state}
+      else
+        do_merge_blocks(state, eligible, recent)
+      end
+    end
+  end
+
+  defp do_merge_blocks(state, eligible, recent) do
+    # Group eligible blocks into batches of ~merge_block_max_points
+    batches = group_merge_batches(eligible, state.merge_block_max_points)
+
+    {merged_blocks, dirty?} =
+      Enum.reduce(batches, {[], false}, fn batch, {acc, dirty} ->
+        case merge_batch(batch, state.compression) do
+          {:ok, merged_block} -> {[merged_block | acc], true}
+          :noop -> {Enum.reverse(batch) ++ acc, dirty}
+        end
+      end)
+
+    if dirty? do
+      # Rebuild queue: merged (oldest first) ++ recent
+      new_blocks_list = Enum.reverse(merged_blocks) ++ recent
+
+      new_queue =
+        Enum.reduce(new_blocks_list, :queue.new(), fn block, q -> :queue.in(block, q) end)
+
+      {:ok, %{state | blocks: new_queue, block_count: length(new_blocks_list), dirty: true}}
+    else
+      {:noop, state}
+    end
+  end
+
+  defp group_merge_batches(blocks, target_size) do
+    {batches, current, _current_count} =
+      Enum.reduce(blocks, {[], [], 0}, fn block, {batches, current, current_count} ->
+        if current_count + block.point_count > target_size and current != [] do
+          {[Enum.reverse(current) | batches], [block], block.point_count}
+        else
+          {batches, [block | current], current_count + block.point_count}
+        end
+      end)
+
+    # Include the last batch only if it has >= 2 blocks
+    all =
+      if length(current) >= 2 do
+        [Enum.reverse(current) | batches]
+      else
+        # Single-block batch: return as-is (won't be merged)
+        case current do
+          [single] -> [{:passthrough, single} | batches]
+          [] -> batches
+        end
+      end
+
+    Enum.reverse(all)
+  end
+
+  defp merge_batch({:passthrough, block}, _compression), do: {:ok, block}
+
+  defp merge_batch(batch, _compression) when is_list(batch) and length(batch) < 2, do: :noop
+
+  defp merge_batch(batch, compression) when is_list(batch) do
+    all_points =
+      Enum.flat_map(batch, fn block ->
+        case GorillaStream.decompress(block.data, compression: compression) do
+          {:ok, points} -> points
+          {:error, _} -> []
+        end
+      end)
+
+    if all_points == [] do
+      :noop
+    else
+      sorted = Enum.sort_by(all_points, &elem(&1, 0))
+
+      case GorillaStream.compress(sorted, compression: compression) do
+        {:ok, data} ->
+          {first_ts, _} = List.first(sorted)
+          {last_ts, _} = List.last(sorted)
+
+          merged = %{
+            start_ts: first_ts,
+            end_ts: last_ts,
+            point_count: length(sorted),
+            data: data
+          }
+
+          {:ok, merged}
+
+        {:error, _} ->
+          :noop
+      end
     end
   end
 

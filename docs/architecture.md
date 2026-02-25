@@ -120,6 +120,41 @@ SQLite (in WAL mode with mmap) stores:
 
 SQLite is not used for raw time series data -- that goes directly to compressed block files for maximum throughput.
 
+## Block merge compaction
+
+Each series actor accumulates many small compressed blocks over time (one per `block_size` points or stale-buffer flush). The merge compaction pass consolidates adjacent old blocks into fewer, larger blocks. Larger blocks achieve better compression ratios (bigger Gorilla + zstd dictionary window) and reduce per-block decompression overhead during large-range queries.
+
+Merge runs inside each `SeriesServer` process -- there is no centralized compactor. It is triggered by a periodic timer (default every 5 minutes) and can also be forced across all series via `TimelessMetrics.merge_now(store)`.
+
+```
+Per-series compressed block queue: [b1] [b2] [b3] [b4] [b5] [b6] ... [bN]
+  │
+  ▼
+Age check: only blocks with end_ts older than merge_block_min_age_seconds
+  │
+  ▼
+Count check: eligible blocks >= merge_block_min_count
+  │
+  ▼
+Group into batches of ≈ merge_block_max_points
+  │
+  ▼
+For each batch:
+  Decompress blocks → concatenate points → sort by timestamp → recompress
+  │
+  ▼
+Replace batch entries in queue with single merged block
+```
+
+| Configuration | Default | Description |
+|---------------|---------|-------------|
+| `merge_block_min_count` | 4 | Minimum eligible blocks before merge triggers |
+| `merge_block_max_points` | 10,000 | Target points per merged block |
+| `merge_block_min_age_seconds` | 300 | Only merge blocks older than this (avoids churning recent data) |
+| `merge_interval` | 300,000 | Merge check timer interval in ms |
+
+The age threshold ensures recent blocks (still likely to be queried individually) are left alone, while older blocks that are typically scanned in bulk are consolidated for efficiency.
+
 ## Rollup pipeline
 
 The `Rollup` actor runs periodically (default: every 5 minutes) and computes daily aggregates:

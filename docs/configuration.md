@@ -17,6 +17,10 @@ All options are passed to the `TimelessMetrics` child spec:
   rollup_interval: 300_000,
   retention_interval: 3_600_000,
   alert_interval: 60_000,
+  merge_block_min_count: 4,
+  merge_block_max_points: 10_000,
+  merge_block_min_age_seconds: 300,
+  merge_interval: 300_000,
   self_monitor: true,
   scraping: true}
 ```
@@ -36,6 +40,10 @@ All options are passed to the `TimelessMetrics` child spec:
 | `rollup_interval` | `pos_integer()` | `300_000` | Milliseconds between automatic rollup runs (default: 5 minutes) |
 | `retention_interval` | `pos_integer()` | `3_600_000` | Milliseconds between retention enforcement runs (default: 1 hour) |
 | `alert_interval` | `pos_integer()` | `60_000` | Milliseconds between alert evaluation cycles (default: 60 seconds) |
+| `merge_block_min_count` | `pos_integer()` | `4` | Minimum eligible blocks before merge compaction triggers |
+| `merge_block_max_points` | `pos_integer()` | `10_000` | Target points per merged block |
+| `merge_block_min_age_seconds` | `non_neg_integer()` | `300` | Only merge blocks older than this (avoids churning recent data) |
+| `merge_interval` | `pos_integer()` | `300_000` | Milliseconds between merge compaction checks (default: 5 minutes) |
 | `self_monitor` | `boolean()` | `true` | Enable self-monitoring (writes internal metrics about the store) |
 | `scraping` | `boolean()` | `true` | Enable the Prometheus scraping subsystem |
 
@@ -133,6 +141,17 @@ Configure how long data is kept at each resolution tier:
 
 - **Raw**: detailed point-level data. Default 7 days. Increase for operational dashboards that need fine granularity over longer periods.
 - **Daily**: aggregated daily rollups (avg, min, max, sum, count, last). Default 365 days. Increase for long-term capacity planning.
+
+### Merge compaction
+
+Each series actor periodically consolidates multiple small compressed blocks into fewer, larger ones. Larger blocks achieve better Gorilla + zstd compression and reduce decompression overhead during large-range queries.
+
+- **`merge_block_min_count` (default 4)**: minimum blocks needed to trigger a merge. Lower for faster consolidation, higher to batch more blocks together.
+- **`merge_block_max_points` (default 10,000)**: target size of merged blocks. Increase for better compression at the cost of more memory during merge.
+- **`merge_block_min_age_seconds` (default 300)**: only merge blocks older than this. Prevents churning recently-written blocks that are still being queried individually.
+- **`merge_interval` (default 300,000 / 5 min)**: how often each series process checks for mergeable blocks.
+
+Merge compaction can also be triggered manually via `TimelessMetrics.merge_now(store)`.
 
 ### Multiple store instances
 

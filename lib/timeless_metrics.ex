@@ -187,6 +187,15 @@ defmodule TimelessMetrics do
   end
 
   @doc """
+  Merge multiple small compressed blocks into fewer, larger blocks across all series.
+
+  Returns `:ok` if any series merged blocks, `:noop` if no merge was needed.
+  """
+  def merge_now(store) do
+    Engine.merge_now(store)
+  end
+
+  @doc """
   Force flush all buffered data to disk.
   """
   def flush(store) do

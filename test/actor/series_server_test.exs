@@ -239,4 +239,207 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
     {:ok, points} = GenServer.call(pid, {:query_raw, now + 100, now + 200})
     assert points == []
   end
+
+  describe "merge compaction" do
+    test "merges multiple small blocks into fewer larger ones", ctx do
+      # block_size: 5 creates a block every 5 points
+      # merge_block_min_count: 2 so merge triggers with >= 2 eligible blocks
+      # merge_block_min_age_seconds: 0 so all blocks are immediately eligible
+      # merge_block_max_points: 50 so all blocks merge into one
+      pid =
+        start_server(ctx,
+          block_size: 5,
+          merge_block_min_count: 2,
+          merge_block_min_age_seconds: 0,
+          merge_block_max_points: 50
+        )
+
+      # Use timestamps in the past so age check passes
+      base = System.os_time(:second) - 1000
+
+      # Write 20 points = 4 blocks of 5
+      for i <- 0..19 do
+        GenServer.cast(pid, {:write, base + i, i * 1.0})
+      end
+
+      Process.sleep(50)
+
+      state_before = GenServer.call(pid, :state)
+      assert state_before.block_count == 4
+      assert state_before.raw_count == 0
+
+      # Trigger merge
+      assert :ok = GenServer.call(pid, :merge_blocks)
+
+      state_after = GenServer.call(pid, :state)
+      # 4 blocks of 5 points → 1 merged block of 20 points
+      assert state_after.block_count == 1
+
+      # All points still queryable
+      {:ok, points} = GenServer.call(pid, {:query_raw, base, base + 19})
+      assert length(points) == 20
+    end
+
+    test "returns :noop when below min block count", ctx do
+      pid =
+        start_server(ctx,
+          block_size: 5,
+          merge_block_min_count: 4,
+          merge_block_min_age_seconds: 0,
+          merge_block_max_points: 50
+        )
+
+      now = System.os_time(:second)
+
+      # Write 10 points = 2 blocks, but min_count is 4
+      for i <- 0..9 do
+        GenServer.cast(pid, {:write, now + i, i * 1.0})
+      end
+
+      Process.sleep(50)
+
+      state = GenServer.call(pid, :state)
+      assert state.block_count == 2
+
+      assert :noop = GenServer.call(pid, :merge_blocks)
+    end
+
+    test "respects age threshold — only merges old blocks", ctx do
+      pid =
+        start_server(ctx,
+          block_size: 5,
+          merge_block_min_count: 2,
+          merge_block_min_age_seconds: 300,
+          merge_block_max_points: 50
+        )
+
+      now = System.os_time(:second)
+
+      # Write 20 points = 4 blocks, all with recent timestamps
+      for i <- 0..19 do
+        GenServer.cast(pid, {:write, now + i, i * 1.0})
+      end
+
+      Process.sleep(50)
+
+      state = GenServer.call(pid, :state)
+      assert state.block_count == 4
+
+      # All blocks are "recent" (within 300s) so merge should noop
+      assert :noop = GenServer.call(pid, :merge_blocks)
+    end
+
+    test "preserves query correctness after merge", ctx do
+      pid =
+        start_server(ctx,
+          block_size: 5,
+          merge_block_min_count: 2,
+          merge_block_min_age_seconds: 0,
+          merge_block_max_points: 50
+        )
+
+      base = System.os_time(:second) - 1000
+
+      # Write 30 points = 6 blocks
+      for i <- 0..29 do
+        GenServer.cast(pid, {:write, base + i, i * 2.0})
+      end
+
+      Process.sleep(50)
+
+      # Query before merge
+      {:ok, points_before} = GenServer.call(pid, {:query_raw, base, base + 29})
+      assert length(points_before) == 30
+
+      # Merge
+      assert :ok = GenServer.call(pid, :merge_blocks)
+
+      # Query after merge — same results
+      {:ok, points_after} = GenServer.call(pid, {:query_raw, base, base + 29})
+      assert points_after == points_before
+
+      # Aggregation still works
+      {:ok, buckets} =
+        GenServer.call(pid, {:query_aggregate, base, base + 29, :minute, :avg})
+
+      assert length(buckets) >= 1
+    end
+
+    test "batches into multiple merged blocks when exceeding max_points", ctx do
+      pid =
+        start_server(ctx,
+          block_size: 5,
+          merge_block_min_count: 2,
+          merge_block_min_age_seconds: 0,
+          merge_block_max_points: 15
+        )
+
+      base = System.os_time(:second) - 1000
+
+      # Write 30 points = 6 blocks of 5
+      for i <- 0..29 do
+        GenServer.cast(pid, {:write, base + i, i * 1.0})
+      end
+
+      Process.sleep(50)
+
+      state_before = GenServer.call(pid, :state)
+      assert state_before.block_count == 6
+
+      assert :ok = GenServer.call(pid, :merge_blocks)
+
+      state_after = GenServer.call(pid, :state)
+      # 6 blocks of 5 → 2 blocks of 15 each
+      assert state_after.block_count == 2
+
+      # All 30 points still queryable
+      {:ok, points} = GenServer.call(pid, {:query_raw, base, base + 29})
+      assert length(points) == 30
+    end
+
+    test "persistence round-trip after merge", ctx do
+      pid =
+        start_server(ctx,
+          block_size: 5,
+          series_id: 99,
+          merge_block_min_count: 2,
+          merge_block_min_age_seconds: 0,
+          merge_block_max_points: 50
+        )
+
+      base = System.os_time(:second) - 1000
+
+      for i <- 0..19 do
+        GenServer.cast(pid, {:write, base + i, i * 1.0})
+      end
+
+      Process.sleep(50)
+
+      # Merge then flush
+      assert :ok = GenServer.call(pid, :merge_blocks)
+      :ok = GenServer.call(pid, :flush)
+
+      state_merged = GenServer.call(pid, :state)
+      assert state_merged.block_count == 1
+
+      # Stop and restart
+      GenServer.stop(pid)
+      Process.sleep(50)
+
+      pid2 =
+        start_server(ctx,
+          block_size: 5,
+          series_id: 99,
+          merge_block_min_count: 2,
+          merge_block_min_age_seconds: 0,
+          merge_block_max_points: 50
+        )
+
+      {:ok, points} = GenServer.call(pid2, {:query_raw, base, base + 19})
+      assert length(points) == 20
+
+      state_reloaded = GenServer.call(pid2, :state)
+      assert state_reloaded.block_count == 1
+    end
+  end
 end

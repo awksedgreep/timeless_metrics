@@ -18,6 +18,11 @@ defmodule TimelessMetrics.Supervisor do
     block_size = Keyword.get(opts, :block_size, 1000)
     flush_interval = Keyword.get(opts, :flush_interval, 60_000)
 
+    merge_block_min_count = Keyword.get(opts, :merge_block_min_count, 4)
+    merge_block_max_points = Keyword.get(opts, :merge_block_max_points, 10_000)
+    merge_block_min_age_seconds = Keyword.get(opts, :merge_block_min_age_seconds, 300)
+    merge_interval = Keyword.get(opts, :merge_interval, 300_000)
+
     raw_retention_seconds = Keyword.get(opts, :raw_retention_seconds, 604_800)
     daily_retention_seconds = Keyword.get(opts, :daily_retention_seconds, 31_536_000)
     rollup_interval = Keyword.get(opts, :rollup_interval, :timer.minutes(5))
@@ -49,7 +54,11 @@ defmodule TimelessMetrics.Supervisor do
        max_blocks: max_blocks,
        block_size: block_size,
        compression: compression,
-       flush_interval: flush_interval},
+       flush_interval: flush_interval,
+       merge_block_min_count: merge_block_min_count,
+       merge_block_max_points: merge_block_max_points,
+       merge_block_min_age_seconds: merge_block_min_age_seconds,
+       merge_interval: merge_interval},
       {TimelessMetrics.Actor.Rollup,
        name: :"#{name}_rollup",
        store: name,

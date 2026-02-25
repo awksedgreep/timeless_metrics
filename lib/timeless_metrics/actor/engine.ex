@@ -244,6 +244,12 @@ defmodule TimelessMetrics.Actor.Engine do
   defp last_value(%{data: []}), do: 0.0
   defp last_value(%{data: data}), do: data |> List.last() |> elem(1)
 
+  @doc "Merge small compressed blocks in all series processes."
+  def merge_now(store) do
+    manager = manager_name(store)
+    SeriesManager.merge_all(manager)
+  end
+
   @doc "Force flush all series to disk."
   def flush(store) do
     manager = manager_name(store)
