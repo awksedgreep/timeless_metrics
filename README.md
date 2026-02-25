@@ -1,5 +1,7 @@
 # TimelessMetrics
 
+> "I always found it odd that the first thing you do to time series data is squash the timestamp. That's how the name Timeless was born." --Mark Cotner
+
 Embedded time series database for Elixir. Combines [Gorilla compression](https://github.com/awksedgreep/gorilla_stream) with zstd for fast, compact metric storage with automatic rollups and configurable retention.
 
 Run it as a library inside your Elixir app or as a standalone container.
