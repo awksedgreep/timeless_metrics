@@ -82,7 +82,7 @@ Run `mix bench` to reproduce on your hardware. Use `--tier stress` for 10K devic
 Add to your `mix.exs`:
 
 ```elixir
-{:timeless_metrics, "~> 0.6"}
+{:timeless_metrics, "~> 2.0"}
 ```
 
 Add to your supervision tree:

@@ -27,16 +27,30 @@ defmodule TimelessMetrics.MixProject do
       make_precompiler_filename: "prometheus_nif",
       make_precompiler_priv_paths: ["prometheus_nif.*"],
       make_precompiler_nif_versions: [versions: ["2.16", "2.17"]],
+      description: "Embedded time series database for Elixir with Gorilla + zstd compression.",
+      source_url: "https://github.com/awksedgreep/timeless_metrics",
+      homepage_url: "https://github.com/awksedgreep/timeless_metrics",
       package: package(),
+      docs: docs(),
       deps: deps()
     ]
   end
 
   defp package do
     [
-      files: ~w(lib c_src Makefile mix.exs README* LICENSE* CHANGELOG*),
+      maintainers: ["Matt Cotner"],
+      files: ~w(lib c_src Makefile mix.exs README.md LICENSE),
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/awksedgreep/timeless_metrics"}
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras:
+        ["README.md", "LICENSE"] ++
+          Path.wildcard("docs/*.md")
     ]
   end
 
