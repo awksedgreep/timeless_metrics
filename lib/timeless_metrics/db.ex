@@ -56,7 +56,13 @@ defmodule TimelessMetrics.DB do
     configure_connection(writer)
     run_migrations(writer)
 
-    reader_count = Keyword.get(opts, :reader_pool_size, System.schedulers_online())
+    default_readers =
+      case System.get_env("CI") do
+        nil -> System.schedulers_online()
+        _ -> 1
+      end
+
+    reader_count = Keyword.get(opts, :reader_pool_size, default_readers)
 
     readers =
       for _ <- 1..reader_count do
