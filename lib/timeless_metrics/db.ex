@@ -141,7 +141,7 @@ defmodule TimelessMetrics.DB do
       "PRAGMA synchronous = NORMAL",
       "PRAGMA cache_size = -128000",
       "PRAGMA auto_vacuum = INCREMENTAL",
-      "PRAGMA mmap_size = 2147483648",
+      "PRAGMA mmap_size = #{mmap_size()}",
       "PRAGMA wal_autocheckpoint = 10000",
       "PRAGMA temp_store = MEMORY",
       "PRAGMA busy_timeout = 5000"
@@ -152,13 +152,21 @@ defmodule TimelessMetrics.DB do
 
   defp configure_reader(conn) do
     pragmas = [
-      "PRAGMA mmap_size = 2147483648",
+      "PRAGMA mmap_size = #{mmap_size()}",
       "PRAGMA cache_size = -8000",
       "PRAGMA temp_store = MEMORY",
       "PRAGMA busy_timeout = 5000"
     ]
 
     Enum.each(pragmas, &execute(conn, &1, []))
+  end
+
+  # 2GB mmap on real systems, disabled on CI/overlay filesystems
+  defp mmap_size do
+    case System.get_env("CI") do
+      nil -> 2_147_483_648
+      _ -> 0
+    end
   end
 
   defp run_migrations(conn) do
