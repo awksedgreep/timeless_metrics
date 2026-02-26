@@ -1,6 +1,8 @@
 defmodule TimelessMetrics.DB.Migrations do
   @moduledoc false
 
+  @max_retries 8
+
   def run(conn) do
     create_metadata_table(conn)
     version = get_version(conn)
@@ -17,7 +19,7 @@ defmodule TimelessMetrics.DB.Migrations do
   end
 
   defp get_version(conn) do
-    get_version_with_retry(conn, 5)
+    get_version_with_retry(conn, @max_retries)
   end
 
   defp get_version_with_retry(conn, retries) do
@@ -32,7 +34,7 @@ defmodule TimelessMetrics.DB.Migrations do
         end
 
       {:error, _reason} when retries > 0 ->
-        Process.sleep(100 * (6 - retries))
+        Process.sleep(retry_backoff(@max_retries - retries))
         get_version_with_retry(conn, retries - 1)
 
       {:error, reason} ->
@@ -293,7 +295,7 @@ defmodule TimelessMetrics.DB.Migrations do
   defp run_from(_conn, 7), do: :ok
 
   defp execute(conn, sql, params \\ []) do
-    execute_with_retry(conn, sql, params, 5)
+    execute_with_retry(conn, sql, params, @max_retries)
   end
 
   defp execute_with_retry(conn, sql, params, retries) do
@@ -307,11 +309,13 @@ defmodule TimelessMetrics.DB.Migrations do
         Exqlite.Sqlite3.release(conn, stmt)
 
       {:error, _reason} when retries > 0 ->
-        Process.sleep(100 * (6 - retries))
+        Process.sleep(retry_backoff(@max_retries - retries))
         execute_with_retry(conn, sql, params, retries - 1)
 
       {:error, reason} ->
         raise "SQLite migration failed after retries: #{inspect(reason)} (sql: #{sql})"
     end
   end
+
+  defp retry_backoff(attempt), do: 100 * Integer.pow(2, attempt)
 end

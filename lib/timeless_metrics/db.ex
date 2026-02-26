@@ -10,6 +10,8 @@ defmodule TimelessMetrics.DB do
 
   defstruct [:writer, :readers, :data_dir, :db_path, :name]
 
+  @max_retries 8
+
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
     GenServer.start_link(__MODULE__, opts, name: name)
@@ -50,7 +52,7 @@ defmodule TimelessMetrics.DB do
 
     db_path = Path.join(data_dir, "metrics.db")
 
-    writer = open_with_retry(db_path, 5)
+    writer = open_with_retry(db_path, @max_retries)
     configure_connection(writer)
     run_migrations(writer)
 
@@ -58,7 +60,7 @@ defmodule TimelessMetrics.DB do
 
     readers =
       for _ <- 1..reader_count do
-        conn = open_with_retry(db_path, 5)
+        conn = open_with_retry(db_path, @max_retries)
         configure_reader(conn)
         conn
       end
@@ -124,7 +126,7 @@ defmodule TimelessMetrics.DB do
         conn
 
       {:error, _reason} when retries > 0 ->
-        Process.sleep(50 * (6 - retries))
+        Process.sleep(retry_backoff(@max_retries - retries))
         open_with_retry(path, retries - 1)
 
       {:error, reason} ->
@@ -165,7 +167,7 @@ defmodule TimelessMetrics.DB do
 
   @doc false
   def execute(conn, sql, params) do
-    execute_with_retry(conn, sql, params, 5)
+    execute_with_retry(conn, sql, params, @max_retries)
   end
 
   defp execute_with_retry(conn, sql, params, retries) do
@@ -180,7 +182,7 @@ defmodule TimelessMetrics.DB do
         {:ok, rows}
 
       {:error, _reason} when retries > 0 ->
-        Process.sleep(100 * (6 - retries))
+        Process.sleep(retry_backoff(@max_retries - retries))
         execute_with_retry(conn, sql, params, retries - 1)
 
       {:error, reason} ->
@@ -195,4 +197,7 @@ defmodule TimelessMetrics.DB do
       {:error, reason} -> raise "SQLite step failed: #{inspect(reason)}"
     end
   end
+
+  # Exponential backoff: 100, 200, 400, 800, 1600, 3200, 6400, 12800ms
+  defp retry_backoff(attempt), do: 100 * Integer.pow(2, attempt)
 end
