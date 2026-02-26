@@ -165,7 +165,7 @@ defmodule TimelessMetrics.DB do
 
   @doc false
   def execute(conn, sql, params) do
-    execute_with_retry(conn, sql, params, 3)
+    execute_with_retry(conn, sql, params, 5)
   end
 
   defp execute_with_retry(conn, sql, params, retries) do
@@ -180,11 +180,11 @@ defmodule TimelessMetrics.DB do
         {:ok, rows}
 
       {:error, _reason} when retries > 0 ->
-        Process.sleep(50 * (4 - retries))
+        Process.sleep(100 * (6 - retries))
         execute_with_retry(conn, sql, params, retries - 1)
 
       {:error, reason} ->
-        {:error, reason}
+        raise "SQLite execute failed after retries: #{inspect(reason)} (sql: #{sql})"
     end
   end
 
@@ -192,7 +192,7 @@ defmodule TimelessMetrics.DB do
     case Exqlite.Sqlite3.step(conn, stmt) do
       {:row, row} -> fetch_all(conn, stmt, [row | acc])
       :done -> Enum.reverse(acc)
-      {:error, reason} -> {:error, reason}
+      {:error, reason} -> raise "SQLite step failed: #{inspect(reason)}"
     end
   end
 end

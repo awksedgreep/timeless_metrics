@@ -17,15 +17,26 @@ defmodule TimelessMetrics.DB.Migrations do
   end
 
   defp get_version(conn) do
-    {:ok, stmt} =
-      Exqlite.Sqlite3.prepare(conn, "SELECT value FROM _metadata WHERE key = 'schema_version'")
+    get_version_with_retry(conn, 5)
+  end
 
-    result = Exqlite.Sqlite3.step(conn, stmt)
-    Exqlite.Sqlite3.release(conn, stmt)
+  defp get_version_with_retry(conn, retries) do
+    case Exqlite.Sqlite3.prepare(conn, "SELECT value FROM _metadata WHERE key = 'schema_version'") do
+      {:ok, stmt} ->
+        result = Exqlite.Sqlite3.step(conn, stmt)
+        Exqlite.Sqlite3.release(conn, stmt)
 
-    case result do
-      {:row, [version]} -> String.to_integer(version)
-      :done -> 0
+        case result do
+          {:row, [version]} -> String.to_integer(version)
+          :done -> 0
+        end
+
+      {:error, _reason} when retries > 0 ->
+        Process.sleep(100 * (6 - retries))
+        get_version_with_retry(conn, retries - 1)
+
+      {:error, reason} ->
+        raise "SQLite get_version failed after retries: #{inspect(reason)}"
     end
   end
 
@@ -282,13 +293,25 @@ defmodule TimelessMetrics.DB.Migrations do
   defp run_from(_conn, 7), do: :ok
 
   defp execute(conn, sql, params \\ []) do
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, sql)
+    execute_with_retry(conn, sql, params, 5)
+  end
 
-    if params != [] do
-      :ok = Exqlite.Sqlite3.bind(stmt, params)
+  defp execute_with_retry(conn, sql, params, retries) do
+    case Exqlite.Sqlite3.prepare(conn, sql) do
+      {:ok, stmt} ->
+        if params != [] do
+          :ok = Exqlite.Sqlite3.bind(stmt, params)
+        end
+
+        :done = Exqlite.Sqlite3.step(conn, stmt)
+        Exqlite.Sqlite3.release(conn, stmt)
+
+      {:error, _reason} when retries > 0 ->
+        Process.sleep(100 * (6 - retries))
+        execute_with_retry(conn, sql, params, retries - 1)
+
+      {:error, reason} ->
+        raise "SQLite migration failed after retries: #{inspect(reason)} (sql: #{sql})"
     end
-
-    :done = Exqlite.Sqlite3.step(conn, stmt)
-    Exqlite.Sqlite3.release(conn, stmt)
   end
 end
