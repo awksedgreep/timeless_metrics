@@ -50,7 +50,7 @@ defmodule TimelessMetrics.DB do
 
     db_path = Path.join(data_dir, "metrics.db")
 
-    {:ok, writer} = Exqlite.Sqlite3.open(db_path)
+    writer = open_with_retry(db_path, 5)
     configure_connection(writer)
     run_migrations(writer)
 
@@ -58,7 +58,7 @@ defmodule TimelessMetrics.DB do
 
     readers =
       for _ <- 1..reader_count do
-        {:ok, conn} = Exqlite.Sqlite3.open(db_path)
+        conn = open_with_retry(db_path, 5)
         configure_reader(conn)
         conn
       end
@@ -118,6 +118,20 @@ defmodule TimelessMetrics.DB do
 
   # --- Internals ---
 
+  defp open_with_retry(path, retries) do
+    case Exqlite.Sqlite3.open(path) do
+      {:ok, conn} ->
+        conn
+
+      {:error, _reason} when retries > 0 ->
+        Process.sleep(50 * (6 - retries))
+        open_with_retry(path, retries - 1)
+
+      {:error, reason} ->
+        raise "failed to open SQLite database #{path}: #{inspect(reason)}"
+    end
+  end
+
   defp configure_connection(conn) do
     pragmas = [
       "PRAGMA page_size = 16384",
@@ -151,21 +165,34 @@ defmodule TimelessMetrics.DB do
 
   @doc false
   def execute(conn, sql, params) do
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, sql)
+    execute_with_retry(conn, sql, params, 3)
+  end
 
-    if params != [] do
-      :ok = Exqlite.Sqlite3.bind(stmt, params)
+  defp execute_with_retry(conn, sql, params, retries) do
+    case Exqlite.Sqlite3.prepare(conn, sql) do
+      {:ok, stmt} ->
+        if params != [] do
+          :ok = Exqlite.Sqlite3.bind(stmt, params)
+        end
+
+        rows = fetch_all(conn, stmt, [])
+        Exqlite.Sqlite3.release(conn, stmt)
+        {:ok, rows}
+
+      {:error, _reason} when retries > 0 ->
+        Process.sleep(50 * (4 - retries))
+        execute_with_retry(conn, sql, params, retries - 1)
+
+      {:error, reason} ->
+        {:error, reason}
     end
-
-    rows = fetch_all(conn, stmt, [])
-    Exqlite.Sqlite3.release(conn, stmt)
-    {:ok, rows}
   end
 
   defp fetch_all(conn, stmt, acc) do
     case Exqlite.Sqlite3.step(conn, stmt) do
       {:row, row} -> fetch_all(conn, stmt, [row | acc])
       :done -> Enum.reverse(acc)
+      {:error, reason} -> {:error, reason}
     end
   end
 end
