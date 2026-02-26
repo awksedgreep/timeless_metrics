@@ -66,9 +66,7 @@ defmodule TimelessMetrics.DB do
 
     readers =
       for _ <- 1..reader_count do
-        conn = open_with_retry(db_path, @max_retries)
-        configure_reader(conn)
-        conn
+        open_and_configure_reader(db_path)
       end
 
     state = %__MODULE__{
@@ -154,6 +152,25 @@ defmodule TimelessMetrics.DB do
     ]
 
     Enum.each(pragmas, &execute(conn, &1, []))
+  end
+
+  defp open_and_configure_reader(db_path, attempts \\ 5) do
+    conn = open_with_retry(db_path, @max_retries)
+
+    try do
+      configure_reader(conn)
+      conn
+    rescue
+      e ->
+        Exqlite.Sqlite3.close(conn)
+
+        if attempts > 1 do
+          Process.sleep(200 * (6 - attempts))
+          open_and_configure_reader(db_path, attempts - 1)
+        else
+          reraise e, __STACKTRACE__
+        end
+    end
   end
 
   defp configure_reader(conn) do
