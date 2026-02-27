@@ -11,6 +11,8 @@ covers the Elixir API, the HTTP interface, and the SVG charting endpoint.
 - [Elixir API](#elixir-api)
   - [Starting a Store](#starting-a-store)
   - [Writing Data](#writing-data)
+  - [Writing Text Data](#writing-text-data)
+  - [Querying Text Data](#querying-text-data)
   - [Pre-Resolved Writes (High-Throughput)](#pre-resolved-writes-high-throughput)
   - [Querying Data](#querying-data)
   - [Aggregation Queries](#aggregation-queries)
@@ -92,6 +94,67 @@ TimelessMetrics.write_batch(:metrics, [
   {"cpu_usage", %{"host" => "web-2"}, 81.0},
   {"mem_usage", %{"host" => "web-1"}, 4_200_000, 1_700_000_000}
 ])
+```
+
+### Writing Text Data
+
+Text series store string values alongside numeric time-series. They use RLE + zstd
+compression and are ideal for values that rarely change (firmware versions, interface
+descriptions, SNMP sysDescr, etc.).
+
+#### Single text point
+
+```elixir
+TimelessMetrics.write_text(:metrics, "sysDescr", %{"host" => "router1"},
+  "Cisco IOS 15.2")
+
+# With explicit timestamp
+TimelessMetrics.write_text(:metrics, "sysDescr", %{"host" => "router1"},
+  "Cisco IOS 15.2", timestamp: 1_700_000_000)
+```
+
+#### Text batch write
+
+Each entry is `{metric, labels, value}` or `{metric, labels, value, timestamp}`:
+
+```elixir
+TimelessMetrics.write_text_batch(:metrics, [
+  {"ifDescr", %{"host" => "sw1", "ifIndex" => "1"}, "GigabitEthernet0/0"},
+  {"ifDescr", %{"host" => "sw1", "ifIndex" => "2"}, "FastEthernet0/1"},
+  {"sysDescr", %{"host" => "sw1"}, "Cisco IOS 15.2", 1_700_000_000}
+])
+```
+
+### Querying Text Data
+
+#### Text points (single series, exact label match)
+
+```elixir
+{:ok, points} = TimelessMetrics.query_text(:metrics, "sysDescr", %{"host" => "router1"},
+  from: System.os_time(:second) - 86_400,
+  to: System.os_time(:second))
+
+# points = [{1700000000, "Cisco IOS 15.2"}, {1700000060, "Cisco IOS 15.2"}, ...]
+```
+
+#### Text points (multi-series, label filter)
+
+```elixir
+{:ok, results} = TimelessMetrics.query_text_multi(:metrics, "ifDescr",
+  %{"host" => "sw1"},
+  from: System.os_time(:second) - 3600)
+
+# results = [
+#   %{labels: %{"host" => "sw1", "ifIndex" => "1"}, points: [{ts, "GigabitEthernet0/0"}, ...]},
+#   %{labels: %{"host" => "sw1", "ifIndex" => "2"}, points: [{ts, "FastEthernet0/1"}, ...]},
+# ]
+```
+
+#### Latest text value
+
+```elixir
+{:ok, {timestamp, value}} = TimelessMetrics.latest_text(:metrics, "sysDescr", %{"host" => "router1"})
+{:ok, nil} = TimelessMetrics.latest_text(:metrics, "nonexistent", %{})
 ```
 
 ### Pre-Resolved Writes (High-Throughput)

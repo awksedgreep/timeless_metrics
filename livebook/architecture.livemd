@@ -41,15 +41,17 @@ graph TD
 
 ## Write Path
 
-A write enters through `TimelessMetrics.write/4` or `write_batch/2`, which delegates to
-`Engine`. The engine resolves each `{metric, labels}` pair to a `SeriesServer` pid via
-`SeriesManager.get_or_start` -- a hot path using ETS + Registry that completes in
-microseconds. The actual write is a non-blocking `GenServer.cast`, so callers never wait.
+A write enters through `TimelessMetrics.write/4` (numeric) or `write_text/5` (text),
+which delegates to `Engine`. The engine resolves each `{metric, labels}` pair to a
+`SeriesServer` pid via `SeriesManager.get_or_start` — a hot path using ETS + Registry
+that completes in microseconds. For text series, `get_or_start` receives `:text` as the
+series type. The actual write is a non-blocking `GenServer.cast`, so callers never wait.
 Inside the `SeriesServer`, points accumulate in `raw_buffer` until `block_size` (default
 
-1. is reached, at which point they are Gorilla + zstd compressed into a block. A
-   periodic flush timer (default 60s) persists blocks and buffer to a `.dat` file via
-   `BlockStore`, and a stale-buffer timer (30s) compresses idle buffers early.
+1. is reached, at which point they are compressed into a block — using GorillaStream +
+   zstd for numeric series, or RLE + zstd (`TextCodec`) for text series. A periodic flush
+   timer (default 60s) persists blocks and buffer to a `.dat` file via `BlockStore`, and a
+   stale-buffer timer (30s) compresses idle buffers early.
 
 ```mermaid
 flowchart TD
@@ -81,7 +83,7 @@ flowchart TD
         Check -->|yes| Compress["compress_buffer/1"]
         Check -->|no| Wait["Await more writes"]
         Compress --> Sort["Sort raw_buffer by timestamp"]
-        Sort --> Gorilla["GorillaStream.compress(sorted, compression: :zstd)"]
+        Sort --> Gorilla["GorillaStream.compress (numeric)\nor TextCodec.compress (text)"]
         Gorilla --> Enqueue[":queue.in(block, blocks)"]
         Enqueue --> Ring{"block_count > max_blocks?"}
         Ring -->|yes| Drop["Drop oldest block"]
@@ -152,25 +154,28 @@ sequenceDiagram
 
 ## Storage Layer
 
-Data lives in two places. Per-series `.dat` files hold the in-memory ring buffer of
-compressed blocks plus the unflushed raw buffer tail -- written atomically via
-tmp-file + rename by `BlockStore`. SQLite (WAL mode, single writer + pooled readers)
-stores series metadata, daily rollups, alert rules, scrape targets, and watermarks.
-Blocks use a two-stage compression pipeline: Gorilla time-series encoding
-(delta-of-delta timestamps, XOR-based values) followed by zstd container compression.
+Data lives in two places. Per-series `.dat` files (BlockStore v2 format) hold the
+in-memory ring buffer of compressed blocks plus the unflushed raw buffer tail — written
+atomically via tmp-file + rename by `BlockStore`. SQLite (WAL mode, single writer +
+pooled readers) stores series metadata (including `series_type`), daily rollups, alert
+rules, scrape targets, and watermarks. Numeric blocks use a two-stage compression
+pipeline: Gorilla time-series encoding (delta-of-delta timestamps, XOR-based values)
+followed by zstd container compression. Text blocks use RLE grouping (consecutive
+identical strings stored once) followed by zstd compression — achieving excellent ratios
+for values that rarely change (firmware versions, interface descriptions, etc.).
 
 ```mermaid
 flowchart LR
     subgraph Per-Series .dat File
-        Header["Header (12 bytes)<br/>'AM' magic | version 1<br/>block_count u32 | raw_count u32 | flags"]
-        Block1["Block 0<br/>start_ts i64 | end_ts i64<br/>point_count u32 | data_len u32<br/>data: Gorilla + zstd"]
+        Header["Header (12 bytes)<br/>'AM' magic | version 2<br/>block_count u32 | raw_count u32 | flags<br/>bit 0: 0=numeric, 1=text"]
+        Block1["Block 0<br/>start_ts i64 | end_ts i64<br/>point_count u32 | data_len u32<br/>data: Gorilla+zstd (numeric)<br/>or RLE+zstd (text)"]
         BlockN["Block N<br/>..."]
-        Raw["Raw Buffer Tail<br/>repeated raw_count×<br/>timestamp i64 | value f64"]
+        Raw["Raw Buffer Tail<br/>repeated raw_count×<br/>Numeric: ts i64 | value f64<br/>Text: ts i64 | len u32 | UTF-8"]
         Header --- Block1 --- BlockN --- Raw
     end
 
     subgraph SQLite metrics.db
-        Series["series<br/>id, metric_name, labels, created_at"]
+        Series["series<br/>id, metric_name, labels, created_at, series_type"]
         Metadata["metric_metadata<br/>metric_name, type, unit, description"]
         TierDaily["tier_daily<br/>series_id, bucket, avg, min, max, count, sum, last"]
         AlertRules["alert_rules<br/>id, name, metric, condition, threshold, ..."]
@@ -213,9 +218,9 @@ flowchart TD
         GROUP --> B1["Batch 1"]
         GROUP --> BN["Batch N"]
 
-        B1 & BN --> DECOMP["GorillaStream.decompress<br/>each block in batch"]
+        B1 & BN --> DECOMP["Decompress each block<br/>GorillaStream (numeric)<br/>or TextCodec (text)"]
         DECOMP --> SORT["Concatenate + sort<br/>by timestamp"]
-        SORT --> RECOMP["GorillaStream.compress<br/>(Gorilla + zstd)"]
+        SORT --> RECOMP["Recompress merged block<br/>(codec matches series_type)"]
         RECOMP --> REPLACE["Replace batch entries<br/>in :queue with<br/>single merged block"]
         REPLACE --> DIRTY["Mark dirty for<br/>next disk flush"]
     end
