@@ -5,33 +5,39 @@ defmodule TimelessMetrics.Actor.BlockStore do
   Pure functions — no GenServer. Each series has a single `.dat` file
   containing compressed blocks and the raw buffer tail.
 
-  File format:
-    Header (12 bytes):
+  File format v2 (12 bytes header):
+    Header:
       "AM"             — 2 bytes magic
-      version          — 1 byte (1)
+      version          — 1 byte (2)
       block_count      — 4 bytes uint32
       raw_count        — 4 bytes uint32
-      flags            — 1 byte reserved
+      flags            — 1 byte (bit 0: 0=numeric, 1=text)
 
     Per block (repeated block_count times):
       start_ts         — 8 bytes int64
       end_ts           — 8 bytes int64
       point_count      — 4 bytes uint32
       data_len         — 4 bytes uint32
-      data             — data_len bytes (GorillaStream + zstd compressed)
+      data             — data_len bytes (compressed payload)
 
-    Raw buffer (repeated raw_count times):
-      timestamp        — 8 bytes int64
-      value            — 8 bytes float64
+    Raw buffer — type-dependent:
+      Numeric (flags bit 0 = 0): <<ts::signed-64, val::float-64>> per entry
+      Text (flags bit 0 = 1): <<ts::signed-64, value_len::unsigned-32, value::binary>> per entry
   """
 
   @magic "AM"
-  @version 1
+  @version 2
+
+  @flag_text 1
 
   @doc """
   Write blocks and raw buffer to a file atomically (tmp + rename).
+
+  Options:
+    * `:series_type` - `:numeric` (default) or `:text`
   """
-  def write(path, blocks_queue, raw_buffer) do
+  def write(path, blocks_queue, raw_buffer, opts \\ []) do
+    series_type = Keyword.get(opts, :series_type, :numeric)
     dir = Path.dirname(path)
     File.mkdir_p!(dir)
     tmp_path = path <> ".tmp"
@@ -39,13 +45,14 @@ defmodule TimelessMetrics.Actor.BlockStore do
     blocks = :queue.to_list(blocks_queue)
     block_count = length(blocks)
     raw_count = length(raw_buffer)
+    flags = if series_type == :text, do: @flag_text, else: 0
 
     header = <<
       @magic::binary,
       @version::8,
       block_count::unsigned-32,
       raw_count::unsigned-32,
-      0::8
+      flags::8
     >>
 
     block_data =
@@ -61,10 +68,7 @@ defmodule TimelessMetrics.Actor.BlockStore do
         >>
       end)
 
-    raw_data =
-      Enum.map(raw_buffer, fn {ts, val} ->
-        <<ts::signed-64, val::float-64>>
-      end)
+    raw_data = encode_raw_buffer(raw_buffer, series_type)
 
     iodata = [header | block_data] ++ raw_data
 
@@ -76,7 +80,7 @@ defmodule TimelessMetrics.Actor.BlockStore do
   @doc """
   Read blocks and raw buffer from a file.
 
-  Returns `{:ok, {blocks_queue, raw_buffer}}` or `{:error, reason}`.
+  Returns `{:ok, {blocks_queue, raw_buffer, series_type}}` or `{:error, reason}`.
   """
   def read(path) do
     case File.read(path) do
@@ -91,15 +95,38 @@ defmodule TimelessMetrics.Actor.BlockStore do
     end
   end
 
+  # Version 2: check flags for series type
   defp parse(
-         <<@magic, @version::8, block_count::unsigned-32, raw_count::unsigned-32, _flags::8,
+         <<@magic, @version::8, block_count::unsigned-32, raw_count::unsigned-32, flags::8,
+           rest::binary>>
+       ) do
+    series_type = if Bitwise.band(flags, @flag_text) == @flag_text, do: :text, else: :numeric
+
+    case parse_blocks(rest, block_count, :queue.new()) do
+      {:ok, blocks, remaining} ->
+        case parse_raw(remaining, raw_count, [], series_type) do
+          {:ok, raw_buffer} ->
+            {:ok, {blocks, raw_buffer, series_type}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Version 1 backward compatibility: always numeric
+  defp parse(
+         <<@magic, 1::8, block_count::unsigned-32, raw_count::unsigned-32, _flags::8,
            rest::binary>>
        ) do
     case parse_blocks(rest, block_count, :queue.new()) do
       {:ok, blocks, remaining} ->
-        case parse_raw(remaining, raw_count, []) do
+        case parse_raw(remaining, raw_count, [], :numeric) do
           {:ok, raw_buffer} ->
-            {:ok, {blocks, raw_buffer}}
+            {:ok, {blocks, raw_buffer, :numeric}}
 
           {:error, reason} ->
             {:error, reason}
@@ -136,15 +163,40 @@ defmodule TimelessMetrics.Actor.BlockStore do
     {:error, :corrupt_block}
   end
 
-  defp parse_raw(<<>>, 0, acc), do: {:ok, Enum.reverse(acc)}
-  defp parse_raw(_rest, 0, acc), do: {:ok, Enum.reverse(acc)}
+  # Numeric raw buffer parsing
+  defp parse_raw(<<>>, 0, acc, _type), do: {:ok, Enum.reverse(acc)}
+  defp parse_raw(_rest, 0, acc, _type), do: {:ok, Enum.reverse(acc)}
 
-  defp parse_raw(<<ts::signed-64, val::float-64, rest::binary>>, remaining, acc) do
-    parse_raw(rest, remaining - 1, [{ts, val} | acc])
+  defp parse_raw(<<ts::signed-64, val::float-64, rest::binary>>, remaining, acc, :numeric) do
+    parse_raw(rest, remaining - 1, [{ts, val} | acc], :numeric)
   end
 
-  defp parse_raw(_data, _remaining, _acc) do
+  defp parse_raw(
+         <<ts::signed-64, value_len::unsigned-32, value::binary-size(value_len), rest::binary>>,
+         remaining,
+         acc,
+         :text
+       ) do
+    parse_raw(rest, remaining - 1, [{ts, value} | acc], :text)
+  end
+
+  defp parse_raw(_data, _remaining, _acc, _type) do
     {:error, :corrupt_raw}
+  end
+
+  # Encoding helpers
+  defp encode_raw_buffer(raw_buffer, :numeric) do
+    Enum.map(raw_buffer, fn {ts, val} ->
+      <<ts::signed-64, val::float-64>>
+    end)
+  end
+
+  defp encode_raw_buffer(raw_buffer, :text) do
+    Enum.map(raw_buffer, fn {ts, val} ->
+      value_bytes = :erlang.iolist_to_binary(val)
+      value_len = byte_size(value_bytes)
+      <<ts::signed-64, value_len::unsigned-32, value_bytes::binary>>
+    end)
   end
 
   @doc """

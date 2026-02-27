@@ -17,7 +17,7 @@ defmodule TimelessMetrics.Actor.BlockStoreTest do
     raw_buffer = []
 
     assert :ok = BlockStore.write(path, blocks, raw_buffer)
-    assert {:ok, {read_blocks, read_raw}} = BlockStore.read(path)
+    assert {:ok, {read_blocks, read_raw, :numeric}} = BlockStore.read(path)
     assert :queue.to_list(read_blocks) == []
     assert read_raw == []
   end
@@ -44,7 +44,7 @@ defmodule TimelessMetrics.Actor.BlockStoreTest do
     raw_buffer = [{1200, 42.0}, {1201, 43.5}, {1202, 44.1}]
 
     assert :ok = BlockStore.write(path, blocks, raw_buffer)
-    assert {:ok, {read_blocks, read_raw}} = BlockStore.read(path)
+    assert {:ok, {read_blocks, read_raw, :numeric}} = BlockStore.read(path)
 
     read_blocks_list = :queue.to_list(read_blocks)
     assert length(read_blocks_list) == 2
@@ -70,7 +70,7 @@ defmodule TimelessMetrics.Actor.BlockStoreTest do
     blocks = :queue.from_list([block])
 
     assert :ok = BlockStore.write(path, blocks, [])
-    assert {:ok, {read_blocks, read_raw}} = BlockStore.read(path)
+    assert {:ok, {read_blocks, read_raw, :numeric}} = BlockStore.read(path)
     assert length(:queue.to_list(read_blocks)) == 1
     assert read_raw == []
   end
@@ -81,7 +81,7 @@ defmodule TimelessMetrics.Actor.BlockStoreTest do
     raw = [{100, 1.0}, {200, 2.0}]
 
     assert :ok = BlockStore.write(path, :queue.new(), raw)
-    assert {:ok, {read_blocks, read_raw}} = BlockStore.read(path)
+    assert {:ok, {read_blocks, read_raw, :numeric}} = BlockStore.read(path)
     assert :queue.to_list(read_blocks) == []
     assert read_raw == [{100, 1.0}, {200, 2.0}]
   end
@@ -123,7 +123,7 @@ defmodule TimelessMetrics.Actor.BlockStoreTest do
     raw = [{-100, -42.5}]
 
     assert :ok = BlockStore.write(path, blocks, raw)
-    assert {:ok, {read_blocks, read_raw}} = BlockStore.read(path)
+    assert {:ok, {read_blocks, read_raw, :numeric}} = BlockStore.read(path)
 
     [rb] = :queue.to_list(read_blocks)
     assert rb.start_ts == -1000

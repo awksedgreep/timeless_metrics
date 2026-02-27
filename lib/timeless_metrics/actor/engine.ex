@@ -498,6 +498,78 @@ defmodule TimelessMetrics.Actor.Engine do
     {:ok, %{path: target_dir, files: files, total_bytes: total_bytes}}
   end
 
+  # --- Text series API ---
+
+  @doc "Write a single text metric point."
+  def write_text(store, metric_name, labels, value, opts \\ []) do
+    timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
+    manager = manager_name(store)
+    {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels, :text)
+    GenServer.cast(pid, {:write_text, timestamp, value})
+  end
+
+  @doc "Write a batch of text metric points."
+  def write_text_batch(store, entries) do
+    manager = manager_name(store)
+
+    entries
+    |> Enum.map(fn
+      {metric_name, labels, value} ->
+        {metric_name, labels, System.os_time(:second), value}
+
+      {metric_name, labels, value, ts} ->
+        {metric_name, labels, ts, value}
+    end)
+    |> Enum.group_by(fn {mn, l, _ts, _v} -> {mn, l} end)
+    |> Enum.each(fn {{metric_name, labels}, points} ->
+      {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels, :text)
+      batch = Enum.map(points, fn {_mn, _l, ts, v} -> {ts, v} end)
+      GenServer.cast(pid, {:write_text_batch, batch})
+    end)
+
+    :ok
+  end
+
+  @doc "Query text points for a single series."
+  def query_text(store, metric_name, labels, opts \\ []) do
+    from = Keyword.get(opts, :from, 0)
+    to = Keyword.get(opts, :to, System.os_time(:second))
+    manager = manager_name(store)
+    {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels, :text)
+    GenServer.call(pid, {:query_raw, from, to})
+  end
+
+  @doc "Query text points across multiple series matching a label filter."
+  def query_text_multi(store, metric_name, label_filter, opts \\ []) do
+    from = Keyword.get(opts, :from, 0)
+    to = Keyword.get(opts, :to, System.os_time(:second))
+    manager = manager_name(store)
+    matching = SeriesManager.find_series(manager, metric_name, label_filter)
+
+    results =
+      matching
+      |> Task.async_stream(
+        fn {_id, labels, pid} ->
+          {:ok, points} = GenServer.call(pid, {:query_raw, from, to})
+          %{labels: labels, points: points}
+        end,
+        max_concurrency: System.schedulers_online(),
+        ordered: false,
+        timeout: :infinity
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+      |> Enum.reject(fn %{points: pts} -> pts == [] end)
+
+    {:ok, results}
+  end
+
+  @doc "Get the latest text value for a series."
+  def latest_text(store, metric_name, labels) do
+    manager = manager_name(store)
+    {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels, :text)
+    GenServer.call(pid, :latest)
+  end
+
   @doc "Query pre-computed daily rollup data."
   def query_daily(store, metric_name, labels, from, to) do
     manager = manager_name(store)

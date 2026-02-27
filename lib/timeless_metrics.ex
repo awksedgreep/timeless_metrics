@@ -186,6 +186,60 @@ defmodule TimelessMetrics do
     Engine.latest_multi(store, metric_name, label_filter)
   end
 
+  # --- Text series API ---
+
+  @doc """
+  Write a single text metric point.
+
+  ## Parameters
+
+    * `store` - The store name (atom)
+    * `metric_name` - String metric name
+    * `labels` - Map of string labels
+    * `value` - String value
+    * `opts` - Optional keyword list:
+      * `:timestamp` - Unix timestamp in seconds (default: now)
+  """
+  def write_text(store, metric_name, labels, value, opts \\ []) do
+    Engine.write_text(store, metric_name, labels, value, opts)
+  end
+
+  @doc """
+  Write a batch of text metric points.
+
+  Each entry is `{metric_name, labels, value}` or `{metric_name, labels, value, timestamp}`.
+  """
+  def write_text_batch(store, entries) do
+    Engine.write_text_batch(store, entries)
+  end
+
+  @doc """
+  Query text time series points for a single series (exact label match).
+
+  Returns `{:ok, [{timestamp, string_value}, ...]}`.
+  """
+  def query_text(store, metric_name, labels, opts \\ []) do
+    Engine.query_text(store, metric_name, labels, opts)
+  end
+
+  @doc """
+  Query text points across multiple series matching a label filter.
+
+  Returns `{:ok, [%{labels: %{...}, points: [{ts, string_value}, ...]}, ...]}`.
+  """
+  def query_text_multi(store, metric_name, label_filter \\ %{}, opts \\ []) do
+    Engine.query_text_multi(store, metric_name, label_filter, opts)
+  end
+
+  @doc """
+  Get the latest text value for a series.
+
+  Returns `{:ok, {timestamp, string_value}}` or `{:ok, nil}`.
+  """
+  def latest_text(store, metric_name, labels) do
+    Engine.latest_text(store, metric_name, labels)
+  end
+
   @doc """
   Merge multiple small compressed blocks into fewer, larger blocks across all series.
 

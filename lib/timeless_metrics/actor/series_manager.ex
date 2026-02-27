@@ -38,8 +38,11 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   @doc """
   Get or start a series process. Hot path uses ETS + Registry directly.
   Cold path (new series) goes through the GenServer.
+
+  The optional `series_type` parameter (`:numeric` or `:text`) is only used
+  when creating a new series. Existing series retain their original type.
   """
-  def get_or_start(manager, metric_name, labels) do
+  def get_or_start(manager, metric_name, labels, series_type \\ :numeric) do
     state_info = :persistent_term.get({__MODULE__, manager})
     index = state_info.index
     registry = state_info.registry
@@ -54,11 +57,11 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
           [] ->
             # Process died — restart via GenServer
-            GenServer.call(manager, {:start_series, series_id, metric_name, labels})
+            GenServer.call(manager, {:start_series, series_id, metric_name, labels, series_type})
         end
 
       [] ->
-        GenServer.call(manager, {:get_or_start, metric_name, labels})
+        GenServer.call(manager, {:get_or_start, metric_name, labels, series_type})
     end
   end
 
@@ -229,7 +232,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   end
 
   @impl true
-  def handle_call({:get_or_start, metric_name, labels}, _from, state) do
+  def handle_call({:get_or_start, metric_name, labels, series_type}, _from, state) do
     encoded = encode_labels(labels)
     key = {metric_name, encoded}
 
@@ -241,45 +244,51 @@ defmodule TimelessMetrics.Actor.SeriesManager do
             {:reply, {series_id, pid}, state}
 
           [] ->
-            {:reply, start_series_process(state, series_id, metric_name, labels), state}
+            {:reply, start_series_process(state, series_id, metric_name, labels, series_type),
+             state}
         end
 
       [] ->
         # Create in SQLite
         now = System.os_time(:second)
+        type_str = Atom.to_string(series_type)
 
         {:ok, [[series_id]]} =
           TimelessMetrics.DB.write(
             state.db,
-            "INSERT INTO series (metric_name, labels, created_at) VALUES (?1, ?2, ?3) ON CONFLICT(metric_name, labels) DO UPDATE SET created_at = created_at RETURNING id",
-            [metric_name, encoded, now]
+            "INSERT INTO series (metric_name, labels, created_at, series_type) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(metric_name, labels) DO UPDATE SET created_at = created_at RETURNING id",
+            [metric_name, encoded, now, type_str]
           )
 
         # Insert into ETS index
         :ets.insert(state.index, {key, series_id})
 
-        {:reply, start_series_process(state, series_id, metric_name, labels), state}
+        {:reply, start_series_process(state, series_id, metric_name, labels, series_type), state}
     end
   end
 
-  def handle_call({:start_series, series_id, metric_name, labels}, _from, state) do
-    {:reply, start_series_process(state, series_id, metric_name, labels), state}
+  def handle_call({:start_series, series_id, metric_name, labels, series_type}, _from, state) do
+    {:reply, start_series_process(state, series_id, metric_name, labels, series_type), state}
   end
 
   # --- Internals ---
 
   defp recover_series(state) do
     {:ok, rows} =
-      TimelessMetrics.DB.read(state.db, "SELECT id, metric_name, labels FROM series")
+      TimelessMetrics.DB.read(
+        state.db,
+        "SELECT id, metric_name, labels, series_type FROM series"
+      )
 
-    Enum.each(rows, fn [id, metric_name, encoded_labels] ->
+    Enum.each(rows, fn [id, metric_name, encoded_labels, type_str] ->
       labels = decode_labels(encoded_labels)
+      series_type = String.to_existing_atom(type_str)
       :ets.insert(state.index, {{metric_name, encoded_labels}, id})
-      start_series_process(state, id, metric_name, labels)
+      start_series_process(state, id, metric_name, labels, series_type)
     end)
   end
 
-  defp start_series_process(state, series_id, metric_name, labels) do
+  defp start_series_process(state, series_id, metric_name, labels, series_type) do
     child_spec = %{
       id: {:series, series_id},
       start:
@@ -299,7 +308,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
              merge_block_min_count: state.merge_block_min_count,
              merge_block_max_points: state.merge_block_max_points,
              merge_block_min_age_seconds: state.merge_block_min_age_seconds,
-             merge_interval: state.merge_interval
+             merge_interval: state.merge_interval,
+             series_type: series_type
            ]
          ]},
       restart: :transient

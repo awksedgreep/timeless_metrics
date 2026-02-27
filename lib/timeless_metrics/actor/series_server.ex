@@ -7,11 +7,14 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   persistence to disk, and query serving.
 
   Write path is `cast` (fire and forget). Read path is `call` (synchronous).
+
+  Supports both numeric (float64) and text (string) series, dispatched on
+  the `series_type` field.
   """
 
   use GenServer
 
-  alias TimelessMetrics.Actor.{Aggregation, BlockStore}
+  alias TimelessMetrics.Actor.{Aggregation, BlockStore, TextCodec}
 
   @flush_interval_ms 60_000
   @stale_check_ms 30_000
@@ -38,7 +41,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     last_write_at: nil,
     merge_block_min_count: 4,
     merge_block_max_points: 10_000,
-    merge_block_min_age_seconds: 300
+    merge_block_min_age_seconds: 300,
+    series_type: :numeric
   ]
 
   # --- Client API ---
@@ -69,6 +73,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     merge_block_max_points = Keyword.get(opts, :merge_block_max_points, 10_000)
     merge_block_min_age_seconds = Keyword.get(opts, :merge_block_min_age_seconds, 300)
     merge_interval = Keyword.get(opts, :merge_interval, @merge_check_ms)
+    series_type = Keyword.get(opts, :series_type, :numeric)
 
     state = %__MODULE__{
       series_id: series_id,
@@ -82,7 +87,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       compression: compression,
       merge_block_min_count: merge_block_min_count,
       merge_block_max_points: merge_block_max_points,
-      merge_block_min_age_seconds: merge_block_min_age_seconds
+      merge_block_min_age_seconds: merge_block_min_age_seconds,
+      series_type: series_type
     }
 
     # Load existing data from disk
@@ -138,6 +144,48 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     {:noreply, state}
   end
 
+  # Text write casts — same buffer mechanics, different cast name for clarity
+  def handle_cast({:write_text, ts, val}, state) do
+    state = %{
+      state
+      | raw_buffer: [{ts, val} | state.raw_buffer],
+        raw_count: state.raw_count + 1,
+        dirty: true,
+        last_write_at: System.monotonic_time(:millisecond)
+    }
+
+    state =
+      if state.raw_count >= state.block_size do
+        compress_buffer(state)
+      else
+        state
+      end
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:write_text_batch, points}, state) do
+    state =
+      Enum.reduce(points, state, fn {ts, val}, acc ->
+        %{
+          acc
+          | raw_buffer: [{ts, val} | acc.raw_buffer],
+            raw_count: acc.raw_count + 1
+        }
+      end)
+
+    state = %{state | dirty: true, last_write_at: System.monotonic_time(:millisecond)}
+
+    state =
+      if state.raw_count >= state.block_size do
+        compress_buffer(state)
+      else
+        state
+      end
+
+    {:noreply, state}
+  end
+
   @impl true
   def handle_call({:query_raw, from, to}, _from_pid, state) do
     points = query_raw_points(state, from, to)
@@ -145,10 +193,14 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   end
 
   def handle_call({:query_aggregate, from, to, bucket_spec, agg_fn}, _from_pid, state) do
-    bucket_seconds = Aggregation.bucket_to_seconds(bucket_spec)
-    points = query_raw_points(state, from, to)
-    buckets = Aggregation.bucket_points(points, bucket_seconds, agg_fn)
-    {:reply, {:ok, buckets}, state}
+    if state.series_type == :text and agg_fn not in [:last, :first, :count] do
+      {:reply, {:error, :unsupported_aggregation_for_text}, state}
+    else
+      bucket_seconds = Aggregation.bucket_to_seconds(bucket_spec)
+      points = query_raw_points(state, from, to)
+      buckets = Aggregation.bucket_points(points, bucket_seconds, agg_fn)
+      {:reply, {:ok, buckets}, state}
+    end
   end
 
   def handle_call(:latest, _from_pid, state) do
@@ -209,6 +261,11 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     }
 
     {:reply, stats, state}
+  end
+
+  def handle_call({:compute_daily, _from, _to}, _from_pid, %{series_type: :text} = state) do
+    # Text series don't participate in numeric daily rollups
+    {:reply, nil, state}
   end
 
   def handle_call({:compute_daily, from, to}, _from_pid, state) do
@@ -322,7 +379,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
     {merged_blocks, dirty?} =
       Enum.reduce(batches, {[], false}, fn batch, {acc, dirty} ->
-        case merge_batch(batch, state.compression) do
+        case merge_batch(batch, state.compression, state.series_type) do
           {:ok, merged_block} -> {[merged_block | acc], true}
           :noop -> {Enum.reverse(batch) ++ acc, dirty}
         end
@@ -366,11 +423,46 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     Enum.reverse(all)
   end
 
-  defp merge_batch({:passthrough, block}, _compression), do: {:ok, block}
+  defp merge_batch({:passthrough, block}, _compression, _series_type), do: {:ok, block}
 
-  defp merge_batch(batch, _compression) when is_list(batch) and length(batch) < 2, do: :noop
+  defp merge_batch(batch, _compression, _series_type) when is_list(batch) and length(batch) < 2,
+    do: :noop
 
-  defp merge_batch(batch, compression) when is_list(batch) do
+  defp merge_batch(batch, _compression, :text) when is_list(batch) do
+    all_points =
+      Enum.flat_map(batch, fn block ->
+        case TextCodec.decompress(block.data) do
+          {:ok, points} -> points
+          {:error, _} -> []
+        end
+      end)
+
+    if all_points == [] do
+      :noop
+    else
+      sorted = Enum.sort_by(all_points, &elem(&1, 0))
+
+      case TextCodec.compress(sorted) do
+        {:ok, data} ->
+          {first_ts, _} = List.first(sorted)
+          {last_ts, _} = List.last(sorted)
+
+          merged = %{
+            start_ts: first_ts,
+            end_ts: last_ts,
+            point_count: length(sorted),
+            data: data
+          }
+
+          {:ok, merged}
+
+        {:error, _} ->
+          :noop
+      end
+    end
+  end
+
+  defp merge_batch(batch, compression, :numeric) when is_list(batch) do
     all_points =
       Enum.flat_map(batch, fn block ->
         case GorillaStream.decompress(block.data, compression: compression) do
@@ -405,6 +497,46 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   end
 
   defp compress_buffer(%{raw_count: 0} = state), do: state
+
+  defp compress_buffer(%{series_type: :text} = state) do
+    sorted = Enum.sort_by(state.raw_buffer, &elem(&1, 0))
+
+    case TextCodec.compress(sorted) do
+      {:ok, data} ->
+        {first_ts, _} = List.first(sorted)
+        {last_ts, _} = List.last(sorted)
+
+        block = %{
+          start_ts: first_ts,
+          end_ts: last_ts,
+          point_count: state.raw_count,
+          data: data
+        }
+
+        blocks = :queue.in(block, state.blocks)
+        block_count = state.block_count + 1
+
+        {blocks, block_count} =
+          if block_count > state.max_blocks do
+            {{:value, _dropped}, remaining} = :queue.out(blocks)
+            {remaining, block_count - 1}
+          else
+            {blocks, block_count}
+          end
+
+        %{
+          state
+          | blocks: blocks,
+            block_count: block_count,
+            raw_buffer: [],
+            raw_count: 0,
+            dirty: true
+        }
+
+      {:error, _reason} ->
+        state
+    end
+  end
 
   defp compress_buffer(state) do
     sorted = Enum.sort_by(state.raw_buffer, &elem(&1, 0))
@@ -447,6 +579,29 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     end
   end
 
+  defp query_raw_points(%{series_type: :text} = state, from, to) do
+    block_points =
+      state.blocks
+      |> :queue.to_list()
+      |> Enum.filter(fn block -> block.end_ts >= from and block.start_ts <= to end)
+      |> Enum.flat_map(fn block ->
+        case TextCodec.decompress(block.data) do
+          {:ok, points} ->
+            Enum.filter(points, fn {ts, _} -> ts >= from and ts <= to end)
+
+          {:error, _} ->
+            []
+        end
+      end)
+
+    raw_points =
+      state.raw_buffer
+      |> Enum.filter(fn {ts, _} -> ts >= from and ts <= to end)
+
+    (block_points ++ raw_points)
+    |> Enum.sort_by(&elem(&1, 0))
+  end
+
   defp query_raw_points(state, from, to) do
     # Decompress overlapping blocks
     block_points =
@@ -471,6 +626,28 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     # Merge and sort
     (block_points ++ raw_points)
     |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp get_latest(%{series_type: :text} = state) do
+    case state.raw_buffer do
+      [] ->
+        case :queue.peek_r(state.blocks) do
+          {:value, block} ->
+            case TextCodec.decompress(block.data) do
+              {:ok, points} ->
+                points |> Enum.max_by(&elem(&1, 0))
+
+              {:error, _} ->
+                nil
+            end
+
+          :empty ->
+            nil
+        end
+
+      buffer ->
+        Enum.max_by(buffer, &elem(&1, 0))
+    end
   end
 
   defp get_latest(state) do
@@ -501,7 +678,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     path = BlockStore.series_path(state.data_dir, state.series_id)
 
     case BlockStore.read(path) do
-      {:ok, {blocks, raw_buffer}} ->
+      {:ok, {blocks, raw_buffer, _series_type}} ->
         block_count = :queue.len(blocks)
 
         %{
@@ -536,7 +713,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
   defp flush_to_disk(state) do
     path = BlockStore.series_path(state.data_dir, state.series_id)
-    BlockStore.write(path, state.blocks, state.raw_buffer)
+    BlockStore.write(path, state.blocks, state.raw_buffer, series_type: state.series_type)
     %{state | dirty: false}
   end
 end
