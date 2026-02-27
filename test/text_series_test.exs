@@ -15,15 +15,17 @@ defmodule TimelessMetrics.TextSeriesTest do
   test "write text and query text round-trip" do
     now = System.os_time(:second)
 
-    TimelessMetrics.write_text(:text_test_store, "sysDescr", %{"host" => "router1"},
-      "Cisco IOS 15.2",
-      timestamp: now
-    )
+    TimelessMetrics.write_text(
+      :text_test_store,
+      "sysDescr",
+      %{"host" => "router1"},
+      "Cisco IOS 15.2", timestamp: now)
 
-    TimelessMetrics.write_text(:text_test_store, "sysDescr", %{"host" => "router1"},
-      "Cisco IOS 15.2",
-      timestamp: now + 60
-    )
+    TimelessMetrics.write_text(
+      :text_test_store,
+      "sysDescr",
+      %{"host" => "router1"},
+      "Cisco IOS 15.2", timestamp: now + 60)
 
     TimelessMetrics.flush(:text_test_store)
 
@@ -70,8 +72,7 @@ defmodule TimelessMetrics.TextSeriesTest do
   test "text persistence across restart" do
     now = System.os_time(:second)
 
-    TimelessMetrics.write_text(:text_test_store, "firmware", %{"device" => "sw1"},
-      "v3.2.1",
+    TimelessMetrics.write_text(:text_test_store, "firmware", %{"device" => "sw1"}, "v3.2.1",
       timestamp: now
     )
 
@@ -80,9 +81,7 @@ defmodule TimelessMetrics.TextSeriesTest do
     # Stop and restart
     stop_supervised!({TimelessMetrics, :text_test_store})
 
-    :persistent_term.erase(
-      {TimelessMetrics.Actor.SeriesManager, :text_test_store_actor_manager}
-    )
+    :persistent_term.erase({TimelessMetrics.Actor.SeriesManager, :text_test_store_actor_manager})
 
     start_supervised!(
       {TimelessMetrics, name: :text_test_store, data_dir: @data_dir, engine: :actor}
@@ -161,13 +160,11 @@ defmodule TimelessMetrics.TextSeriesTest do
   test "latest_text" do
     now = System.os_time(:second)
 
-    TimelessMetrics.write_text(:text_test_store, "status", %{"id" => "1"},
-      "initializing",
+    TimelessMetrics.write_text(:text_test_store, "status", %{"id" => "1"}, "initializing",
       timestamp: now
     )
 
-    TimelessMetrics.write_text(:text_test_store, "status", %{"id" => "1"},
-      "running",
+    TimelessMetrics.write_text(:text_test_store, "status", %{"id" => "1"}, "running",
       timestamp: now + 60
     )
 
@@ -181,20 +178,23 @@ defmodule TimelessMetrics.TextSeriesTest do
   test "query_text_multi with label filter" do
     now = System.os_time(:second)
 
-    TimelessMetrics.write_text(:text_test_store, "ifName", %{"host" => "sw1", "ifIndex" => "1"},
-      "Gi0/0",
-      timestamp: now
-    )
+    TimelessMetrics.write_text(
+      :text_test_store,
+      "ifName",
+      %{"host" => "sw1", "ifIndex" => "1"},
+      "Gi0/0", timestamp: now)
 
-    TimelessMetrics.write_text(:text_test_store, "ifName", %{"host" => "sw1", "ifIndex" => "2"},
-      "Gi0/1",
-      timestamp: now
-    )
+    TimelessMetrics.write_text(
+      :text_test_store,
+      "ifName",
+      %{"host" => "sw1", "ifIndex" => "2"},
+      "Gi0/1", timestamp: now)
 
-    TimelessMetrics.write_text(:text_test_store, "ifName", %{"host" => "sw2", "ifIndex" => "1"},
-      "Fa0/0",
-      timestamp: now
-    )
+    TimelessMetrics.write_text(
+      :text_test_store,
+      "ifName",
+      %{"host" => "sw2", "ifIndex" => "1"},
+      "Fa0/0", timestamp: now)
 
     TimelessMetrics.flush(:text_test_store)
 
@@ -220,8 +220,7 @@ defmodule TimelessMetrics.TextSeriesTest do
     )
 
     # Write text
-    TimelessMetrics.write_text(:text_test_store, "sysDescr", %{"host" => "web1"},
-      "Linux 5.15",
+    TimelessMetrics.write_text(:text_test_store, "sysDescr", %{"host" => "web1"}, "Linux 5.15",
       timestamp: now
     )
 
@@ -249,8 +248,7 @@ defmodule TimelessMetrics.TextSeriesTest do
   test "text series skipped in daily rollup" do
     now = System.os_time(:second)
     # Write to a text series
-    TimelessMetrics.write_text(:text_test_store, "text_metric", %{"id" => "1"},
-      "hello",
+    TimelessMetrics.write_text(:text_test_store, "text_metric", %{"id" => "1"}, "hello",
       timestamp: now
     )
 
