@@ -19,13 +19,17 @@ defmodule TimelessMetrics.TextSeriesTest do
       :text_test_store,
       "sysDescr",
       %{"host" => "router1"},
-      "Cisco IOS 15.2", timestamp: now)
+      "Cisco IOS 15.2",
+      timestamp: now
+    )
 
     TimelessMetrics.write_text(
       :text_test_store,
       "sysDescr",
       %{"host" => "router1"},
-      "Cisco IOS 15.2", timestamp: now + 60)
+      "Cisco IOS 15.2",
+      timestamp: now + 60
+    )
 
     TimelessMetrics.flush(:text_test_store)
 
@@ -182,19 +186,25 @@ defmodule TimelessMetrics.TextSeriesTest do
       :text_test_store,
       "ifName",
       %{"host" => "sw1", "ifIndex" => "1"},
-      "Gi0/0", timestamp: now)
+      "Gi0/0",
+      timestamp: now
+    )
 
     TimelessMetrics.write_text(
       :text_test_store,
       "ifName",
       %{"host" => "sw1", "ifIndex" => "2"},
-      "Gi0/1", timestamp: now)
+      "Gi0/1",
+      timestamp: now
+    )
 
     TimelessMetrics.write_text(
       :text_test_store,
       "ifName",
       %{"host" => "sw2", "ifIndex" => "1"},
-      "Fa0/0", timestamp: now)
+      "Fa0/0",
+      timestamp: now
+    )
 
     TimelessMetrics.flush(:text_test_store)
 
