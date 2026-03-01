@@ -253,7 +253,9 @@ defmodule TimelessMetrics.VMetricsCompatTest do
           :vmc,
           "http_requests",
           %{"host" => "web-1", "method" => "GET"},
-          i * 10.0, timestamp: now - (9 - i) * 60)
+          i * 10.0,
+          timestamp: now - (9 - i) * 60
+        )
       end
 
       for i <- 0..9 do
@@ -261,7 +263,9 @@ defmodule TimelessMetrics.VMetricsCompatTest do
           :vmc,
           "http_requests",
           %{"host" => "web-2", "method" => "GET"},
-          i * 5.0, timestamp: now - (9 - i) * 60)
+          i * 5.0,
+          timestamp: now - (9 - i) * 60
+        )
       end
 
       TimelessMetrics.flush(:vmc)
@@ -829,13 +833,17 @@ defmodule TimelessMetrics.VMetricsCompatTest do
           :vmc,
           "ifHCInOctets",
           %{"host" => "router-1", "ifIndex" => "1"},
-          (i + 1) * 1000.0, timestamp: now - (4 - i) * 60)
+          (i + 1) * 1000.0,
+          timestamp: now - (4 - i) * 60
+        )
 
         TimelessMetrics.write(
           :vmc,
           "ifHCInOctets",
           %{"host" => "router-2", "ifIndex" => "1"},
-          (i + 1) * 500.0, timestamp: now - (4 - i) * 60)
+          (i + 1) * 500.0,
+          timestamp: now - (4 - i) * 60
+        )
       end
 
       TimelessMetrics.flush(:vmc)
