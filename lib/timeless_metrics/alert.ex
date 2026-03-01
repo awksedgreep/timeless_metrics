@@ -19,7 +19,7 @@ defmodule TimelessMetrics.Alert do
   def create_rule(db, opts) do
     name = Keyword.fetch!(opts, :name)
     metric = Keyword.fetch!(opts, :metric)
-    labels = Keyword.get(opts, :labels, %{}) |> Jason.encode!()
+    labels = Keyword.get(opts, :labels, %{}) |> :json.encode() |> IO.iodata_to_binary()
     condition = to_string(Keyword.fetch!(opts, :condition))
     threshold = Keyword.fetch!(opts, :threshold) * 1.0
     duration = Keyword.get(opts, :duration, 0)
@@ -89,7 +89,7 @@ defmodule TimelessMetrics.Alert do
         states =
           Enum.map(state_rows, fn [series_labels, state, triggered_at, last_value] ->
             %{
-              series_labels: Jason.decode!(series_labels),
+              series_labels: :json.decode(series_labels),
               state: state,
               triggered_at: triggered_at,
               last_value: last_value
@@ -100,7 +100,7 @@ defmodule TimelessMetrics.Alert do
           id: id,
           name: name,
           metric: metric,
-          labels: Jason.decode!(labels || "{}"),
+          labels: :json.decode(labels || "{}"),
           condition: condition,
           threshold: threshold,
           duration: duration,
@@ -133,7 +133,7 @@ defmodule TimelessMetrics.Alert do
 
         val =
           case key do
-            "labels" -> Jason.encode!(v)
+            "labels" -> :json.encode(v) |> IO.iodata_to_binary()
             "condition" -> to_string(v)
             "aggregate" -> to_string(v)
             "threshold" -> v * 1.0
@@ -225,7 +225,7 @@ defmodule TimelessMetrics.Alert do
 
       if value != nil do
         breaching = check_condition(value, rule.condition, rule.threshold)
-        series_key = Jason.encode!(labels)
+        series_key = :json.encode(labels) |> IO.iodata_to_binary()
         update_state(db, rule, series_key, labels, value, breaching, now)
       end
     end)
@@ -401,7 +401,7 @@ defmodule TimelessMetrics.Alert do
           rule_id: rule_id,
           rule_name: rule_name,
           metric: metric,
-          series_labels: Jason.decode!(series_labels),
+          series_labels: :json.decode(series_labels),
           state: state,
           value: value,
           threshold: threshold,
@@ -481,7 +481,7 @@ defmodule TimelessMetrics.Alert do
     chart_url = "chart?metric=#{rule.metric}&#{label_params}&from=-1h&theme=auto"
 
     payload =
-      Jason.encode!(%{
+      :json.encode(%{
         alert: rule.name,
         metric: rule.metric,
         labels: labels,
@@ -493,6 +493,7 @@ defmodule TimelessMetrics.Alert do
         triggered_at: timestamp,
         url: chart_url
       })
+      |> IO.iodata_to_binary()
 
     # Fire and forget — don't block the alert loop on webhook delivery
     Task.start(fn ->

@@ -1,7 +1,7 @@
 defmodule TimelessMetrics.MixProject do
   use Mix.Project
 
-  @version "3.0.4"
+  @version "3.0.5"
 
   def project do
     [
@@ -68,7 +68,6 @@ defmodule TimelessMetrics.MixProject do
       {:ezstd, "~> 1.2"},
       {:bandit, "~> 1.6"},
       {:plug, "~> 1.16"},
-      {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
       {:elixir_make, "~> 0.9", runtime: false},
       {:cc_precompiler, "~> 0.1", runtime: false}

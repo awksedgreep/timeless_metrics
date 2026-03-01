@@ -134,17 +134,18 @@ defmodule TimelessMetrics.ScraperTest do
         Plug.Test.conn(
           :post,
           "/api/v1/scrape_targets",
-          Jason.encode!(%{
+          :json.encode(%{
             job_name: "http_test",
             address: "localhost:9999",
             scrape_interval: 300
           })
+          |> IO.iodata_to_binary()
         )
         |> Plug.Conn.put_req_header("content-type", "application/json")
         |> TimelessMetrics.HTTP.call(store: :scraper_test)
 
       assert conn.status == 201
-      result = Jason.decode!(conn.resp_body)
+      result = :json.decode(conn.resp_body)
       id = result["id"]
       assert is_integer(id)
 
@@ -154,7 +155,7 @@ defmodule TimelessMetrics.ScraperTest do
         |> TimelessMetrics.HTTP.call(store: :scraper_test)
 
       assert conn.status == 200
-      result = Jason.decode!(conn.resp_body)
+      result = :json.decode(conn.resp_body)
       assert length(result["data"]) == 1
       assert List.first(result["data"])["job_name"] == "http_test"
 
@@ -164,7 +165,7 @@ defmodule TimelessMetrics.ScraperTest do
         |> TimelessMetrics.HTTP.call(store: :scraper_test)
 
       assert conn.status == 200
-      result = Jason.decode!(conn.resp_body)
+      result = :json.decode(conn.resp_body)
       assert result["job_name"] == "http_test"
 
       # Update
@@ -172,11 +173,12 @@ defmodule TimelessMetrics.ScraperTest do
         Plug.Test.conn(
           :put,
           "/api/v1/scrape_targets/#{id}",
-          Jason.encode!(%{
+          :json.encode(%{
             job_name: "http_test_updated",
             address: "localhost:9998",
             scrape_interval: 60
           })
+          |> IO.iodata_to_binary()
         )
         |> Plug.Conn.put_req_header("content-type", "application/json")
         |> TimelessMetrics.HTTP.call(store: :scraper_test)
@@ -188,7 +190,7 @@ defmodule TimelessMetrics.ScraperTest do
         Plug.Test.conn(:get, "/api/v1/scrape_targets/#{id}")
         |> TimelessMetrics.HTTP.call(store: :scraper_test)
 
-      result = Jason.decode!(conn.resp_body)
+      result = :json.decode(conn.resp_body)
       assert result["job_name"] == "http_test_updated"
       assert result["address"] == "localhost:9998"
 
@@ -204,7 +206,7 @@ defmodule TimelessMetrics.ScraperTest do
         Plug.Test.conn(:get, "/api/v1/scrape_targets")
         |> TimelessMetrics.HTTP.call(store: :scraper_test)
 
-      result = Jason.decode!(conn.resp_body)
+      result = :json.decode(conn.resp_body)
       assert result["data"] == []
     end
 
@@ -226,7 +228,7 @@ defmodule TimelessMetrics.ScraperTest do
       assert conn.status == 200
       assert {"content-type", "application/json; charset=utf-8"} in conn.resp_headers
 
-      spec = Jason.decode!(conn.resp_body)
+      spec = :json.decode(conn.resp_body)
       assert spec["openapi"] == "3.1.0"
       assert spec["info"]["title"] == "TimelessMetrics API"
       assert Map.has_key?(spec["paths"], "/api/v1/scrape_targets")

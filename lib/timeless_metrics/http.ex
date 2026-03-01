@@ -162,7 +162,7 @@ defmodule TimelessMetrics.HTTP do
           |> put_resp_content_type("application/json")
           |> send_resp(
             200,
-            Jason.encode!(%{
+            json_encode!(%{
               samples: count,
               errors: errors,
               failed_lines: error_samples
@@ -175,12 +175,12 @@ defmodule TimelessMetrics.HTTP do
       {:more, _partial, conn} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(413, Jason.encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
+        |> send_resp(413, json_encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
 
       {:error, reason} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(400, Jason.encode!(%{error: to_string(reason)}))
+        |> send_resp(400, json_encode!(%{error: to_string(reason)}))
     end
   end
 
@@ -203,7 +203,7 @@ defmodule TimelessMetrics.HTTP do
           |> put_resp_content_type("application/json")
           |> send_resp(
             200,
-            Jason.encode!(%{
+            json_encode!(%{
               samples: count,
               errors: errors,
               failed_lines: error_samples
@@ -216,12 +216,12 @@ defmodule TimelessMetrics.HTTP do
       {:more, _partial, conn} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(413, Jason.encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
+        |> send_resp(413, json_encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
 
       {:error, reason} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(400, Jason.encode!(%{error: to_string(reason)}))
+        |> send_resp(400, json_encode!(%{error: to_string(reason)}))
     end
   end
 
@@ -231,7 +231,7 @@ defmodule TimelessMetrics.HTTP do
     info = TimelessMetrics.info(store)
 
     body =
-      Jason.encode!(%{
+      json_encode!(%{
         status: "ok",
         series: info.series_count,
         points: info.total_points,
@@ -255,8 +255,8 @@ defmodule TimelessMetrics.HTTP do
           nil
 
         {:ok, body, _} ->
-          case Jason.decode(body) do
-            {:ok, %{"path" => path}} when is_binary(path) and path != "" -> path
+          case safe_json_decode(body) do
+            %{"path" => path} when is_binary(path) and path != "" -> path
             _ -> nil
           end
 
@@ -273,7 +273,7 @@ defmodule TimelessMetrics.HTTP do
     |> put_resp_content_type("application/json")
     |> send_resp(
       200,
-      Jason.encode!(%{
+      json_encode!(%{
         status: "ok",
         path: result.path,
         files: result.files,
@@ -296,7 +296,7 @@ defmodule TimelessMetrics.HTTP do
           |> Enum.map(fn %{labels: l, points: pts} ->
             {timestamps, values} = Enum.unzip(pts)
 
-            Jason.encode!(%{
+            json_encode!(%{
               metric: Map.put(l, "__name__", metric),
               values: values,
               timestamps: timestamps
@@ -333,8 +333,8 @@ defmodule TimelessMetrics.HTTP do
 
         body =
           case data do
-            [single] -> Jason.encode!(single)
-            multiple -> Jason.encode!(%{data: multiple})
+            [single] -> json_encode!(single)
+            multiple -> json_encode!(%{data: multiple})
           end
 
         conn
@@ -368,7 +368,7 @@ defmodule TimelessMetrics.HTTP do
 
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(200, Jason.encode!(response))
+          |> send_resp(200, json_encode!(response))
 
         {:error, reason} ->
           json_error(conn, 400, "PromQL parse error: #{reason}")
@@ -467,7 +467,7 @@ defmodule TimelessMetrics.HTTP do
 
           conn
           |> put_resp_content_type("application/json")
-          |> send_resp(200, Jason.encode!(body))
+          |> send_resp(200, json_encode!(body))
 
         {:error, msg} ->
           json_error(conn, 400, msg)
@@ -482,7 +482,7 @@ defmodule TimelessMetrics.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{status: "success", data: metrics}))
+    |> send_resp(200, json_encode!(%{status: "success", data: metrics}))
   end
 
   # List values for a specific label key
@@ -497,7 +497,7 @@ defmodule TimelessMetrics.HTTP do
 
       conn
       |> put_resp_content_type("application/json")
-      |> send_resp(200, Jason.encode!(%{status: "success", data: values}))
+      |> send_resp(200, json_encode!(%{status: "success", data: values}))
     else
       json_error(conn, 400, "missing required parameter: metric")
     end
@@ -517,7 +517,7 @@ defmodule TimelessMetrics.HTTP do
 
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(%{status: "success", data: series}))
+        |> send_resp(200, json_encode!(%{status: "success", data: series}))
     end
   end
 
@@ -527,8 +527,8 @@ defmodule TimelessMetrics.HTTP do
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
-        case Jason.decode(body) do
-          {:ok, %{"metric" => metric, "type" => type} = params}
+        case safe_json_decode(body) do
+          %{"metric" => metric, "type" => type} = params
           when type in ~w(gauge counter histogram) ->
             TimelessMetrics.register_metric(store, metric, String.to_existing_atom(type),
               unit: params["unit"],
@@ -537,9 +537,9 @@ defmodule TimelessMetrics.HTTP do
 
             conn
             |> put_resp_content_type("application/json")
-            |> send_resp(200, Jason.encode!(%{status: "ok"}))
+            |> send_resp(200, json_encode!(%{status: "ok"}))
 
-          {:ok, %{"metric" => _}} ->
+          %{"metric" => _} ->
             json_error(conn, 400, "type must be one of: gauge, counter, histogram")
 
           _ ->
@@ -568,7 +568,7 @@ defmodule TimelessMetrics.HTTP do
           |> put_resp_content_type("application/json")
           |> send_resp(
             200,
-            Jason.encode!(%{
+            json_encode!(%{
               metric: metric,
               type: meta.type,
               unit: meta.unit,
@@ -580,7 +580,7 @@ defmodule TimelessMetrics.HTTP do
           |> put_resp_content_type("application/json")
           |> send_resp(
             200,
-            Jason.encode!(%{metric: metric, type: "gauge", unit: nil, description: nil})
+            json_encode!(%{metric: metric, type: "gauge", unit: nil, description: nil})
           )
         end
     end
@@ -592,8 +592,8 @@ defmodule TimelessMetrics.HTTP do
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
-        case Jason.decode(body) do
-          {:ok, %{"title" => title} = params} ->
+        case safe_json_decode(body) do
+          %{"title" => title} = params ->
             timestamp = params["timestamp"] || System.os_time(:second)
             tags = params["tags"] || []
             description = params["description"]
@@ -606,7 +606,7 @@ defmodule TimelessMetrics.HTTP do
 
             conn
             |> put_resp_content_type("application/json")
-            |> send_resp(201, Jason.encode!(%{id: id, status: "created"}))
+            |> send_resp(201, json_encode!(%{id: id, status: "created"}))
 
           _ ->
             json_error(conn, 400, "invalid JSON: requires title field")
@@ -637,7 +637,7 @@ defmodule TimelessMetrics.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{data: results}))
+    |> send_resp(200, json_encode!(%{data: results}))
   end
 
   # Delete an annotation
@@ -648,7 +648,7 @@ defmodule TimelessMetrics.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{status: "deleted"}))
+    |> send_resp(200, json_encode!(%{status: "deleted"}))
   end
 
   # Create an alert rule
@@ -657,14 +657,13 @@ defmodule TimelessMetrics.HTTP do
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
-        case Jason.decode(body) do
-          {:ok,
-           %{
-             "name" => name,
-             "metric" => metric,
-             "condition" => cond_str,
-             "threshold" => threshold
-           } = params}
+        case safe_json_decode(body) do
+          %{
+            "name" => name,
+            "metric" => metric,
+            "condition" => cond_str,
+            "threshold" => threshold
+          } = params
           when cond_str in ~w(above below) and is_number(threshold) ->
             opts = [
               name: name,
@@ -681,7 +680,7 @@ defmodule TimelessMetrics.HTTP do
 
             conn
             |> put_resp_content_type("application/json")
-            |> send_resp(201, Jason.encode!(%{id: id, status: "created"}))
+            |> send_resp(201, json_encode!(%{id: id, status: "created"}))
 
           _ ->
             json_error(
@@ -703,7 +702,7 @@ defmodule TimelessMetrics.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{data: rules}))
+    |> send_resp(200, json_encode!(%{data: rules}))
   end
 
   # Delete an alert rule
@@ -714,7 +713,7 @@ defmodule TimelessMetrics.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{status: "deleted"}))
+    |> send_resp(200, json_encode!(%{status: "deleted"}))
   end
 
   # Forecast future values
@@ -755,7 +754,7 @@ defmodule TimelessMetrics.HTTP do
 
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(%{metric: metric, series: forecasts}))
+        |> send_resp(200, json_encode!(%{metric: metric, series: forecasts}))
 
       {:error, msg} ->
         json_error(conn, 400, msg)
@@ -793,7 +792,7 @@ defmodule TimelessMetrics.HTTP do
 
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(%{metric: metric, series: detections}))
+        |> send_resp(200, json_encode!(%{metric: metric, series: detections}))
 
       {:error, msg} ->
         json_error(conn, 400, msg)
@@ -910,7 +909,7 @@ defmodule TimelessMetrics.HTTP do
           |> put_resp_content_type("application/json")
           |> send_resp(
             200,
-            Jason.encode!(%{
+            json_encode!(%{
               samples: count,
               errors: errors,
               failed_lines: error_samples
@@ -923,7 +922,7 @@ defmodule TimelessMetrics.HTTP do
       {:more, _partial, conn} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(413, Jason.encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
+        |> send_resp(413, json_encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
 
       {:error, reason} ->
         json_error(conn, 400, to_string(reason))
@@ -953,7 +952,163 @@ defmodule TimelessMetrics.HTTP do
 
             conn
             |> put_resp_content_type("application/json")
-            |> send_resp(200, Jason.encode!(response))
+            |> send_resp(200, json_encode!(response))
+
+          {:error, reason} ->
+            json_error(conn, 400, "PromQL parse error: #{reason}")
+        end
+    end
+  end
+
+  # Prometheus-compatible instant query endpoint (for Grafana health check + current-value panels)
+  get "/prometheus/api/v1/query" do
+    store = conn.private.timeless_metrics
+    conn = Plug.Conn.fetch_query_params(conn)
+    params = conn.query_params
+
+    case params["query"] do
+      nil ->
+        json_error(conn, 400, "missing required parameter: query")
+
+      query ->
+        now = System.os_time(:second)
+        time = parse_prom_time(params["time"], now)
+        start_ts = time - 300
+        end_ts = time
+        step = 300
+
+        case TimelessMetrics.PromQL.parse(query) do
+          {:ok, plan} ->
+            {:ok, response} =
+              TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
+
+            # Convert matrix results to vector (take last value from each series)
+            vector_results =
+              Enum.map(response["data"]["result"], fn series ->
+                case List.last(series["values"]) do
+                  [ts, val] -> %{"metric" => series["metric"], "value" => [ts, val]}
+                  _ -> %{"metric" => series["metric"], "value" => [end_ts, "0"]}
+                end
+              end)
+
+            vector_response = %{
+              "status" => "success",
+              "data" => %{"resultType" => "vector", "result" => vector_results}
+            }
+
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, json_encode!(vector_response))
+
+          {:error, reason} ->
+            json_error(conn, 400, "PromQL parse error: #{reason}")
+        end
+    end
+  end
+
+  # Prometheus-compatible labels endpoint (for Grafana label autocomplete)
+  get "/prometheus/api/v1/labels" do
+    store = conn.private.timeless_metrics
+    {:ok, metrics} = TimelessMetrics.list_metrics(store)
+
+    label_names =
+      metrics
+      |> Enum.flat_map(fn metric ->
+        case TimelessMetrics.list_series(store, metric) do
+          {:ok, series} -> Enum.flat_map(series, fn %{labels: l} -> Map.keys(l) end)
+          _ -> []
+        end
+      end)
+      |> MapSet.new()
+      |> MapSet.put("__name__")
+      |> MapSet.to_list()
+      |> Enum.sort()
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, json_encode!(%{"status" => "success", "data" => label_names}))
+  end
+
+  # Prometheus-compatible label values endpoint (no metric= param required)
+  get "/prometheus/api/v1/label/:name/values" do
+    store = conn.private.timeless_metrics
+    label_name = conn.path_params["name"]
+
+    values =
+      if label_name == "__name__" do
+        {:ok, metrics} = TimelessMetrics.list_metrics(store)
+        metrics
+      else
+        {:ok, metrics} = TimelessMetrics.list_metrics(store)
+
+        metrics
+        |> Enum.flat_map(fn metric ->
+          case TimelessMetrics.label_values(store, metric, label_name) do
+            {:ok, vals} -> vals
+            _ -> []
+          end
+        end)
+        |> Enum.uniq()
+        |> Enum.sort()
+      end
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, json_encode!(%{"status" => "success", "data" => values}))
+  end
+
+  # Prometheus-compatible series endpoint (accepts match[] param)
+  get "/prometheus/api/v1/series" do
+    store = conn.private.timeless_metrics
+    conn = Plug.Conn.fetch_query_params(conn)
+    params = conn.query_params
+
+    match_param =
+      case params["match[]"] || params["match"] do
+        [first | _] -> first
+        other -> other
+      end
+
+    case match_param do
+      nil ->
+        json_error(conn, 400, "missing required parameter: match[]")
+
+      match_query ->
+        case TimelessMetrics.PromQL.parse(match_query) do
+          {:ok, plan} ->
+            metric_names =
+              case {plan.metric, plan.metric_pattern} do
+                {name, nil} when is_binary(name) ->
+                  [name]
+
+                {nil, pattern} when is_binary(pattern) ->
+                  {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
+                  {:ok, regex} = Regex.compile("^(?:" <> pattern <> ")$")
+                  Enum.filter(all_metrics, &Regex.match?(regex, &1))
+
+                _ ->
+                  {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
+                  all_metrics
+              end
+
+            series =
+              Enum.flat_map(metric_names, fn metric ->
+                case TimelessMetrics.list_series(store, metric) do
+                  {:ok, series_list} ->
+                    label_maps = Enum.map(series_list, fn %{labels: l} -> l end)
+
+                    label_maps
+                    |> filter_series_by_labels(plan.labels)
+                    |> Enum.map(&Map.put(&1, "__name__", metric))
+
+                  _ ->
+                    []
+                end
+              end)
+
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(200, json_encode!(%{"status" => "success", "data" => series}))
 
           {:error, reason} ->
             json_error(conn, 400, "PromQL parse error: #{reason}")
@@ -1012,13 +1167,13 @@ defmodule TimelessMetrics.HTTP do
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
-        case Jason.decode(body) do
-          {:ok, params} when is_map(params) ->
+        case safe_json_decode(body) do
+          params when is_map(params) ->
             case TimelessMetrics.Scraper.add_target(scraper, params) do
               {:ok, id} ->
                 conn
                 |> put_resp_content_type("application/json")
-                |> send_resp(201, Jason.encode!(%{id: id, status: "created"}))
+                |> send_resp(201, json_encode!(%{id: id, status: "created"}))
 
               {:error, reason} ->
                 json_error(conn, 400, to_string(reason))
@@ -1041,7 +1196,7 @@ defmodule TimelessMetrics.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{data: targets}))
+    |> send_resp(200, json_encode!(%{data: targets}))
   end
 
   # Get a single scrape target with health
@@ -1054,7 +1209,7 @@ defmodule TimelessMetrics.HTTP do
       {:ok, target} ->
         conn
         |> put_resp_content_type("application/json")
-        |> send_resp(200, Jason.encode!(target))
+        |> send_resp(200, json_encode!(target))
 
       {:error, :not_found} ->
         json_error(conn, 404, "target not found")
@@ -1069,13 +1224,13 @@ defmodule TimelessMetrics.HTTP do
 
     case Plug.Conn.read_body(conn, length: 64_000) do
       {:ok, body, conn} ->
-        case Jason.decode(body) do
-          {:ok, params} when is_map(params) ->
+        case safe_json_decode(body) do
+          params when is_map(params) ->
             case TimelessMetrics.Scraper.update_target(scraper, target_id, params) do
               :ok ->
                 conn
                 |> put_resp_content_type("application/json")
-                |> send_resp(200, Jason.encode!(%{status: "updated"}))
+                |> send_resp(200, json_encode!(%{status: "updated"}))
 
               {:error, reason} ->
                 json_error(conn, 400, to_string(reason))
@@ -1099,7 +1254,7 @@ defmodule TimelessMetrics.HTTP do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, Jason.encode!(%{status: "deleted"}))
+    |> send_resp(200, json_encode!(%{status: "deleted"}))
   end
 
   # Prometheus exposition format endpoint for self-scraping
@@ -1347,6 +1502,40 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
+  defp filter_series_by_labels(series_list, labels) when map_size(labels) == 0, do: series_list
+
+  defp filter_series_by_labels(series_list, labels) do
+    Enum.filter(series_list, fn series_labels ->
+      Enum.all?(labels, fn
+        {key, {:regex, pattern}} ->
+          case Map.get(series_labels, key) do
+            nil ->
+              false
+
+            val ->
+              {:ok, regex} = Regex.compile("^(?:" <> pattern <> ")$")
+              Regex.match?(regex, val)
+          end
+
+        {key, {:not_regex, pattern}} ->
+          case Map.get(series_labels, key) do
+            nil ->
+              true
+
+            val ->
+              {:ok, regex} = Regex.compile("^(?:" <> pattern <> ")$")
+              not Regex.match?(regex, val)
+          end
+
+        {key, {:not_equal, value}} ->
+          Map.get(series_labels, key) != value
+
+        {key, value} when is_binary(value) ->
+          Map.get(series_labels, key) == value
+      end)
+    end)
+  end
+
   defp parse_aggregate(nil), do: :avg
 
   defp parse_aggregate(agg) when agg in ~w(avg min max sum count last first rate),
@@ -1382,10 +1571,17 @@ defmodule TimelessMetrics.HTTP do
   defp parse_theme("light"), do: :light
   defp parse_theme(_), do: :auto
 
+  defp json_encode!(term), do: term |> nullify() |> :json.encode() |> IO.iodata_to_binary()
+
+  defp nullify(nil), do: :null
+  defp nullify(map) when is_map(map), do: Map.new(map, fn {k, v} -> {k, nullify(v)} end)
+  defp nullify(list) when is_list(list), do: Enum.map(list, &nullify/1)
+  defp nullify(other), do: other
+
   defp json_error(conn, status, msg) do
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(%{error: msg}))
+    |> send_resp(status, json_encode!(%{error: msg}))
   end
 
   defp scalar_html do

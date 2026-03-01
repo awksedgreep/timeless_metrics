@@ -125,7 +125,7 @@ defmodule TimelessMetrics.AlertTest do
       )
 
     # Manually set state to "firing" to simulate a previously-fired alert
-    series_key = Jason.encode!(%{"host" => "web-1"})
+    series_key = :json.encode(%{"host" => "web-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
       :alert_test_db,
@@ -217,19 +217,20 @@ defmodule TimelessMetrics.AlertTest do
       Plug.Test.conn(
         :post,
         "/api/v1/alerts",
-        Jason.encode!(%{
+        :json.encode(%{
           name: "HTTP Alert",
           metric: "cpu_usage",
           condition: "above",
           threshold: 80.0,
           webhook_url: "http://localhost:9999/hook"
         })
+        |> IO.iodata_to_binary()
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> TimelessMetrics.HTTP.call(store: :alert_test)
 
     assert conn.status == 201
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     id = result["id"]
     assert is_integer(id)
 
@@ -239,7 +240,7 @@ defmodule TimelessMetrics.AlertTest do
       |> TimelessMetrics.HTTP.call(store: :alert_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert length(result["data"]) == 1
     assert List.first(result["data"])["name"] == "HTTP Alert"
 
@@ -255,7 +256,7 @@ defmodule TimelessMetrics.AlertTest do
       Plug.Test.conn(:get, "/api/v1/alerts")
       |> TimelessMetrics.HTTP.call(store: :alert_test)
 
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert length(result["data"]) == 0
   end
 
@@ -294,7 +295,7 @@ defmodule TimelessMetrics.AlertTest do
     end
 
     # Manually set triggered_at to 6 minutes ago to simulate passage of time
-    series_key = Jason.encode!(%{"host" => "web-1"})
+    series_key = :json.encode(%{"host" => "web-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
       :alert_test_db,
@@ -343,7 +344,7 @@ defmodule TimelessMetrics.AlertTest do
     assert List.first(rule.states).state == "pending"
 
     # Simulate time passing by backdating triggered_at
-    series_key = Jason.encode!(%{"host" => "transition-1"})
+    series_key = :json.encode(%{"host" => "transition-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
       :alert_test_db,
@@ -382,7 +383,7 @@ defmodule TimelessMetrics.AlertTest do
       )
 
     # Manually set state to "firing"
-    series_key = Jason.encode!(%{"host" => "cleanup-1"})
+    series_key = :json.encode(%{"host" => "cleanup-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
       :alert_test_db,
@@ -428,7 +429,7 @@ defmodule TimelessMetrics.AlertTest do
       )
 
     # Manually set state to "resolved" (simulating previous resolution)
-    series_key = Jason.encode!(%{"host" => "retrigger-1"})
+    series_key = :json.encode(%{"host" => "retrigger-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
       :alert_test_db,

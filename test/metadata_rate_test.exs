@@ -51,12 +51,13 @@ defmodule TimelessMetrics.MetadataRateTest do
       Plug.Test.conn(
         :post,
         "/api/v1/metadata",
-        Jason.encode!(%{
+        :json.encode(%{
           metric: "disk_usage",
           type: "gauge",
           unit: "%",
           description: "Disk utilization"
         })
+        |> IO.iodata_to_binary()
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> TimelessMetrics.HTTP.call(store: :meta_test)
@@ -68,7 +69,7 @@ defmodule TimelessMetrics.MetadataRateTest do
       |> TimelessMetrics.HTTP.call(store: :meta_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["type"] == "gauge"
     assert result["unit"] == "%"
   end
@@ -78,10 +79,11 @@ defmodule TimelessMetrics.MetadataRateTest do
       Plug.Test.conn(
         :post,
         "/api/v1/metadata",
-        Jason.encode!(%{
+        :json.encode(%{
           metric: "foo",
           type: "invalid"
         })
+        |> IO.iodata_to_binary()
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> TimelessMetrics.HTTP.call(store: :meta_test)
@@ -95,9 +97,9 @@ defmodule TimelessMetrics.MetadataRateTest do
       |> TimelessMetrics.HTTP.call(store: :meta_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["type"] == "gauge"
-    assert result["unit"] == nil
+    assert result["unit"] == :null
   end
 
   # --- Rate Aggregate ---
@@ -181,7 +183,7 @@ defmodule TimelessMetrics.MetadataRateTest do
       |> TimelessMetrics.HTTP.call(store: :meta_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     series = List.first(result["series"])
     assert series != nil
     assert length(series["data"]) >= 1

@@ -20,7 +20,7 @@ defmodule TimelessMetrics.OpenAPI do
   end
 
   def spec_json do
-    Jason.encode!(spec(), pretty: true)
+    :json.encode(spec()) |> IO.iodata_to_binary()
   end
 
   defp tags do

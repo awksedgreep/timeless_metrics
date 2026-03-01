@@ -267,7 +267,7 @@ defmodule TimelessMetrics.InfluxTest do
 
       # Partial success returns 200 with error info
       assert conn.status == 200
-      resp = Jason.decode!(conn.resp_body)
+      resp = :json.decode(conn.resp_body)
       assert resp["samples"] == 1
       assert resp["errors"] == 1
     end
@@ -305,7 +305,7 @@ defmodule TimelessMetrics.InfluxTest do
         |> TimelessMetrics.HTTP.call(store: :influx_test)
 
       assert conn.status == 200
-      body = Jason.decode!(conn.resp_body)
+      body = :json.decode(conn.resp_body)
       assert body["status"] == "success"
       assert body["data"]["resultType"] == "matrix"
       assert length(body["data"]["result"]) == 1
@@ -324,7 +324,7 @@ defmodule TimelessMetrics.InfluxTest do
         |> TimelessMetrics.HTTP.call(store: :influx_test)
 
       assert conn.status == 200
-      body = Jason.decode!(conn.resp_body)
+      body = :json.decode(conn.resp_body)
       # Native response format (not Prometheus format)
       assert body["metric"] == "cpu_usage_user"
       assert length(body["series"]) == 1
@@ -344,7 +344,7 @@ defmodule TimelessMetrics.InfluxTest do
         |> TimelessMetrics.HTTP.call(store: :influx_test)
 
       assert conn.status == 200
-      body = Jason.decode!(conn.resp_body)
+      body = :json.decode(conn.resp_body)
       assert body["status"] == "success"
       assert length(body["data"]["result"]) == 3
 
@@ -393,7 +393,7 @@ defmodule TimelessMetrics.InfluxTest do
         |> TimelessMetrics.HTTP.call(store: :influx_test)
 
       assert query_conn.status == 200
-      body = Jason.decode!(query_conn.resp_body)
+      body = :json.decode(query_conn.resp_body)
       assert body["status"] == "success"
       assert length(body["data"]["result"]) == 5
 

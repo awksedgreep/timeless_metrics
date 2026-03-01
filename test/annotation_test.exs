@@ -72,18 +72,19 @@ defmodule TimelessMetrics.AnnotationTest do
       Plug.Test.conn(
         :post,
         "/api/v1/annotations",
-        Jason.encode!(%{
+        :json.encode(%{
           timestamp: now,
           title: "HTTP Deploy",
           description: "Deployed via CI",
           tags: ["deploy", "ci"]
         })
+        |> IO.iodata_to_binary()
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     assert conn.status == 201
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     id = result["id"]
     assert is_integer(id)
 
@@ -93,7 +94,7 @@ defmodule TimelessMetrics.AnnotationTest do
       |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert length(result["data"]) == 1
     assert List.first(result["data"])["title"] == "HTTP Deploy"
 
@@ -103,7 +104,7 @@ defmodule TimelessMetrics.AnnotationTest do
       |> TimelessMetrics.HTTP.call(store: :annot_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert length(result["data"]) == 1
 
     # Delete
@@ -118,7 +119,7 @@ defmodule TimelessMetrics.AnnotationTest do
       Plug.Test.conn(:get, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}")
       |> TimelessMetrics.HTTP.call(store: :annot_test)
 
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert length(result["data"]) == 0
   end
 
@@ -154,9 +155,10 @@ defmodule TimelessMetrics.AnnotationTest do
       Plug.Test.conn(
         :post,
         "/api/v1/annotations",
-        Jason.encode!(%{
+        :json.encode(%{
           title: "Now annotation"
         })
+        |> IO.iodata_to_binary()
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> TimelessMetrics.HTTP.call(store: :annot_test)

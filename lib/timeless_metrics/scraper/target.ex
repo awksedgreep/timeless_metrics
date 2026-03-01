@@ -71,7 +71,7 @@ defmodule TimelessMetrics.Scraper.Target do
       target.metrics_path,
       target.scrape_interval,
       target.scrape_timeout,
-      Jason.encode!(target.labels),
+      :json.encode(target.labels) |> IO.iodata_to_binary(),
       bool_to_int(target.honor_labels),
       bool_to_int(target.honor_timestamps),
       encode_relabel_configs(target.relabel_configs),
@@ -138,19 +138,20 @@ defmodule TimelessMetrics.Scraper.Target do
   defp decode_json(nil, default), do: default
 
   defp decode_json(str, default) when is_binary(str) do
-    case Jason.decode(str) do
-      {:ok, val} -> val
-      _ -> default
-    end
+    :json.decode(str)
+  catch
+    :error, _ -> default
   end
 
   defp decode_relabel_configs(nil), do: nil
 
   defp decode_relabel_configs(str) when is_binary(str) do
-    case Jason.decode(str) do
-      {:ok, configs} when is_list(configs) -> compile_relabel_configs(configs)
+    case :json.decode(str) do
+      configs when is_list(configs) -> compile_relabel_configs(configs)
       _ -> nil
     end
+  catch
+    :error, _ -> nil
   end
 
   defp compile_relabel_configs(nil), do: nil
@@ -167,7 +168,7 @@ defmodule TimelessMetrics.Scraper.Target do
 
   defp encode_relabel_configs(configs) when is_list(configs) do
     cleaned = Enum.map(configs, &Map.delete(&1, "__compiled_regex__"))
-    Jason.encode!(cleaned)
+    :json.encode(cleaned) |> IO.iodata_to_binary()
   end
 
   defp bool_to_int(true), do: 1

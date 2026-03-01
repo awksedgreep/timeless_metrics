@@ -17,16 +17,18 @@ defmodule TimelessMetrics.HTTPTest do
     lines =
       Enum.join(
         [
-          Jason.encode!(%{
+          :json.encode(%{
             metric: %{__name__: "cpu_usage", host: "web-1"},
             values: [73.2, 74.1],
             timestamps: [now, now + 60]
-          }),
-          Jason.encode!(%{
+          })
+          |> IO.iodata_to_binary(),
+          :json.encode(%{
             metric: %{__name__: "mem_usage", host: "web-1"},
             values: [45.0],
             timestamps: [now]
           })
+          |> IO.iodata_to_binary()
         ],
         "\n"
       )
@@ -63,11 +65,12 @@ defmodule TimelessMetrics.HTTPTest do
 
     lines =
       for i <- 1..50 do
-        Jason.encode!(%{
+        :json.encode(%{
           metric: %{__name__: "cpu", host: "host-#{i}"},
           values: [i * 1.0],
           timestamps: [now]
         })
+        |> IO.iodata_to_binary()
       end
       |> Enum.join("\n")
 
@@ -94,7 +97,7 @@ this is not json
 
     # Returns 200 with error count when there are partial failures
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["samples"] == 2
     assert result["errors"] == 1
   end
@@ -109,11 +112,12 @@ this is not json
 
   test "POST /api/v1/import rejects mismatched array lengths" do
     body =
-      Jason.encode!(%{
+      :json.encode(%{
         metric: %{__name__: "bad"},
         values: [1.0, 2.0],
         timestamps: [1_700_000_000]
       })
+      |> IO.iodata_to_binary()
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import", body)
@@ -121,7 +125,7 @@ this is not json
 
     # Entire line treated as error
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["errors"] == 1
     assert result["samples"] == 0
   end
@@ -132,7 +136,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    body = Jason.decode!(conn.resp_body)
+    body = :json.decode(conn.resp_body)
     assert body["status"] == "ok"
     assert is_integer(body["series"])
     assert is_integer(body["points"])
@@ -161,7 +165,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["metric"]["__name__"] == "cpu_usage"
     assert result["metric"]["host"] == "web-1"
     assert length(result["values"]) == 3
@@ -183,7 +187,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 400
-    assert Jason.decode!(conn.resp_body)["error"] =~ "metric"
+    assert :json.decode(conn.resp_body)["error"] =~ "metric"
   end
 
   test "GET /api/v1/query returns latest value" do
@@ -195,7 +199,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["timestamp"] == now + 2
     assert_in_delta result["value"], 50.0, 0.01
   end
@@ -206,7 +210,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["timestamp"] == nil
     assert result["value"] == nil
   end
@@ -227,7 +231,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["metric"] == "req_rate"
     assert length(result["series"]) >= 1
     series = List.first(result["series"])
@@ -248,7 +252,7 @@ this is not json
         |> TimelessMetrics.HTTP.call(store: :http_test)
 
       assert conn.status == 200
-      result = Jason.decode!(conn.resp_body)
+      result = :json.decode(conn.resp_body)
       series = result["series"]
       assert length(series) >= 1, "aggregate #{agg} returned no series"
       assert length(List.first(series)["data"]) >= 1, "aggregate #{agg} returned no data"
@@ -311,7 +315,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert length(result["series"]) == 2
   end
 
@@ -441,7 +445,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["status"] == "success"
     assert "cpu_usage" in result["data"]
     assert "mem_usage" in result["data"]
@@ -459,7 +463,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert length(result["data"]) == 3
     assert "web-1" in result["data"]
     assert "web-2" in result["data"]
@@ -477,7 +481,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert length(result["data"]) == 3
   end
 
@@ -509,11 +513,12 @@ this is not json
 
   test "labels without __name__ default to 'unknown'" do
     body =
-      Jason.encode!(%{
+      :json.encode(%{
         metric: %{host: "web-1"},
         values: [99.0],
         timestamps: [1_700_000_000]
       })
+      |> IO.iodata_to_binary()
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import", body)
@@ -576,7 +581,7 @@ this is not json
       |> authed_call()
 
     assert conn.status == 401
-    assert Jason.decode!(conn.resp_body)["error"] == "unauthorized"
+    assert :json.decode(conn.resp_body)["error"] == "unauthorized"
   end
 
   test "auth enabled: wrong token returns 403" do
@@ -588,7 +593,7 @@ this is not json
       |> authed_call()
 
     assert conn.status == 403
-    assert Jason.decode!(conn.resp_body)["error"] == "forbidden"
+    assert :json.decode(conn.resp_body)["error"] == "forbidden"
   end
 
   test "auth enabled: valid token grants access to API" do
@@ -641,7 +646,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     series = List.first(result["series"])
     [_ts, val] = List.first(series["data"])
     # avg of 380 and 400 = 390, divided by 10 = 39.0
@@ -662,7 +667,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     series = List.first(result["series"])
     [_ts, val] = List.first(series["data"])
     assert_in_delta val, 95.0, 0.01
@@ -700,7 +705,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     series = List.first(result["series"])
     [_ts, val] = List.first(series["data"])
     assert_in_delta val, 42.0, 0.01
@@ -708,11 +713,12 @@ this is not json
 
   test "auth enabled: POST endpoint requires token" do
     lines =
-      Jason.encode!(%{
+      :json.encode(%{
         metric: %{__name__: "cpu", host: "web-1"},
         values: [1.0],
         timestamps: [1_700_000_000]
       })
+      |> IO.iodata_to_binary()
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import", lines)
@@ -751,7 +757,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["metric"] == "forecast_test"
     assert length(result["series"]) >= 1
 
@@ -775,7 +781,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     series = List.first(result["series"])
     assert series["forecast"] == []
   end
@@ -802,7 +808,7 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["metric"] == "anom_test"
     assert length(result["series"]) >= 1
 
@@ -870,19 +876,20 @@ this is not json
     now = System.os_time(:second)
 
     body =
-      Jason.encode!(%{
+      :json.encode(%{
         title: "Deploy v1.2.3",
         description: "Production rollout",
         timestamp: now,
         tags: ["deploy", "production"]
       })
+      |> IO.iodata_to_binary()
 
     conn =
       Plug.Test.conn(:post, "/api/v1/annotations", body)
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 201
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["status"] == "created"
     assert is_integer(result["id"])
 
@@ -892,14 +899,14 @@ this is not json
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert length(result["data"]) == 1
     annot = List.first(result["data"])
     assert annot["title"] == "Deploy v1.2.3"
   end
 
   test "POST /api/v1/annotations rejects missing title" do
-    body = Jason.encode!(%{description: "no title"})
+    body = :json.encode(%{description: "no title"}) |> IO.iodata_to_binary()
 
     conn =
       Plug.Test.conn(:post, "/api/v1/annotations", body)

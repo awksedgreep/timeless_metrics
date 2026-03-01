@@ -116,7 +116,7 @@ defmodule TimelessMetrics.BackupTest do
 
     on_exit(fn -> File.rm_rf!(http_backup_dir) end)
 
-    body = Jason.encode!(%{path: http_backup_dir})
+    body = :json.encode(%{path: http_backup_dir}) |> IO.iodata_to_binary()
 
     conn =
       Plug.Test.conn(:post, "/api/v1/backup", body)
@@ -124,7 +124,7 @@ defmodule TimelessMetrics.BackupTest do
       |> TimelessMetrics.HTTP.call(store: :backup_test)
 
     assert conn.status == 200
-    resp = Jason.decode!(conn.resp_body)
+    resp = :json.decode(conn.resp_body)
     assert resp["status"] == "ok"
     assert resp["path"] == http_backup_dir
     assert is_list(resp["files"])
@@ -143,7 +143,7 @@ defmodule TimelessMetrics.BackupTest do
       |> TimelessMetrics.HTTP.call(store: :backup_test)
 
     assert conn.status == 200
-    resp = Jason.decode!(conn.resp_body)
+    resp = :json.decode(conn.resp_body)
     assert resp["status"] == "ok"
     assert String.contains?(resp["path"], "backups")
 

@@ -126,7 +126,7 @@ defmodule TimelessMetrics.PrometheusTest do
       |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["samples"] == 2
     assert result["errors"] == 1
   end
@@ -153,7 +153,7 @@ defmodule TimelessMetrics.PrometheusTest do
       |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["status"] == "success"
     assert result["data"]["resultType"] == "matrix"
 
@@ -198,7 +198,7 @@ defmodule TimelessMetrics.PrometheusTest do
       |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     series = result["data"]["result"]
     assert length(series) == 1
     assert List.first(series)["metric"]["host"] == "web-1"
@@ -224,7 +224,7 @@ defmodule TimelessMetrics.PrometheusTest do
       |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["status"] == "success"
     # With 5-minute step over a 10-minute range, we should get 1-2 buckets
     series = result["data"]["result"]
@@ -237,7 +237,256 @@ defmodule TimelessMetrics.PrometheusTest do
       |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 400
-    result = Jason.decode!(conn.resp_body)
+    result = :json.decode(conn.resp_body)
     assert result["error"] =~ "query"
+  end
+
+  # --- Prometheus-compatible instant query endpoint ---
+
+  test "prometheus query returns vector format with last value", %{store: store} do
+    now = System.os_time(:second)
+    base = div(now, 60) * 60
+
+    for i <- 0..4 do
+      TimelessMetrics.write(store, "mem_usage", %{"host" => "web-1"}, 100.0 + i,
+        timestamp: base + i * 60
+      )
+    end
+
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(:get, "/prometheus/api/v1/query?query=mem_usage&time=#{base + 300}")
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    assert result["status"] == "success"
+    assert result["data"]["resultType"] == "vector"
+
+    series = result["data"]["result"]
+    assert length(series) >= 1
+
+    first = List.first(series)
+    assert first["metric"]["__name__"] == "mem_usage"
+    # value is [timestamp, string_value]
+    [ts, val_str] = first["value"]
+    assert is_integer(ts)
+    assert is_binary(val_str)
+  end
+
+  test "prometheus query returns error for missing query param", %{store: store} do
+    conn =
+      Plug.Test.conn(:get, "/prometheus/api/v1/query")
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 400
+    result = :json.decode(conn.resp_body)
+    assert result["error"] =~ "query"
+  end
+
+  test "prometheus query with label filter", %{store: store} do
+    now = System.os_time(:second)
+    base = div(now, 60) * 60
+
+    TimelessMetrics.write(store, "cpu", %{"host" => "a"}, 10.0, timestamp: base)
+    TimelessMetrics.write(store, "cpu", %{"host" => "b"}, 20.0, timestamp: base)
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(
+        :get,
+        ~s(/prometheus/api/v1/query?query=cpu%7Bhost%3D%22a%22%7D&time=#{base + 300})
+      )
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    series = result["data"]["result"]
+    assert length(series) == 1
+    assert List.first(series)["metric"]["host"] == "a"
+  end
+
+  # --- Prometheus-compatible labels endpoint ---
+
+  test "prometheus labels returns all label names including __name__", %{store: store} do
+    now = System.os_time(:second)
+
+    TimelessMetrics.write(store, "cpu_usage", %{"host" => "web-1", "region" => "us"}, 50.0,
+      timestamp: now
+    )
+
+    TimelessMetrics.write(store, "mem_usage", %{"host" => "web-1", "env" => "prod"}, 1024.0,
+      timestamp: now
+    )
+
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(:get, "/prometheus/api/v1/labels")
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    assert result["status"] == "success"
+
+    labels = result["data"]
+    assert "__name__" in labels
+    assert "host" in labels
+    assert "region" in labels
+    assert "env" in labels
+    # Should be sorted
+    assert labels == Enum.sort(labels)
+  end
+
+  test "prometheus labels returns only __name__ when no labels exist", %{store: store} do
+    now = System.os_time(:second)
+    TimelessMetrics.write(store, "simple_metric", %{}, 42.0, timestamp: now)
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(:get, "/prometheus/api/v1/labels")
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    assert "__name__" in result["data"]
+  end
+
+  # --- Prometheus-compatible label values endpoint ---
+
+  test "prometheus label __name__ values returns all metric names", %{store: store} do
+    now = System.os_time(:second)
+    TimelessMetrics.write(store, "cpu_usage", %{"host" => "a"}, 1.0, timestamp: now)
+    TimelessMetrics.write(store, "mem_usage", %{"host" => "a"}, 2.0, timestamp: now)
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(:get, "/prometheus/api/v1/label/__name__/values")
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    assert result["status"] == "success"
+    assert "cpu_usage" in result["data"]
+    assert "mem_usage" in result["data"]
+  end
+
+  test "prometheus label values returns deduplicated values across metrics", %{store: store} do
+    now = System.os_time(:second)
+    TimelessMetrics.write(store, "cpu", %{"host" => "web-1"}, 1.0, timestamp: now)
+    TimelessMetrics.write(store, "cpu", %{"host" => "web-2"}, 2.0, timestamp: now)
+    TimelessMetrics.write(store, "mem", %{"host" => "web-1"}, 3.0, timestamp: now)
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(:get, "/prometheus/api/v1/label/host/values")
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    values = result["data"]
+    assert "web-1" in values
+    assert "web-2" in values
+    # Deduplicated — web-1 appears in both cpu and mem but only once in result
+    assert length(Enum.filter(values, &(&1 == "web-1"))) == 1
+    # Should be sorted
+    assert values == Enum.sort(values)
+  end
+
+  test "prometheus label values for unknown label returns empty list", %{store: store} do
+    now = System.os_time(:second)
+    TimelessMetrics.write(store, "cpu", %{"host" => "a"}, 1.0, timestamp: now)
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(:get, "/prometheus/api/v1/label/nonexistent/values")
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    assert result["data"] == []
+  end
+
+  # --- Prometheus-compatible series endpoint ---
+
+  test "prometheus series returns matching series with __name__", %{store: store} do
+    now = System.os_time(:second)
+
+    TimelessMetrics.write(store, "cpu", %{"host" => "web-1", "region" => "us"}, 1.0,
+      timestamp: now
+    )
+
+    TimelessMetrics.write(store, "cpu", %{"host" => "web-2", "region" => "eu"}, 2.0,
+      timestamp: now
+    )
+
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(:get, "/prometheus/api/v1/series?match[]=cpu")
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    assert result["status"] == "success"
+
+    series = result["data"]
+    assert length(series) == 2
+    assert Enum.all?(series, &(&1["__name__"] == "cpu"))
+    hosts = Enum.map(series, & &1["host"]) |> Enum.sort()
+    assert hosts == ["web-1", "web-2"]
+  end
+
+  test "prometheus series with label filter in match[]", %{store: store} do
+    now = System.os_time(:second)
+    TimelessMetrics.write(store, "cpu", %{"host" => "web-1"}, 1.0, timestamp: now)
+    TimelessMetrics.write(store, "cpu", %{"host" => "web-2"}, 2.0, timestamp: now)
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(
+        :get,
+        ~s(/prometheus/api/v1/series?match[]=cpu%7Bhost%3D%22web-1%22%7D)
+      )
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    series = result["data"]
+    assert length(series) == 1
+    assert List.first(series)["host"] == "web-1"
+  end
+
+  test "prometheus series returns error for missing match[]", %{store: store} do
+    conn =
+      Plug.Test.conn(:get, "/prometheus/api/v1/series")
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 400
+    result = :json.decode(conn.resp_body)
+    assert result["error"] =~ "match"
+  end
+
+  test "prometheus series with regex match", %{store: store} do
+    now = System.os_time(:second)
+    TimelessMetrics.write(store, "cpu_user", %{"host" => "a"}, 1.0, timestamp: now)
+    TimelessMetrics.write(store, "cpu_system", %{"host" => "a"}, 2.0, timestamp: now)
+    TimelessMetrics.write(store, "mem_usage", %{"host" => "a"}, 3.0, timestamp: now)
+    TimelessMetrics.flush(store)
+
+    conn =
+      Plug.Test.conn(
+        :get,
+        ~s(/prometheus/api/v1/series?match[]=%7B__name__%3D~%22cpu_.*%22%7D)
+      )
+      |> TimelessMetrics.HTTP.call(store: store)
+
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    series = result["data"]
+    assert length(series) == 2
+    names = Enum.map(series, & &1["__name__"]) |> Enum.sort()
+    assert names == ["cpu_system", "cpu_user"]
   end
 end

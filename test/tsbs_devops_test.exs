@@ -434,7 +434,7 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
         |> TimelessMetrics.HTTP.call(store: :tsbs_test)
 
       assert conn.status == 200
-      body = Jason.decode!(conn.resp_body)
+      body = :json.decode(conn.resp_body)
       assert body["status"] == "success"
       assert body["data"]["resultType"] == "matrix"
       assert length(body["data"]["result"]) == 1

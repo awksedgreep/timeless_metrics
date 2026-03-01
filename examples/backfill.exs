@@ -111,11 +111,11 @@ batch_size = 100
         uptime = ts - last_reboot
 
         [
-          Jason.encode!(%{metric: %{__name__: "cpu_usage", device: device, region: "east"}, values: [Float.round(cpu, 1)], timestamps: [ts]}),
-          Jason.encode!(%{metric: %{__name__: "mem_usage", device: device, region: "east"}, values: [Float.round(mem, 1)], timestamps: [ts]}),
-          Jason.encode!(%{metric: %{__name__: "if_throughput_mbps", device: device, interface: "ae0", region: "east"}, values: [round(bw)], timestamps: [ts]}),
-          Jason.encode!(%{metric: %{__name__: "snr_tenth_dbmv", device: device, interface: "cm0", region: "east"}, values: [snr], timestamps: [ts]}),
-          Jason.encode!(%{metric: %{__name__: "snmp_uptime", device: device, region: "east"}, values: [uptime], timestamps: [ts]})
+          :json.encode(%{metric: %{__name__: "cpu_usage", device: device, region: "east"}, values: [Float.round(cpu, 1)], timestamps: [ts]}) |> IO.iodata_to_binary(),
+          :json.encode(%{metric: %{__name__: "mem_usage", device: device, region: "east"}, values: [Float.round(mem, 1)], timestamps: [ts]}) |> IO.iodata_to_binary(),
+          :json.encode(%{metric: %{__name__: "if_throughput_mbps", device: device, interface: "ae0", region: "east"}, values: [round(bw)], timestamps: [ts]}) |> IO.iodata_to_binary(),
+          :json.encode(%{metric: %{__name__: "snr_tenth_dbmv", device: device, interface: "cm0", region: "east"}, values: [snr], timestamps: [ts]}) |> IO.iodata_to_binary(),
+          :json.encode(%{metric: %{__name__: "snmp_uptime", device: device, region: "east"}, values: [uptime], timestamps: [ts]}) |> IO.iodata_to_binary()
         ]
       end
     end)
