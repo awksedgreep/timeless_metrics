@@ -299,7 +299,7 @@ defmodule TimelessMetrics.HTTP do
             json_encode!(%{
               metric: Map.put(l, "__name__", metric),
               values: values,
-              timestamps: timestamps
+              timestamps: Enum.map(timestamps, &(&1 * 1000))
             })
           end)
           |> Enum.join("\n")
@@ -475,6 +475,29 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
+  # List all label names (VictoriaMetrics native path)
+  get "/api/v1/labels" do
+    store = conn.private.timeless_metrics
+    {:ok, metrics} = TimelessMetrics.list_metrics(store)
+
+    label_names =
+      metrics
+      |> Enum.flat_map(fn metric ->
+        case TimelessMetrics.list_series(store, metric) do
+          {:ok, series} -> Enum.flat_map(series, fn %{labels: l} -> Map.keys(l) end)
+          _ -> []
+        end
+      end)
+      |> MapSet.new()
+      |> MapSet.put("__name__")
+      |> MapSet.to_list()
+      |> Enum.sort()
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, json_encode!(%{"status" => "success", "data" => label_names}))
+  end
+
   # List all metric names
   get "/api/v1/label/__name__/values" do
     store = conn.private.timeless_metrics
@@ -486,21 +509,34 @@ defmodule TimelessMetrics.HTTP do
   end
 
   # List values for a specific label key
+  # When metric= is provided, scopes to that metric. Otherwise queries all metrics (VM compat).
   get "/api/v1/label/:name/values" do
     store = conn.private.timeless_metrics
     conn = Plug.Conn.fetch_query_params(conn)
     label_name = conn.path_params["name"]
     metric = conn.query_params["metric"]
 
-    if metric do
-      {:ok, values} = TimelessMetrics.label_values(store, metric, label_name)
+    values =
+      if metric do
+        {:ok, vals} = TimelessMetrics.label_values(store, metric, label_name)
+        vals
+      else
+        {:ok, metrics} = TimelessMetrics.list_metrics(store)
 
-      conn
-      |> put_resp_content_type("application/json")
-      |> send_resp(200, json_encode!(%{status: "success", data: values}))
-    else
-      json_error(conn, 400, "missing required parameter: metric")
-    end
+        metrics
+        |> Enum.flat_map(fn m ->
+          case TimelessMetrics.label_values(store, m, label_name) do
+            {:ok, vals} -> vals
+            _ -> []
+          end
+        end)
+        |> Enum.uniq()
+        |> Enum.sort()
+      end
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, json_encode!(%{status: "success", data: values}))
   end
 
   # List all series for a metric

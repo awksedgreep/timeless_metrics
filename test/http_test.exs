@@ -485,13 +485,22 @@ this is not json
     assert length(result["data"]) == 3
   end
 
-  test "discovery endpoints require metric param where needed" do
+  test "label values without metric param returns all values (VM compat)" do
+    now = System.os_time(:second)
+    seed_points(:http_test, "cpu", %{"host" => "web-1"}, now, [1.0])
+    seed_points(:http_test, "cpu", %{"host" => "web-2"}, now, [2.0])
+
     conn =
       Plug.Test.conn(:get, "/api/v1/label/host/values")
       |> TimelessMetrics.HTTP.call(store: :http_test)
 
-    assert conn.status == 400
+    assert conn.status == 200
+    result = :json.decode(conn.resp_body)
+    assert "web-1" in result["data"]
+    assert "web-2" in result["data"]
+  end
 
+  test "series endpoint requires metric param" do
     conn =
       Plug.Test.conn(:get, "/api/v1/series")
       |> TimelessMetrics.HTTP.call(store: :http_test)
