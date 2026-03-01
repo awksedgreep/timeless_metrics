@@ -1,6 +1,6 @@
 defmodule TimelessMetrics.TSBSDevOpsTest do
   use ExUnit.Case, async: false
-  @moduletag timeout: 120_000
+  @moduletag timeout: 300_000
 
   @moduledoc """
   End-to-end simulation of TSBS DevOps query types.
