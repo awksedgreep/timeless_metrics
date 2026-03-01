@@ -6,6 +6,8 @@ defmodule TimelessMetrics.Actor.Engine do
   SeriesServer processes via the SeriesManager.
   """
 
+  require Logger
+
   alias TimelessMetrics.Actor.SeriesManager
 
   @doc "Write a single metric point."
@@ -65,7 +67,14 @@ defmodule TimelessMetrics.Actor.Engine do
         ordered: false,
         timeout: :infinity
       )
-      |> Enum.map(fn {:ok, result} -> result end)
+      |> Enum.flat_map(fn
+        {:ok, result} ->
+          [result]
+
+        {:exit, reason} ->
+          Logger.error("TimelessMetrics: query_multi task crashed: #{inspect(reason)}")
+          []
+      end)
       |> Enum.reject(fn %{points: pts} -> pts == [] end)
 
     {:ok, results}
@@ -108,8 +117,15 @@ defmodule TimelessMetrics.Actor.Engine do
         timeout: :infinity
       )
       |> Enum.flat_map(fn
-        {:ok, nil} -> []
-        {:ok, result} -> [result]
+        {:ok, nil} ->
+          []
+
+        {:ok, result} ->
+          [result]
+
+        {:exit, reason} ->
+          Logger.error("TimelessMetrics: query_aggregate_multi task crashed: #{inspect(reason)}")
+          []
       end)
 
     {:ok, results}
@@ -169,8 +185,18 @@ defmodule TimelessMetrics.Actor.Engine do
           timeout: :infinity
         )
         |> Enum.flat_map(fn
-          {:ok, nil} -> []
-          {:ok, result} -> [result]
+          {:ok, nil} ->
+            []
+
+          {:ok, result} ->
+            [result]
+
+          {:exit, reason} ->
+            Logger.error(
+              "TimelessMetrics: query_aggregate_multi_metrics task crashed: #{inspect(reason)}"
+            )
+
+            []
         end)
       end)
 
@@ -282,8 +308,15 @@ defmodule TimelessMetrics.Actor.Engine do
         timeout: :infinity
       )
       |> Enum.flat_map(fn
-        {:ok, nil} -> []
-        {:ok, result} -> [result]
+        {:ok, nil} ->
+          []
+
+        {:ok, result} ->
+          [result]
+
+        {:exit, reason} ->
+          Logger.error("TimelessMetrics: latest_multi task crashed: #{inspect(reason)}")
+          []
       end)
 
     {:ok, results}
@@ -414,7 +447,10 @@ defmodule TimelessMetrics.Actor.Engine do
         ordered: false,
         timeout: :infinity
       )
-      |> Enum.reduce(0, fn {:ok, n}, acc -> acc + n end)
+      |> Enum.reduce(0, fn
+        {:ok, n}, acc -> acc + n
+        {:exit, _}, acc -> acc
+      end)
 
     all_points = total_block_points + raw_buffer_points
 
@@ -557,7 +593,14 @@ defmodule TimelessMetrics.Actor.Engine do
         ordered: false,
         timeout: :infinity
       )
-      |> Enum.map(fn {:ok, result} -> result end)
+      |> Enum.flat_map(fn
+        {:ok, result} ->
+          [result]
+
+        {:exit, reason} ->
+          Logger.error("TimelessMetrics: query_text_multi task crashed: #{inspect(reason)}")
+          []
+      end)
       |> Enum.reject(fn %{points: pts} -> pts == [] end)
 
     {:ok, results}

@@ -14,6 +14,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
   use GenServer
 
+  require Logger
+
   alias TimelessMetrics.Actor.{Aggregation, BlockStore, TextCodec}
 
   @flush_interval_ms 60_000
@@ -456,7 +458,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
           {:ok, merged}
 
-        {:error, _} ->
+        {:error, reason} ->
+          Logger.error("TimelessMetrics: text merge recompression failed: #{inspect(reason)}")
           :noop
       end
     end
@@ -490,7 +493,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
           {:ok, merged}
 
-        {:error, _} ->
+        {:error, reason} ->
+          Logger.error("TimelessMetrics: gorilla merge recompression failed: #{inspect(reason)}")
           :noop
       end
     end
@@ -533,7 +537,11 @@ defmodule TimelessMetrics.Actor.SeriesServer do
             dirty: true
         }
 
-      {:error, _reason} ->
+      {:error, reason} ->
+        Logger.error(
+          "TimelessMetrics: text compression failed for series #{state.series_id}: #{inspect(reason)}"
+        )
+
         state
     end
   end
@@ -573,8 +581,11 @@ defmodule TimelessMetrics.Actor.SeriesServer do
             dirty: true
         }
 
-      {:error, _reason} ->
-        # Compression failed — keep raw buffer as-is
+      {:error, reason} ->
+        Logger.error(
+          "TimelessMetrics: gorilla compression failed for series #{state.series_id}: #{inspect(reason)}"
+        )
+
         state
     end
   end
@@ -715,5 +726,12 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     path = BlockStore.series_path(state.data_dir, state.series_id)
     BlockStore.write(path, state.blocks, state.raw_buffer, series_type: state.series_type)
     %{state | dirty: false}
+  rescue
+    e ->
+      Logger.error(
+        "TimelessMetrics: flush_to_disk crashed for series #{state.series_id}: #{Exception.format(:error, e, __STACKTRACE__)}"
+      )
+
+      state
   end
 end

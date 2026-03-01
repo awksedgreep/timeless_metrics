@@ -9,6 +9,8 @@ defmodule TimelessMetrics.Actor.Rollup do
 
   use GenServer
 
+  require Logger
+
   defstruct [:store, :db, :manager, :registry, :interval, :timer_ref]
 
   def start_link(opts) do
@@ -49,7 +51,15 @@ defmodule TimelessMetrics.Actor.Rollup do
 
   @impl true
   def handle_info(:tick, state) do
-    do_rollup(state)
+    try do
+      do_rollup(state)
+    rescue
+      e ->
+        Logger.error(
+          "TimelessMetrics: rollup crashed: #{Exception.format(:error, e, __STACKTRACE__)}"
+        )
+    end
+
     timer_ref = schedule_next_tick(state.interval)
     {:noreply, %{state | timer_ref: timer_ref}}
   end

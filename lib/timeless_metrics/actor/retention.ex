@@ -8,6 +8,8 @@ defmodule TimelessMetrics.Actor.Retention do
 
   use GenServer
 
+  require Logger
+
   defstruct [
     :store,
     :db,
@@ -61,7 +63,15 @@ defmodule TimelessMetrics.Actor.Retention do
 
   @impl true
   def handle_info(:tick, state) do
-    do_enforce(state)
+    try do
+      do_enforce(state)
+    rescue
+      e ->
+        Logger.error(
+          "TimelessMetrics: retention enforcement crashed: #{Exception.format(:error, e, __STACKTRACE__)}"
+        )
+    end
+
     timer_ref = schedule_next_tick(state.interval)
     {:noreply, %{state | timer_ref: timer_ref}}
   end
