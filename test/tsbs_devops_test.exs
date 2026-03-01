@@ -1,5 +1,6 @@
 defmodule TimelessMetrics.TSBSDevOpsTest do
   use ExUnit.Case, async: false
+  @moduletag :integration
   @moduletag timeout: 300_000
 
   @moduledoc """

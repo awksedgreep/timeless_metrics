@@ -1,52 +1,54 @@
 defmodule TimelessMetrics.MetadataRateTest do
   use ExUnit.Case, async: false
 
-  @data_dir "/tmp/timeless_meta_test_#{System.os_time(:millisecond)}"
-
   setup do
-    start_supervised!({TimelessMetrics, name: :meta_test, data_dir: @data_dir, engine: :actor})
+    id = System.unique_integer([:positive])
+    store = :"meta_test_#{id}"
+    data_dir = "/tmp/timeless_meta_test_#{id}"
 
-    on_exit(fn -> File.rm_rf!(@data_dir) end)
+    start_supervised!({TimelessMetrics, name: store, data_dir: data_dir, engine: :actor})
 
-    :ok
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    {:ok, store: store}
   end
 
   # --- Metadata ---
 
-  test "register and retrieve metric metadata" do
-    TimelessMetrics.register_metric(:meta_test, "cpu_usage", :gauge,
+  test "register and retrieve metric metadata", %{store: store} do
+    TimelessMetrics.register_metric(store, "cpu_usage", :gauge,
       unit: "%",
       description: "CPU utilization"
     )
 
-    {:ok, meta} = TimelessMetrics.get_metadata(:meta_test, "cpu_usage")
+    {:ok, meta} = TimelessMetrics.get_metadata(store, "cpu_usage")
 
     assert meta.type == :gauge
     assert meta.unit == "%"
     assert meta.description == "CPU utilization"
   end
 
-  test "get_metadata returns nil for unregistered metric" do
-    {:ok, meta} = TimelessMetrics.get_metadata(:meta_test, "nonexistent")
+  test "get_metadata returns nil for unregistered metric", %{store: store} do
+    {:ok, meta} = TimelessMetrics.get_metadata(store, "nonexistent")
     assert meta == nil
   end
 
-  test "register_metric upserts" do
-    TimelessMetrics.register_metric(:meta_test, "bytes_in", :counter, unit: "bytes")
+  test "register_metric upserts", %{store: store} do
+    TimelessMetrics.register_metric(store, "bytes_in", :counter, unit: "bytes")
 
-    TimelessMetrics.register_metric(:meta_test, "bytes_in", :counter,
+    TimelessMetrics.register_metric(store, "bytes_in", :counter,
       unit: "bytes/s",
       description: "Inbound traffic"
     )
 
-    {:ok, meta} = TimelessMetrics.get_metadata(:meta_test, "bytes_in")
+    {:ok, meta} = TimelessMetrics.get_metadata(store, "bytes_in")
     assert meta.unit == "bytes/s"
     assert meta.description == "Inbound traffic"
   end
 
   # --- Metadata via HTTP ---
 
-  test "POST and GET /api/v1/metadata via HTTP" do
+  test "POST and GET /api/v1/metadata via HTTP", %{store: store} do
     conn =
       Plug.Test.conn(
         :post,
@@ -60,13 +62,13 @@ defmodule TimelessMetrics.MetadataRateTest do
         |> IO.iodata_to_binary()
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> TimelessMetrics.HTTP.call(store: :meta_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
 
     conn =
       Plug.Test.conn(:get, "/api/v1/metadata?metric=disk_usage")
-      |> TimelessMetrics.HTTP.call(store: :meta_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
     result = :json.decode(conn.resp_body)
@@ -74,7 +76,7 @@ defmodule TimelessMetrics.MetadataRateTest do
     assert result["unit"] == "%"
   end
 
-  test "POST /api/v1/metadata rejects invalid type" do
+  test "POST /api/v1/metadata rejects invalid type", %{store: store} do
     conn =
       Plug.Test.conn(
         :post,
@@ -86,15 +88,15 @@ defmodule TimelessMetrics.MetadataRateTest do
         |> IO.iodata_to_binary()
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> TimelessMetrics.HTTP.call(store: :meta_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 400
   end
 
-  test "GET /api/v1/metadata returns default gauge for unregistered metric" do
+  test "GET /api/v1/metadata returns default gauge for unregistered metric", %{store: store} do
     conn =
       Plug.Test.conn(:get, "/api/v1/metadata?metric=unknown_metric")
-      |> TimelessMetrics.HTTP.call(store: :meta_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
     result = :json.decode(conn.resp_body)
@@ -104,22 +106,22 @@ defmodule TimelessMetrics.MetadataRateTest do
 
   # --- Rate Aggregate ---
 
-  test "rate aggregate computes per-second rate from raw data" do
+  test "rate aggregate computes per-second rate from raw data", %{store: store} do
     now = System.os_time(:second)
     base = div(now, 300) * 300
 
     # Monotonically increasing counter: 0, 100, 200, 300, 400, 500
     # 100 units per 60 seconds = 1.667/s
     for i <- 0..5 do
-      TimelessMetrics.write(:meta_test, "bytes_in", %{"if" => "eth0"}, i * 100.0,
+      TimelessMetrics.write(store, "bytes_in", %{"if" => "eth0"}, i * 100.0,
         timestamp: base + i * 60
       )
     end
 
-    TimelessMetrics.flush(:meta_test)
+    TimelessMetrics.flush(store)
 
     {:ok, buckets} =
-      TimelessMetrics.query_aggregate(:meta_test, "bytes_in", %{"if" => "eth0"},
+      TimelessMetrics.query_aggregate(store, "bytes_in", %{"if" => "eth0"},
         from: base,
         to: base + 360,
         bucket: {300, :seconds},
@@ -132,7 +134,7 @@ defmodule TimelessMetrics.MetadataRateTest do
     assert_in_delta rate, 100.0 / 60, 0.1
   end
 
-  test "rate handles counter resets gracefully" do
+  test "rate handles counter resets gracefully", %{store: store} do
     now = System.os_time(:second)
     base = div(now, 360) * 360
 
@@ -140,15 +142,13 @@ defmodule TimelessMetrics.MetadataRateTest do
     values = [100.0, 200.0, 300.0, 50.0, 150.0, 250.0]
 
     for {val, i} <- Enum.with_index(values) do
-      TimelessMetrics.write(:meta_test, "counter_reset", %{"id" => "1"}, val,
-        timestamp: base + i * 60
-      )
+      TimelessMetrics.write(store, "counter_reset", %{"id" => "1"}, val, timestamp: base + i * 60)
     end
 
-    TimelessMetrics.flush(:meta_test)
+    TimelessMetrics.flush(store)
 
     {:ok, buckets} =
-      TimelessMetrics.query_aggregate(:meta_test, "counter_reset", %{"id" => "1"},
+      TimelessMetrics.query_aggregate(store, "counter_reset", %{"id" => "1"},
         from: base,
         to: base + 360,
         bucket: {360, :seconds},
@@ -163,24 +163,24 @@ defmodule TimelessMetrics.MetadataRateTest do
     assert_in_delta rate, 400.0 / 240, 0.1
   end
 
-  test "rate via HTTP query_range" do
+  test "rate via HTTP query_range", %{store: store} do
     now = System.os_time(:second)
     base = div(now, 600) * 600
 
     for i <- 0..9 do
-      TimelessMetrics.write(:meta_test, "http_rate", %{"host" => "web-1"}, i * 1000.0,
+      TimelessMetrics.write(store, "http_rate", %{"host" => "web-1"}, i * 1000.0,
         timestamp: base + i * 60
       )
     end
 
-    TimelessMetrics.flush(:meta_test)
+    TimelessMetrics.flush(store)
 
     conn =
       Plug.Test.conn(
         :get,
         "/api/v1/query_range?metric=http_rate&host=web-1&from=#{base}&to=#{base + 600}&step=600&aggregate=rate"
       )
-      |> TimelessMetrics.HTTP.call(store: :meta_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
     result = :json.decode(conn.resp_body)
@@ -192,16 +192,16 @@ defmodule TimelessMetrics.MetadataRateTest do
     assert_in_delta rate_val, 1000.0 / 60, 1.0
   end
 
-  test "rate with less than 2 points returns 0" do
+  test "rate with less than 2 points returns 0", %{store: store} do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    TimelessMetrics.write(:meta_test, "single_point", %{"id" => "1"}, 42.0, timestamp: base)
+    TimelessMetrics.write(store, "single_point", %{"id" => "1"}, 42.0, timestamp: base)
 
-    TimelessMetrics.flush(:meta_test)
+    TimelessMetrics.flush(store)
 
     {:ok, buckets} =
-      TimelessMetrics.query_aggregate(:meta_test, "single_point", %{"id" => "1"},
+      TimelessMetrics.query_aggregate(store, "single_point", %{"id" => "1"},
         from: base,
         to: base + 60,
         bucket: {60, :seconds},
