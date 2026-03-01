@@ -1433,7 +1433,9 @@ defmodule TimelessMetrics.HTTP do
     end
 
     if all_entries != [] do
-      TimelessMetrics.write_batch(store, all_entries)
+      {text, numeric} = Enum.split_with(all_entries, fn {_, _, v, _} -> is_binary(v) end)
+      if numeric != [], do: TimelessMetrics.write_batch(store, numeric)
+      if text != [], do: TimelessMetrics.write_text_batch(store, text)
     end
 
     {length(all_entries), errors, error_samples}
@@ -1502,6 +1504,10 @@ defmodule TimelessMetrics.HTTP do
 
   defp zip_entries(n, l, [ts | tsr], [v | vr], acc) when is_integer(ts) and is_number(v) do
     zip_entries(n, l, tsr, vr, [{n, l, ensure_float(v), ts} | acc])
+  end
+
+  defp zip_entries(n, l, [ts | tsr], [v | vr], acc) when is_integer(ts) and is_binary(v) do
+    zip_entries(n, l, tsr, vr, [{n, l, v, ts} | acc])
   end
 
   defp zip_entries(_, _, _, _, _), do: throw(:bad_entry)

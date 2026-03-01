@@ -8,7 +8,7 @@ defmodule TimelessMetrics.OpenAPI do
         "title" => "TimelessMetrics API",
         "description" =>
           "Embedded time series storage for Elixir. Compatible with Prometheus, VictoriaMetrics, and InfluxDB ingest formats.",
-        "version" => "1.0.2"
+        "version" => "1.0.3"
       },
       "servers" => [
         %{"url" => "/", "description" => "Current instance"}
@@ -203,11 +203,13 @@ defmodule TimelessMetrics.OpenAPI do
           "tags" => ["Ingest"],
           "summary" => "Import (VictoriaMetrics JSON lines)",
           "description" =>
-            "Import metrics in VictoriaMetrics JSON line format. Each line: `{\"metric\":{\"__name__\":\"cpu\",\"host\":\"web-1\"},\"values\":[73.2],\"timestamps\":[1700000000]}`",
+            "Import metrics in VictoriaMetrics JSON line format. Supports both numeric and text (string) values. " <>
+              "Numeric: `{\"metric\":{\"__name__\":\"cpu\",\"host\":\"web-1\"},\"values\":[73.2],\"timestamps\":[1700000000]}` " <>
+              "Text: `{\"metric\":{\"__name__\":\"sysDescr\",\"host\":\"switch1\"},\"values\":[\"Cisco IOS 15.2\"],\"timestamps\":[1700000000]}`",
           "operationId" => "importJsonLines",
           "requestBody" =>
             text_body(
-              "VictoriaMetrics JSON lines",
+              "VictoriaMetrics JSON lines (numeric or text values)",
               "{\"metric\":{\"__name__\":\"cpu_usage\",\"host\":\"web-1\"},\"values\":[73.2,74.1],\"timestamps\":[1700000000,1700000060]}"
             ),
           "responses" => ingest_responses()
