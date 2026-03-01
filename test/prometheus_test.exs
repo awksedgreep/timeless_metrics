@@ -1,19 +1,21 @@
 defmodule TimelessMetrics.PrometheusTest do
   use ExUnit.Case, async: false
 
-  @data_dir "/tmp/timeless_prom_test_#{System.os_time(:millisecond)}"
-
   setup do
-    start_supervised!({TimelessMetrics, name: :prom_test, data_dir: @data_dir, engine: :actor})
+    id = System.unique_integer([:positive])
+    store = :"prom_test_#{id}"
+    data_dir = "/tmp/timeless_prom_test_#{id}"
 
-    on_exit(fn -> File.rm_rf!(@data_dir) end)
+    start_supervised!({TimelessMetrics, name: store, data_dir: data_dir, engine: :actor})
 
-    :ok
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    {:ok, store: store}
   end
 
   # --- Prometheus text format import ---
 
-  test "import prometheus text format with labels and millisecond timestamps" do
+  test "import prometheus text format with labels and millisecond timestamps", %{store: store} do
     now_ms = System.os_time(:millisecond)
     now_s = div(now_ms, 1000)
 
@@ -25,14 +27,14 @@ defmodule TimelessMetrics.PrometheusTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: :prom_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 204
 
-    TimelessMetrics.flush(:prom_test)
+    TimelessMetrics.flush(store)
 
     {:ok, results} =
-      TimelessMetrics.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
+      TimelessMetrics.query_multi(store, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
 
     assert length(results) == 2
 
@@ -42,7 +44,7 @@ defmodule TimelessMetrics.PrometheusTest do
     assert_in_delta val, 73.2, 0.01
   end
 
-  test "import prometheus text format without labels" do
+  test "import prometheus text format without labels", %{store: store} do
     now_ms = System.os_time(:millisecond)
     now_s = div(now_ms, 1000)
 
@@ -51,21 +53,21 @@ defmodule TimelessMetrics.PrometheusTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: :prom_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 204
 
-    TimelessMetrics.flush(:prom_test)
+    TimelessMetrics.flush(store)
 
     {:ok, results} =
-      TimelessMetrics.query_multi(:prom_test, "up", %{}, from: now_s - 60, to: now_s + 60)
+      TimelessMetrics.query_multi(store, "up", %{}, from: now_s - 60, to: now_s + 60)
 
     assert length(results) == 1
     [{_ts, val}] = List.first(results).points
     assert_in_delta val, 1.0, 0.01
   end
 
-  test "import skips comment and HELP/TYPE lines" do
+  test "import skips comment and HELP/TYPE lines", %{store: store} do
     now_ms = System.os_time(:millisecond)
     now_s = div(now_ms, 1000)
 
@@ -79,39 +81,39 @@ defmodule TimelessMetrics.PrometheusTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: :prom_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 204
 
-    TimelessMetrics.flush(:prom_test)
+    TimelessMetrics.flush(store)
 
     {:ok, results} =
-      TimelessMetrics.query_multi(:prom_test, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
+      TimelessMetrics.query_multi(store, "cpu_usage", %{}, from: now_s - 60, to: now_s + 60)
 
     assert length(results) == 1
   end
 
-  test "import without timestamp uses current time" do
+  test "import without timestamp uses current time", %{store: store} do
     body = "my_gauge{env=\"prod\"} 42.0\n"
 
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: :prom_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 204
 
-    TimelessMetrics.flush(:prom_test)
+    TimelessMetrics.flush(store)
 
     now = System.os_time(:second)
 
     {:ok, results} =
-      TimelessMetrics.query_multi(:prom_test, "my_gauge", %{}, from: now - 10, to: now + 10)
+      TimelessMetrics.query_multi(store, "my_gauge", %{}, from: now - 10, to: now + 10)
 
     assert length(results) == 1
   end
 
-  test "import reports errors for malformed lines" do
+  test "import reports errors for malformed lines", %{store: store} do
     body = """
     valid_metric{host="a"} 10.0
     this is not valid prometheus format
@@ -121,7 +123,7 @@ defmodule TimelessMetrics.PrometheusTest do
     conn =
       Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
       |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: :prom_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -131,24 +133,24 @@ defmodule TimelessMetrics.PrometheusTest do
 
   # --- Prometheus-compatible query_range endpoint ---
 
-  test "prometheus query_range returns matrix format" do
+  test "prometheus query_range returns matrix format", %{store: store} do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
     for i <- 0..9 do
-      TimelessMetrics.write(:prom_test, "cpu_usage", %{"host" => "web-1"}, 50.0 + i,
+      TimelessMetrics.write(store, "cpu_usage", %{"host" => "web-1"}, 50.0 + i,
         timestamp: base + i * 60
       )
     end
 
-    TimelessMetrics.flush(:prom_test)
+    TimelessMetrics.flush(store)
 
     conn =
       Plug.Test.conn(
         :get,
         "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=60"
       )
-      |> TimelessMetrics.HTTP.call(store: :prom_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -171,21 +173,21 @@ defmodule TimelessMetrics.PrometheusTest do
     assert val >= 50.0
   end
 
-  test "prometheus query_range with label filter" do
+  test "prometheus query_range with label filter", %{store: store} do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
     for i <- 0..5 do
-      TimelessMetrics.write(:prom_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
+      TimelessMetrics.write(store, "cpu_usage", %{"host" => "web-1"}, 50.0,
         timestamp: base + i * 60
       )
 
-      TimelessMetrics.write(:prom_test, "cpu_usage", %{"host" => "web-2"}, 70.0,
+      TimelessMetrics.write(store, "cpu_usage", %{"host" => "web-2"}, 70.0,
         timestamp: base + i * 60
       )
     end
 
-    TimelessMetrics.flush(:prom_test)
+    TimelessMetrics.flush(store)
 
     # Query with PromQL-style label filter
     conn =
@@ -193,7 +195,7 @@ defmodule TimelessMetrics.PrometheusTest do
         :get,
         ~s(/prometheus/api/v1/query_range?query=cpu_usage%7Bhost%3D%22web-1%22%7D&start=#{base}&end=#{base + 600}&step=60)
       )
-      |> TimelessMetrics.HTTP.call(store: :prom_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -202,24 +204,24 @@ defmodule TimelessMetrics.PrometheusTest do
     assert List.first(series)["metric"]["host"] == "web-1"
   end
 
-  test "prometheus query_range with duration step" do
+  test "prometheus query_range with duration step", %{store: store} do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
     for i <- 0..5 do
-      TimelessMetrics.write(:prom_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
+      TimelessMetrics.write(store, "cpu_usage", %{"host" => "web-1"}, 50.0,
         timestamp: base + i * 60
       )
     end
 
-    TimelessMetrics.flush(:prom_test)
+    TimelessMetrics.flush(store)
 
     conn =
       Plug.Test.conn(
         :get,
         "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=5m"
       )
-      |> TimelessMetrics.HTTP.call(store: :prom_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 200
     result = Jason.decode!(conn.resp_body)
@@ -229,10 +231,10 @@ defmodule TimelessMetrics.PrometheusTest do
     assert length(series) >= 1
   end
 
-  test "prometheus query_range returns error for missing query" do
+  test "prometheus query_range returns error for missing query", %{store: store} do
     conn =
       Plug.Test.conn(:get, "/prometheus/api/v1/query_range?start=1000&end=2000&step=60")
-      |> TimelessMetrics.HTTP.call(store: :prom_test)
+      |> TimelessMetrics.HTTP.call(store: store)
 
     assert conn.status == 400
     result = Jason.decode!(conn.resp_body)

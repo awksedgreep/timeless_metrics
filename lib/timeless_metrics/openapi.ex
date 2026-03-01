@@ -8,7 +8,7 @@ defmodule TimelessMetrics.OpenAPI do
         "title" => "TimelessMetrics API",
         "description" =>
           "Embedded time series storage for Elixir. Compatible with Prometheus, VictoriaMetrics, and InfluxDB ingest formats.",
-        "version" => "1.0.3"
+        "version" => "1.0.4"
       },
       "servers" => [
         %{"url" => "/", "description" => "Current instance"}
