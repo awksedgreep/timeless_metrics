@@ -38,7 +38,7 @@ defmodule TimelessMetrics.MixProject do
 
   defp package do
     [
-      maintainers: ["Matt Cotner"],
+      maintainers: ["Mark Cotner"],
       files: ~w(lib c_src Makefile mix.exs README.md LICENSE),
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/awksedgreep/timeless_metrics"}
