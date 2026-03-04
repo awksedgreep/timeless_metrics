@@ -25,6 +25,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     :merge_block_min_count,
     :merge_block_max_points,
     :merge_block_min_age_seconds,
+    :merge_compression_level,
     :merge_interval
   ]
 
@@ -177,6 +178,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     merge_block_min_count = Keyword.get(opts, :merge_block_min_count, 4)
     merge_block_max_points = Keyword.get(opts, :merge_block_max_points, 10_000)
     merge_block_min_age_seconds = Keyword.get(opts, :merge_block_min_age_seconds, 300)
+    merge_compression_level = Keyword.get(opts, :merge_compression_level, 19)
     merge_interval = Keyword.get(opts, :merge_interval, 300_000)
 
     # Create ETS index: {metric_name, encoded_labels} => series_id
@@ -203,6 +205,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       merge_block_min_count: merge_block_min_count,
       merge_block_max_points: merge_block_max_points,
       merge_block_min_age_seconds: merge_block_min_age_seconds,
+      merge_compression_level: merge_compression_level,
       merge_interval: merge_interval
     }
 
@@ -237,6 +240,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
       [] ->
         # Create in SQLite
+        TimelessMetrics.Stats.incr_series_created(state.store)
         encoded = encode_labels(labels)
         now = System.os_time(:second)
         type_str = Atom.to_string(series_type)
@@ -303,6 +307,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
              merge_block_min_count: state.merge_block_min_count,
              merge_block_max_points: state.merge_block_max_points,
              merge_block_min_age_seconds: state.merge_block_min_age_seconds,
+             merge_compression_level: state.merge_compression_level,
              merge_interval: state.merge_interval,
              series_type: series_type
            ]

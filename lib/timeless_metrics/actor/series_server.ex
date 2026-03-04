@@ -44,6 +44,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     merge_block_min_count: 4,
     merge_block_max_points: 10_000,
     merge_block_min_age_seconds: 300,
+    merge_compression_level: 19,
     series_type: :numeric
   ]
 
@@ -74,6 +75,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     merge_block_min_count = Keyword.get(opts, :merge_block_min_count, 4)
     merge_block_max_points = Keyword.get(opts, :merge_block_max_points, 10_000)
     merge_block_min_age_seconds = Keyword.get(opts, :merge_block_min_age_seconds, 300)
+    merge_compression_level = Keyword.get(opts, :merge_compression_level, 19)
     merge_interval = Keyword.get(opts, :merge_interval, @merge_check_ms)
     series_type = Keyword.get(opts, :series_type, :numeric)
 
@@ -90,6 +92,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       merge_block_min_count: merge_block_min_count,
       merge_block_max_points: merge_block_max_points,
       merge_block_min_age_seconds: merge_block_min_age_seconds,
+      merge_compression_level: merge_compression_level,
       series_type: series_type
     }
 
@@ -379,15 +382,18 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     # Group eligible blocks into batches of ~merge_block_max_points
     batches = group_merge_batches(eligible, state.merge_block_max_points)
 
-    {merged_blocks, dirty?} =
-      Enum.reduce(batches, {[], false}, fn batch, {acc, dirty} ->
-        case merge_batch(batch, state.compression, state.series_type) do
-          {:ok, merged_block} -> {[merged_block | acc], true}
-          :noop -> {Enum.reverse(batch) ++ acc, dirty}
+    {merged_blocks, dirty?, total_points_merged} =
+      Enum.reduce(batches, {[], false, 0}, fn batch, {acc, dirty, pts} ->
+        case merge_batch(batch, state.compression, state.merge_compression_level, state.series_type) do
+          {:ok, merged_block} -> {[merged_block | acc], true, pts + merged_block.point_count}
+          :noop -> {Enum.reverse(batch) ++ acc, dirty, pts}
         end
       end)
 
     if dirty? do
+      TimelessMetrics.Stats.incr_merges_completed(state.store)
+      TimelessMetrics.Stats.add_points_merged(state.store, total_points_merged)
+
       # Rebuild queue: merged (oldest first) ++ recent
       new_blocks_list = Enum.reverse(merged_blocks) ++ recent
 
@@ -425,12 +431,12 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     Enum.reverse(all)
   end
 
-  defp merge_batch({:passthrough, block}, _compression, _series_type), do: {:ok, block}
+  defp merge_batch({:passthrough, block}, _compression, _level, _series_type), do: {:ok, block}
 
-  defp merge_batch(batch, _compression, _series_type) when is_list(batch) and length(batch) < 2,
+  defp merge_batch(batch, _compression, _level, _series_type) when is_list(batch) and length(batch) < 2,
     do: :noop
 
-  defp merge_batch(batch, _compression, :text) when is_list(batch) do
+  defp merge_batch(batch, _compression, _level, :text) when is_list(batch) do
     all_points =
       Enum.flat_map(batch, fn block ->
         case TextCodec.decompress(block.data) do
@@ -465,7 +471,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     end
   end
 
-  defp merge_batch(batch, compression, :numeric) when is_list(batch) do
+  defp merge_batch(batch, compression, level, :numeric) when is_list(batch) do
     all_points =
       Enum.flat_map(batch, fn block ->
         case GorillaStream.decompress(block.data, compression: compression) do
@@ -479,7 +485,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     else
       sorted = Enum.sort_by(all_points, &elem(&1, 0))
 
-      case GorillaStream.compress(sorted, compression: compression) do
+      case GorillaStream.compress(sorted, compression: compression, compression_level: level) do
         {:ok, data} ->
           {first_ts, _} = List.first(sorted)
           {last_ts, _} = List.last(sorted)

@@ -9,9 +9,12 @@ defmodule TimelessMetrics.Actor.Engine do
   require Logger
 
   alias TimelessMetrics.Actor.SeriesManager
+  alias TimelessMetrics.Stats
 
   @doc "Write a single metric point."
   def write(store, metric_name, labels, value, opts) do
+    Stats.incr_writes(store)
+    Stats.add_points(store, 1)
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
     %{index: index, manager: manager} = :persistent_term.get({SeriesManager, store})
 
@@ -27,6 +30,8 @@ defmodule TimelessMetrics.Actor.Engine do
 
   @doc "Write a batch of metric points."
   def write_batch(store, entries) do
+    Stats.incr_writes(store)
+    Stats.add_points(store, length(entries))
     %{manager: manager} = :persistent_term.get({SeriesManager, store})
 
     entries
@@ -58,6 +63,8 @@ defmodule TimelessMetrics.Actor.Engine do
   Entries: `[{metric_name, labels, value} | {metric_name, labels, value, ts}]`
   """
   def write_each(store, entries) do
+    Stats.incr_writes(store)
+    Stats.add_points(store, length(entries))
     %{index: index, manager: manager} = :persistent_term.get({SeriesManager, store})
 
     Enum.each(entries, fn
@@ -613,6 +620,8 @@ defmodule TimelessMetrics.Actor.Engine do
 
   @doc "Write a single text metric point."
   def write_text(store, metric_name, labels, value, opts \\ []) do
+    Stats.incr_writes(store)
+    Stats.add_points(store, 1)
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
     %{index: index, manager: manager} = :persistent_term.get({SeriesManager, store})
 
@@ -628,6 +637,8 @@ defmodule TimelessMetrics.Actor.Engine do
 
   @doc "Write a batch of text metric points."
   def write_text_batch(store, entries) do
+    Stats.incr_writes(store)
+    Stats.add_points(store, length(entries))
     %{manager: manager} = :persistent_term.get({SeriesManager, store})
 
     entries

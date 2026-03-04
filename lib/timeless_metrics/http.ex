@@ -142,10 +142,12 @@ defmodule TimelessMetrics.HTTP do
   # Format: measurement,tag=val,tag=val field=value timestamp_ns
   post "/write" do
     store = conn.private.timeless_metrics
+    TimelessMetrics.Stats.incr_http_imports(store)
 
     case Plug.Conn.read_body(conn, length: @max_body_bytes) do
       {:ok, body, conn} ->
         {count, errors, error_samples} = ingest_influx_lines(store, body)
+        TimelessMetrics.Stats.add_http_import_errors(store, errors)
 
         :telemetry.execute(
           [:timeless_metrics, :http, :import],
@@ -187,10 +189,12 @@ defmodule TimelessMetrics.HTTP do
   # VictoriaMetrics JSON line import
   post "/api/v1/import" do
     store = conn.private.timeless_metrics
+    TimelessMetrics.Stats.incr_http_imports(store)
 
     case Plug.Conn.read_body(conn, length: @max_body_bytes) do
       {:ok, body, conn} ->
         {count, errors, error_samples} = ingest_json_lines(store, body)
+        TimelessMetrics.Stats.add_http_import_errors(store, errors)
 
         :telemetry.execute(
           [:timeless_metrics, :http, :import],
@@ -285,6 +289,7 @@ defmodule TimelessMetrics.HTTP do
   # Export raw points in VictoriaMetrics JSON line format (multi-series)
   get "/api/v1/export" do
     store = conn.private.timeless_metrics
+    TimelessMetrics.Stats.incr_http_queries(store)
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_query_params(conn.query_params) do
@@ -316,6 +321,7 @@ defmodule TimelessMetrics.HTTP do
   # Latest value for matching series
   get "/api/v1/query" do
     store = conn.private.timeless_metrics
+    TimelessMetrics.Stats.incr_http_queries(store)
     conn = Plug.Conn.fetch_query_params(conn)
 
     case extract_metric_and_labels(conn.query_params) do
@@ -351,6 +357,7 @@ defmodule TimelessMetrics.HTTP do
   # Otherwise uses native params: metric=, metrics=, group_by=, cross_aggregate=, etc.
   get "/api/v1/query_range" do
     store = conn.private.timeless_metrics
+    TimelessMetrics.Stats.incr_http_queries(store)
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
@@ -929,10 +936,12 @@ defmodule TimelessMetrics.HTTP do
   # Each line: metric_name{label1="val1",label2="val2"} value [timestamp_ms]
   post "/api/v1/import/prometheus" do
     store = conn.private.timeless_metrics
+    TimelessMetrics.Stats.incr_http_imports(store)
 
     case Plug.Conn.read_body(conn, length: @max_body_bytes) do
       {:ok, body, conn} ->
         {count, errors, error_samples} = ingest_prometheus_text(store, body)
+        TimelessMetrics.Stats.add_http_import_errors(store, errors)
 
         :telemetry.execute(
           [:timeless_metrics, :http, :import],
@@ -968,6 +977,7 @@ defmodule TimelessMetrics.HTTP do
   # Prometheus-compatible query_range endpoint (for Grafana + TSBS)
   get "/prometheus/api/v1/query_range" do
     store = conn.private.timeless_metrics
+    TimelessMetrics.Stats.incr_http_queries(store)
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
@@ -999,6 +1009,7 @@ defmodule TimelessMetrics.HTTP do
   # Prometheus-compatible instant query endpoint (for Grafana health check + current-value panels)
   get "/prometheus/api/v1/query" do
     store = conn.private.timeless_metrics
+    TimelessMetrics.Stats.incr_http_queries(store)
     conn = Plug.Conn.fetch_query_params(conn)
     params = conn.query_params
 
