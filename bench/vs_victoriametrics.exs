@@ -6,7 +6,7 @@
 # Measures native API, HTTP ingest (apples-to-apples), storage, and query latency.
 
 defmodule VsBench do
-  @vm_url "http://localhost:8428"
+  @vm_url "http://localhost:9428"
   @tm_http_port 19_428
   @tm_http_url "http://localhost:#{@tm_http_port}"
   @metrics ~w(cpu_usage mem_usage disk_usage load_avg if_in_octets if_out_octets
@@ -47,7 +47,7 @@ defmodule VsBench do
     labels_for = 0..(devices - 1) |> Enum.map(&%{"host" => "dev_#{&1}"}) |> List.to_tuple()
 
     # --- Phase 1: Native API Ingest (for query data + reference speed) ---
-    data_dir = "/tmp/timeless_vs_bench_#{System.os_time(:millisecond)}"
+    data_dir = "/home/mcotner/timeless_vs_bench_#{System.os_time(:millisecond)}"
     File.mkdir_p!(data_dir)
 
     {:ok, _} =
@@ -125,7 +125,7 @@ defmodule VsBench do
     IO.puts("")
 
     # Start TM HTTP server on separate port
-    http_data_dir = "/tmp/timeless_vs_bench_http_#{System.os_time(:millisecond)}"
+    http_data_dir = "/home/mcotner/timeless_vs_bench_http_#{System.os_time(:millisecond)}"
     File.mkdir_p!(http_data_dir)
 
     {:ok, _} =
@@ -258,9 +258,11 @@ defmodule VsBench do
     IO.puts("      Bytes/pt:   #{http_info.bytes_per_point}")
     IO.puts("      Storage:    #{fmt_bytes(http_info.storage_bytes)}")
 
-    # VM storage via TSDB status API
-    %{status: 200, body: vm_tsdb} = Req.get!(vm_req, url: "/api/v1/status/tsdb")
-    vm_series = vm_tsdb["data"]["totalSeries"]
+    # VM storage via series API (more reliable for historical data)
+    now_q = System.os_time(:second)
+    %{status: 200, body: vm_series_resp} = Req.get!(vm_req, url: "/api/v1/series",
+      params: ["match[]": ~s({__name__=~".+"}), start: now_q - 40 * 86_400, end: now_q])
+    vm_series = length(vm_series_resp["data"])
     IO.puts("    VictoriaMetrics:")
     IO.puts("      Series:     #{fmt_int(vm_series)}")
 
@@ -417,7 +419,9 @@ defmodule VsBench do
   defp fmt_us(us) when us >= 1_000, do: "#{:erlang.float_to_binary(us / 1_000, decimals: 2)}ms"
   defp fmt_us(us), do: "#{:erlang.float_to_binary(us / 1, decimals: 0)}us"
 
-  # Poll VM's TSDB status until totalSeries reaches expected count or stabilizes
+  # Verify VM data landed by querying series count via /api/v1/series
+  # The TSDB status endpoint doesn't reliably count historical data, so we
+  # use a direct series query with the time range from the benchmark.
   defp wait_for_vm_stable(vm_req, expected_series) do
     wait_for_vm_stable(vm_req, expected_series, 0, 0, 60)
   end
@@ -430,15 +434,19 @@ defmodule VsBench do
   defp wait_for_vm_stable(vm_req, expected_series, last_count, stable_checks, retries) do
     Process.sleep(500)
 
-    case Req.get(vm_req, url: "/api/v1/status/tsdb") do
-      {:ok, %{status: 200, body: %{"data" => %{"totalSeries" => count}}}} ->
+    now = System.os_time(:second)
+    start = now - 40 * 86_400
+
+    case Req.get(vm_req, url: "/api/v1/series",
+           params: ["match[]": ~s({__name__=~".+"}), start: start, end: now]) do
+      {:ok, %{status: 200, body: %{"data" => data}}} ->
+        count = length(data)
+
         cond do
           count >= expected_series ->
-            # All series present
             count
 
           count == last_count and stable_checks >= 3 ->
-            # Series count stopped growing — VM is done
             IO.write(" (stabilized at #{count}/#{expected_series} series)")
             count
 

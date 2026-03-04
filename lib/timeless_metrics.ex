@@ -62,6 +62,38 @@ defmodule TimelessMetrics do
   end
 
   @doc """
+  Write entries directly, one per unique series. Faster than `write_batch/2`
+  for collection-cycle workloads (SNMP polling, Prometheus scraping) where
+  each entry targets a different series — skips grouping overhead.
+
+  Each entry is a tuple of `{metric_name, labels, value}` or
+  `{metric_name, labels, value, timestamp}`.
+  """
+  def write_each(store, entries) do
+    Engine.write_each(store, entries)
+  end
+
+  @doc """
+  Resolve a series to a PID for use with `write_resolved/3`.
+
+  Cache the result for repeated writes to the same series (collection
+  cycles, polling loops). Re-resolve if the process dies.
+  """
+  def resolve_series(store, metric_name, labels) do
+    Engine.resolve_series(store, metric_name, labels)
+  end
+
+  @doc """
+  Write directly to a pre-resolved PID. Zero lookup cost per write.
+
+      pid = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
+      TimelessMetrics.write_resolved(pid, 73.2, System.os_time(:second))
+  """
+  def write_resolved(pid, value, timestamp) do
+    Engine.write_resolved(pid, value, timestamp)
+  end
+
+  @doc """
   Query raw time series points for a single series (exact label match).
 
   ## Options

@@ -13,30 +13,105 @@ defmodule TimelessMetrics.Actor.Engine do
   @doc "Write a single metric point."
   def write(store, metric_name, labels, value, opts) do
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
-    manager = manager_name(store)
-    {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
-    GenServer.cast(pid, {:write, timestamp, value})
+    %{index: index, manager: manager} = :persistent_term.get({SeriesManager, store})
+
+    case :ets.lookup_element(index, {metric_name, labels}, 3, nil) do
+      nil ->
+        {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
+        GenServer.cast(pid, {:write, timestamp, value})
+
+      pid ->
+        :erlang.send(pid, {:"$gen_cast", {:write, timestamp, value}})
+    end
   end
 
   @doc "Write a batch of metric points."
   def write_batch(store, entries) do
-    manager = manager_name(store)
+    %{manager: manager} = :persistent_term.get({SeriesManager, store})
 
     entries
-    |> Enum.map(fn
-      {metric_name, labels, value} ->
-        {metric_name, labels, System.os_time(:second), value}
-
-      {metric_name, labels, value, ts} ->
-        {metric_name, labels, ts, value}
-    end)
-    |> Enum.group_by(fn {mn, l, _ts, _v} -> {mn, l} end)
-    |> Enum.each(fn {{metric_name, labels}, points} ->
+    |> Enum.group_by(
+      fn
+        {mn, l, _v} -> {mn, l}
+        {mn, l, _v, _ts} -> {mn, l}
+      end,
+      fn
+        {_mn, _l, v} -> {System.os_time(:second), v}
+        {_mn, _l, v, ts} -> {ts, v}
+      end
+    )
+    |> Enum.each(fn {{metric_name, labels}, batch} ->
       {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
-      batch = Enum.map(points, fn {_mn, _l, ts, v} -> {ts, v} end)
       GenServer.cast(pid, {:write_batch, batch})
     end)
 
+    :ok
+  end
+
+  @doc """
+  Write entries directly, one per unique series. Skips group_by for
+  collection-cycle workloads where each entry targets a different series.
+
+  Hot path is inlined: single ETS lookup + raw send per entry, no
+  intermediate allocations. Falls back to full `get_or_start` on miss.
+
+  Entries: `[{metric_name, labels, value} | {metric_name, labels, value, ts}]`
+  """
+  def write_each(store, entries) do
+    %{index: index, manager: manager} = :persistent_term.get({SeriesManager, store})
+
+    Enum.each(entries, fn
+      {metric_name, labels, value} ->
+        case :ets.lookup_element(index, {metric_name, labels}, 3, nil) do
+          nil ->
+            {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
+            GenServer.cast(pid, {:write, System.os_time(:second), value})
+
+          pid ->
+            :erlang.send(pid, {:"$gen_cast", {:write, System.os_time(:second), value}})
+        end
+
+      {metric_name, labels, value, ts} ->
+        case :ets.lookup_element(index, {metric_name, labels}, 3, nil) do
+          nil ->
+            {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
+            GenServer.cast(pid, {:write, ts, value})
+
+          pid ->
+            :erlang.send(pid, {:"$gen_cast", {:write, ts, value}})
+        end
+    end)
+
+    :ok
+  end
+
+  @doc """
+  Resolve a series to its PID for use with `write_resolved/3`.
+
+  Cache the result for repeated writes to the same series. If the
+  process dies, the PID becomes stale — re-resolve when needed.
+  """
+  def resolve_series(store, metric_name, labels) do
+    %{index: index, manager: manager} = :persistent_term.get({SeriesManager, store})
+
+    case :ets.lookup_element(index, {metric_name, labels}, 3, nil) do
+      nil ->
+        {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
+        pid
+
+      pid ->
+        pid
+    end
+  end
+
+  @doc """
+  Write directly to a pre-resolved PID. Zero lookup cost.
+
+  Use `resolve_series/3` to get the PID. This is the fastest write path
+  for hot loops where the same series are written repeatedly.
+  """
+  def write_resolved(pid, value, timestamp) do
+    :erlang.send(pid, {:"$gen_cast", {:write, timestamp, value}})
     :ok
   end
 
@@ -539,27 +614,35 @@ defmodule TimelessMetrics.Actor.Engine do
   @doc "Write a single text metric point."
   def write_text(store, metric_name, labels, value, opts \\ []) do
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
-    manager = manager_name(store)
-    {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels, :text)
-    GenServer.cast(pid, {:write_text, timestamp, value})
+    %{index: index, manager: manager} = :persistent_term.get({SeriesManager, store})
+
+    case :ets.lookup_element(index, {metric_name, labels}, 3, nil) do
+      nil ->
+        {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels, :text)
+        GenServer.cast(pid, {:write_text, timestamp, value})
+
+      pid ->
+        :erlang.send(pid, {:"$gen_cast", {:write_text, timestamp, value}})
+    end
   end
 
   @doc "Write a batch of text metric points."
   def write_text_batch(store, entries) do
-    manager = manager_name(store)
+    %{manager: manager} = :persistent_term.get({SeriesManager, store})
 
     entries
-    |> Enum.map(fn
-      {metric_name, labels, value} ->
-        {metric_name, labels, System.os_time(:second), value}
-
-      {metric_name, labels, value, ts} ->
-        {metric_name, labels, ts, value}
-    end)
-    |> Enum.group_by(fn {mn, l, _ts, _v} -> {mn, l} end)
-    |> Enum.each(fn {{metric_name, labels}, points} ->
+    |> Enum.group_by(
+      fn
+        {mn, l, _v} -> {mn, l}
+        {mn, l, _v, _ts} -> {mn, l}
+      end,
+      fn
+        {_mn, _l, v} -> {System.os_time(:second), v}
+        {_mn, _l, v, ts} -> {ts, v}
+      end
+    )
+    |> Enum.each(fn {{metric_name, labels}, batch} ->
       {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels, :text)
-      batch = Enum.map(points, fn {_mn, _l, ts, v} -> {ts, v} end)
       GenServer.cast(pid, {:write_text_batch, batch})
     end)
 

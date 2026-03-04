@@ -202,6 +202,143 @@ defmodule Mix.Tasks.Bench.Actor do
     rate = trunc(total / (us / 1_000_000))
     IO.puts("    #{fmt_int(total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} pts/sec]")
 
+    # 1d. Collection cycles via write_each (optimized: no group_by, no batch mapping)
+    IO.puts("")
+
+    IO.puts(
+      "  Collection cycles (#{cycles} cycles × #{fmt_int(series_count)} series, write_each):"
+    )
+
+    each_total = series_count * cycles
+
+    {us, _} =
+      :timer.tc(fn ->
+        for cycle <- 0..(cycles - 1) do
+          ts = base_ts + 300 + cycle
+
+          entries =
+            for n <- 0..(series_count - 1) do
+              {"scale_metric", labels_by_id[n], gen_value(), ts}
+            end
+
+          TimelessMetrics.write_each(:bench_actor, entries)
+        end
+      end)
+
+    rate = trunc(each_total / (us / 1_000_000))
+
+    IO.puts(
+      "    #{fmt_int(each_total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} pts/sec]  (#{cycles} cycles)"
+    )
+
+    # 1e. Pre-resolved writes (zero lookup per write)
+    IO.puts("")
+
+    IO.puts(
+      "  Collection cycles (#{cycles} cycles × #{fmt_int(series_count)} series, write_resolved):"
+    )
+
+    # Resolve all PIDs once
+    pids_list =
+      for n <- 0..(series_count - 1) do
+        TimelessMetrics.resolve_series(:bench_actor, "scale_metric", labels_by_id[n])
+      end
+
+    {us, _} =
+      :timer.tc(fn ->
+        for cycle <- 0..(cycles - 1) do
+          ts = base_ts + 400 + cycle
+
+          Enum.each(pids_list, fn pid ->
+            TimelessMetrics.write_resolved(pid, gen_value(), ts)
+          end)
+        end
+      end)
+
+    rate = trunc(each_total / (us / 1_000_000))
+
+    IO.puts(
+      "    #{fmt_int(each_total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} pts/sec]  (#{cycles} cycles)"
+    )
+
+    # 1f. Write path breakdown — bulk-timed stages
+    IO.puts("")
+    IO.puts("  Write path breakdown (1 cycle × #{fmt_int(series_count)} series):")
+    IO.puts("")
+
+    manager = :bench_actor_actor_manager
+    state_info = :persistent_term.get({TimelessMetrics.Actor.SeriesManager, manager})
+    index = state_info.index
+
+    # Build entries
+    ts_bd = base_ts + 500
+
+    {us_build, bd_entries} =
+      :timer.tc(fn ->
+        for n <- 0..(series_count - 1) do
+          {"scale_metric", labels_by_id[n], gen_value(), ts_bd}
+        end
+      end)
+
+    # ETS lookup (map key — no encode_labels needed)
+    {us_ets, ets_results} =
+      :timer.tc(fn ->
+        Enum.map(bd_entries, fn {metric_name, labels, _v, _ts} ->
+          [{_key, _sid, pid}] = :ets.lookup(index, {metric_name, labels})
+          pid
+        end)
+      end)
+
+    # GenServer.cast
+    {us_cast, _} =
+      :timer.tc(fn ->
+        bd_entries
+        |> Enum.zip(ets_results)
+        |> Enum.each(fn {{_mn, _l, v, ts}, pid} ->
+          GenServer.cast(pid, {:write, ts, v})
+        end)
+      end)
+
+    # Full write_each for comparison
+    ts_full = base_ts + 501
+    full_entries =
+      for n <- 0..(series_count - 1) do
+        {"scale_metric", labels_by_id[n], gen_value(), ts_full}
+      end
+
+    {us_full_each, _} =
+      :timer.tc(fn ->
+        TimelessMetrics.write_each(:bench_actor, full_entries)
+      end)
+
+    # Full write_batch for comparison
+    ts_full2 = base_ts + 502
+    full_entries2 =
+      for n <- 0..(series_count - 1) do
+        {"scale_metric", labels_by_id[n], gen_value(), ts_full2}
+      end
+
+    {us_full_batch, _} =
+      :timer.tc(fn ->
+        TimelessMetrics.write_batch(:bench_actor, full_entries2)
+      end)
+
+    IO.puts("    Build entries:         #{String.pad_leading(fmt_dur(us_build), 10)}")
+    IO.puts("    ETS lookup (map key):  #{String.pad_leading(fmt_dur(us_ets), 10)}")
+    IO.puts("    GenServer.cast:        #{String.pad_leading(fmt_dur(us_cast), 10)}")
+    IO.puts("    ─────────────────────────────────────")
+
+    rate_each = trunc(series_count / (us_full_each / 1_000_000))
+    rate_batch = trunc(series_count / (us_full_batch / 1_000_000))
+
+    IO.puts(
+      "    write_each:            #{String.pad_leading(fmt_dur(us_full_each), 10)}  [#{fmt_int(rate_each)} pts/sec]"
+    )
+
+    IO.puts(
+      "    write_batch:           #{String.pad_leading(fmt_dur(us_full_batch), 10)}  [#{fmt_int(rate_batch)} pts/sec]"
+    )
+
     # Let mailboxes drain and GC settle before memory measurements
     IO.write("    Draining mailboxes...")
     drain_mailboxes()

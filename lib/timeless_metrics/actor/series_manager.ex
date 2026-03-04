@@ -45,19 +45,15 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   def get_or_start(manager, metric_name, labels, series_type \\ :numeric) do
     state_info = :persistent_term.get({__MODULE__, manager})
     index = state_info.index
-    registry = state_info.registry
-    encoded = encode_labels(labels)
-    key = {metric_name, encoded}
+    key = {metric_name, labels}
 
     case :ets.lookup(index, key) do
-      [{^key, series_id}] ->
-        case Registry.lookup(registry, series_id) do
-          [{pid, _}] ->
-            {series_id, pid}
-
-          [] ->
-            # Process died — restart via GenServer
-            GenServer.call(manager, {:start_series, series_id, metric_name, labels, series_type})
+      [{^key, series_id, pid}] ->
+        if Process.alive?(pid) do
+          {series_id, pid}
+        else
+          # Process died — restart via GenServer (will update ETS with new PID)
+          GenServer.call(manager, {:start_series, series_id, metric_name, labels, series_type})
         end
 
       [] ->
@@ -72,22 +68,14 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   def find_series(manager, metric_name, label_filter) do
     state_info = :persistent_term.get({__MODULE__, manager})
     index = state_info.index
-    registry = state_info.registry
 
-    # Get all series for this metric
-    pattern = {{metric_name, :_}, :_}
-
-    :ets.match_object(index, pattern)
-    |> Enum.map(fn {{_metric, encoded_labels}, series_id} ->
-      {series_id, decode_labels(encoded_labels)}
+    # Get all series for this metric — labels are maps, PID is cached
+    :ets.match_object(index, {{metric_name, :_}, :_, :_})
+    |> Enum.map(fn {{_metric, labels}, series_id, pid} ->
+      {series_id, labels, pid}
     end)
     |> filter_by_labels(label_filter)
-    |> Enum.flat_map(fn {series_id, labels} ->
-      case Registry.lookup(registry, series_id) do
-        [{pid, _}] -> [{series_id, labels, pid}]
-        [] -> []
-      end
-    end)
+    |> Enum.filter(fn {_series_id, _labels, pid} -> Process.alive?(pid) end)
   end
 
   @doc "List all unique metric names."
@@ -219,11 +207,10 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     }
 
     # Store in persistent_term for fast client-side access
-    :persistent_term.put({__MODULE__, name}, %{
-      index: index,
-      registry: registry,
-      db: db
-    })
+    # Keyed by manager name (for get_or_start) and by store atom (for hot-path writes)
+    info = %{index: index, registry: registry, db: db, manager: name}
+    :persistent_term.put({__MODULE__, name}, info)
+    :persistent_term.put({__MODULE__, store}, info)
 
     # Recovery: load all series from DB and start processes
     recover_series(state)
@@ -233,23 +220,24 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
   @impl true
   def handle_call({:get_or_start, metric_name, labels, series_type}, _from, state) do
-    encoded = encode_labels(labels)
-    key = {metric_name, encoded}
+    key = {metric_name, labels}
 
     # Double-check ETS (another process may have registered it)
     case :ets.lookup(state.index, key) do
-      [{^key, series_id}] ->
-        case Registry.lookup(state.registry, series_id) do
-          [{pid, _}] ->
-            {:reply, {series_id, pid}, state}
+      [{^key, series_id, pid}] ->
+        if Process.alive?(pid) do
+          {:reply, {series_id, pid}, state}
+        else
+          {series_id, new_pid} =
+            start_series_process(state, series_id, metric_name, labels, series_type)
 
-          [] ->
-            {:reply, start_series_process(state, series_id, metric_name, labels, series_type),
-             state}
+          :ets.insert(state.index, {key, series_id, new_pid})
+          {:reply, {series_id, new_pid}, state}
         end
 
       [] ->
         # Create in SQLite
+        encoded = encode_labels(labels)
         now = System.os_time(:second)
         type_str = Atom.to_string(series_type)
 
@@ -260,15 +248,22 @@ defmodule TimelessMetrics.Actor.SeriesManager do
             [metric_name, encoded, now, type_str]
           )
 
-        # Insert into ETS index
-        :ets.insert(state.index, {key, series_id})
+        # Start process, then insert into ETS with PID
+        {series_id, pid} =
+          start_series_process(state, series_id, metric_name, labels, series_type)
 
-        {:reply, start_series_process(state, series_id, metric_name, labels, series_type), state}
+        :ets.insert(state.index, {key, series_id, pid})
+        {:reply, {series_id, pid}, state}
     end
   end
 
   def handle_call({:start_series, series_id, metric_name, labels, series_type}, _from, state) do
-    {:reply, start_series_process(state, series_id, metric_name, labels, series_type), state}
+    {series_id, pid} =
+      start_series_process(state, series_id, metric_name, labels, series_type)
+
+    # Update ETS with new PID (process restarted)
+    :ets.insert(state.index, {{metric_name, labels}, series_id, pid})
+    {:reply, {series_id, pid}, state}
   end
 
   # --- Internals ---
@@ -283,8 +278,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     Enum.each(rows, fn [id, metric_name, encoded_labels, type_str] ->
       labels = decode_labels(encoded_labels)
       series_type = String.to_existing_atom(type_str)
-      :ets.insert(state.index, {{metric_name, encoded_labels}, id})
-      start_series_process(state, id, metric_name, labels, series_type)
+      {_id, pid} = start_series_process(state, id, metric_name, labels, series_type)
+      :ets.insert(state.index, {{metric_name, labels}, id, pid})
     end)
   end
 
@@ -334,17 +329,22 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   defp filter_by_labels(series_list, label_filter) do
     compiled = compile_label_filter(label_filter)
 
-    Enum.filter(series_list, fn {_id, labels} ->
-      Enum.all?(compiled, fn
-        {k, {:compiled_regex, regex}} ->
-          case Map.get(labels, k) do
-            nil -> false
-            val -> Regex.match?(regex, val)
-          end
+    Enum.filter(series_list, fn
+      {_id, labels} -> matches_filter?(labels, compiled)
+      {_id, labels, _pid} -> matches_filter?(labels, compiled)
+    end)
+  end
 
-        {k, v} ->
-          Map.get(labels, k) == v
-      end)
+  defp matches_filter?(labels, compiled) do
+    Enum.all?(compiled, fn
+      {k, {:compiled_regex, regex}} ->
+        case Map.get(labels, k) do
+          nil -> false
+          val -> Regex.match?(regex, val)
+        end
+
+      {k, v} ->
+        Map.get(labels, k) == v
     end)
   end
 
