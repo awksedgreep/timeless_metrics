@@ -106,41 +106,77 @@ defmodule Mix.Tasks.Bench.Actor do
   end
 
   # ── Phase 1: Write Throughput ───────────────────────────────────────
+  #
+  # Simulates real-world data collection cycles: a poller collects N metrics
+  # from all devices every interval. Each cycle writes 1 point per series
+  # via write_batch, then the next cycle does the same with a new timestamp.
+  # This is how SNMP polling, Prometheus scraping, and agent-based collection
+  # actually work — the same set of series, written to repeatedly.
 
   defp phase1_writes(series_count, base_ts) do
     header("Phase 1: Write Throughput")
 
-    # 1a. Sequential writes — 1 point to each series
+    cycles = cycles_for(series_count)
+
+    # Pre-build the label maps once (in real life these are stable)
+    labels_by_id =
+      for n <- 0..(series_count - 1), into: %{} do
+        {n, %{"id" => Integer.to_string(n)}}
+      end
+
+    # 1a. Collection cycles via write_batch (the standard ingest path)
     IO.puts("")
-    IO.puts("  Sequential writes (1 pt × #{fmt_int(series_count)} series):")
+
+    IO.puts(
+      "  Collection cycles (#{cycles} cycles × #{fmt_int(series_count)} series, write_batch):"
+    )
 
     {us, _} =
       :timer.tc(fn ->
-        for n <- 0..(series_count - 1) do
-          labels = %{"id" => Integer.to_string(n)}
+        for cycle <- 0..(cycles - 1) do
+          ts = base_ts + 100 + cycle
 
-          TimelessMetrics.write(:bench_actor, "scale_metric", labels, gen_value(),
-            timestamp: base_ts + 100
-          )
+          entries =
+            for n <- 0..(series_count - 1) do
+              {"scale_metric", labels_by_id[n], gen_value(), ts}
+            end
+
+          TimelessMetrics.write_batch(:bench_actor, entries)
         end
       end)
 
-    rate = trunc(series_count / (us / 1_000_000))
-    IO.puts("    #{fmt_int(series_count)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} pts/sec]")
+    total = series_count * cycles
+    rate = trunc(total / (us / 1_000_000))
 
-    # 1b. Batch writes — all series at once
+    IO.puts(
+      "    #{fmt_int(total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} pts/sec]  (#{cycles} cycles)"
+    )
+
+    # 1b. Collection cycles via individual writes (measures per-write routing cost)
     IO.puts("")
-    IO.puts("  Batch write (#{fmt_int(series_count)} entries):")
 
-    entries =
-      for n <- 0..(series_count - 1) do
-        {"scale_metric", %{"id" => Integer.to_string(n)}, gen_value(), base_ts + 200}
-      end
+    IO.puts(
+      "  Collection cycles (#{cycles} cycles × #{fmt_int(series_count)} series, individual writes):"
+    )
 
-    {us, _} = :timer.tc(fn -> TimelessMetrics.write_batch(:bench_actor, entries) end)
+    {us, _} =
+      :timer.tc(fn ->
+        for cycle <- 0..(cycles - 1) do
+          ts = base_ts + 200 + cycle
 
-    rate = trunc(series_count / (us / 1_000_000))
-    IO.puts("    #{fmt_int(series_count)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} pts/sec]")
+          for n <- 0..(series_count - 1) do
+            TimelessMetrics.write(:bench_actor, "scale_metric", labels_by_id[n], gen_value(),
+              timestamp: ts
+            )
+          end
+        end
+      end)
+
+    rate = trunc(total / (us / 1_000_000))
+
+    IO.puts(
+      "    #{fmt_int(total)} writes in #{fmt_dur(us)}  [#{fmt_int(rate)} pts/sec]  (#{cycles} cycles)"
+    )
 
     # 1c. Concurrent saturation — schedulers_online() writers for 5s
     writers = System.schedulers_online()
@@ -156,7 +192,7 @@ defmodule Mix.Tasks.Bench.Actor do
         1..writers
         |> Enum.map(fn _w ->
           Task.async(fn ->
-            saturate_loop(counter, deadline, series_count, base_ts + 300)
+            saturate_loop(counter, deadline, series_count, base_ts + 400)
           end)
         end)
         |> Task.await_many(:infinity)
@@ -171,6 +207,12 @@ defmodule Mix.Tasks.Bench.Actor do
     drain_mailboxes()
     IO.puts(" done")
   end
+
+  defp cycles_for(series_count) when series_count <= 1_000, do: 1_000
+  defp cycles_for(series_count) when series_count <= 5_000, do: 500
+  defp cycles_for(series_count) when series_count <= 10_000, do: 200
+  defp cycles_for(series_count) when series_count <= 100_000, do: 20
+  defp cycles_for(_), do: 5
 
   defp saturate_loop(counter, deadline, series_count, base_ts) do
     if System.monotonic_time(:millisecond) < deadline do

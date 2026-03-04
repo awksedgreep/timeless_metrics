@@ -24,25 +24,28 @@ Run it as a library inside your Elixir app or as a standalone container.
 
 ## Performance
 
-Run on a 28-core laptop (DDR5-5600). Reproduce with `mix bench.actor --tier medium` (10K series).
+Run on a 28-core laptop (DDR5-5600). Benchmarks simulate real-world data collection cycles (N series polled repeatedly, like SNMP or Prometheus scraping). Reproduce with `mix bench.actor`.
 
-### Write Throughput (10K series)
+### Write Throughput
 
-| Write Path | Throughput |
+Collection cycle pattern: poll all series, write one point per series per cycle, repeat.
+
+| Workload | Throughput |
 |---|---|
-| Sequential (1 point × 10K series) | ~746K pts/sec |
-| Batch (10K entries) | ~546K pts/sec |
-| Concurrent saturation (28 writers × 5s) | 5.7M pts/sec |
+| 2K series × 500 cycles (write_batch) | ~634K pts/sec |
+| 10K series × 200 cycles (write_batch) | ~523K pts/sec |
+| 10K series × 200 cycles (individual writes) | ~617K pts/sec |
+| Concurrent saturation (28 writers × 5s) | 5.3-6.5M pts/sec |
 
 ### Query Latency (10K series, 50 iterations)
 
 | Query | Avg | P50 | P99 |
 |---|---|---|---|
-| Raw single series | 441us | 427us | 690us |
-| Fan-out 100 series | 1.03ms | 994us | 2.03ms |
-| Fan-out 1K series | 9.92ms | 10.26ms | 12.31ms |
-| Aggregation single | 657us | 591us | 935us |
-| Latest value | 171us | 167us | 208us |
+| Raw single series | 532us | 515us | 881us |
+| Fan-out 100 series | 1.08ms | 996us | 2.30ms |
+| Fan-out 1K series | 10.37ms | 10.41ms | 16.10ms |
+| Aggregation single | 705us | 667us | 1.02ms |
+| Latest value | 13us | 13us | 20us |
 
 ### Storage Efficiency
 
