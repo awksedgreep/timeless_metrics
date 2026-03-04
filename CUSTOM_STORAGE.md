@@ -1,5 +1,10 @@
 # Custom Storage Backend — Design Document
 
+> **Note:** This design document is historical. The custom storage backend described
+> here has been implemented as the **per-series actor model with BlockStore v2**
+> (`.dat` files). Raw data no longer uses SQLite shard DBs. See
+> [docs/architecture.md](docs/architecture.md) for the current architecture.
+
 ## Problem
 
 SQLite shard DBs add ~25x storage overhead for write-once time series data.

@@ -1,18 +1,25 @@
 # Timeless - Embedded Time Series Storage for Elixir
 
+> **Note:** This was the original design document written before implementation.
+> The actual architecture has evolved significantly — most notably, the shard-based
+> buffer/segment pipeline was replaced by a **per-series actor model** with `.dat`
+> file storage (BlockStore v2). Raw data no longer goes through SQLite; it is stored
+> directly in per-series compressed block files. See [docs/architecture.md](docs/architecture.md)
+> for the current architecture.
+
 ## Overview
 
 Timeless is an embedded time series database library for Elixir applications.
-It combines Gorilla compression (via `gorilla_stream`) with SQLite/libsql for
-storage, providing automatic rollups, configurable retention, and microsecond
-query latency with zero external dependencies.
+It combines Gorilla compression (via `gorilla_stream`) with per-series `.dat`
+file storage and SQLite for metadata, providing automatic rollups, configurable
+retention, and microsecond query latency with zero external dependencies.
 
 **Design principles:**
-- Embedded library, not a service — `use Timeless` and go
-- Zero network hops — ETS write buffer, local SQLite storage
+- Embedded library, not a service — add to your supervision tree and go
+- Zero network hops — per-series actor model, local file storage
 - Declarative configuration — define tiers once, the engine handles the rest
-- Compression first — gorilla + zstd achieves ~2 bytes/sample
-- Horizontally scalable — partition via Erlang clustering when ready
+- Compression first — gorilla + zstd achieves ~0.67 bytes/sample
+- Per-series isolation — one GenServer per metric/label combination
 
 ---
 

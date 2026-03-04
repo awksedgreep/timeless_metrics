@@ -64,11 +64,10 @@ All subsequent API calls reference the store by its name (`:metrics` above).
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `:name` | atom | **required** | Store name used in all API calls |
-| `:data_dir` | string | **required** | Directory for segment files and metadata database |
-| `:buffer_shards` | integer | `schedulers / 2` (min 2) | Number of write buffer shards |
-| `:flush_interval` | integer | `5000` | Buffer flush interval in ms |
-| `:flush_threshold` | integer | `10_000` | Points per shard before forced flush |
-| `:segment_duration` | integer | `3600` | Raw segment duration in seconds |
+| `:data_dir` | string | **required** | Directory for block data files and metadata database |
+| `:block_size` | integer | `1000` | Points per compressed block |
+| `:max_blocks` | integer | `100` | Maximum compressed blocks per series (ring buffer) |
+| `:flush_interval` | integer | `60_000` | Flush to disk interval in ms |
 | `:compression` | atom | `:zstd` | Compression algorithm |
 | `:schema` | module/struct | `TimelessMetrics.Schema.default()` | Rollup tier configuration |
 
@@ -388,8 +387,7 @@ TimelessMetrics.enforce_retention(:metrics)
 | `storage_bytes` | Total on-disk storage (segment files + metadata DB) |
 | `oldest_timestamp` | Earliest data point |
 | `newest_timestamp` | Latest data point |
-| `buffer_points` | Points still in write buffers |
-| `buffer_shards` | Number of buffer shards |
+| `buffer_points` | Points still in raw buffers (not yet compressed) |
 | `tiers` | Map of tier names to stats |
 | `raw_retention` | Raw data retention in seconds |
 | `db_path` | Main database file path |
@@ -944,10 +942,9 @@ When starting TimelessMetrics as a library:
 {TimelessMetrics,
   name: :metrics,
   data_dir: "/var/lib/metrics",
-  buffer_shards: 8,
-  flush_interval: :timer.seconds(5),
-  flush_threshold: 10_000,
-  segment_duration: 14_400,
+  block_size: 1000,
+  max_blocks: 100,
+  flush_interval: 60_000,
   compression: :zstd,
   schema: MyApp.MetricsSchema}
 ```
@@ -998,14 +995,12 @@ the store:
 |----------|---------|-------------|
 | `TIMELESS_DATA_DIR` | `/data` | Storage directory (mount a volume here) |
 | `TIMELESS_PORT` | `8428` | HTTP listen port |
-| `TIMELESS_SHARDS` | `schedulers / 2` | Number of write buffer/builder shards |
-| `TIMELESS_SEGMENT_DURATION` | `14400` | Raw segment duration in seconds |
+| `TIMELESS_BEARER_TOKEN` | *(none)* | Bearer token for API auth (unset = no auth) |
 
 ```bash
 podman run -d \
   -p 8428:8428 \
   -v timeless_data:/data:Z \
-  -e TIMELESS_SHARDS=4 \
-  -e TIMELESS_SEGMENT_DURATION=7200 \
+  -e TIMELESS_BEARER_TOKEN=my-secret \
   localhost/timeless:latest
 ```

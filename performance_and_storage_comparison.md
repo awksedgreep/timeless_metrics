@@ -1,12 +1,17 @@
 # TimelessMetrics vs VictoriaMetrics: Performance & Storage Comparison
 
+> **Note:** This comparison was performed against the older shard-based architecture
+> with SQLite for raw data storage. The current actor-based architecture (BlockStore v2,
+> per-series `.dat` files) has significantly different performance characteristics.
+> Run `mix bench.actor` for current numbers.
+
 Last updated: 2026-02-21
 
 ## Test Environment
 
 - CPU: 22 cores (AMD)
 - Storage: tmpfs (ramdisk) — eliminates disk I/O as a variable
-- TimelessMetrics: Elixir/OTP, Gorilla NIF + zstd level 9, SQLite backend
+- TimelessMetrics: Elixir/OTP, Gorilla NIF + zstd level 9, shard-based SQLite backend (old architecture)
 - VictoriaMetrics: Go, custom decimal-delta + ZSTD, LSM-tree storage
 - Data: 50 devices x 10 metrics x 30 days @ 5-min intervals = 4.3M points
 - Series: 500 (realistic ISP monitoring data — noisy sine waves, gauges, counters)

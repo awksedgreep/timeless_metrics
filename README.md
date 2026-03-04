@@ -24,30 +24,25 @@ Run it as a library inside your Elixir app or as a standalone container.
 
 ## Performance
 
-Benchmarked with realistic ISP/network data (100 devices, 20 metrics each, 90 days of 5-minute samples):
+Run on a 28-core laptop (DDR5-5600). Reproduce with `mix bench.actor --tier medium` (10K series).
 
-### Write Throughput
+### Write Throughput (10K series)
 
 | Write Path | Throughput |
 |---|---|
-| Single series write | ~4M points/sec |
-| Pre-resolved write (bypass registry) | ~6M points/sec |
-| Batch write | ~4M points/sec |
-| Concurrent batch, pre-resolved | ~9.5M points/sec |
-| Concurrent saturation (28 cores, DDR5-5600) | 5.6M points/sec |
+| Sequential (1 point × 10K series) | ~746K pts/sec |
+| Batch (10K entries) | ~546K pts/sec |
+| Concurrent saturation (28 writers × 5s) | 5.7M pts/sec |
 
-### Query Latency (2K series, 5.2M points, 100 iterations)
+### Query Latency (10K series, 50 iterations)
 
 | Query | Avg | P50 | P99 |
 |---|---|---|---|
-| Raw points (1h) | <0.1ms | <0.1ms | <0.1ms |
-| Raw points (24h) | ~0.1ms | ~0.1ms | ~0.2ms |
-| Aggregation (1h, 60s buckets) | ~0.1ms | ~0.1ms | ~0.2ms |
-| Aggregation (24h, 5m buckets) | ~0.2ms | ~0.2ms | ~0.3ms |
-| Multi-series (100 hosts, 1h) | ~2ms | ~2ms | ~3ms |
-| Latest value | <0.1ms | <0.1ms | <0.1ms |
-| Tier query: hourly (7d) | <0.1ms | <0.1ms | <0.1ms |
-| Tier query: daily (90d) | <0.1ms | <0.1ms | <0.1ms |
+| Raw single series | 441us | 427us | 690us |
+| Fan-out 100 series | 1.03ms | 994us | 2.03ms |
+| Fan-out 1K series | 9.92ms | 10.26ms | 12.31ms |
+| Aggregation single | 657us | 591us | 935us |
+| Latest value | 171us | 167us | 208us |
 
 ### Storage Efficiency
 
@@ -57,13 +52,13 @@ Benchmarked with realistic ISP/network data (100 devices, 20 metrics each, 90 da
 | Bytes per point | ~0.67 |
 | Compression engine | Gorilla (delta-of-delta + XOR) + zstd |
 
-Run `mix bench` to reproduce on your hardware. Use `--tier stress` for 10K devices.
+Run `mix bench.actor` to reproduce on your hardware. Use `--tier large` for 100K series, `--tier moon` for 500K.
 
 ## Features
 
-- **High throughput** — 4M+ points/sec ingest, 5.6M+ points/sec concurrent writes, 9.5M+ points/sec concurrent pre-resolved writes
+- **High throughput** — 5.7M+ points/sec concurrent writes, per-series actor isolation
 - **Compact storage** — Gorilla + zstd compression, 11.5x ratio (~95% reduction)
-- **Sharded writes** — parallel buffer/builder shards across CPU cores
+- **Per-series actors** — one GenServer per metric/label combination, lock-free routing via ETS + Registry
 - **Automatic rollups** — configurable tiers (hourly, daily, monthly) with retention policies
 - **VictoriaMetrics compatible** — JSON line import, works with Vector, Grafana, and existing VM tooling
 - **Prometheus compatible** — text exposition import and PromQL-compatible query endpoint for Grafana
@@ -75,7 +70,7 @@ Run `mix bench` to reproduce on your hardware. Use `--tier stress` for 10K devic
 - **Capacity planning** — forecast from daily/weekly data to predict growth months or years ahead
 - **Alerts** — threshold-based rules with webhook notifications (ntfy.sh, Slack, etc.)
 - **Metric metadata** — type, unit, and description registration
-- **Zero external dependencies** — SQLite + pure Elixir, no Nx/Scholar/ML libraries required
+- **Zero external dependencies** — SQLite (metadata only) + pure Elixir, no Nx/Scholar/ML libraries required
 
 ## Quick Start
 
@@ -197,7 +192,6 @@ info = TimelessMetrics.info(:metrics)
 #   bytes_per_point: 0.67,
 #   storage_bytes: 24_000_000,
 #   buffer_points: 320,
-#   buffer_shards: 4,
 #   oldest_timestamp: 1700000000,
 #   newest_timestamp: 1700086400,
 #   tiers: [%{name: :hourly, chunks: 24, buckets: 3600, ...}, ...],
@@ -221,7 +215,7 @@ TimelessMetrics.label_values(:metrics, "cpu_usage", "host")
 ### Operations
 
 ```elixir
-TimelessMetrics.flush(:metrics)              # Force flush all buffer shards
+TimelessMetrics.flush(:metrics)              # Force flush all series to disk
 TimelessMetrics.rollup(:metrics)             # Run rollup aggregation
 TimelessMetrics.compact(:metrics)            # Compact raw segments
 TimelessMetrics.enforce_retention(:metrics)  # Clean up expired data
@@ -304,8 +298,6 @@ See [docs/alerting.md](docs/alerting.md) for alert rules, webhook payloads, and 
 |----------|---------|-------------|
 | `TIMELESS_DATA_DIR` | `/data` | Storage directory |
 | `TIMELESS_PORT` | `8428` | HTTP listen port |
-| `TIMELESS_SHARDS` | `schedulers / 2` | Write buffer shard count |
-| `TIMELESS_SEGMENT_DURATION` | `14400` | Raw segment duration (seconds) |
 | `TIMELESS_BEARER_TOKEN` | *(none)* | Bearer token for API auth (unset = no auth) |
 
 ## Authentication
@@ -338,21 +330,20 @@ systemctl --user start timeless
 ## Architecture
 
 ```
-Writes ──> Buffer Shards (ETS) ──> Segment Builders ──> Shard Stores (.seg files)
+Writes ──> Engine ──> SeriesManager (ETS + Registry) ──> SeriesServer (per-series)
                                                               │
-                                              Rollup Engine ──┤── hourly tier
-                                                              ├── daily tier
-                                                              └── monthly tier
-
+                                                    BlockStore (.dat files)
+                                                              │
+                                              Rollup Engine ──┤── daily tier
+                                                              │
 Main DB (SQLite): series registry, metadata, annotations, alerts
-Shard Stores: immutable .seg files + WAL for raw data, tier chunk files
 ```
 
-- **Buffer shards** — lock-free ETS tables, `schedulers/2` shards (min 2), flushed every 5s or 10K points
-- **Segment builders** — Gorilla + zstd compression, one per shard for parallel writes
-- **Shard stores** — immutable `.seg` segment files per shard, no SQLite for raw data
-- **Rollup engine** — parallel per-shard aggregation into configurable tiers
-- **Retention enforcer** — periodic cleanup of expired raw data and tier rows
+- **Per-series actors** — one GenServer per `{metric, labels}`, write isolation, natural backpressure
+- **ETS + Registry routing** — microsecond series resolution, lock-free hot path
+- **BlockStore** — Gorilla + zstd compressed blocks in per-series `.dat` files (ring buffer)
+- **Rollup engine** — periodic daily aggregation with watermark tracking
+- **Retention enforcer** — periodic cleanup of expired blocks and rollup rows
 - **SQLite** — WAL mode, mmap, used only for series registry + metadata (not raw data)
 
 ## Custom Rollup Schema
