@@ -41,8 +41,16 @@ defmodule TimelessMetrics.Stats do
     case ref(store) do
       nil ->
         Map.new(
-          [:writes_total, :points_ingested, :series_created, :http_imports,
-           :http_queries, :http_import_errors, :merges_completed, :points_merged],
+          [
+            :writes_total,
+            :points_ingested,
+            :series_created,
+            :http_imports,
+            :http_queries,
+            :http_import_errors,
+            :merges_completed,
+            :points_merged
+          ],
           &{&1, 0}
         )
 

@@ -301,6 +301,7 @@ defmodule Mix.Tasks.Bench.Actor do
 
     # Full write_each for comparison
     ts_full = base_ts + 501
+
     full_entries =
       for n <- 0..(series_count - 1) do
         {"scale_metric", labels_by_id[n], gen_value(), ts_full}
@@ -313,6 +314,7 @@ defmodule Mix.Tasks.Bench.Actor do
 
     # Full write_batch for comparison
     ts_full2 = base_ts + 502
+
     full_entries2 =
       for n <- 0..(series_count - 1) do
         {"scale_metric", labels_by_id[n], gen_value(), ts_full2}

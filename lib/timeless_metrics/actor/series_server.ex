@@ -384,7 +384,12 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
     {merged_blocks, dirty?, total_points_merged} =
       Enum.reduce(batches, {[], false, 0}, fn batch, {acc, dirty, pts} ->
-        case merge_batch(batch, state.compression, state.merge_compression_level, state.series_type) do
+        case merge_batch(
+               batch,
+               state.compression,
+               state.merge_compression_level,
+               state.series_type
+             ) do
           {:ok, merged_block} -> {[merged_block | acc], true, pts + merged_block.point_count}
           :noop -> {Enum.reverse(batch) ++ acc, dirty, pts}
         end
@@ -433,8 +438,9 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
   defp merge_batch({:passthrough, block}, _compression, _level, _series_type), do: {:ok, block}
 
-  defp merge_batch(batch, _compression, _level, _series_type) when is_list(batch) and length(batch) < 2,
-    do: :noop
+  defp merge_batch(batch, _compression, _level, _series_type)
+       when is_list(batch) and length(batch) < 2,
+       do: :noop
 
   defp merge_batch(batch, _compression, _level, :text) when is_list(batch) do
     all_points =
