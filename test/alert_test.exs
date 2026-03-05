@@ -4,6 +4,7 @@ defmodule TimelessMetrics.AlertTest do
   @data_dir "/tmp/timeless_alert_test_#{System.os_time(:millisecond)}"
 
   setup do
+    TimelessMetrics.TestHelper.await_down(:alert_test_sup)
     start_supervised!({TimelessMetrics, name: :alert_test, data_dir: @data_dir, engine: :actor})
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)

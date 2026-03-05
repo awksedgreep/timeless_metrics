@@ -17,6 +17,7 @@ defmodule TimelessMetrics.VMetricsCompatTest do
   @data_dir "/tmp/timeless_vmetrics_compat_#{System.os_time(:millisecond)}"
 
   setup do
+    TimelessMetrics.TestHelper.await_down(:vmc_sup)
     start_supervised!({TimelessMetrics, name: :vmc, data_dir: @data_dir, engine: :actor})
     on_exit(fn -> File.rm_rf!(@data_dir) end)
     :ok
