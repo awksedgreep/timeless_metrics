@@ -49,14 +49,12 @@ defmodule WriteBench do
 
     # Info
     info = TimelessMetrics.info(:bench)
-    IO.puts("  Segments: #{info.segment_count}")
-    IO.puts("  Compressed: #{format_bytes(info.raw_compressed_bytes)}")
+    IO.puts("  Blocks: #{info.block_count}")
+    IO.puts("  Compressed: #{format_bytes(info.compressed_bytes)}")
     IO.puts("  Bytes/point: #{info.bytes_per_point}")
     IO.puts("  DB size: #{format_bytes(info.storage_bytes)}")
 
     # Query benchmark
-    series_id_to_query = TimelessMetrics.SeriesRegistry.get_or_create(:"bench_registry", "metric", %{"id" => "1"})
-
     {query_us, {:ok, points}} =
       :timer.tc(fn ->
         TimelessMetrics.query(:bench, "metric", %{"id" => "1"}, from: 0, to: now + point_count)
@@ -71,14 +69,6 @@ defmodule WriteBench do
   end
 
   defp run_compression_analysis do
-    data_dir = "#{@data_dir}_compression"
-
-    {:ok, sup} =
-      Supervisor.start_link(
-        [{TimelessMetrics, name: :cmp, data_dir: data_dir, buffer_shards: 1}],
-        strategy: :one_for_one
-      )
-
     now = System.os_time(:second)
     n = 10_000
 
@@ -96,6 +86,14 @@ defmodule WriteBench do
     IO.puts("  ├──────────────────────┼────────────┼──────────────┤")
 
     Enum.each(patterns, fn {label, gen_fn} ->
+      data_dir = "#{@data_dir}_cmp_#{System.os_time(:millisecond)}"
+
+      {:ok, sup} =
+        Supervisor.start_link(
+          [{TimelessMetrics, name: :cmp, data_dir: data_dir, buffer_shards: 1}],
+          strategy: :one_for_one
+        )
+
       # Write points
       for i <- 0..(n - 1) do
         TimelessMetrics.write(:cmp, label, %{"t" => "1"}, gen_fn.(i), timestamp: now - n + i)
@@ -104,7 +102,7 @@ defmodule WriteBench do
       TimelessMetrics.flush(:cmp)
 
       info = TimelessMetrics.info(:cmp)
-      bytes = info.raw_compressed_bytes
+      bytes = info.compressed_bytes
       bpp = Float.round(bytes / n, 2)
 
       label_fmt = String.pad_trailing(label, 20)
@@ -113,17 +111,13 @@ defmodule WriteBench do
 
       IO.puts("  │ #{label_fmt} │ #{bytes_fmt} │ #{bpp_fmt} │")
 
-      # Reset for next pattern - drop table data
-      TimelessMetrics.DB.write(:"cmp_db", "DELETE FROM raw_segments", [])
-      TimelessMetrics.DB.write(:"cmp_db", "DELETE FROM series", [])
+      Supervisor.stop(sup)
+      :persistent_term.erase({TimelessMetrics, :cmp, :schema})
+      File.rm_rf!(data_dir)
     end)
 
     IO.puts("  └──────────────────────┴────────────┴──────────────┘")
     IO.puts("")
-
-    Supervisor.stop(sup)
-    :persistent_term.erase({TimelessMetrics, :cmp, :schema})
-    File.rm_rf!(data_dir)
   end
 
   # --- Helpers ---
