@@ -21,7 +21,6 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   @flush_interval_ms 60_000
   @stale_check_ms 30_000
   @merge_check_ms 300_000
-  @max_mailbox_len 100_000
 
   defstruct [
     :series_id,
@@ -110,102 +109,86 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
   @impl true
   def handle_cast({:write, ts, val}, state) do
-    if mailbox_full?() do
-      {:noreply, state}
-    else
-      state = %{
+    state = %{
+      state
+      | raw_buffer: [{ts, val} | state.raw_buffer],
+        raw_count: state.raw_count + 1,
+        dirty: true,
+        last_write_at: System.monotonic_time(:millisecond)
+    }
+
+    state =
+      if state.raw_count >= state.block_size do
+        compress_buffer(state)
+      else
         state
-        | raw_buffer: [{ts, val} | state.raw_buffer],
-          raw_count: state.raw_count + 1,
-          dirty: true,
-          last_write_at: System.monotonic_time(:millisecond)
-      }
+      end
 
-      state =
-        if state.raw_count >= state.block_size do
-          compress_buffer(state)
-        else
-          state
-        end
-
-      {:noreply, state}
-    end
+    {:noreply, state}
   end
 
   def handle_cast({:write_batch, points}, state) do
-    if mailbox_full?() do
-      {:noreply, state}
-    else
-      state =
-        Enum.reduce(points, state, fn {ts, val}, acc ->
-          %{
-            acc
-            | raw_buffer: [{ts, val} | acc.raw_buffer],
-              raw_count: acc.raw_count + 1
-          }
-        end)
+    state =
+      Enum.reduce(points, state, fn {ts, val}, acc ->
+        %{
+          acc
+          | raw_buffer: [{ts, val} | acc.raw_buffer],
+            raw_count: acc.raw_count + 1
+        }
+      end)
 
-      state = %{state | dirty: true, last_write_at: System.monotonic_time(:millisecond)}
+    state = %{state | dirty: true, last_write_at: System.monotonic_time(:millisecond)}
 
-      state =
-        if state.raw_count >= state.block_size do
-          compress_buffer(state)
-        else
-          state
-        end
+    state =
+      if state.raw_count >= state.block_size do
+        compress_buffer(state)
+      else
+        state
+      end
 
-      {:noreply, state}
-    end
+    {:noreply, state}
   end
 
   # Text write casts — same buffer mechanics, different cast name for clarity
   def handle_cast({:write_text, ts, val}, state) do
-    if mailbox_full?() do
-      {:noreply, state}
-    else
-      state = %{
+    state = %{
+      state
+      | raw_buffer: [{ts, val} | state.raw_buffer],
+        raw_count: state.raw_count + 1,
+        dirty: true,
+        last_write_at: System.monotonic_time(:millisecond)
+    }
+
+    state =
+      if state.raw_count >= state.block_size do
+        compress_buffer(state)
+      else
         state
-        | raw_buffer: [{ts, val} | state.raw_buffer],
-          raw_count: state.raw_count + 1,
-          dirty: true,
-          last_write_at: System.monotonic_time(:millisecond)
-      }
+      end
 
-      state =
-        if state.raw_count >= state.block_size do
-          compress_buffer(state)
-        else
-          state
-        end
-
-      {:noreply, state}
-    end
+    {:noreply, state}
   end
 
   def handle_cast({:write_text_batch, points}, state) do
-    if mailbox_full?() do
-      {:noreply, state}
-    else
-      state =
-        Enum.reduce(points, state, fn {ts, val}, acc ->
-          %{
-            acc
-            | raw_buffer: [{ts, val} | acc.raw_buffer],
-              raw_count: acc.raw_count + 1
-          }
-        end)
+    state =
+      Enum.reduce(points, state, fn {ts, val}, acc ->
+        %{
+          acc
+          | raw_buffer: [{ts, val} | acc.raw_buffer],
+            raw_count: acc.raw_count + 1
+        }
+      end)
 
-      state = %{state | dirty: true, last_write_at: System.monotonic_time(:millisecond)}
+    state = %{state | dirty: true, last_write_at: System.monotonic_time(:millisecond)}
 
-      state =
-        if state.raw_count >= state.block_size do
-          compress_buffer(state)
-        else
-          state
-        end
+    state =
+      if state.raw_count >= state.block_size do
+        compress_buffer(state)
+      else
+        state
+      end
 
-      {:noreply, state}
-    end
+    {:noreply, state}
   end
 
   @impl true
@@ -527,11 +510,6 @@ defmodule TimelessMetrics.Actor.SeriesServer do
           :noop
       end
     end
-  end
-
-  defp mailbox_full? do
-    {:message_queue_len, len} = Process.info(self(), :message_queue_len)
-    len >= @max_mailbox_len
   end
 
   defp compress_buffer(%{raw_count: 0} = state), do: state
