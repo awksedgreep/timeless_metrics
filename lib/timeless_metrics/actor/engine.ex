@@ -21,10 +21,10 @@ defmodule TimelessMetrics.Actor.Engine do
     case :ets.lookup_element(index, {metric_name, labels}, 3, nil) do
       nil ->
         {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
-        GenServer.cast(pid, {:write, timestamp, value})
+        send(pid, {:write, timestamp, value})
 
       pid ->
-        :erlang.send(pid, {:"$gen_cast", {:write, timestamp, value}})
+        send(pid, {:write, timestamp, value})
     end
   end
 
@@ -47,7 +47,7 @@ defmodule TimelessMetrics.Actor.Engine do
     )
     |> Enum.each(fn {{metric_name, labels}, batch} ->
       {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
-      GenServer.cast(pid, {:write_batch, batch})
+      send(pid, {:write_batch, batch})
     end)
 
     :ok
@@ -72,20 +72,20 @@ defmodule TimelessMetrics.Actor.Engine do
         case :ets.lookup_element(index, {metric_name, labels}, 3, nil) do
           nil ->
             {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
-            GenServer.cast(pid, {:write, System.os_time(:second), value})
+            send(pid, {:write, System.os_time(:second), value})
 
           pid ->
-            :erlang.send(pid, {:"$gen_cast", {:write, System.os_time(:second), value}})
+            send(pid, {:write, System.os_time(:second), value})
         end
 
       {metric_name, labels, value, ts} ->
         case :ets.lookup_element(index, {metric_name, labels}, 3, nil) do
           nil ->
             {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
-            GenServer.cast(pid, {:write, ts, value})
+            send(pid, {:write, ts, value})
 
           pid ->
-            :erlang.send(pid, {:"$gen_cast", {:write, ts, value}})
+            send(pid, {:write, ts, value})
         end
     end)
 
@@ -118,7 +118,7 @@ defmodule TimelessMetrics.Actor.Engine do
   for hot loops where the same series are written repeatedly.
   """
   def write_resolved(pid, value, timestamp) do
-    :erlang.send(pid, {:"$gen_cast", {:write, timestamp, value}})
+    send(pid, {:write, timestamp, value})
     :ok
   end
 
@@ -633,10 +633,10 @@ defmodule TimelessMetrics.Actor.Engine do
     case :ets.lookup_element(index, {metric_name, labels}, 3, nil) do
       nil ->
         {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels, :text)
-        GenServer.cast(pid, {:write_text, timestamp, value})
+        send(pid, {:write_text, timestamp, value})
 
       pid ->
-        :erlang.send(pid, {:"$gen_cast", {:write_text, timestamp, value}})
+        send(pid, {:write_text, timestamp, value})
     end
   end
 
@@ -659,7 +659,7 @@ defmodule TimelessMetrics.Actor.Engine do
     )
     |> Enum.each(fn {{metric_name, labels}, batch} ->
       {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels, :text)
-      GenServer.cast(pid, {:write_text_batch, batch})
+      send(pid, {:write_text_batch, batch})
     end)
 
     :ok

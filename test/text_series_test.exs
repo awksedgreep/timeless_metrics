@@ -146,7 +146,7 @@ defmodule TimelessMetrics.TextSeriesTest do
 
     # Write 5 points to trigger compression
     for i <- 0..4 do
-      GenServer.cast(pid, {:write_text, now + i, "value_#{i}"})
+      send(pid, {:write_text, now + i, "value_#{i}"})
     end
 
     Process.sleep(50)

@@ -64,7 +64,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
     pid = start_server(ctx)
     now = System.os_time(:second)
 
-    GenServer.cast(pid, {:write, now, 42.0})
+    send(pid, {:write, now, 42.0})
     # Give cast time to process
     Process.sleep(10)
 
@@ -77,7 +77,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
     now = System.os_time(:second)
 
     batch = for i <- 0..9, do: {now + i, i * 1.0}
-    GenServer.cast(pid, {:write_batch, batch})
+    send(pid, {:write_batch, batch})
     Process.sleep(10)
 
     {:ok, points} = GenServer.call(pid, {:query_raw, now, now + 9})
@@ -91,7 +91,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
 
     # Write 10 points to trigger compression
     for i <- 0..9 do
-      GenServer.cast(pid, {:write, now + i, i * 1.0})
+      send(pid, {:write, now + i, i * 1.0})
     end
 
     Process.sleep(50)
@@ -107,7 +107,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
 
     # Write 25 points = 5 blocks, but max_blocks is 3
     for i <- 0..24 do
-      GenServer.cast(pid, {:write, now + i, i * 1.0})
+      send(pid, {:write, now + i, i * 1.0})
     end
 
     Process.sleep(50)
@@ -129,7 +129,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
 
     # Write 6 points within one minute bucket
     for i <- 0..5 do
-      GenServer.cast(pid, {:write, now + i * 5, 20.0 + i})
+      send(pid, {:write, now + i * 5, 20.0 + i})
     end
 
     Process.sleep(10)
@@ -146,7 +146,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
     pid = start_server(ctx)
     now = div(System.os_time(:second), 60) * 60
 
-    for i <- 1..5, do: GenServer.cast(pid, {:write, now + i, i * 10.0})
+    for i <- 1..5, do: send(pid, {:write, now + i, i * 10.0})
     Process.sleep(10)
 
     {:ok, [{_, max_val}]} =
@@ -171,8 +171,8 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
     pid = start_server(ctx)
     now = System.os_time(:second)
 
-    GenServer.cast(pid, {:write, now, 10.0})
-    GenServer.cast(pid, {:write, now + 1, 20.0})
+    send(pid, {:write, now, 10.0})
+    send(pid, {:write, now + 1, 20.0})
     Process.sleep(10)
 
     {:ok, {ts, val}} = GenServer.call(pid, :latest)
@@ -184,7 +184,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
     pid = start_server(ctx, block_size: 5)
     now = System.os_time(:second)
 
-    for i <- 0..4, do: GenServer.cast(pid, {:write, now + i, i * 1.0})
+    for i <- 0..4, do: send(pid, {:write, now + i, i * 1.0})
     Process.sleep(50)
 
     # Verify block was created and raw buffer is empty
@@ -202,7 +202,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
     now = System.os_time(:second)
 
     # Write 7 points: 5 → 1 block + 2 in raw buffer
-    for i <- 0..6, do: GenServer.cast(pid, {:write, now + i, i * 10.0})
+    for i <- 0..6, do: send(pid, {:write, now + i, i * 10.0})
     Process.sleep(50)
 
     # Flush to disk
@@ -233,7 +233,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
     pid = start_server(ctx)
     now = System.os_time(:second)
 
-    GenServer.cast(pid, {:write, now, 42.0})
+    send(pid, {:write, now, 42.0})
     Process.sleep(10)
 
     {:ok, points} = GenServer.call(pid, {:query_raw, now + 100, now + 200})
@@ -259,7 +259,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
 
       # Write 20 points = 4 blocks of 5
       for i <- 0..19 do
-        GenServer.cast(pid, {:write, base + i, i * 1.0})
+        send(pid, {:write, base + i, i * 1.0})
       end
 
       Process.sleep(50)
@@ -293,7 +293,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
 
       # Write 10 points = 2 blocks, but min_count is 4
       for i <- 0..9 do
-        GenServer.cast(pid, {:write, now + i, i * 1.0})
+        send(pid, {:write, now + i, i * 1.0})
       end
 
       Process.sleep(50)
@@ -317,7 +317,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
 
       # Write 20 points = 4 blocks, all with recent timestamps
       for i <- 0..19 do
-        GenServer.cast(pid, {:write, now + i, i * 1.0})
+        send(pid, {:write, now + i, i * 1.0})
       end
 
       Process.sleep(50)
@@ -342,7 +342,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
 
       # Write 30 points = 6 blocks
       for i <- 0..29 do
-        GenServer.cast(pid, {:write, base + i, i * 2.0})
+        send(pid, {:write, base + i, i * 2.0})
       end
 
       Process.sleep(50)
@@ -378,7 +378,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
 
       # Write 30 points = 6 blocks of 5
       for i <- 0..29 do
-        GenServer.cast(pid, {:write, base + i, i * 1.0})
+        send(pid, {:write, base + i, i * 1.0})
       end
 
       Process.sleep(50)
@@ -410,7 +410,7 @@ defmodule TimelessMetrics.Actor.SeriesServerTest do
       base = System.os_time(:second) - 1000
 
       for i <- 0..19 do
-        GenServer.cast(pid, {:write, base + i, i * 1.0})
+        send(pid, {:write, base + i, i * 1.0})
       end
 
       Process.sleep(50)

@@ -6,7 +6,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   lifecycle: raw buffer, compression into blocks, ring buffer retention,
   persistence to disk, and query serving.
 
-  Write path is `cast` (fire and forget). Read path is `call` (synchronous).
+  Write path is plain `send` (fire and forget). Read path is `call` (synchronous).
 
   Supports both numeric (float64) and text (string) series, dispatched on
   the `series_type` field.
@@ -107,8 +107,11 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     {:ok, %{state | flush_ref: flush_ref, stale_ref: stale_ref, merge_ref: merge_ref}}
   end
 
+  # Write messages dispatched via plain `send` for minimal overhead.
+  # These are fire-and-forget writes from the engine — no $gen_cast wrapper.
+
   @impl true
-  def handle_cast({:write, ts, val}, state) do
+  def handle_info({:write, ts, val}, state) do
     state = %{
       state
       | raw_buffer: [{ts, val} | state.raw_buffer],
@@ -127,7 +130,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     {:noreply, state}
   end
 
-  def handle_cast({:write_batch, points}, state) do
+  def handle_info({:write_batch, points}, state) do
     state =
       Enum.reduce(points, state, fn {ts, val}, acc ->
         %{
@@ -149,8 +152,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     {:noreply, state}
   end
 
-  # Text write casts — same buffer mechanics, different cast name for clarity
-  def handle_cast({:write_text, ts, val}, state) do
+  def handle_info({:write_text, ts, val}, state) do
     state = %{
       state
       | raw_buffer: [{ts, val} | state.raw_buffer],
@@ -169,7 +171,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     {:noreply, state}
   end
 
-  def handle_cast({:write_text_batch, points}, state) do
+  def handle_info({:write_text_batch, points}, state) do
     state =
       Enum.reduce(points, state, fn {ts, val}, acc ->
         %{
@@ -189,6 +191,30 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       end
 
     {:noreply, state}
+  end
+
+  def handle_info(:flush_to_disk, state) do
+    state = flush_to_disk(state)
+    flush_ref = Process.send_after(self(), :flush_to_disk, @flush_interval_ms)
+    {:noreply, %{state | flush_ref: flush_ref}}
+  end
+
+  def handle_info(:maybe_compress_stale, state) do
+    state =
+      if state.raw_count > 0 && stale?(state) do
+        compress_buffer(state)
+      else
+        state
+      end
+
+    stale_ref = Process.send_after(self(), :maybe_compress_stale, @stale_check_ms)
+    {:noreply, %{state | stale_ref: stale_ref}}
+  end
+
+  def handle_info(:maybe_merge_blocks, state) do
+    {_result, state} = maybe_merge_blocks(state)
+    merge_ref = Process.send_after(self(), :maybe_merge_blocks, @merge_check_ms)
+    {:noreply, %{state | merge_ref: merge_ref}}
   end
 
   @impl true
@@ -315,31 +341,6 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     }
 
     {:reply, {:ok, dropped, empty?}, state}
-  end
-
-  @impl true
-  def handle_info(:flush_to_disk, state) do
-    state = flush_to_disk(state)
-    flush_ref = Process.send_after(self(), :flush_to_disk, @flush_interval_ms)
-    {:noreply, %{state | flush_ref: flush_ref}}
-  end
-
-  def handle_info(:maybe_compress_stale, state) do
-    state =
-      if state.raw_count > 0 && stale?(state) do
-        compress_buffer(state)
-      else
-        state
-      end
-
-    stale_ref = Process.send_after(self(), :maybe_compress_stale, @stale_check_ms)
-    {:noreply, %{state | stale_ref: stale_ref}}
-  end
-
-  def handle_info(:maybe_merge_blocks, state) do
-    {_result, state} = maybe_merge_blocks(state)
-    merge_ref = Process.send_after(self(), :maybe_merge_blocks, @merge_check_ms)
-    {:noreply, %{state | merge_ref: merge_ref}}
   end
 
   @impl true

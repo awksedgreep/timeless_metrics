@@ -289,13 +289,13 @@ defmodule Mix.Tasks.Bench.Actor do
         end)
       end)
 
-    # GenServer.cast
+    # send (plain message, no $gen_cast wrapper)
     {us_cast, _} =
       :timer.tc(fn ->
         bd_entries
         |> Enum.zip(ets_results)
         |> Enum.each(fn {{_mn, _l, v, ts}, pid} ->
-          GenServer.cast(pid, {:write, ts, v})
+          send(pid, {:write, ts, v})
         end)
       end)
 
@@ -327,7 +327,7 @@ defmodule Mix.Tasks.Bench.Actor do
 
     IO.puts("    Build entries:         #{String.pad_leading(fmt_dur(us_build), 10)}")
     IO.puts("    ETS lookup (map key):  #{String.pad_leading(fmt_dur(us_ets), 10)}")
-    IO.puts("    GenServer.cast:        #{String.pad_leading(fmt_dur(us_cast), 10)}")
+    IO.puts("    send:                  #{String.pad_leading(fmt_dur(us_cast), 10)}")
     IO.puts("    ─────────────────────────────────────")
 
     rate_each = trunc(series_count / (us_full_each / 1_000_000))
