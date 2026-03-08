@@ -94,7 +94,10 @@ defmodule TimelessMetrics.Supervisor do
 
     self_monitor_children =
       if Keyword.get(opts, :self_monitor, true) do
-        [{TimelessMetrics.SelfMonitor, name: :"#{name}_self_monitor", store: name}]
+        labels = Keyword.get(opts, :self_monitor_labels, %{})
+
+        [{TimelessMetrics.SelfMonitor,
+          name: :"#{name}_self_monitor", store: name, labels: labels}]
       else
         []
       end
