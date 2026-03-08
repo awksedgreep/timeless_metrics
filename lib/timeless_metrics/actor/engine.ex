@@ -124,6 +124,7 @@ defmodule TimelessMetrics.Actor.Engine do
 
   @doc "Query raw points for a single series."
   def query(store, metric_name, labels, opts) do
+    Stats.incr_queries(store)
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
     manager = manager_name(store)
@@ -133,6 +134,7 @@ defmodule TimelessMetrics.Actor.Engine do
 
   @doc "Query raw points across multiple series matching a label filter."
   def query_multi(store, metric_name, label_filter, opts) do
+    Stats.incr_queries(store)
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
     manager = manager_name(store)
@@ -164,6 +166,7 @@ defmodule TimelessMetrics.Actor.Engine do
 
   @doc "Query with time-bucket aggregation for a single series."
   def query_aggregate(store, metric_name, labels, opts) do
+    Stats.incr_queries(store)
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
     bucket = Keyword.fetch!(opts, :bucket)
@@ -175,6 +178,7 @@ defmodule TimelessMetrics.Actor.Engine do
 
   @doc "Query with aggregation across multiple series matching a label filter."
   def query_aggregate_multi(store, metric_name, label_filter, opts) do
+    Stats.incr_queries(store)
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
     bucket = Keyword.fetch!(opts, :bucket)
@@ -240,6 +244,7 @@ defmodule TimelessMetrics.Actor.Engine do
 
   @doc "Query with aggregation across multiple metric names."
   def query_aggregate_multi_metrics(store, metric_names, label_filter, opts) do
+    Stats.incr_queries(store)
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
     bucket = Keyword.fetch!(opts, :bucket)

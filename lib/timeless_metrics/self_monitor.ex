@@ -15,7 +15,8 @@ defmodule TimelessMetrics.SelfMonitor do
     :http_queries,
     :http_import_errors,
     :merges_completed,
-    :points_merged
+    :points_merged,
+    :queries
   ]
 
   def start_link(opts) do
@@ -115,6 +116,7 @@ defmodule TimelessMetrics.SelfMonitor do
       {"timeless_http_import_errors_total", labels, counters.http_import_errors / 1, now},
       {"timeless_merges_completed_total", labels, counters.merges_completed / 1, now},
       {"timeless_points_merged_total", labels, counters.points_merged / 1, now},
+      {"timeless_queries_total", labels, counters.queries / 1, now},
 
       # Counter rates (per second)
       {"timeless_writes_per_second", labels, rates.writes_total, now},
@@ -124,7 +126,8 @@ defmodule TimelessMetrics.SelfMonitor do
       {"timeless_http_queries_per_second", labels, rates.http_queries, now},
       {"timeless_http_import_errors_per_second", labels, rates.http_import_errors, now},
       {"timeless_merges_per_second", labels, rates.merges_completed, now},
-      {"timeless_points_merged_per_second", labels, rates.points_merged, now}
+      {"timeless_points_merged_per_second", labels, rates.points_merged, now},
+      {"timeless_queries_per_second", labels, rates.queries, now}
     ]
 
     TimelessMetrics.write_batch(store, entries)

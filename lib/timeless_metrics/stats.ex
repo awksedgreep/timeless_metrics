@@ -10,8 +10,9 @@ defmodule TimelessMetrics.Stats do
   @http_import_errors 6
   @merges_completed 7
   @points_merged 8
+  @queries 9
 
-  @counter_size 8
+  @counter_size 9
 
   @doc "Initialize counters for a store. Call once before children start."
   def init(store) do
@@ -26,6 +27,7 @@ defmodule TimelessMetrics.Stats do
   def incr_http_imports(store), do: add(store, @http_imports, 1)
   def incr_http_queries(store), do: add(store, @http_queries, 1)
   def incr_merges_completed(store), do: add(store, @merges_completed, 1)
+  def incr_queries(store), do: add(store, @queries, 1)
 
   # --- Add N ---
 
@@ -49,7 +51,8 @@ defmodule TimelessMetrics.Stats do
             :http_queries,
             :http_import_errors,
             :merges_completed,
-            :points_merged
+            :points_merged,
+            :queries
           ],
           &{&1, 0}
         )
@@ -63,7 +66,8 @@ defmodule TimelessMetrics.Stats do
           http_queries: :counters.get(ref, @http_queries),
           http_import_errors: :counters.get(ref, @http_import_errors),
           merges_completed: :counters.get(ref, @merges_completed),
-          points_merged: :counters.get(ref, @points_merged)
+          points_merged: :counters.get(ref, @points_merged),
+          queries: :counters.get(ref, @queries)
         }
     end
   end
