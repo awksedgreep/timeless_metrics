@@ -40,7 +40,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     flush_ref: nil,
     stale_ref: nil,
     merge_ref: nil,
-    last_write_at: nil,
+    wrote_recently: false,
     merge_block_min_count: 4,
     merge_block_max_points: 10_000,
     merge_block_min_age_seconds: 300,
@@ -117,7 +117,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       | raw_buffer: [{ts, val} | state.raw_buffer],
         raw_count: state.raw_count + 1,
         dirty: true,
-        last_write_at: System.monotonic_time(:millisecond)
+        wrote_recently: true
     }
 
     state =
@@ -140,7 +140,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
         }
       end)
 
-    state = %{state | dirty: true, last_write_at: System.monotonic_time(:millisecond)}
+    state = %{state | dirty: true, wrote_recently: true}
 
     state =
       if state.raw_count >= state.block_size do
@@ -158,7 +158,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       | raw_buffer: [{ts, val} | state.raw_buffer],
         raw_count: state.raw_count + 1,
         dirty: true,
-        last_write_at: System.monotonic_time(:millisecond)
+        wrote_recently: true
     }
 
     state =
@@ -181,7 +181,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
         }
       end)
 
-    state = %{state | dirty: true, last_write_at: System.monotonic_time(:millisecond)}
+    state = %{state | dirty: true, wrote_recently: true}
 
     state =
       if state.raw_count >= state.block_size do
@@ -200,8 +200,10 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   end
 
   def handle_info(:maybe_compress_stale, state) do
+    {state, wrote_recently} = {%{state | wrote_recently: false}, state.wrote_recently}
+
     state =
-      if state.raw_count > 0 && stale?(state) do
+      if state.raw_count > 0 && !wrote_recently do
         compress_buffer(state)
       else
         state
@@ -350,13 +352,6 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   end
 
   # --- Internals ---
-
-  defp stale?(state) do
-    case state.last_write_at do
-      nil -> false
-      last -> System.monotonic_time(:millisecond) - last > @stale_check_ms
-    end
-  end
 
   defp maybe_merge_blocks(state) do
     blocks_list = :queue.to_list(state.blocks)
