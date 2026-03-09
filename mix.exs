@@ -66,7 +66,7 @@ defmodule TimelessMetrics.MixProject do
       {:gorilla_stream, "~> 2.2"},
       {:exqlite, "~> 0.27"},
       {:ezstd, "~> 1.2"},
-      {:rocket, path: "../rocket"},
+      {:rocket, github: "awksedgreep/rocket"},
       {:req, "~> 0.5"},
       {:elixir_make, "~> 0.9", runtime: false},
       {:cc_precompiler, "~> 0.1", runtime: false}
