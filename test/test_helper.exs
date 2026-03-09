@@ -1,5 +1,11 @@
 ExUnit.start()
 
+# Ensure httpc is available for test HTTP client
+:inets.start()
+
+# Load test support modules
+Code.require_file("support/http_client.ex", __DIR__)
+
 defmodule TimelessMetrics.TestHelper do
   @doc """
   Ensure a previously-registered supervisor is fully stopped before restarting.

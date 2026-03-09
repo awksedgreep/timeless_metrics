@@ -11,6 +11,7 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
   """
 
   @data_dir "/tmp/timeless_tsbs_test_#{System.os_time(:millisecond)}"
+  @port 18_409
   @hosts 10
   @cpu_metrics ~w(
     cpu_usage_user cpu_usage_system cpu_usage_idle cpu_usage_nice
@@ -22,6 +23,8 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
 
   setup do
     start_supervised!({TimelessMetrics, name: :tsbs_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics.HTTP, store: :tsbs_test, port: @port})
+    Process.sleep(50)
 
     # Write TSBS-style data: 10 hosts x 10 CPU metrics x 100 points
     entries =
@@ -427,15 +430,14 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
 
   describe "Phase 4: HTTP Prometheus endpoint" do
     test "PromQL query via HTTP endpoint" do
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query_range?query=cpu_usage_user%7Bhostname%3D%22host_0%22%7D&start=#{@base_ts}&end=#{@base_ts + 1000}&step=1000"
         )
-        |> TimelessMetrics.HTTP.call(store: :tsbs_test)
 
-      assert conn.status == 200
-      body = :json.decode(conn.resp_body)
+      assert resp.status == 200
+      body = :json.decode(resp.body)
       assert body["status"] == "success"
       assert body["data"]["resultType"] == "matrix"
       assert length(body["data"]["result"]) == 1

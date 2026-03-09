@@ -2,9 +2,12 @@ defmodule TimelessMetrics.DashboardTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_dash_test_#{System.os_time(:millisecond)}"
+  @port 18_401
 
   setup do
     start_supervised!({TimelessMetrics, name: :dash_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics.HTTP, store: :dash_test, port: @port})
+    Process.sleep(50)
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
 
@@ -12,21 +15,18 @@ defmodule TimelessMetrics.DashboardTest do
   end
 
   test "dashboard renders HTML with no metrics" do
-    conn =
-      Plug.Test.conn(:get, "/")
-      |> TimelessMetrics.HTTP.call(store: :dash_test)
+    resp = TimelessMetrics.TestHTTP.get(@port, "/")
 
-    assert conn.status == 200
-    assert String.contains?(conn.resp_body, "<!DOCTYPE html>")
-    assert String.contains?(conn.resp_body, "TimelessMetrics")
-    assert String.contains?(conn.resp_body, "No metrics yet")
+    assert resp.status == 200
+    assert String.contains?(resp.body, "<!DOCTYPE html>")
+    assert String.contains?(resp.body, "TimelessMetrics")
+    assert String.contains?(resp.body, "No metrics yet")
   end
 
   test "dashboard renders metric charts" do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write data for two metrics
     for i <- 0..5 do
       TimelessMetrics.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 50.0 + i,
         timestamp: base + i * 60
@@ -39,12 +39,10 @@ defmodule TimelessMetrics.DashboardTest do
 
     TimelessMetrics.flush(:dash_test)
 
-    conn =
-      Plug.Test.conn(:get, "/")
-      |> TimelessMetrics.HTTP.call(store: :dash_test)
+    resp = TimelessMetrics.TestHTTP.get(@port, "/")
 
-    assert conn.status == 200
-    body = conn.resp_body
+    assert resp.status == 200
+    body = resp.body
     assert String.contains?(body, "cpu_usage")
     assert String.contains?(body, "mem_usage")
     assert String.contains?(body, "/chart?metric=cpu_usage")
@@ -56,7 +54,6 @@ defmodule TimelessMetrics.DashboardTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write high data
     for i <- 0..5 do
       TimelessMetrics.write(:dash_test, "cpu_usage", %{"host" => "web-1"}, 95.0,
         timestamp: base + i * 60
@@ -65,7 +62,6 @@ defmodule TimelessMetrics.DashboardTest do
 
     TimelessMetrics.flush(:dash_test)
 
-    # Create alert rule and trigger it
     {:ok, _id} =
       TimelessMetrics.create_alert(:dash_test,
         name: "High CPU",
@@ -76,25 +72,20 @@ defmodule TimelessMetrics.DashboardTest do
 
     TimelessMetrics.evaluate_alerts(:dash_test)
 
-    conn =
-      Plug.Test.conn(:get, "/")
-      |> TimelessMetrics.HTTP.call(store: :dash_test)
+    resp = TimelessMetrics.TestHTTP.get(@port, "/")
 
-    assert conn.status == 200
-    body = conn.resp_body
+    assert resp.status == 200
+    body = resp.body
     assert String.contains?(body, "1 firing")
     assert String.contains?(body, "High CPU")
     assert String.contains?(body, "badge-fire")
   end
 
   test "dashboard respects from parameter" do
-    conn =
-      Plug.Test.conn(:get, "/?from=-6h")
-      |> TimelessMetrics.HTTP.call(store: :dash_test)
+    resp = TimelessMetrics.TestHTTP.get(@port, "/?from=-6h")
 
-    assert conn.status == 200
-    body = conn.resp_body
-    # The 6 hours option should be selected in the dropdown
+    assert resp.status == 200
+    body = resp.body
     assert String.contains?(body, ~s(value="-6h" selected))
   end
 
@@ -105,12 +96,10 @@ defmodule TimelessMetrics.DashboardTest do
 
     TimelessMetrics.flush(:dash_test)
 
-    conn =
-      Plug.Test.conn(:get, "/?host=web-1")
-      |> TimelessMetrics.HTTP.call(store: :dash_test)
+    resp = TimelessMetrics.TestHTTP.get(@port, "/?host=web-1")
 
-    assert conn.status == 200
-    body = conn.resp_body
+    assert resp.status == 200
+    body = resp.body
     assert String.contains?(body, "host=web-1")
   end
 end

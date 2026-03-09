@@ -565,7 +565,10 @@ defmodule Mix.Tasks.Bench.Actor do
     IO.puts("  Binary memory:    #{fmt_bytes(mem_gc[:binary])}")
     IO.puts("  Per-series est:   #{fmt_bytes(per_series_gc)}")
     IO.puts("  Memory delta:     #{fmt_bytes(mem_delta_gc)}")
-    IO.puts("  Reclaimed:        #{fmt_bytes(reclaimed)} (#{Float.round(reclaimed / max(mem[:total], 1) * 100, 1)}%)")
+
+    IO.puts(
+      "  Reclaimed:        #{fmt_bytes(reclaimed)} (#{Float.round(reclaimed / max(mem[:total], 1) * 100, 1)}%)"
+    )
 
     # Registry + index ETS memory
     actor_index = :bench_actor_actor_index

@@ -62,90 +62,112 @@ defmodule TimelessMetrics.HTTP do
       framing.method = "newline_delimited"
   """
 
-  use Plug.Router
+  use Rocket.Router
 
   @max_body_bytes 10 * 1024 * 1024
-
-  plug(:match)
-  plug(:authenticate)
-  plug(:dispatch)
 
   def child_spec(opts) do
     store = Keyword.fetch!(opts, :store)
     port = Keyword.get(opts, :port, 8428)
     bearer_token = Keyword.get(opts, :bearer_token)
-    plug_opts = [store: store, bearer_token: bearer_token]
+
+    :persistent_term.put({__MODULE__, :config}, {store, bearer_token})
 
     %{
       id: {__MODULE__, store},
-      start: {Bandit, :start_link, [[plug: {__MODULE__, plug_opts}, port: port]]},
+      start:
+        {Rocket, :start_link, [[port: port, handler: __MODULE__, max_body: @max_body_bytes]]},
       type: :supervisor
     }
   end
 
-  @impl Plug
-  def init(opts), do: opts
+  # --- Config access ---
 
-  @impl Plug
-  def call(conn, opts) do
-    conn
-    |> Plug.Conn.put_private(:timeless_metrics, Keyword.get(opts, :store))
-    |> Plug.Conn.put_private(:timeless_metrics_token, Keyword.get(opts, :bearer_token))
-    |> super(opts)
-  end
+  defp store, do: elem(:persistent_term.get({__MODULE__, :config}), 0)
+  defp bearer_token, do: elem(:persistent_term.get({__MODULE__, :config}), 1)
 
-  # Bearer token authentication plug.
+  # --- Authentication ---
+  # Returns :ok or :halt (response already sent).
   # Skips auth when no token is configured (backwards compatible).
-  # Exempts /health for load balancers and monitoring.
-  defp authenticate(%{request_path: "/health"} = conn, _opts), do: conn
 
-  defp authenticate(conn, _opts) do
-    case conn.private[:timeless_metrics_token] do
-      nil -> conn
-      expected -> check_token(conn, expected)
+  defp check_auth(req) do
+    case bearer_token() do
+      nil -> :ok
+      expected -> verify_token(req, expected)
     end
   end
 
-  defp check_token(conn, expected) do
-    case extract_token(conn) do
+  defp verify_token(req, expected) do
+    case extract_token(req) do
       nil ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(401, ~s({"error":"unauthorized"}))
-        |> halt()
+        json_resp(req, 401, %{error: "unauthorized"})
+        :halt
 
       token ->
-        if Plug.Crypto.secure_compare(token, expected) do
-          conn
+        if constant_time_compare(token, expected) do
+          :ok
         else
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(403, ~s({"error":"forbidden"}))
-          |> halt()
+          json_resp(req, 403, %{error: "forbidden"})
+          :halt
         end
     end
   end
 
-  defp extract_token(conn) do
-    case Plug.Conn.get_req_header(conn, "authorization") do
-      ["Bearer " <> token] ->
+  defp extract_token(req) do
+    auth =
+      Rocket.Request.get_header(req, "Authorization") ||
+        Rocket.Request.get_header(req, "authorization")
+
+    case auth do
+      "Bearer " <> token ->
         String.trim(token)
 
       _ ->
-        # Fallback: ?token= query param for browser access (dashboard, charts)
-        conn = Plug.Conn.fetch_query_params(conn)
-        conn.query_params["token"]
+        {params, _} = Rocket.Request.query_params(req)
+        params["token"]
     end
   end
+
+  defp constant_time_compare(a, b) when byte_size(a) == byte_size(b) do
+    :crypto.hash_equals(a, b)
+  end
+
+  defp constant_time_compare(_a, _b), do: false
+
+  # --- Response helpers ---
+
+  defp json_resp(req, status, term) do
+    body = json_encode!(term)
+
+    Rocket.Response.send_iodata(req, status, [{"content-type", "application/json"}], body)
+  end
+
+  defp json_error(req, status, msg) do
+    json_resp(req, status, %{error: msg})
+  end
+
+  defp html_resp(req, status, html) do
+    Rocket.Response.send_iodata(req, status, [{"content-type", "text/html"}], html)
+  end
+
+  defp text_resp(req, status, text) do
+    Rocket.Response.send_iodata(req, status, [{"content-type", "text/plain"}], text)
+  end
+
+  # --- Route Handlers ---
 
   # InfluxDB line protocol import (used by TSBS, compatible with VictoriaMetrics /write)
   # Format: measurement,tag=val,tag=val field=value timestamp_ns
   post "/write" do
-    store = conn.private.timeless_metrics
-    TimelessMetrics.Stats.incr_http_imports(store)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case Plug.Conn.read_body(conn, length: @max_body_bytes) do
-      {:ok, body, conn} ->
+      :ok ->
+        store = store()
+        TimelessMetrics.Stats.incr_http_imports(store)
+        body = req.body
+
         {count, errors, error_samples} = ingest_influx_lines(store, body)
         TimelessMetrics.Stats.add_http_import_errors(store, errors)
 
@@ -160,39 +182,28 @@ defmodule TimelessMetrics.HTTP do
             "Influx import: #{errors} line(s) failed to parse, sample: #{inspect(error_samples)}"
           )
 
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(
-            200,
-            json_encode!(%{
-              samples: count,
-              errors: errors,
-              failed_lines: error_samples
-            })
-          )
+          json_resp(req, 200, %{
+            samples: count,
+            errors: errors,
+            failed_lines: error_samples
+          })
         else
-          send_resp(conn, 204, "")
+          send_resp(req, 204)
         end
-
-      {:more, _partial, conn} ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(413, json_encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
-
-      {:error, reason} ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(400, json_encode!(%{error: to_string(reason)}))
     end
   end
 
   # VictoriaMetrics JSON line import
   post "/api/v1/import" do
-    store = conn.private.timeless_metrics
-    TimelessMetrics.Stats.incr_http_imports(store)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case Plug.Conn.read_body(conn, length: @max_body_bytes) do
-      {:ok, body, conn} ->
+      :ok ->
+        store = store()
+        TimelessMetrics.Stats.incr_http_imports(store)
+        body = req.body
+
         {count, errors, error_samples} = ingest_json_lines(store, body)
         TimelessMetrics.Stats.add_http_import_errors(store, errors)
 
@@ -203,176 +214,164 @@ defmodule TimelessMetrics.HTTP do
         )
 
         if errors > 0 do
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(
-            200,
-            json_encode!(%{
-              samples: count,
-              errors: errors,
-              failed_lines: error_samples
-            })
-          )
+          json_resp(req, 200, %{
+            samples: count,
+            errors: errors,
+            failed_lines: error_samples
+          })
         else
-          send_resp(conn, 204, "")
+          send_resp(req, 204)
         end
-
-      {:more, _partial, conn} ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(413, json_encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
-
-      {:error, reason} ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(400, json_encode!(%{error: to_string(reason)}))
     end
   end
 
-  # Health check with store stats
+  # Health check with store stats (no auth required)
   get "/health" do
-    store = conn.private.timeless_metrics
+    store = store()
     info = TimelessMetrics.info(store)
 
-    body =
-      json_encode!(%{
-        status: "ok",
-        series: info.series_count,
-        points: info.total_points,
-        storage_bytes: info.storage_bytes,
-        buffer_points: info.raw_buffer_points,
-        bytes_per_point: info.bytes_per_point
-      })
-
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, body)
+    json_resp(req, 200, %{
+      status: "ok",
+      series: info.series_count,
+      points: info.total_points,
+      storage_bytes: info.storage_bytes,
+      buffer_points: info.raw_buffer_points,
+      bytes_per_point: info.bytes_per_point
+    })
   end
 
   # Online backup — creates consistent snapshot of all databases
   post "/api/v1/backup" do
-    store = conn.private.timeless_metrics
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    parsed_path =
-      case Plug.Conn.read_body(conn, length: 64_000) do
-        {:ok, "", _} ->
-          nil
+      :ok ->
+        store = store()
+        body = req.body
 
-        {:ok, body, _} ->
-          case safe_json_decode(body) do
-            %{"path" => path} when is_binary(path) and path != "" -> path
-            _ -> nil
+        parsed_path =
+          case body do
+            "" ->
+              nil
+
+            _ ->
+              case safe_json_decode(body) do
+                %{"path" => path} when is_binary(path) and path != "" -> path
+                _ -> nil
+              end
           end
 
-        _ ->
-          nil
-      end
+        target_dir = parsed_path || default_backup_dir(store)
+        {:ok, result} = TimelessMetrics.backup(store, target_dir)
 
-    target_dir =
-      parsed_path || default_backup_dir(store)
-
-    {:ok, result} = TimelessMetrics.backup(store, target_dir)
-
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(
-      200,
-      json_encode!(%{
-        status: "ok",
-        path: result.path,
-        files: result.files,
-        total_bytes: result.total_bytes
-      })
-    )
+        json_resp(req, 200, %{
+          status: "ok",
+          path: result.path,
+          files: result.files,
+          total_bytes: result.total_bytes
+        })
+    end
   end
 
   # Export raw points in VictoriaMetrics JSON line format (multi-series)
   get "/api/v1/export" do
-    store = conn.private.timeless_metrics
-    TimelessMetrics.Stats.incr_http_queries(store)
-    conn = Plug.Conn.fetch_query_params(conn)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case extract_query_params(conn.query_params) do
-      {:ok, metric, labels, from, to} ->
-        {:ok, results} = TimelessMetrics.query_multi(store, metric, labels, from: from, to: to)
+      :ok ->
+        store = store()
+        TimelessMetrics.Stats.incr_http_queries(store)
+        {params, _} = Rocket.Request.query_params(req)
 
-        body =
-          results
-          |> Enum.map(fn %{labels: l, points: pts} ->
-            {timestamps, values} = Enum.unzip(pts)
+        case extract_query_params(params) do
+          {:ok, metric, labels, from, to} ->
+            {:ok, results} =
+              TimelessMetrics.query_multi(store, metric, labels, from: from, to: to)
 
-            json_encode!(%{
-              metric: Map.put(l, "__name__", metric),
-              values: values,
-              timestamps: Enum.map(timestamps, &(&1 * 1000))
-            })
-          end)
-          |> Enum.join("\n")
+            body =
+              results
+              |> Enum.map(fn %{labels: l, points: pts} ->
+                {timestamps, values} = Enum.unzip(pts)
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, body)
+                json_encode!(%{
+                  metric: Map.put(l, "__name__", metric),
+                  values: values,
+                  timestamps: Enum.map(timestamps, &(&1 * 1000))
+                })
+              end)
+              |> Enum.join("\n")
 
-      {:error, msg} ->
-        json_error(conn, 400, msg)
+            Rocket.Response.send_iodata(req, 200, [{"content-type", "application/json"}], body)
+
+          {:error, msg} ->
+            json_error(req, 400, msg)
+        end
     end
   end
 
   # Latest value for matching series
   get "/api/v1/query" do
-    store = conn.private.timeless_metrics
-    TimelessMetrics.Stats.incr_http_queries(store)
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    if params["query"] do
-      # PromQL instant query — evaluate at `time` (default: now)
-      now = System.os_time(:second)
-      eval_time = parse_prom_time(params["time"], now)
-      lookback = 300
+      :ok ->
+        store = store()
+        TimelessMetrics.Stats.incr_http_queries(store)
+        {params, _} = Rocket.Request.query_params(req)
 
-      case TimelessMetrics.PromQL.parse(params["query"]) do
-        {:ok, plan} ->
-          {:ok, response} =
-            TimelessMetrics.PromQL.execute(plan, store, eval_time - lookback, eval_time, lookback)
+        if params["query"] do
+          # PromQL instant query — evaluate at `time` (default: now)
+          now = System.os_time(:second)
+          eval_time = parse_prom_time(params["time"], now)
+          lookback = 300
 
-          # Convert range response to instant: keep only the last point per series
-          instant_response = to_instant_response(response, eval_time)
+          case TimelessMetrics.PromQL.parse(params["query"]) do
+            {:ok, plan} ->
+              {:ok, response} =
+                TimelessMetrics.PromQL.execute(
+                  plan,
+                  store,
+                  eval_time - lookback,
+                  eval_time,
+                  lookback
+                )
 
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(200, json_encode!(instant_response))
+              # Convert range response to instant: keep only the last point per series
+              instant_response = to_instant_response(response, eval_time)
+              json_resp(req, 200, instant_response)
 
-        {:error, reason} ->
-          json_error(conn, 400, "PromQL parse error: #{reason}")
-      end
-    else
-      case extract_metric_and_labels(params) do
-        {:ok, metric, labels} ->
-          {:ok, results} = TimelessMetrics.query_multi(store, metric, labels)
+            {:error, reason} ->
+              json_error(req, 400, "PromQL parse error: #{reason}")
+          end
+        else
+          case extract_metric_and_labels(params) do
+            {:ok, metric, labels} ->
+              {:ok, results} = TimelessMetrics.query_multi(store, metric, labels)
 
-          data =
-            results
-            |> Enum.flat_map(fn %{labels: l, points: pts} ->
-              case List.last(Enum.sort_by(pts, &elem(&1, 0))) do
-                {ts, val} -> [%{labels: l, timestamp: ts, value: val}]
-                nil -> []
-              end
-            end)
+              data =
+                results
+                |> Enum.flat_map(fn %{labels: l, points: pts} ->
+                  case List.last(Enum.sort_by(pts, &elem(&1, 0))) do
+                    {ts, val} -> [%{labels: l, timestamp: ts, value: val}]
+                    nil -> []
+                  end
+                end)
 
-          body =
-            case data do
-              [single] -> json_encode!(single)
-              multiple -> json_encode!(%{data: multiple})
-            end
+              body =
+                case data do
+                  [single] -> single
+                  multiple -> %{data: multiple}
+                end
 
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(200, body)
+              json_resp(req, 200, body)
 
-        {:error, msg} ->
-          json_error(conn, 400, msg)
-      end
+            {:error, msg} ->
+              json_error(req, 400, msg)
+          end
+        end
     end
   end
 
@@ -380,220 +379,238 @@ defmodule TimelessMetrics.HTTP do
   # When query= param is present, routes through PromQL parser (TSBS/Grafana compatible).
   # Otherwise uses native params: metric=, metrics=, group_by=, cross_aggregate=, etc.
   get "/api/v1/query_range" do
-    store = conn.private.timeless_metrics
-    TimelessMetrics.Stats.incr_http_queries(store)
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    # If query= param is present, treat as PromQL (TSBS sends PromQL here)
-    if params["query"] do
-      now = System.os_time(:second)
-      start_ts = parse_prom_time(params["start"], now - 3600)
-      end_ts = parse_prom_time(params["end"], now)
-      step = parse_prom_step(params["step"], 60)
+      :ok ->
+        store = store()
+        TimelessMetrics.Stats.incr_http_queries(store)
+        {params, _} = Rocket.Request.query_params(req)
 
-      case TimelessMetrics.PromQL.parse(params["query"]) do
-        {:ok, plan} ->
-          {:ok, response} =
-            TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
+        # If query= param is present, treat as PromQL (TSBS sends PromQL here)
+        if params["query"] do
+          now = System.os_time(:second)
+          start_ts = parse_prom_time(params["start"], now - 3600)
+          end_ts = parse_prom_time(params["end"], now)
+          step = parse_prom_step(params["step"], 60)
 
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(200, json_encode!(response))
+          case TimelessMetrics.PromQL.parse(params["query"]) do
+            {:ok, plan} ->
+              {:ok, response} =
+                TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
 
-        {:error, reason} ->
-          json_error(conn, 400, "PromQL parse error: #{reason}")
-      end
-    else
-      case extract_query_params_extended(params) do
-        {:ok, query_spec} ->
-          params = conn.query_params
-          step = parse_int(params["step"], 60)
-          agg = parse_aggregate(params["aggregate"])
-          transform = TimelessMetrics.Transform.parse(params["transform"])
-          group_by = params["group_by"]
-          cross_agg = parse_aggregate_or_nil(params["cross_aggregate"])
-          threshold = parse_threshold_params(params)
-          limit = parse_int_or_nil(params["limit"])
+              json_resp(req, 200, response)
 
-          base_opts = [
-            from: query_spec.from,
-            to: query_spec.to,
-            bucket: {step, :seconds},
-            aggregate: agg,
-            transform: transform
-          ]
+            {:error, reason} ->
+              json_error(req, 400, "PromQL parse error: #{reason}")
+          end
+        else
+          case extract_query_params_extended(params) do
+            {:ok, query_spec} ->
+              step = parse_int(params["step"], 60)
+              agg = parse_aggregate(params["aggregate"])
+              transform = TimelessMetrics.Transform.parse(params["transform"])
+              group_by = params["group_by"]
+              cross_agg = parse_aggregate_or_nil(params["cross_aggregate"])
+              threshold = parse_threshold_params(params)
+              limit = parse_int_or_nil(params["limit"])
 
-          {result_type, results} =
-            case {query_spec.metrics, group_by} do
-              {metrics, group_by} when is_list(metrics) and is_binary(group_by) ->
-                group_keys = String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
+              base_opts = [
+                from: query_spec.from,
+                to: query_spec.to,
+                bucket: {step, :seconds},
+                aggregate: agg,
+                transform: transform
+              ]
 
-                {:ok, grouped} =
-                  TimelessMetrics.query_aggregate_grouped_metrics(
-                    store,
-                    metrics,
-                    query_spec.labels,
-                    Keyword.merge(base_opts,
-                      group_by: group_keys,
-                      cross_series_aggregate: cross_agg || :max
-                    )
-                  )
+              {result_type, results} =
+                case {query_spec.metrics, group_by} do
+                  {metrics, group_by} when is_list(metrics) and is_binary(group_by) ->
+                    group_keys =
+                      String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
 
-                {:grouped, grouped}
+                    {:ok, grouped} =
+                      TimelessMetrics.query_aggregate_grouped_metrics(
+                        store,
+                        metrics,
+                        query_spec.labels,
+                        Keyword.merge(base_opts,
+                          group_by: group_keys,
+                          cross_series_aggregate: cross_agg || :max
+                        )
+                      )
 
-              {metrics, _} when is_list(metrics) ->
-                {:ok, multi} =
-                  TimelessMetrics.query_aggregate_multi_metrics(
-                    store,
-                    metrics,
-                    query_spec.labels,
-                    base_opts
-                  )
+                    {:grouped, grouped}
 
-                {:multi, multi}
+                  {metrics, _} when is_list(metrics) ->
+                    {:ok, multi} =
+                      TimelessMetrics.query_aggregate_multi_metrics(
+                        store,
+                        metrics,
+                        query_spec.labels,
+                        base_opts
+                      )
 
-              {_, group_by} when is_binary(group_by) ->
-                group_keys = String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
+                    {:multi, multi}
 
-                {:ok, grouped} =
-                  TimelessMetrics.query_aggregate_grouped(
-                    store,
-                    query_spec.metric,
-                    query_spec.labels,
-                    Keyword.merge(base_opts,
-                      group_by: group_keys,
-                      cross_series_aggregate: cross_agg || :max
-                    )
-                  )
+                  {_, group_by} when is_binary(group_by) ->
+                    group_keys =
+                      String.split(group_by, ",", trim: true) |> Enum.map(&String.trim/1)
 
-                {:grouped, grouped}
+                    {:ok, grouped} =
+                      TimelessMetrics.query_aggregate_grouped(
+                        store,
+                        query_spec.metric,
+                        query_spec.labels,
+                        Keyword.merge(base_opts,
+                          group_by: group_keys,
+                          cross_series_aggregate: cross_agg || :max
+                        )
+                      )
 
-              _ when threshold != nil ->
-                {:ok, filtered} =
-                  TimelessMetrics.query_aggregate_multi_filtered(
-                    store,
-                    query_spec.metric,
-                    query_spec.labels,
-                    Keyword.put(base_opts, :threshold, threshold)
-                  )
+                    {:grouped, grouped}
 
-                {:flat, filtered}
+                  _ when threshold != nil ->
+                    {:ok, filtered} =
+                      TimelessMetrics.query_aggregate_multi_filtered(
+                        store,
+                        query_spec.metric,
+                        query_spec.labels,
+                        Keyword.put(base_opts, :threshold, threshold)
+                      )
 
-              _ ->
-                {:ok, flat} =
-                  TimelessMetrics.query_aggregate_multi(
-                    store,
-                    query_spec.metric,
-                    query_spec.labels,
-                    base_opts
-                  )
+                    {:flat, filtered}
 
-                {:flat, flat}
-            end
+                  _ ->
+                    {:ok, flat} =
+                      TimelessMetrics.query_aggregate_multi(
+                        store,
+                        query_spec.metric,
+                        query_spec.labels,
+                        base_opts
+                      )
 
-          results = maybe_apply_limit(results, limit)
+                    {:flat, flat}
+                end
 
-          body = format_native_response(result_type, results, query_spec)
+              results = maybe_apply_limit(results, limit)
+              body = format_native_response(result_type, results, query_spec)
+              json_resp(req, 200, body)
 
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(200, json_encode!(body))
-
-        {:error, msg} ->
-          json_error(conn, 400, msg)
-      end
+            {:error, msg} ->
+              json_error(req, 400, msg)
+          end
+        end
     end
   end
 
   # List all label names (VictoriaMetrics native path)
   get "/api/v1/labels" do
-    store = conn.private.timeless_metrics
-    {:ok, metrics} = TimelessMetrics.list_metrics(store)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    label_names =
-      metrics
-      |> Enum.flat_map(fn metric ->
-        case TimelessMetrics.list_series(store, metric) do
-          {:ok, series} -> Enum.flat_map(series, fn %{labels: l} -> Map.keys(l) end)
-          _ -> []
-        end
-      end)
-      |> MapSet.new()
-      |> MapSet.put("__name__")
-      |> MapSet.to_list()
-      |> Enum.sort()
+      :ok ->
+        store = store()
+        {:ok, metrics} = TimelessMetrics.list_metrics(store)
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{"status" => "success", "data" => label_names}))
+        label_names =
+          metrics
+          |> Enum.flat_map(fn metric ->
+            case TimelessMetrics.list_series(store, metric) do
+              {:ok, series} -> Enum.flat_map(series, fn %{labels: l} -> Map.keys(l) end)
+              _ -> []
+            end
+          end)
+          |> MapSet.new()
+          |> MapSet.put("__name__")
+          |> MapSet.to_list()
+          |> Enum.sort()
+
+        json_resp(req, 200, %{"status" => "success", "data" => label_names})
+    end
   end
 
   # List all metric names
   get "/api/v1/label/__name__/values" do
-    store = conn.private.timeless_metrics
-    {:ok, metrics} = TimelessMetrics.list_metrics(store)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{status: "success", data: metrics}))
+      :ok ->
+        store = store()
+        {:ok, metrics} = TimelessMetrics.list_metrics(store)
+        json_resp(req, 200, %{status: "success", data: metrics})
+    end
   end
 
   # List values for a specific label key
   # When metric= is provided, scopes to that metric. Otherwise queries all metrics (VM compat).
   get "/api/v1/label/:name/values" do
-    store = conn.private.timeless_metrics
-    conn = Plug.Conn.fetch_query_params(conn)
-    label_name = conn.path_params["name"]
-    metric = conn.query_params["metric"]
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    values =
-      if metric do
-        {:ok, vals} = TimelessMetrics.label_values(store, metric, label_name)
-        vals
-      else
-        {:ok, metrics} = TimelessMetrics.list_metrics(store)
+      :ok ->
+        store = store()
+        {params, _} = Rocket.Request.query_params(req)
+        label_name = req.path_params["name"]
+        metric = params["metric"]
 
-        metrics
-        |> Enum.flat_map(fn m ->
-          case TimelessMetrics.label_values(store, m, label_name) do
-            {:ok, vals} -> vals
-            _ -> []
+        values =
+          if metric do
+            {:ok, vals} = TimelessMetrics.label_values(store, metric, label_name)
+            vals
+          else
+            {:ok, metrics} = TimelessMetrics.list_metrics(store)
+
+            metrics
+            |> Enum.flat_map(fn m ->
+              case TimelessMetrics.label_values(store, m, label_name) do
+                {:ok, vals} -> vals
+                _ -> []
+              end
+            end)
+            |> Enum.uniq()
+            |> Enum.sort()
           end
-        end)
-        |> Enum.uniq()
-        |> Enum.sort()
-      end
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{status: "success", data: values}))
+        json_resp(req, 200, %{status: "success", data: values})
+    end
   end
 
   # List all series for a metric
   get "/api/v1/series" do
-    store = conn.private.timeless_metrics
-    conn = Plug.Conn.fetch_query_params(conn)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case conn.query_params["metric"] do
-      nil ->
-        json_error(conn, 400, "missing required parameter: metric")
+      :ok ->
+        store = store()
+        {params, _} = Rocket.Request.query_params(req)
 
-      metric ->
-        {:ok, series} = TimelessMetrics.list_series(store, metric)
+        case params["metric"] do
+          nil ->
+            json_error(req, 400, "missing required parameter: metric")
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, json_encode!(%{status: "success", data: series}))
+          metric ->
+            {:ok, series} = TimelessMetrics.list_series(store, metric)
+            json_resp(req, 200, %{status: "success", data: series})
+        end
     end
   end
 
   # Register or update metric metadata
   post "/api/v1/metadata" do
-    store = conn.private.timeless_metrics
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case Plug.Conn.read_body(conn, length: 64_000) do
-      {:ok, body, conn} ->
+      :ok ->
+        store = store()
+        body = req.body
+
         case safe_json_decode(body) do
           %{"metric" => metric, "type" => type} = params
           when type in ~w(gauge counter histogram) ->
@@ -602,63 +619,63 @@ defmodule TimelessMetrics.HTTP do
               description: params["description"]
             )
 
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(200, json_encode!(%{status: "ok"}))
+            json_resp(req, 200, %{status: "ok"})
 
           %{"metric" => _} ->
-            json_error(conn, 400, "type must be one of: gauge, counter, histogram")
+            json_error(req, 400, "type must be one of: gauge, counter, histogram")
 
           _ ->
-            json_error(conn, 400, "invalid JSON: requires metric and type fields")
+            json_error(req, 400, "invalid JSON: requires metric and type fields")
         end
-
-      {:error, reason} ->
-        json_error(conn, 400, to_string(reason))
     end
   end
 
   # Get metric metadata
   get "/api/v1/metadata" do
-    store = conn.private.timeless_metrics
-    conn = Plug.Conn.fetch_query_params(conn)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case conn.query_params["metric"] do
-      nil ->
-        json_error(conn, 400, "missing required parameter: metric")
+      :ok ->
+        store = store()
+        {params, _} = Rocket.Request.query_params(req)
 
-      metric ->
-        {:ok, meta} = TimelessMetrics.get_metadata(store, metric)
+        case params["metric"] do
+          nil ->
+            json_error(req, 400, "missing required parameter: metric")
 
-        if meta do
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(
-            200,
-            json_encode!(%{
-              metric: metric,
-              type: meta.type,
-              unit: meta.unit,
-              description: meta.description
-            })
-          )
-        else
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(
-            200,
-            json_encode!(%{metric: metric, type: "gauge", unit: nil, description: nil})
-          )
+          metric ->
+            {:ok, meta} = TimelessMetrics.get_metadata(store, metric)
+
+            if meta do
+              json_resp(req, 200, %{
+                metric: metric,
+                type: meta.type,
+                unit: meta.unit,
+                description: meta.description
+              })
+            else
+              json_resp(req, 200, %{
+                metric: metric,
+                type: "gauge",
+                unit: nil,
+                description: nil
+              })
+            end
         end
     end
   end
 
   # Create an annotation
   post "/api/v1/annotations" do
-    store = conn.private.timeless_metrics
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case Plug.Conn.read_body(conn, length: 64_000) do
-      {:ok, body, conn} ->
+      :ok ->
+        store = store()
+        body = req.body
+
         case safe_json_decode(body) do
           %{"title" => title} = params ->
             timestamp = params["timestamp"] || System.os_time(:second)
@@ -671,59 +688,63 @@ defmodule TimelessMetrics.HTTP do
                 tags: tags
               )
 
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(201, json_encode!(%{id: id, status: "created"}))
+            json_resp(req, 201, %{id: id, status: "created"})
 
           _ ->
-            json_error(conn, 400, "invalid JSON: requires title field")
+            json_error(req, 400, "invalid JSON: requires title field")
         end
-
-      {:error, reason} ->
-        json_error(conn, 400, to_string(reason))
     end
   end
 
   # Query annotations in a time range
   get "/api/v1/annotations" do
-    store = conn.private.timeless_metrics
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    now = System.os_time(:second)
-    from = parse_time(params["from"], now - 86_400)
-    to = parse_time(params["to"], now)
+      :ok ->
+        store = store()
+        {params, _} = Rocket.Request.query_params(req)
 
-    tag_filter =
-      case params["tags"] do
-        nil -> []
-        tags_str -> String.split(tags_str, ",", trim: true)
-      end
+        now = System.os_time(:second)
+        from = parse_time(params["from"], now - 86_400)
+        to = parse_time(params["to"], now)
 
-    {:ok, results} = TimelessMetrics.annotations(store, from, to, tags: tag_filter)
+        tag_filter =
+          case params["tags"] do
+            nil -> []
+            tags_str -> String.split(tags_str, ",", trim: true)
+          end
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{data: results}))
+        {:ok, results} = TimelessMetrics.annotations(store, from, to, tags: tag_filter)
+        json_resp(req, 200, %{data: results})
+    end
   end
 
   # Delete an annotation
   delete "/api/v1/annotations/:id" do
-    store = conn.private.timeless_metrics
-    {id, _} = Integer.parse(conn.path_params["id"])
-    TimelessMetrics.delete_annotation(store, id)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{status: "deleted"}))
+      :ok ->
+        store = store()
+        {id, _} = Integer.parse(req.path_params["id"])
+        TimelessMetrics.delete_annotation(store, id)
+        json_resp(req, 200, %{status: "deleted"})
+    end
   end
 
   # Create an alert rule
   post "/api/v1/alerts" do
-    store = conn.private.timeless_metrics
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case Plug.Conn.read_body(conn, length: 64_000) do
-      {:ok, body, conn} ->
+      :ok ->
+        store = store()
+        body = req.body
+
         case safe_json_decode(body) do
           %{
             "name" => name,
@@ -744,226 +765,247 @@ defmodule TimelessMetrics.HTTP do
             ]
 
             {:ok, id} = TimelessMetrics.create_alert(store, opts)
-
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(201, json_encode!(%{id: id, status: "created"}))
+            json_resp(req, 201, %{id: id, status: "created"})
 
           _ ->
             json_error(
-              conn,
+              req,
               400,
               "requires: name, metric, condition (above/below), threshold (number)"
             )
         end
-
-      {:error, reason} ->
-        json_error(conn, 400, to_string(reason))
     end
   end
 
   # List all alert rules with state
   get "/api/v1/alerts" do
-    store = conn.private.timeless_metrics
-    {:ok, rules} = TimelessMetrics.list_alerts(store)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{data: rules}))
+      :ok ->
+        store = store()
+        {:ok, rules} = TimelessMetrics.list_alerts(store)
+        json_resp(req, 200, %{data: rules})
+    end
   end
 
   # Delete an alert rule
   delete "/api/v1/alerts/:id" do
-    store = conn.private.timeless_metrics
-    {id, _} = Integer.parse(conn.path_params["id"])
-    TimelessMetrics.delete_alert(store, id)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{status: "deleted"}))
+      :ok ->
+        store = store()
+        {id, _} = Integer.parse(req.path_params["id"])
+        TimelessMetrics.delete_alert(store, id)
+        json_resp(req, 200, %{status: "deleted"})
+    end
   end
 
   # Forecast future values
   get "/api/v1/forecast" do
-    store = conn.private.timeless_metrics
-    conn = Plug.Conn.fetch_query_params(conn)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case extract_query_params(conn.query_params) do
-      {:ok, metric, labels, from, to} ->
-        params = conn.query_params
-        step = parse_int(params["step"], 300)
-        horizon = parse_duration_param(params["horizon"], 3600)
-        transform = TimelessMetrics.Transform.parse(params["transform"])
+      :ok ->
+        store = store()
+        {params, _} = Rocket.Request.query_params(req)
 
-        {:ok, results} =
-          TimelessMetrics.query_aggregate_multi(store, metric, labels,
-            from: from,
-            to: to,
-            bucket: {step, :seconds},
-            aggregate: :avg,
-            transform: transform
-          )
+        case extract_query_params(params) do
+          {:ok, metric, labels, from, to} ->
+            step = parse_int(params["step"], 300)
+            horizon = parse_duration_param(params["horizon"], 3600)
+            transform = TimelessMetrics.Transform.parse(params["transform"])
 
-        forecasts =
-          Enum.map(results, fn %{labels: l, data: data} ->
-            case TimelessMetrics.Forecast.predict(data, horizon: horizon, bucket: step) do
-              {:ok, predictions} ->
-                %{
-                  labels: l,
-                  data: Enum.map(data, fn {ts, val} -> [ts, val] end),
-                  forecast: Enum.map(predictions, fn {ts, val} -> [ts, val] end)
-                }
+            {:ok, results} =
+              TimelessMetrics.query_aggregate_multi(store, metric, labels,
+                from: from,
+                to: to,
+                bucket: {step, :seconds},
+                aggregate: :avg,
+                transform: transform
+              )
 
-              {:error, _} ->
-                %{labels: l, data: Enum.map(data, fn {ts, val} -> [ts, val] end), forecast: []}
-            end
-          end)
+            forecasts =
+              Enum.map(results, fn %{labels: l, data: data} ->
+                case TimelessMetrics.Forecast.predict(data, horizon: horizon, bucket: step) do
+                  {:ok, predictions} ->
+                    %{
+                      labels: l,
+                      data: Enum.map(data, fn {ts, val} -> [ts, val] end),
+                      forecast: Enum.map(predictions, fn {ts, val} -> [ts, val] end)
+                    }
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, json_encode!(%{metric: metric, series: forecasts}))
+                  {:error, _} ->
+                    %{
+                      labels: l,
+                      data: Enum.map(data, fn {ts, val} -> [ts, val] end),
+                      forecast: []
+                    }
+                end
+              end)
 
-      {:error, msg} ->
-        json_error(conn, 400, msg)
+            json_resp(req, 200, %{metric: metric, series: forecasts})
+
+          {:error, msg} ->
+            json_error(req, 400, msg)
+        end
     end
   end
 
   # Anomaly detection
   get "/api/v1/anomalies" do
-    store = conn.private.timeless_metrics
-    conn = Plug.Conn.fetch_query_params(conn)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case extract_query_params(conn.query_params) do
-      {:ok, metric, labels, from, to} ->
-        params = conn.query_params
-        step = parse_int(params["step"], 300)
-        sensitivity = parse_sensitivity(params["sensitivity"])
-        transform = TimelessMetrics.Transform.parse(params["transform"])
+      :ok ->
+        store = store()
+        {params, _} = Rocket.Request.query_params(req)
 
-        {:ok, results} =
-          TimelessMetrics.query_aggregate_multi(store, metric, labels,
-            from: from,
-            to: to,
-            bucket: {step, :seconds},
-            aggregate: :avg,
-            transform: transform
-          )
+        case extract_query_params(params) do
+          {:ok, metric, labels, from, to} ->
+            step = parse_int(params["step"], 300)
+            sensitivity = parse_sensitivity(params["sensitivity"])
+            transform = TimelessMetrics.Transform.parse(params["transform"])
 
-        detections =
-          Enum.map(results, fn %{labels: l, data: data} ->
-            case TimelessMetrics.Anomaly.detect(data, sensitivity: sensitivity) do
-              {:ok, analysis} -> %{labels: l, analysis: analysis}
-              {:error, _} -> %{labels: l, analysis: []}
-            end
-          end)
+            {:ok, results} =
+              TimelessMetrics.query_aggregate_multi(store, metric, labels,
+                from: from,
+                to: to,
+                bucket: {step, :seconds},
+                aggregate: :avg,
+                transform: transform
+              )
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, json_encode!(%{metric: metric, series: detections}))
+            detections =
+              Enum.map(results, fn %{labels: l, data: data} ->
+                case TimelessMetrics.Anomaly.detect(data, sensitivity: sensitivity) do
+                  {:ok, analysis} -> %{labels: l, analysis: analysis}
+                  {:error, _} -> %{labels: l, analysis: []}
+                end
+              end)
 
-      {:error, msg} ->
-        json_error(conn, 400, msg)
+            json_resp(req, 200, %{metric: metric, series: detections})
+
+          {:error, msg} ->
+            json_error(req, 400, msg)
+        end
     end
   end
 
   # SVG chart — embeddable via <img src="http://host:port/chart?metric=cpu&host=web-1&from=-1h">
   # Optional: &forecast=1h for forecast overlay, &anomalies=medium for anomaly markers
   get "/chart" do
-    store = conn.private.timeless_metrics
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case extract_chart_params(params) do
-      {:ok, metric, labels, from, to, step, agg, width, height, theme} ->
-        transform = TimelessMetrics.Transform.parse(params["transform"])
+      :ok ->
+        store = store()
+        {params, _} = Rocket.Request.query_params(req)
 
-        {:ok, results} =
-          TimelessMetrics.query_aggregate_multi(store, metric, labels,
-            from: from,
-            to: to,
-            bucket: {step, :seconds},
-            aggregate: agg,
-            transform: transform
-          )
+        case extract_chart_params(params) do
+          {:ok, metric, labels, from, to, step, agg, width, height, theme} ->
+            transform = TimelessMetrics.Transform.parse(params["transform"])
 
-        {:ok, annots} = TimelessMetrics.annotations(store, from, to)
+            {:ok, results} =
+              TimelessMetrics.query_aggregate_multi(store, metric, labels,
+                from: from,
+                to: to,
+                bucket: {step, :seconds},
+                aggregate: agg,
+                transform: transform
+              )
 
-        # Optional forecast overlay
-        forecast_data =
-          case params["forecast"] do
-            nil ->
-              []
+            {:ok, annots} = TimelessMetrics.annotations(store, from, to)
 
-            horizon_str ->
-              horizon = parse_duration_param(horizon_str, 3600)
+            # Optional forecast overlay
+            forecast_data =
+              case params["forecast"] do
+                nil ->
+                  []
 
-              case results do
-                [%{data: data} | _] ->
-                  case TimelessMetrics.Forecast.predict(data, horizon: horizon, bucket: step) do
-                    {:ok, predictions} ->
-                      last_point = List.last(data)
-                      if last_point, do: [last_point | predictions], else: predictions
+                horizon_str ->
+                  horizon = parse_duration_param(horizon_str, 3600)
+
+                  case results do
+                    [%{data: data} | _] ->
+                      case TimelessMetrics.Forecast.predict(data, horizon: horizon, bucket: step) do
+                        {:ok, predictions} ->
+                          last_point = List.last(data)
+                          if last_point, do: [last_point | predictions], else: predictions
+
+                        _ ->
+                          []
+                      end
 
                     _ ->
                       []
                   end
-
-                _ ->
-                  []
               end
-          end
 
-        # Optional anomaly overlay
-        anomaly_points =
-          case params["anomalies"] do
-            nil ->
-              []
+            # Optional anomaly overlay
+            anomaly_points =
+              case params["anomalies"] do
+                nil ->
+                  []
 
-            sensitivity_str ->
-              sensitivity = parse_sensitivity(sensitivity_str)
+                sensitivity_str ->
+                  sensitivity = parse_sensitivity(sensitivity_str)
 
-              results
-              |> Enum.flat_map(fn %{data: data} ->
-                case TimelessMetrics.Anomaly.detect(data, sensitivity: sensitivity) do
-                  {:ok, analysis} ->
-                    analysis
-                    |> Enum.filter(& &1.anomaly)
-                    |> Enum.map(fn a -> {a.timestamp, a.value} end)
+                  results
+                  |> Enum.flat_map(fn %{data: data} ->
+                    case TimelessMetrics.Anomaly.detect(data, sensitivity: sensitivity) do
+                      {:ok, analysis} ->
+                        analysis
+                        |> Enum.filter(& &1.anomaly)
+                        |> Enum.map(fn a -> {a.timestamp, a.value} end)
 
-                  _ ->
-                    []
-                end
-              end)
-          end
+                      _ ->
+                        []
+                    end
+                  end)
+              end
 
-        svg =
-          TimelessMetrics.Chart.render(metric, results,
-            width: width,
-            height: height,
-            theme: theme,
-            annotations: annots,
-            forecast: forecast_data,
-            anomalies: anomaly_points
-          )
+            svg =
+              TimelessMetrics.Chart.render(metric, results,
+                width: width,
+                height: height,
+                theme: theme,
+                annotations: annots,
+                forecast: forecast_data,
+                anomalies: anomaly_points
+              )
 
-        conn
-        |> put_resp_content_type("image/svg+xml")
-        |> put_resp_header("cache-control", "public, max-age=60")
-        |> send_resp(200, svg)
+            Rocket.Response.send_iodata(
+              req,
+              200,
+              [{"content-type", "image/svg+xml"}, {"cache-control", "public, max-age=60"}],
+              svg
+            )
 
-      {:error, msg} ->
-        json_error(conn, 400, msg)
+          {:error, msg} ->
+            json_error(req, 400, msg)
+        end
     end
   end
 
   # Prometheus text exposition format import
   # Each line: metric_name{label1="val1",label2="val2"} value [timestamp_ms]
   post "/api/v1/import/prometheus" do
-    store = conn.private.timeless_metrics
-    TimelessMetrics.Stats.incr_http_imports(store)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case Plug.Conn.read_body(conn, length: @max_body_bytes) do
-      {:ok, body, conn} ->
+      :ok ->
+        store = store()
+        TimelessMetrics.Stats.incr_http_imports(store)
+        body = req.body
+
         {count, errors, error_samples} = ingest_prometheus_text(store, body)
         TimelessMetrics.Stats.add_http_import_errors(store, errors)
 
@@ -974,438 +1016,455 @@ defmodule TimelessMetrics.HTTP do
         )
 
         if errors > 0 do
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(
-            200,
-            json_encode!(%{
-              samples: count,
-              errors: errors,
-              failed_lines: error_samples
-            })
-          )
+          json_resp(req, 200, %{
+            samples: count,
+            errors: errors,
+            failed_lines: error_samples
+          })
         else
-          send_resp(conn, 204, "")
+          send_resp(req, 204)
         end
-
-      {:more, _partial, conn} ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(413, json_encode!(%{error: "body too large", max_bytes: @max_body_bytes}))
-
-      {:error, reason} ->
-        json_error(conn, 400, to_string(reason))
     end
   end
 
   # Prometheus-compatible query_range endpoint (for Grafana + TSBS)
   get "/prometheus/api/v1/query_range" do
-    store = conn.private.timeless_metrics
-    TimelessMetrics.Stats.incr_http_queries(store)
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case params["query"] do
-      nil ->
-        json_error(conn, 400, "missing required parameter: query")
+      :ok ->
+        store = store()
+        TimelessMetrics.Stats.incr_http_queries(store)
+        {params, _} = Rocket.Request.query_params(req)
 
-      query ->
-        now = System.os_time(:second)
-        start_ts = parse_prom_time(params["start"], now - 3600)
-        end_ts = parse_prom_time(params["end"], now)
-        step = parse_prom_step(params["step"], 60)
+        case params["query"] do
+          nil ->
+            json_error(req, 400, "missing required parameter: query")
 
-        case TimelessMetrics.PromQL.parse(query) do
-          {:ok, plan} ->
-            {:ok, response} =
-              TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
+          query ->
+            now = System.os_time(:second)
+            start_ts = parse_prom_time(params["start"], now - 3600)
+            end_ts = parse_prom_time(params["end"], now)
+            step = parse_prom_step(params["step"], 60)
 
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(200, json_encode!(response))
+            case TimelessMetrics.PromQL.parse(query) do
+              {:ok, plan} ->
+                {:ok, response} =
+                  TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
 
-          {:error, reason} ->
-            json_error(conn, 400, "PromQL parse error: #{reason}")
+                json_resp(req, 200, response)
+
+              {:error, reason} ->
+                json_error(req, 400, "PromQL parse error: #{reason}")
+            end
         end
     end
   end
 
   # Prometheus-compatible instant query endpoint (for Grafana health check + current-value panels)
   get "/prometheus/api/v1/query" do
-    store = conn.private.timeless_metrics
-    TimelessMetrics.Stats.incr_http_queries(store)
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case params["query"] do
-      nil ->
-        json_error(conn, 400, "missing required parameter: query")
+      :ok ->
+        store = store()
+        TimelessMetrics.Stats.incr_http_queries(store)
+        {params, _} = Rocket.Request.query_params(req)
 
-      query ->
-        now = System.os_time(:second)
-        time = parse_prom_time(params["time"], now)
-        start_ts = time - 300
-        end_ts = time
-        step = 300
+        case params["query"] do
+          nil ->
+            json_error(req, 400, "missing required parameter: query")
 
-        case TimelessMetrics.PromQL.parse(query) do
-          {:ok, plan} ->
-            {:ok, response} =
-              TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
+          query ->
+            now = System.os_time(:second)
+            time = parse_prom_time(params["time"], now)
+            start_ts = time - 300
+            end_ts = time
+            step = 300
 
-            # Convert matrix results to vector (take last value from each series)
-            vector_results =
-              Enum.map(response["data"]["result"], fn series ->
-                case List.last(series["values"]) do
-                  [ts, val] -> %{"metric" => series["metric"], "value" => [ts, val]}
-                  _ -> %{"metric" => series["metric"], "value" => [end_ts, "0"]}
-                end
-              end)
+            case TimelessMetrics.PromQL.parse(query) do
+              {:ok, plan} ->
+                {:ok, response} =
+                  TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
 
-            vector_response = %{
-              "status" => "success",
-              "data" => %{"resultType" => "vector", "result" => vector_results}
-            }
+                # Convert matrix results to vector (take last value from each series)
+                vector_results =
+                  Enum.map(response["data"]["result"], fn series ->
+                    case List.last(series["values"]) do
+                      [ts, val] -> %{"metric" => series["metric"], "value" => [ts, val]}
+                      _ -> %{"metric" => series["metric"], "value" => [end_ts, "0"]}
+                    end
+                  end)
 
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(200, json_encode!(vector_response))
+                vector_response = %{
+                  "status" => "success",
+                  "data" => %{"resultType" => "vector", "result" => vector_results}
+                }
 
-          {:error, reason} ->
-            json_error(conn, 400, "PromQL parse error: #{reason}")
+                json_resp(req, 200, vector_response)
+
+              {:error, reason} ->
+                json_error(req, 400, "PromQL parse error: #{reason}")
+            end
         end
     end
   end
 
   # Prometheus-compatible labels endpoint (for Grafana label autocomplete)
   get "/prometheus/api/v1/labels" do
-    store = conn.private.timeless_metrics
-    {:ok, metrics} = TimelessMetrics.list_metrics(store)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    label_names =
-      metrics
-      |> Enum.flat_map(fn metric ->
-        case TimelessMetrics.list_series(store, metric) do
-          {:ok, series} -> Enum.flat_map(series, fn %{labels: l} -> Map.keys(l) end)
-          _ -> []
-        end
-      end)
-      |> MapSet.new()
-      |> MapSet.put("__name__")
-      |> MapSet.to_list()
-      |> Enum.sort()
+      :ok ->
+        store = store()
+        {:ok, metrics} = TimelessMetrics.list_metrics(store)
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{"status" => "success", "data" => label_names}))
+        label_names =
+          metrics
+          |> Enum.flat_map(fn metric ->
+            case TimelessMetrics.list_series(store, metric) do
+              {:ok, series} -> Enum.flat_map(series, fn %{labels: l} -> Map.keys(l) end)
+              _ -> []
+            end
+          end)
+          |> MapSet.new()
+          |> MapSet.put("__name__")
+          |> MapSet.to_list()
+          |> Enum.sort()
+
+        json_resp(req, 200, %{"status" => "success", "data" => label_names})
+    end
   end
 
   # Prometheus-compatible label values endpoint (no metric= param required)
   get "/prometheus/api/v1/label/:name/values" do
-    store = conn.private.timeless_metrics
-    label_name = conn.path_params["name"]
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    values =
-      if label_name == "__name__" do
-        {:ok, metrics} = TimelessMetrics.list_metrics(store)
-        metrics
-      else
-        {:ok, metrics} = TimelessMetrics.list_metrics(store)
+      :ok ->
+        store = store()
+        label_name = req.path_params["name"]
 
-        metrics
-        |> Enum.flat_map(fn metric ->
-          case TimelessMetrics.label_values(store, metric, label_name) do
-            {:ok, vals} -> vals
-            _ -> []
+        values =
+          if label_name == "__name__" do
+            {:ok, metrics} = TimelessMetrics.list_metrics(store)
+            metrics
+          else
+            {:ok, metrics} = TimelessMetrics.list_metrics(store)
+
+            metrics
+            |> Enum.flat_map(fn metric ->
+              case TimelessMetrics.label_values(store, metric, label_name) do
+                {:ok, vals} -> vals
+                _ -> []
+              end
+            end)
+            |> Enum.uniq()
+            |> Enum.sort()
           end
-        end)
-        |> Enum.uniq()
-        |> Enum.sort()
-      end
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{"status" => "success", "data" => values}))
+        json_resp(req, 200, %{"status" => "success", "data" => values})
+    end
   end
 
   # Prometheus-compatible series endpoint (accepts match[] param)
   get "/prometheus/api/v1/series" do
-    store = conn.private.timeless_metrics
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    match_param =
-      case params["match[]"] || params["match"] do
-        [first | _] -> first
-        other -> other
-      end
+      :ok ->
+        store = store()
+        {params, _} = Rocket.Request.query_params(req)
 
-    case match_param do
-      nil ->
-        json_error(conn, 400, "missing required parameter: match[]")
+        match_param =
+          case params["match[]"] || params["match"] do
+            [first | _] -> first
+            other -> other
+          end
 
-      match_query ->
-        case TimelessMetrics.PromQL.parse(match_query) do
-          {:ok, plan} ->
-            metric_names =
-              case {plan.metric, plan.metric_pattern} do
-                {name, nil} when is_binary(name) ->
-                  [name]
+        case match_param do
+          nil ->
+            json_error(req, 400, "missing required parameter: match[]")
 
-                {nil, pattern} when is_binary(pattern) ->
-                  {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
-                  {:ok, regex} = Regex.compile("^(?:" <> pattern <> ")$")
-                  Enum.filter(all_metrics, &Regex.match?(regex, &1))
+          match_query ->
+            case TimelessMetrics.PromQL.parse(match_query) do
+              {:ok, plan} ->
+                metric_names =
+                  case {plan.metric, plan.metric_pattern} do
+                    {name, nil} when is_binary(name) ->
+                      [name]
 
-                _ ->
-                  {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
-                  all_metrics
-              end
+                    {nil, pattern} when is_binary(pattern) ->
+                      {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
+                      {:ok, regex} = Regex.compile("^(?:" <> pattern <> ")$")
+                      Enum.filter(all_metrics, &Regex.match?(regex, &1))
 
-            series =
-              Enum.flat_map(metric_names, fn metric ->
-                case TimelessMetrics.list_series(store, metric) do
-                  {:ok, series_list} ->
-                    label_maps = Enum.map(series_list, fn %{labels: l} -> l end)
+                    _ ->
+                      {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
+                      all_metrics
+                  end
 
-                    label_maps
-                    |> filter_series_by_labels(plan.labels)
-                    |> Enum.map(&Map.put(&1, "__name__", metric))
+                series =
+                  Enum.flat_map(metric_names, fn metric ->
+                    case TimelessMetrics.list_series(store, metric) do
+                      {:ok, series_list} ->
+                        label_maps = Enum.map(series_list, fn %{labels: l} -> l end)
 
-                  _ ->
-                    []
-                end
-              end)
+                        label_maps
+                        |> filter_series_by_labels(plan.labels)
+                        |> Enum.map(&Map.put(&1, "__name__", metric))
 
-            conn
-            |> put_resp_content_type("application/json")
-            |> send_resp(200, json_encode!(%{"status" => "success", "data" => series}))
+                      _ ->
+                        []
+                    end
+                  end)
 
-          {:error, reason} ->
-            json_error(conn, 400, "PromQL parse error: #{reason}")
+                json_resp(req, 200, %{"status" => "success", "data" => series})
+
+              {:error, reason} ->
+                json_error(req, 400, "PromQL parse error: #{reason}")
+            end
         end
     end
   end
 
   # Dashboard — zero-dependency HTML overview page
   get "/" do
-    store = conn.private.timeless_metrics
-    conn = Plug.Conn.fetch_query_params(conn)
-    params = conn.query_params
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    from = params["from"] || "-1h"
-    to = params["to"] || "now"
-    filter = label_params(params)
+      :ok ->
+        store = store()
+        {params, _} = Rocket.Request.query_params(req)
 
-    html =
-      TimelessMetrics.Dashboard.render(
-        store: store,
-        from: from,
-        to: to,
-        filter: filter
-      )
+        from = params["from"] || "-1h"
+        to = params["to"] || "now"
+        filter = label_params(params)
 
-    conn
-    |> put_resp_content_type("text/html")
-    |> send_resp(200, html)
+        html =
+          TimelessMetrics.Dashboard.render(
+            store: store,
+            from: from,
+            to: to,
+            filter: filter
+          )
+
+        html_resp(req, 200, html)
+    end
   end
 
   # --- OpenAPI / API Docs ---
 
   # Serve the OpenAPI JSON spec
   get "/api/openapi.json" do
-    conn
-    |> put_resp_content_type("application/json")
-    |> put_resp_header("access-control-allow-origin", "*")
-    |> send_resp(200, TimelessMetrics.OpenAPI.spec_json())
+    Rocket.Response.send_iodata(
+      req,
+      200,
+      [{"content-type", "application/json"}, {"access-control-allow-origin", "*"}],
+      TimelessMetrics.OpenAPI.spec_json()
+    )
   end
 
   # Serve the Scalar API reference UI
   get "/api/docs" do
-    html = scalar_html()
-
-    conn
-    |> put_resp_content_type("text/html")
-    |> send_resp(200, html)
+    html_resp(req, 200, scalar_html())
   end
 
   # --- Scrape Target CRUD ---
 
   # Create a scrape target
   post "/api/v1/scrape_targets" do
-    store = conn.private.timeless_metrics
-    scraper = :"#{store}_scraper"
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case Plug.Conn.read_body(conn, length: 64_000) do
-      {:ok, body, conn} ->
+      :ok ->
+        store = store()
+        scraper = :"#{store}_scraper"
+        body = req.body
+
         case safe_json_decode(body) do
           params when is_map(params) ->
             case TimelessMetrics.Scraper.add_target(scraper, params) do
               {:ok, id} ->
-                conn
-                |> put_resp_content_type("application/json")
-                |> send_resp(201, json_encode!(%{id: id, status: "created"}))
+                json_resp(req, 201, %{id: id, status: "created"})
 
               {:error, reason} ->
-                json_error(conn, 400, to_string(reason))
+                json_error(req, 400, to_string(reason))
             end
 
           _ ->
-            json_error(conn, 400, "invalid JSON")
+            json_error(req, 400, "invalid JSON")
         end
-
-      {:error, reason} ->
-        json_error(conn, 400, to_string(reason))
     end
   end
 
   # List all scrape targets with health
   get "/api/v1/scrape_targets" do
-    store = conn.private.timeless_metrics
-    scraper = :"#{store}_scraper"
-    {:ok, targets} = TimelessMetrics.Scraper.list_targets(scraper)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{data: targets}))
+      :ok ->
+        store = store()
+        scraper = :"#{store}_scraper"
+        {:ok, targets} = TimelessMetrics.Scraper.list_targets(scraper)
+        json_resp(req, 200, %{data: targets})
+    end
   end
 
   # Get a single scrape target with health
   get "/api/v1/scrape_targets/:id" do
-    store = conn.private.timeless_metrics
-    scraper = :"#{store}_scraper"
-    {target_id, _} = Integer.parse(conn.path_params["id"])
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case TimelessMetrics.Scraper.get_target(scraper, target_id) do
-      {:ok, target} ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, json_encode!(target))
+      :ok ->
+        store = store()
+        scraper = :"#{store}_scraper"
+        {target_id, _} = Integer.parse(req.path_params["id"])
 
-      {:error, :not_found} ->
-        json_error(conn, 404, "target not found")
+        case TimelessMetrics.Scraper.get_target(scraper, target_id) do
+          {:ok, target} ->
+            json_resp(req, 200, target)
+
+          {:error, :not_found} ->
+            json_error(req, 404, "target not found")
+        end
     end
   end
 
   # Update a scrape target
   put "/api/v1/scrape_targets/:id" do
-    store = conn.private.timeless_metrics
-    scraper = :"#{store}_scraper"
-    {target_id, _} = Integer.parse(conn.path_params["id"])
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    case Plug.Conn.read_body(conn, length: 64_000) do
-      {:ok, body, conn} ->
+      :ok ->
+        store = store()
+        scraper = :"#{store}_scraper"
+        {target_id, _} = Integer.parse(req.path_params["id"])
+        body = req.body
+
         case safe_json_decode(body) do
           params when is_map(params) ->
             case TimelessMetrics.Scraper.update_target(scraper, target_id, params) do
               :ok ->
-                conn
-                |> put_resp_content_type("application/json")
-                |> send_resp(200, json_encode!(%{status: "updated"}))
+                json_resp(req, 200, %{status: "updated"})
 
               {:error, reason} ->
-                json_error(conn, 400, to_string(reason))
+                json_error(req, 400, to_string(reason))
             end
 
           _ ->
-            json_error(conn, 400, "invalid JSON")
+            json_error(req, 400, "invalid JSON")
         end
-
-      {:error, reason} ->
-        json_error(conn, 400, to_string(reason))
     end
   end
 
   # Delete a scrape target
   delete "/api/v1/scrape_targets/:id" do
-    store = conn.private.timeless_metrics
-    scraper = :"#{store}_scraper"
-    {target_id, _} = Integer.parse(conn.path_params["id"])
-    :ok = TimelessMetrics.Scraper.delete_target(scraper, target_id)
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(200, json_encode!(%{status: "deleted"}))
+      :ok ->
+        store = store()
+        scraper = :"#{store}_scraper"
+        {target_id, _} = Integer.parse(req.path_params["id"])
+        :ok = TimelessMetrics.Scraper.delete_target(scraper, target_id)
+        json_resp(req, 200, %{status: "deleted"})
+    end
   end
 
   # Prometheus exposition format endpoint for self-scraping
   get "/metrics" do
-    store = conn.private.timeless_metrics
-    info = TimelessMetrics.info(store)
-    mem = :erlang.memory()
-    {:ok, hostname} = :inet.gethostname()
-    host = to_string(hostname)
-    cpu_rq = :erlang.statistics(:total_run_queue_lengths)
-    all_rq = :erlang.statistics(:total_run_queue_lengths_all)
-    io_rq = all_rq - cpu_rq
+    case check_auth(req) do
+      :halt ->
+        :ok
 
-    lines = [
-      "# HELP vm_memory_total_bytes Total BEAM memory usage in bytes.",
-      "# TYPE vm_memory_total_bytes gauge",
-      ~s(vm_memory_total_bytes{host="#{host}"} #{mem[:total]}),
-      "# HELP vm_memory_processes_bytes BEAM process memory in bytes.",
-      "# TYPE vm_memory_processes_bytes gauge",
-      ~s(vm_memory_processes_bytes{host="#{host}"} #{mem[:processes]}),
-      "# HELP vm_memory_ets_bytes BEAM ETS table memory in bytes.",
-      "# TYPE vm_memory_ets_bytes gauge",
-      ~s(vm_memory_ets_bytes{host="#{host}"} #{mem[:ets]}),
-      "# HELP vm_memory_binary_bytes BEAM binary memory in bytes.",
-      "# TYPE vm_memory_binary_bytes gauge",
-      ~s(vm_memory_binary_bytes{host="#{host}"} #{mem[:binary]}),
-      "# HELP vm_memory_atom_bytes BEAM atom memory in bytes.",
-      "# TYPE vm_memory_atom_bytes gauge",
-      ~s(vm_memory_atom_bytes{host="#{host}"} #{mem[:atom]}),
-      "# HELP vm_memory_system_bytes BEAM system memory in bytes.",
-      "# TYPE vm_memory_system_bytes gauge",
-      ~s(vm_memory_system_bytes{host="#{host}"} #{mem[:system]}),
-      "# HELP vm_process_count Number of BEAM processes.",
-      "# TYPE vm_process_count gauge",
-      ~s(vm_process_count{host="#{host}"} #{:erlang.system_info(:process_count)}),
-      "# HELP vm_process_limit Maximum number of BEAM processes.",
-      "# TYPE vm_process_limit gauge",
-      ~s(vm_process_limit{host="#{host}"} #{:erlang.system_info(:process_limit)}),
-      "# HELP vm_port_count Number of BEAM ports.",
-      "# TYPE vm_port_count gauge",
-      ~s(vm_port_count{host="#{host}"} #{:erlang.system_info(:port_count)}),
-      "# HELP vm_port_limit Maximum number of BEAM ports.",
-      "# TYPE vm_port_limit gauge",
-      ~s(vm_port_limit{host="#{host}"} #{:erlang.system_info(:port_limit)}),
-      "# HELP vm_atom_count Number of atoms.",
-      "# TYPE vm_atom_count gauge",
-      ~s(vm_atom_count{host="#{host}"} #{:erlang.system_info(:atom_count)}),
-      "# HELP vm_atom_limit Maximum number of atoms.",
-      "# TYPE vm_atom_limit gauge",
-      ~s(vm_atom_limit{host="#{host}"} #{:erlang.system_info(:atom_limit)}),
-      "# HELP vm_run_queue_total Total BEAM scheduler run queue length.",
-      "# TYPE vm_run_queue_total gauge",
-      ~s(vm_run_queue_total{host="#{host}"} #{all_rq}),
-      "# HELP vm_run_queue_cpu CPU scheduler run queue length.",
-      "# TYPE vm_run_queue_cpu gauge",
-      ~s(vm_run_queue_cpu{host="#{host}"} #{cpu_rq}),
-      "# HELP vm_run_queue_io IO scheduler run queue length.",
-      "# TYPE vm_run_queue_io gauge",
-      ~s(vm_run_queue_io{host="#{host}"} #{io_rq}),
-      "# HELP timeless_series_count Number of active metric series.",
-      "# TYPE timeless_series_count gauge",
-      ~s(timeless_series_count{host="#{host}"} #{info.series_count}),
-      "# HELP timeless_total_points Total stored data points.",
-      "# TYPE timeless_total_points gauge",
-      ~s(timeless_total_points{host="#{host}"} #{info.total_points}),
-      "# HELP timeless_storage_bytes Storage size in bytes.",
-      "# TYPE timeless_storage_bytes gauge",
-      ~s(timeless_storage_bytes{host="#{host}"} #{info.storage_bytes}),
-      "# HELP timeless_buffer_points Number of points in raw buffer.",
-      "# TYPE timeless_buffer_points gauge",
-      ~s(timeless_buffer_points{host="#{host}"} #{info.raw_buffer_points})
-    ]
+      :ok ->
+        store = store()
+        info = TimelessMetrics.info(store)
+        mem = :erlang.memory()
+        {:ok, hostname} = :inet.gethostname()
+        host = to_string(hostname)
+        cpu_rq = :erlang.statistics(:total_run_queue_lengths)
+        all_rq = :erlang.statistics(:total_run_queue_lengths_all)
+        io_rq = all_rq - cpu_rq
 
-    conn
-    |> put_resp_content_type("text/plain")
-    |> send_resp(200, Enum.join(lines, "\n") <> "\n")
+        lines = [
+          "# HELP vm_memory_total_bytes Total BEAM memory usage in bytes.",
+          "# TYPE vm_memory_total_bytes gauge",
+          ~s(vm_memory_total_bytes{host="#{host}"} #{mem[:total]}),
+          "# HELP vm_memory_processes_bytes BEAM process memory in bytes.",
+          "# TYPE vm_memory_processes_bytes gauge",
+          ~s(vm_memory_processes_bytes{host="#{host}"} #{mem[:processes]}),
+          "# HELP vm_memory_ets_bytes BEAM ETS table memory in bytes.",
+          "# TYPE vm_memory_ets_bytes gauge",
+          ~s(vm_memory_ets_bytes{host="#{host}"} #{mem[:ets]}),
+          "# HELP vm_memory_binary_bytes BEAM binary memory in bytes.",
+          "# TYPE vm_memory_binary_bytes gauge",
+          ~s(vm_memory_binary_bytes{host="#{host}"} #{mem[:binary]}),
+          "# HELP vm_memory_atom_bytes BEAM atom memory in bytes.",
+          "# TYPE vm_memory_atom_bytes gauge",
+          ~s(vm_memory_atom_bytes{host="#{host}"} #{mem[:atom]}),
+          "# HELP vm_memory_system_bytes BEAM system memory in bytes.",
+          "# TYPE vm_memory_system_bytes gauge",
+          ~s(vm_memory_system_bytes{host="#{host}"} #{mem[:system]}),
+          "# HELP vm_process_count Number of BEAM processes.",
+          "# TYPE vm_process_count gauge",
+          ~s(vm_process_count{host="#{host}"} #{:erlang.system_info(:process_count)}),
+          "# HELP vm_process_limit Maximum number of BEAM processes.",
+          "# TYPE vm_process_limit gauge",
+          ~s(vm_process_limit{host="#{host}"} #{:erlang.system_info(:process_limit)}),
+          "# HELP vm_port_count Number of BEAM ports.",
+          "# TYPE vm_port_count gauge",
+          ~s(vm_port_count{host="#{host}"} #{:erlang.system_info(:port_count)}),
+          "# HELP vm_port_limit Maximum number of BEAM ports.",
+          "# TYPE vm_port_limit gauge",
+          ~s(vm_port_limit{host="#{host}"} #{:erlang.system_info(:port_limit)}),
+          "# HELP vm_atom_count Number of atoms.",
+          "# TYPE vm_atom_count gauge",
+          ~s(vm_atom_count{host="#{host}"} #{:erlang.system_info(:atom_count)}),
+          "# HELP vm_atom_limit Maximum number of atoms.",
+          "# TYPE vm_atom_limit gauge",
+          ~s(vm_atom_limit{host="#{host}"} #{:erlang.system_info(:atom_limit)}),
+          "# HELP vm_run_queue_total Total BEAM scheduler run queue length.",
+          "# TYPE vm_run_queue_total gauge",
+          ~s(vm_run_queue_total{host="#{host}"} #{all_rq}),
+          "# HELP vm_run_queue_cpu CPU scheduler run queue length.",
+          "# TYPE vm_run_queue_cpu gauge",
+          ~s(vm_run_queue_cpu{host="#{host}"} #{cpu_rq}),
+          "# HELP vm_run_queue_io IO scheduler run queue length.",
+          "# TYPE vm_run_queue_io gauge",
+          ~s(vm_run_queue_io{host="#{host}"} #{io_rq}),
+          "# HELP timeless_series_count Number of active metric series.",
+          "# TYPE timeless_series_count gauge",
+          ~s(timeless_series_count{host="#{host}"} #{info.series_count}),
+          "# HELP timeless_total_points Total stored data points.",
+          "# TYPE timeless_total_points gauge",
+          ~s(timeless_total_points{host="#{host}"} #{info.total_points}),
+          "# HELP timeless_storage_bytes Storage size in bytes.",
+          "# TYPE timeless_storage_bytes gauge",
+          ~s(timeless_storage_bytes{host="#{host}"} #{info.storage_bytes}),
+          "# HELP timeless_buffer_points Number of points in raw buffer.",
+          "# TYPE timeless_buffer_points gauge",
+          ~s(timeless_buffer_points{host="#{host}"} #{info.raw_buffer_points})
+        ]
+
+        text_resp(req, 200, Enum.join(lines, "\n") <> "\n")
+    end
   end
 
   match _ do
-    send_resp(conn, 404, "not found")
+    send_resp(req, 404, "not found")
   end
 
   # --- Internals ---
@@ -1672,12 +1731,6 @@ defmodule TimelessMetrics.HTTP do
   defp nullify(list) when is_list(list), do: Enum.map(list, &nullify/1)
   defp nullify(other), do: other
 
-  defp json_error(conn, status, msg) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, json_encode!(%{error: msg}))
-  end
-
   defp scalar_html do
     """
     <!doctype html>
@@ -1838,7 +1891,9 @@ defmodule TimelessMetrics.HTTP do
       %{manager: manager} = :persistent_term.get({TimelessMetrics.Actor.SeriesManager, store})
 
       Enum.each(groups, fn {{metric_name, labels}, batch} ->
-        {_id, pid} = TimelessMetrics.Actor.SeriesManager.get_or_start(manager, metric_name, labels)
+        {_id, pid} =
+          TimelessMetrics.Actor.SeriesManager.get_or_start(manager, metric_name, labels)
+
         send(pid, {:write_batch, batch})
       end)
     end
@@ -1918,7 +1973,7 @@ defmodule TimelessMetrics.HTTP do
 
   defp merge_grouped_results(results) do
     Enum.reduce(results, {%{}, 0, 0, []}, fn {groups, count, errors, samples},
-                                              {all_groups, total_count, total_errors, all_samples} ->
+                                             {all_groups, total_count, total_errors, all_samples} ->
       merged =
         Map.merge(all_groups, groups, fn _key, existing, new ->
           new ++ existing

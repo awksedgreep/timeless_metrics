@@ -3,6 +3,7 @@ defmodule TimelessMetrics.BackupTest do
 
   @data_dir "/tmp/timeless_backup_test_#{System.os_time(:millisecond)}"
   @backup_dir "/tmp/timeless_backup_target_#{System.os_time(:millisecond)}"
+  @port 18_402
 
   setup do
     start_supervised!({TimelessMetrics, name: :backup_test, data_dir: @data_dir, engine: :actor})
@@ -32,7 +33,6 @@ defmodule TimelessMetrics.BackupTest do
     assert "metrics.db" in result.files
     assert result.total_bytes > 0
 
-    # Verify main DB is valid SQLite
     main_path = Path.join(@backup_dir, "metrics.db")
     assert File.exists?(main_path)
     {:ok, conn} = Exqlite.Sqlite3.open(main_path, mode: :readonly)
@@ -56,7 +56,6 @@ defmodule TimelessMetrics.BackupTest do
 
     {:ok, result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
-    # Should have metrics.db and actor/*.dat files
     assert "metrics.db" in result.files
     actor_files = Enum.filter(result.files, &String.starts_with?(&1, "actor/"))
     assert length(actor_files) >= 1
@@ -75,7 +74,6 @@ defmodule TimelessMetrics.BackupTest do
 
     {:ok, _result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
-    # Verify .dat files were copied
     actor_dir = Path.join(@backup_dir, "actor")
     assert File.dir?(actor_dir)
     {:ok, files} = File.ls(actor_dir)
@@ -86,7 +84,6 @@ defmodule TimelessMetrics.BackupTest do
   test "backup during active writes does not crash" do
     now = System.os_time(:second)
 
-    # Start background writes
     writer =
       Task.async(fn ->
         for i <- 0..99 do
@@ -96,10 +93,8 @@ defmodule TimelessMetrics.BackupTest do
         end
       end)
 
-    # Give writes a head start
     Process.sleep(10)
 
-    # Backup while writes are happening
     {:ok, result} = TimelessMetrics.backup(:backup_test, @backup_dir)
     assert result.total_bytes > 0
 
@@ -107,6 +102,9 @@ defmodule TimelessMetrics.BackupTest do
   end
 
   test "HTTP POST /api/v1/backup triggers backup with custom path" do
+    start_supervised!({TimelessMetrics.HTTP, store: :backup_test, port: @port})
+    Process.sleep(50)
+
     now = System.os_time(:second)
 
     TimelessMetrics.write(:backup_test, "http_metric", %{"x" => "y"}, 42.0, timestamp: now - 60)
@@ -118,35 +116,36 @@ defmodule TimelessMetrics.BackupTest do
 
     body = :json.encode(%{path: http_backup_dir}) |> IO.iodata_to_binary()
 
-    conn =
-      Plug.Test.conn(:post, "/api/v1/backup", body)
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> TimelessMetrics.HTTP.call(store: :backup_test)
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/backup", body,
+        content_type: "application/json"
+      )
 
-    assert conn.status == 200
-    resp = :json.decode(conn.resp_body)
-    assert resp["status"] == "ok"
-    assert resp["path"] == http_backup_dir
-    assert is_list(resp["files"])
-    assert resp["total_bytes"] > 0
+    assert resp.status == 200
+    result = :json.decode(resp.body)
+    assert result["status"] == "ok"
+    assert result["path"] == http_backup_dir
+    assert is_list(result["files"])
+    assert result["total_bytes"] > 0
     assert File.exists?(Path.join(http_backup_dir, "metrics.db"))
   end
 
   test "HTTP POST /api/v1/backup uses default path when no body" do
+    start_supervised!({TimelessMetrics.HTTP, store: :backup_test, port: @port + 1})
+    Process.sleep(50)
+
     now = System.os_time(:second)
 
     TimelessMetrics.write(:backup_test, "default_path", %{"a" => "b"}, 1.0, timestamp: now - 60)
     TimelessMetrics.flush(:backup_test)
 
-    conn =
-      Plug.Test.conn(:post, "/api/v1/backup", "")
-      |> TimelessMetrics.HTTP.call(store: :backup_test)
+    resp = TimelessMetrics.TestHTTP.post(@port + 1, "/api/v1/backup", "")
 
-    assert conn.status == 200
-    resp = :json.decode(conn.resp_body)
-    assert resp["status"] == "ok"
-    assert String.contains?(resp["path"], "backups")
+    assert resp.status == 200
+    result = :json.decode(resp.body)
+    assert result["status"] == "ok"
+    assert String.contains?(result["path"], "backups")
 
-    on_exit(fn -> File.rm_rf!(resp["path"]) end)
+    on_exit(fn -> File.rm_rf!(result["path"]) end)
   end
 end

@@ -2,9 +2,12 @@ defmodule TimelessMetrics.ScraperTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_scraper_test_#{System.os_time(:millisecond)}"
+  @port 18_408
 
   setup do
     start_supervised!({TimelessMetrics, name: :scraper_test, data_dir: @data_dir, scraping: true})
+    start_supervised!({TimelessMetrics.HTTP, store: :scraper_test, port: @port})
+    Process.sleep(50)
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
 
@@ -130,105 +133,89 @@ defmodule TimelessMetrics.ScraperTest do
   describe "HTTP CRUD" do
     test "create, list, get, update, delete via HTTP" do
       # Create
-      conn =
-        Plug.Test.conn(
-          :post,
+      resp =
+        TimelessMetrics.TestHTTP.post(
+          @port,
           "/api/v1/scrape_targets",
           :json.encode(%{
             job_name: "http_test",
             address: "localhost:9999",
             scrape_interval: 300
           })
-          |> IO.iodata_to_binary()
+          |> IO.iodata_to_binary(),
+          content_type: "application/json"
         )
-        |> Plug.Conn.put_req_header("content-type", "application/json")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
 
-      assert conn.status == 201
-      result = :json.decode(conn.resp_body)
+      assert resp.status == 201
+      result = :json.decode(resp.body)
       id = result["id"]
       assert is_integer(id)
 
       # List
-      conn =
-        Plug.Test.conn(:get, "/api/v1/scrape_targets")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+      resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/scrape_targets")
 
-      assert conn.status == 200
-      result = :json.decode(conn.resp_body)
+      assert resp.status == 200
+      result = :json.decode(resp.body)
       assert length(result["data"]) == 1
       assert List.first(result["data"])["job_name"] == "http_test"
 
       # Get
-      conn =
-        Plug.Test.conn(:get, "/api/v1/scrape_targets/#{id}")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+      resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/scrape_targets/#{id}")
 
-      assert conn.status == 200
-      result = :json.decode(conn.resp_body)
+      assert resp.status == 200
+      result = :json.decode(resp.body)
       assert result["job_name"] == "http_test"
 
       # Update
-      conn =
-        Plug.Test.conn(
-          :put,
+      resp =
+        TimelessMetrics.TestHTTP.put(
+          @port,
           "/api/v1/scrape_targets/#{id}",
           :json.encode(%{
             job_name: "http_test_updated",
             address: "localhost:9998",
             scrape_interval: 60
           })
-          |> IO.iodata_to_binary()
+          |> IO.iodata_to_binary(),
+          content_type: "application/json"
         )
-        |> Plug.Conn.put_req_header("content-type", "application/json")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
 
-      assert conn.status == 200
+      assert resp.status == 200
 
       # Verify update
-      conn =
-        Plug.Test.conn(:get, "/api/v1/scrape_targets/#{id}")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+      resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/scrape_targets/#{id}")
 
-      result = :json.decode(conn.resp_body)
+      result = :json.decode(resp.body)
       assert result["job_name"] == "http_test_updated"
       assert result["address"] == "localhost:9998"
 
       # Delete
-      conn =
-        Plug.Test.conn(:delete, "/api/v1/scrape_targets/#{id}")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+      resp = TimelessMetrics.TestHTTP.delete(@port, "/api/v1/scrape_targets/#{id}")
 
-      assert conn.status == 200
+      assert resp.status == 200
 
       # Verify deleted
-      conn =
-        Plug.Test.conn(:get, "/api/v1/scrape_targets")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+      resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/scrape_targets")
 
-      result = :json.decode(conn.resp_body)
+      result = :json.decode(resp.body)
       assert result["data"] == []
     end
 
     test "get non-existent target returns 404" do
-      conn =
-        Plug.Test.conn(:get, "/api/v1/scrape_targets/99999")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+      resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/scrape_targets/99999")
 
-      assert conn.status == 404
+      assert resp.status == 404
     end
   end
 
   describe "OpenAPI" do
     test "GET /api/openapi.json returns valid spec" do
-      conn =
-        Plug.Test.conn(:get, "/api/openapi.json")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+      resp = TimelessMetrics.TestHTTP.get(@port, "/api/openapi.json")
 
-      assert conn.status == 200
-      assert {"content-type", "application/json; charset=utf-8"} in conn.resp_headers
+      assert resp.status == 200
+      assert {"content-type", "application/json"} in resp.headers
 
-      spec = :json.decode(conn.resp_body)
+      spec = :json.decode(resp.body)
       assert spec["openapi"] == "3.1.0"
       assert spec["info"]["title"] == "TimelessMetrics API"
       assert Map.has_key?(spec["paths"], "/api/v1/scrape_targets")
@@ -238,14 +225,12 @@ defmodule TimelessMetrics.ScraperTest do
     end
 
     test "GET /api/docs returns Scalar HTML" do
-      conn =
-        Plug.Test.conn(:get, "/api/docs")
-        |> TimelessMetrics.HTTP.call(store: :scraper_test)
+      resp = TimelessMetrics.TestHTTP.get(@port, "/api/docs")
 
-      assert conn.status == 200
-      assert {"content-type", "text/html; charset=utf-8"} in conn.resp_headers
-      assert conn.resp_body =~ "scalar"
-      assert conn.resp_body =~ "/api/openapi.json"
+      assert resp.status == 200
+      assert {"content-type", "text/html"} in resp.headers
+      assert resp.body =~ "scalar"
+      assert resp.body =~ "/api/openapi.json"
     end
   end
 

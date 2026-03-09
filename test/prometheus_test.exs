@@ -1,12 +1,16 @@
 defmodule TimelessMetrics.PrometheusTest do
   use ExUnit.Case, async: false
 
+  @port 18_413
+
   setup do
     id = System.unique_integer([:positive])
     store = :"prom_test_#{id}"
     data_dir = "/tmp/timeless_prom_test_#{id}"
 
     start_supervised!({TimelessMetrics, name: store, data_dir: data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics.HTTP, store: store, port: @port})
+    Process.sleep(50)
 
     on_exit(fn -> File.rm_rf!(data_dir) end)
 
@@ -24,12 +28,12 @@ defmodule TimelessMetrics.PrometheusTest do
     cpu_usage{host="web-2",region="us-west"} 81.0 #{now_ms}
     """
 
-    conn =
-      Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
-      |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/import/prometheus", body,
+        content_type: "text/plain"
+      )
 
-    assert conn.status == 204
+    assert resp.status == 204
 
     TimelessMetrics.flush(store)
 
@@ -50,12 +54,12 @@ defmodule TimelessMetrics.PrometheusTest do
 
     body = "up 1.0 #{now_ms}\n"
 
-    conn =
-      Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
-      |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/import/prometheus", body,
+        content_type: "text/plain"
+      )
 
-    assert conn.status == 204
+    assert resp.status == 204
 
     TimelessMetrics.flush(store)
 
@@ -78,12 +82,12 @@ defmodule TimelessMetrics.PrometheusTest do
     # This is a comment
     """
 
-    conn =
-      Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
-      |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/import/prometheus", body,
+        content_type: "text/plain"
+      )
 
-    assert conn.status == 204
+    assert resp.status == 204
 
     TimelessMetrics.flush(store)
 
@@ -96,12 +100,12 @@ defmodule TimelessMetrics.PrometheusTest do
   test "import without timestamp uses current time", %{store: store} do
     body = "my_gauge{env=\"prod\"} 42.0\n"
 
-    conn =
-      Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
-      |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/import/prometheus", body,
+        content_type: "text/plain"
+      )
 
-    assert conn.status == 204
+    assert resp.status == 204
 
     TimelessMetrics.flush(store)
 
@@ -120,13 +124,13 @@ defmodule TimelessMetrics.PrometheusTest do
     another_valid{host="b"} 20.0
     """
 
-    conn =
-      Plug.Test.conn(:post, "/api/v1/import/prometheus", body)
-      |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/import/prometheus", body,
+        content_type: "text/plain"
+      )
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert result["samples"] == 2
     assert result["errors"] == 1
   end
@@ -145,15 +149,14 @@ defmodule TimelessMetrics.PrometheusTest do
 
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(
-        :get,
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
         "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=60"
       )
-      |> TimelessMetrics.HTTP.call(store: store)
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert result["status"] == "success"
     assert result["data"]["resultType"] == "matrix"
 
@@ -190,15 +193,14 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.flush(store)
 
     # Query with PromQL-style label filter
-    conn =
-      Plug.Test.conn(
-        :get,
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
         ~s(/prometheus/api/v1/query_range?query=cpu_usage%7Bhost%3D%22web-1%22%7D&start=#{base}&end=#{base + 600}&step=60)
       )
-      |> TimelessMetrics.HTTP.call(store: store)
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     series = result["data"]["result"]
     assert length(series) == 1
     assert List.first(series)["metric"]["host"] == "web-1"
@@ -216,15 +218,14 @@ defmodule TimelessMetrics.PrometheusTest do
 
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(
-        :get,
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
         "/prometheus/api/v1/query_range?query=cpu_usage&start=#{base}&end=#{base + 600}&step=5m"
       )
-      |> TimelessMetrics.HTTP.call(store: store)
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert result["status"] == "success"
     # With 5-minute step over a 10-minute range, we should get 1-2 buckets
     series = result["data"]["result"]
@@ -232,12 +233,16 @@ defmodule TimelessMetrics.PrometheusTest do
   end
 
   test "prometheus query_range returns error for missing query", %{store: store} do
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/query_range?start=1000&end=2000&step=60")
-      |> TimelessMetrics.HTTP.call(store: store)
+    _store = store
 
-    assert conn.status == 400
-    result = :json.decode(conn.resp_body)
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
+        "/prometheus/api/v1/query_range?start=1000&end=2000&step=60"
+      )
+
+    assert resp.status == 400
+    result = :json.decode(resp.body)
     assert result["error"] =~ "query"
   end
 
@@ -255,12 +260,14 @@ defmodule TimelessMetrics.PrometheusTest do
 
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/query?query=mem_usage&time=#{base + 300}")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
+        "/prometheus/api/v1/query?query=mem_usage&time=#{base + 300}"
+      )
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert result["status"] == "success"
     assert result["data"]["resultType"] == "vector"
 
@@ -276,12 +283,13 @@ defmodule TimelessMetrics.PrometheusTest do
   end
 
   test "prometheus query returns error for missing query param", %{store: store} do
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/query")
-      |> TimelessMetrics.HTTP.call(store: store)
+    _store = store
 
-    assert conn.status == 400
-    result = :json.decode(conn.resp_body)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/query")
+
+    assert resp.status == 400
+    result = :json.decode(resp.body)
     assert result["error"] =~ "query"
   end
 
@@ -293,15 +301,14 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.write(store, "cpu", %{"host" => "b"}, 20.0, timestamp: base)
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(
-        :get,
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
         ~s(/prometheus/api/v1/query?query=cpu%7Bhost%3D%22a%22%7D&time=#{base + 300})
       )
-      |> TimelessMetrics.HTTP.call(store: store)
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     series = result["data"]["result"]
     assert length(series) == 1
     assert List.first(series)["metric"]["host"] == "a"
@@ -322,12 +329,11 @@ defmodule TimelessMetrics.PrometheusTest do
 
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/labels")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/labels")
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert result["status"] == "success"
 
     labels = result["data"]
@@ -344,12 +350,11 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.write(store, "simple_metric", %{}, 42.0, timestamp: now)
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/labels")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/labels")
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert "__name__" in result["data"]
   end
 
@@ -361,12 +366,11 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.write(store, "mem_usage", %{"host" => "a"}, 2.0, timestamp: now)
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/label/__name__/values")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/label/__name__/values")
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert result["status"] == "success"
     assert "cpu_usage" in result["data"]
     assert "mem_usage" in result["data"]
@@ -379,12 +383,11 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.write(store, "mem", %{"host" => "web-1"}, 3.0, timestamp: now)
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/label/host/values")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/label/host/values")
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     values = result["data"]
     assert "web-1" in values
     assert "web-2" in values
@@ -399,12 +402,11 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.write(store, "cpu", %{"host" => "a"}, 1.0, timestamp: now)
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/label/nonexistent/values")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/label/nonexistent/values")
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert result["data"] == []
   end
 
@@ -423,12 +425,11 @@ defmodule TimelessMetrics.PrometheusTest do
 
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/series?match[]=cpu")
-      |> TimelessMetrics.HTTP.call(store: store)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/series?match[]=cpu")
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert result["status"] == "success"
 
     series = result["data"]
@@ -444,27 +445,27 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.write(store, "cpu", %{"host" => "web-2"}, 2.0, timestamp: now)
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(
-        :get,
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
         ~s(/prometheus/api/v1/series?match[]=cpu%7Bhost%3D%22web-1%22%7D)
       )
-      |> TimelessMetrics.HTTP.call(store: store)
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     series = result["data"]
     assert length(series) == 1
     assert List.first(series)["host"] == "web-1"
   end
 
   test "prometheus series returns error for missing match[]", %{store: store} do
-    conn =
-      Plug.Test.conn(:get, "/prometheus/api/v1/series")
-      |> TimelessMetrics.HTTP.call(store: store)
+    _store = store
 
-    assert conn.status == 400
-    result = :json.decode(conn.resp_body)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/series")
+
+    assert resp.status == 400
+    result = :json.decode(resp.body)
     assert result["error"] =~ "match"
   end
 
@@ -475,15 +476,14 @@ defmodule TimelessMetrics.PrometheusTest do
     TimelessMetrics.write(store, "mem_usage", %{"host" => "a"}, 3.0, timestamp: now)
     TimelessMetrics.flush(store)
 
-    conn =
-      Plug.Test.conn(
-        :get,
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
         ~s(/prometheus/api/v1/series?match[]=%7B__name__%3D~%22cpu_.*%22%7D)
       )
-      |> TimelessMetrics.HTTP.call(store: store)
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     series = result["data"]
     assert length(series) == 2
     names = Enum.map(series, & &1["__name__"]) |> Enum.sort()

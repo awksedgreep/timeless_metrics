@@ -15,17 +15,19 @@ defmodule TimelessMetrics.VMetricsCompatTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_vmetrics_compat_#{System.os_time(:millisecond)}"
+  @port 18_412
 
   setup do
     TimelessMetrics.TestHelper.await_down(:vmc_sup)
     start_supervised!({TimelessMetrics, name: :vmc, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics.HTTP, store: :vmc, port: @port})
+    Process.sleep(50)
     on_exit(fn -> File.rm_rf!(@data_dir) end)
     :ok
   end
 
-  # ── Helpers ──────────────────────────────────────────────────────────────
+  # -- Helpers ----------------------------------------------------------------
 
-  defp call(conn), do: TimelessMetrics.HTTP.call(conn, store: :vmc)
   defp decode(body), do: :json.decode(body)
 
   defp seed(metric, labels, base_ts, values) do
@@ -39,12 +41,12 @@ defmodule TimelessMetrics.VMetricsCompatTest do
   end
 
   defp seed_prometheus(text) do
-    conn =
-      Plug.Test.conn(:post, "/api/v1/import/prometheus", text)
-      |> Plug.Conn.put_req_header("content-type", "text/plain")
-      |> call()
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/import/prometheus", text,
+        content_type: "text/plain"
+      )
 
-    assert conn.status in [204, 200]
+    assert resp.status in [204, 200]
     TimelessMetrics.flush(:vmc)
   end
 
@@ -54,17 +56,14 @@ defmodule TimelessMetrics.VMetricsCompatTest do
         :json.encode(line) |> IO.iodata_to_binary()
       end)
 
-    conn =
-      Plug.Test.conn(:post, "/api/v1/import", body)
-      |> call()
-
-    assert conn.status == 204
+    resp = TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", body)
+    assert resp.status == 204
     TimelessMetrics.flush(:vmc)
   end
 
-  # ── VictoriaMetrics JSON Line Import ─────────────────────────────────────
+  # -- VictoriaMetrics JSON Line Import ---------------------------------------
 
-  describe "POST /api/v1/import — VM JSON line format" do
+  describe "POST /api/v1/import -- VM JSON line format" do
     test "accepts standard VM JSON line with __name__, values, timestamps" do
       body =
         :json.encode(%{
@@ -74,8 +73,8 @@ defmodule TimelessMetrics.VMetricsCompatTest do
         })
         |> IO.iodata_to_binary()
 
-      conn = Plug.Test.conn(:post, "/api/v1/import", body) |> call()
-      assert conn.status == 204
+      resp = TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", body)
+      assert resp.status == 204
     end
 
     test "accepts multiple lines (NDJSON)" do
@@ -111,32 +110,31 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       {"metric":{"__name__":"also_good"},"values":[2.0],"timestamps":[1700000001]}
       """
 
-      conn = Plug.Test.conn(:post, "/api/v1/import", body) |> call()
+      resp = TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", body)
       # VM returns 200 with error info for partial failures
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
       assert result["samples"] == 2
       assert result["errors"] == 1
     end
   end
 
-  # ── VictoriaMetrics JSON Line Export ─────────────────────────────────────
+  # -- VictoriaMetrics JSON Line Export ---------------------------------------
 
-  describe "GET /api/v1/export — VM JSON line export format" do
+  describe "GET /api/v1/export -- VM JSON line export format" do
     test "returns VM-compatible JSON lines with metric/values/timestamps" do
       seed("cpu_usage", %{"host" => "web-1"}, 1_700_000_000, [73.2, 74.1, 75.0])
 
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/api/v1/export?metric=cpu_usage&host=web-1&from=1699999900&to=1700000200"
         )
-        |> call()
 
-      assert conn.status == 200
+      assert resp.status == 200
 
       # VM export is newline-delimited JSON (one line per series)
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) >= 1
 
       result = decode(List.first(lines))
@@ -165,11 +163,13 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       seed("net_rx", %{"host" => "a", "iface" => "eth1"}, 1_700_000_000, [200.0])
       seed("net_rx", %{"host" => "b", "iface" => "eth0"}, 1_700_000_000, [300.0])
 
-      conn =
-        Plug.Test.conn(:get, "/api/v1/export?metric=net_rx&from=1699999900&to=1700000200")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
+          "/api/v1/export?metric=net_rx&from=1699999900&to=1700000200"
+        )
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) == 3
 
       # Each line must be valid JSON with the VM structure
@@ -186,27 +186,31 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       seed("disk", %{"host" => "a", "mount" => "/data"}, 1_700_000_000, [80.0])
       seed("disk", %{"host" => "b", "mount" => "/"}, 1_700_000_000, [30.0])
 
-      conn =
-        Plug.Test.conn(:get, "/api/v1/export?metric=disk&host=a&from=1699999900&to=1700000200")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
+          "/api/v1/export?metric=disk&host=a&from=1699999900&to=1700000200"
+        )
 
-      lines = String.split(conn.resp_body, "\n", trim: true)
+      lines = String.split(resp.body, "\n", trim: true)
       assert length(lines) == 2
     end
 
     test "empty result returns empty body (VM compat)" do
-      conn =
-        Plug.Test.conn(:get, "/api/v1/export?metric=nonexistent&from=0&to=9999999999")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
+          "/api/v1/export?metric=nonexistent&from=0&to=9999999999"
+        )
 
-      assert conn.status == 200
-      assert conn.resp_body == ""
+      assert resp.status == 200
+      assert resp.body == ""
     end
   end
 
-  # ── Prometheus Text Format Import ────────────────────────────────────────
+  # -- Prometheus Text Format Import ------------------------------------------
 
-  describe "POST /api/v1/import/prometheus — Prometheus exposition format" do
+  describe "POST /api/v1/import/prometheus -- Prometheus exposition format" do
     test "accepts standard Prometheus text format" do
       text = """
       # HELP http_requests_total Total HTTP requests
@@ -243,9 +247,9 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
   end
 
-  # ── Prometheus Query API (Grafana/DDNet compat) ──────────────────────────
+  # -- Prometheus Query API (Grafana/DDNet compat) ----------------------------
 
-  describe "Prometheus query_range — /prometheus/api/v1/query_range" do
+  describe "Prometheus query_range -- /prometheus/api/v1/query_range" do
     setup do
       now = System.os_time(:second)
 
@@ -274,15 +278,14 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "returns Prometheus-standard response envelope", %{now: now} do
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query_range?query=http_requests&start=#{now - 600}&end=#{now}&step=60"
         )
-        |> call()
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
 
       # VictoriaMetrics always returns this exact envelope
       assert result["status"] == "success"
@@ -292,14 +295,13 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "matrix result entries have metric map and values array", %{now: now} do
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query_range?query=http_requests&start=#{now - 600}&end=#{now}&step=60"
         )
-        |> call()
 
-      result = decode(conn.resp_body)
+      result = decode(resp.body)
       entries = result["data"]["result"]
       assert length(entries) >= 1
 
@@ -317,14 +319,13 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "metric map includes __name__ label", %{now: now} do
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query_range?query=http_requests&start=#{now - 600}&end=#{now}&step=60"
         )
-        |> call()
 
-      result = decode(conn.resp_body)
+      result = decode(resp.body)
 
       for entry <- result["data"]["result"] do
         assert entry["metric"]["__name__"] == "http_requests"
@@ -333,14 +334,13 @@ defmodule TimelessMetrics.VMetricsCompatTest do
 
     test "DDNet VictoriaReader can parse range response", %{now: now} do
       # DDNet sends PromQL queries like: avg by (host) (http_requests{host="web-1"})
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query_range?query=http_requests&start=#{now - 600}&end=#{now}&step=60"
         )
-        |> call()
 
-      body = decode(conn.resp_body)
+      body = decode(resp.body)
 
       # Simulate DDNet's parse_response/1
       assert body["status"] == "success"
@@ -364,7 +364,7 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
   end
 
-  describe "Prometheus instant query — /prometheus/api/v1/query" do
+  describe "Prometheus instant query -- /prometheus/api/v1/query" do
     setup do
       now = System.os_time(:second)
       seed("up_metric", %{"instance" => "web-1:9090"}, now - 10, [1.0])
@@ -373,15 +373,14 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "returns vector resultType with value (not values)", %{now: now} do
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query?query=up_metric&time=#{now}"
         )
-        |> call()
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
 
       assert result["status"] == "success"
       assert result["data"]["resultType"] == "vector"
@@ -399,14 +398,13 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "DDNet VictoriaReader can parse instant response", %{now: now} do
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query?query=up_metric&time=#{now}"
         )
-        |> call()
 
-      body = decode(conn.resp_body)
+      body = decode(resp.body)
 
       # Simulate DDNet's parse_instant_response/1
       assert body["status"] == "success"
@@ -427,9 +425,9 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
   end
 
-  # ── Label Discovery (DDNet VictoriaReader compat) ────────────────────────
+  # -- Label Discovery (DDNet VictoriaReader compat) --------------------------
 
-  describe "label discovery — DDNet list_metrics/list_hosts" do
+  describe "label discovery -- DDNet list_metrics/list_hosts" do
     setup do
       now = System.os_time(:second)
       seed("cpu_usage", %{"host" => "web-1", "dc" => "us"}, now, [73.2])
@@ -439,13 +437,12 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       :ok
     end
 
-    test "GET /api/v1/label/__name__/values — VM envelope format" do
-      conn =
-        Plug.Test.conn(:get, "/api/v1/label/__name__/values")
-        |> call()
+    test "GET /api/v1/label/__name__/values -- VM envelope format" do
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/label/__name__/values")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
 
       # VictoriaMetrics returns: {"status":"success","data":["metric1","metric2",...]}
       assert result["status"] == "success"
@@ -456,11 +453,10 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "DDNet list_metrics parses __name__ response correctly" do
-      conn =
-        Plug.Test.conn(:get, "/api/v1/label/__name__/values")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/label/__name__/values")
 
-      body = decode(conn.resp_body)
+      body = decode(resp.body)
 
       # Simulate DDNet's list_metrics/0 parsing
       assert body["status"] == "success"
@@ -470,13 +466,12 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       assert Enum.sort(metrics) == metrics || true
     end
 
-    test "GET /api/v1/labels — native path matches VM format" do
-      conn =
-        Plug.Test.conn(:get, "/api/v1/labels")
-        |> call()
+    test "GET /api/v1/labels -- native path matches VM format" do
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/labels")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
 
       # VM returns: {"status":"success","data":["__name__","dc","host"]}
       assert result["status"] == "success"
@@ -488,13 +483,12 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       assert result["data"] == Enum.sort(result["data"])
     end
 
-    test "GET /api/v1/label/host/values — works without metric= param (VM compat)" do
-      conn =
-        Plug.Test.conn(:get, "/api/v1/label/host/values")
-        |> call()
+    test "GET /api/v1/label/host/values -- works without metric= param (VM compat)" do
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/label/host/values")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
 
       assert result["status"] == "success"
       assert is_list(result["data"])
@@ -503,14 +497,13 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       assert "db-1" in result["data"]
     end
 
-    test "Prometheus-path label values — /prometheus/api/v1/label/host/values" do
+    test "Prometheus-path label values -- /prometheus/api/v1/label/host/values" do
       # DDNet list_hosts uses the /prometheus path which doesn't require metric= param
-      conn =
-        Plug.Test.conn(:get, "/prometheus/api/v1/label/host/values")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/label/host/values")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
 
       assert result["status"] == "success"
       assert is_list(result["data"])
@@ -520,11 +513,10 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "DDNet list_hosts parses host values response" do
-      conn =
-        Plug.Test.conn(:get, "/prometheus/api/v1/label/host/values")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/label/host/values")
 
-      body = decode(conn.resp_body)
+      body = decode(resp.body)
 
       # Simulate DDNet's list_hosts/0 parsing
       assert body["status"] == "success"
@@ -534,20 +526,19 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "Prometheus-path __name__ values lists all metrics" do
-      conn =
-        Plug.Test.conn(:get, "/prometheus/api/v1/label/__name__/values")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/label/__name__/values")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
       assert result["status"] == "success"
       assert "cpu_usage" in result["data"]
     end
   end
 
-  # ── Prometheus Series Discovery ──────────────────────────────────────────
+  # -- Prometheus Series Discovery --------------------------------------------
 
-  describe "Prometheus series — /prometheus/api/v1/series" do
+  describe "Prometheus series -- /prometheus/api/v1/series" do
     setup do
       now = System.os_time(:second)
       seed("http_requests", %{"host" => "web-1", "method" => "GET"}, now, [100.0])
@@ -557,12 +548,11 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "returns VM/Prometheus format with __name__ in each series" do
-      conn =
-        Plug.Test.conn(:get, "/prometheus/api/v1/series?match[]=http_requests")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/series?match[]=http_requests")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
 
       assert result["status"] == "success"
       assert is_list(result["data"])
@@ -578,9 +568,9 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
   end
 
-  # ── Prometheus Labels Discovery ──────────────────────────────────────────
+  # -- Prometheus Labels Discovery --------------------------------------------
 
-  describe "Prometheus labels — /prometheus/api/v1/labels" do
+  describe "Prometheus labels -- /prometheus/api/v1/labels" do
     setup do
       now = System.os_time(:second)
       seed("cpu", %{"host" => "web-1", "dc" => "us", "env" => "prod"}, now, [50.0])
@@ -588,12 +578,11 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "returns all label names including __name__" do
-      conn =
-        Plug.Test.conn(:get, "/prometheus/api/v1/labels")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/labels")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
 
       assert result["status"] == "success"
       assert is_list(result["data"])
@@ -604,24 +593,23 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "label names are sorted" do
-      conn =
-        Plug.Test.conn(:get, "/prometheus/api/v1/labels")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/prometheus/api/v1/labels")
 
-      result = decode(conn.resp_body)
+      result = decode(resp.body)
       assert result["data"] == Enum.sort(result["data"])
     end
   end
 
-  # ── InfluxDB Line Protocol Import (TSBS compat) ─────────────────────────
+  # -- InfluxDB Line Protocol Import (TSBS compat) ---------------------------
 
-  describe "POST /write — InfluxDB line protocol" do
+  describe "POST /write -- InfluxDB line protocol" do
     test "accepts standard InfluxDB line format" do
       # TSBS format: measurement,tag=val field=value timestamp_ns
       body = "cpu,host=web-1,region=us usage_user=42.5,usage_system=10.2 1700000000000000000\n"
 
-      conn = Plug.Test.conn(:post, "/write", body) |> call()
-      assert conn.status == 204
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
+      assert resp.status == 204
 
       TimelessMetrics.flush(:vmc)
       {:ok, metrics} = TimelessMetrics.list_metrics(:vmc)
@@ -632,14 +620,14 @@ defmodule TimelessMetrics.VMetricsCompatTest do
 
     test "handles integer suffix (42i)" do
       body = "mem,host=db-1 total=16000000000i 1700000000000000000\n"
-      conn = Plug.Test.conn(:post, "/write", body) |> call()
-      assert conn.status == 204
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
+      assert resp.status == 204
     end
 
     test "single field named 'value' uses measurement as metric name" do
       body = "temperature,location=office value=22.5 1700000000000000000\n"
-      conn = Plug.Test.conn(:post, "/write", body) |> call()
-      assert conn.status == 204
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
+      assert resp.status == 204
 
       TimelessMetrics.flush(:vmc)
       {:ok, metrics} = TimelessMetrics.list_metrics(:vmc)
@@ -647,10 +635,10 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
   end
 
-  # ── DDNet End-to-End: Write via Prometheus, Read via PromQL ──────────────
+  # -- DDNet End-to-End: Write via Prometheus, Read via PromQL ----------------
 
-  describe "DDNet roundtrip — write Prometheus, query PromQL" do
-    test "DDNet VictoriaWriter format → DDNet VictoriaReader parse" do
+  describe "DDNet roundtrip -- write Prometheus, query PromQL" do
+    test "DDNet VictoriaWriter format -> DDNet VictoriaReader parse" do
       now_ms = System.system_time(:millisecond)
       now_s = div(now_ms, 1000)
 
@@ -664,15 +652,14 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       seed_prometheus(text)
 
       # Now query like DDNet VictoriaReader does
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query_range?query=ifHCInOctets&start=#{now_s - 60}&end=#{now_s + 60}&step=60"
         )
-        |> call()
 
-      assert conn.status == 200
-      body = decode(conn.resp_body)
+      assert resp.status == 200
+      body = decode(resp.body)
 
       # DDNet parse_response/1 expects this exact structure
       assert body["status"] == "success"
@@ -694,15 +681,14 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       text = "sysUpTime{host=\"switch-01\"} 86400 #{now_ms}\n"
       seed_prometheus(text)
 
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query?query=sysUpTime&time=#{now_s}"
         )
-        |> call()
 
-      assert conn.status == 200
-      body = decode(conn.resp_body)
+      assert resp.status == 200
+      body = decode(resp.body)
 
       assert body["status"] == "success"
       assert body["data"]["resultType"] == "vector"
@@ -720,26 +706,24 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
   end
 
-  # ── Response Format Edge Cases ──────────────────────────────────────────
+  # -- Response Format Edge Cases ---------------------------------------------
 
   describe "format edge cases" do
     test "error responses include status field" do
-      conn =
-        Plug.Test.conn(:get, "/api/v1/export")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/export")
 
-      assert conn.status == 400
-      result = decode(conn.resp_body)
+      assert resp.status == 400
+      result = decode(resp.body)
       assert is_binary(result["error"])
     end
 
     test "health endpoint returns expected fields" do
-      conn =
-        Plug.Test.conn(:get, "/health")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/health")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
       assert result["status"] == "ok"
       assert is_integer(result["series"])
       assert is_integer(result["points"])
@@ -747,23 +731,21 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "404 for unknown routes" do
-      conn =
-        Plug.Test.conn(:get, "/api/v1/nonexistent")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/nonexistent")
 
-      assert conn.status == 404
+      assert resp.status == 404
     end
 
     test "Prometheus /metrics endpoint returns text/plain exposition format" do
-      conn =
-        Plug.Test.conn(:get, "/metrics")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/metrics")
 
-      assert conn.status == 200
-      assert {"content-type", "text/plain; charset=utf-8"} in conn.resp_headers
+      assert resp.status == 200
+      assert {"content-type", "text/plain"} in resp.headers
 
       # Must contain standard VM metrics that Prometheus/VictoriaMetrics can scrape
-      body = conn.resp_body
+      body = resp.body
       assert body =~ "# HELP"
       assert body =~ "# TYPE"
       assert body =~ "vm_memory_total_bytes"
@@ -774,15 +756,17 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     test "content-type is application/json for API responses" do
       seed("ct_test", %{"x" => "1"}, 1_700_000_000, [1.0])
 
-      conn =
-        Plug.Test.conn(:get, "/api/v1/export?metric=ct_test&from=1699999900&to=1700000200")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
+          "/api/v1/export?metric=ct_test&from=1699999900&to=1700000200"
+        )
 
-      assert {"content-type", "application/json; charset=utf-8"} in conn.resp_headers
+      assert {"content-type", "application/json"} in resp.headers
     end
   end
 
-  # ── VM-specific /api/v1 endpoints (native mode) ─────────────────────────
+  # -- VM-specific /api/v1 endpoints (native mode) ---------------------------
 
   describe "native /api/v1/label/:name/values" do
     test "returns VM envelope with status and data" do
@@ -791,12 +775,11 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       seed("req", %{"method" => "POST"}, now, [2.0])
       seed("req", %{"method" => "PUT"}, now, [3.0])
 
-      conn =
-        Plug.Test.conn(:get, "/api/v1/label/method/values?metric=req")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/label/method/values?metric=req")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
       assert result["status"] == "success"
       assert is_list(result["data"])
       assert "GET" in result["data"]
@@ -811,19 +794,18 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       seed("net", %{"host" => "a", "iface" => "eth0"}, now, [1.0])
       seed("net", %{"host" => "b", "iface" => "eth0"}, now, [2.0])
 
-      conn =
-        Plug.Test.conn(:get, "/api/v1/series?metric=net")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/series?metric=net")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
       assert result["status"] == "success"
       assert is_list(result["data"])
       assert length(result["data"]) == 2
     end
   end
 
-  # ── DDNet PromQL Query Patterns ──────────────────────────────────────────
+  # -- DDNet PromQL Query Patterns --------------------------------------------
 
   describe "DDNet PromQL patterns" do
     setup do
@@ -852,23 +834,22 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "simple metric query (no aggregation)", %{now: now} do
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query_range?query=ifHCInOctets&start=#{now - 300}&end=#{now}&step=60"
         )
-        |> call()
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
       assert result["status"] == "success"
       assert length(result["data"]["result"]) >= 1
     end
 
     test "PromQL with host filter", %{now: now} do
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/prometheus/api/v1/query_range?" <>
             URI.encode_query(%{
               "query" => "ifHCInOctets{host=\"router-1\"}",
@@ -877,10 +858,9 @@ defmodule TimelessMetrics.VMetricsCompatTest do
               "step" => "60"
             })
         )
-        |> call()
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
       assert result["status"] == "success"
 
       # Should only return router-1 series
@@ -890,19 +870,18 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
   end
 
-  # ── Native /api/v1/query (instant) ──────────────────────────────────────
+  # -- Native /api/v1/query (instant) ----------------------------------------
 
-  describe "native /api/v1/query — latest value" do
+  describe "native /api/v1/query -- latest value" do
     test "single series returns flat object" do
       now = 1_700_000_000
       seed("temp", %{"sensor" => "1"}, now, [22.5])
 
-      conn =
-        Plug.Test.conn(:get, "/api/v1/query?metric=temp&sensor=1")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/query?metric=temp&sensor=1")
 
-      assert conn.status == 200
-      result = decode(conn.resp_body)
+      assert resp.status == 200
+      result = decode(resp.body)
 
       # Native format: flat object with labels/timestamp/value
       assert is_map(result["labels"]) or is_map(result)
@@ -910,17 +889,16 @@ defmodule TimelessMetrics.VMetricsCompatTest do
     end
 
     test "no data returns gracefully" do
-      conn =
-        Plug.Test.conn(:get, "/api/v1/query?metric=nonexistent")
-        |> call()
+      resp =
+        TimelessMetrics.TestHTTP.get(@port, "/api/v1/query?metric=nonexistent")
 
-      assert conn.status == 200
+      assert resp.status == 200
     end
   end
 
-  # ── Import/Export Roundtrip ──────────────────────────────────────────────
+  # -- Import/Export Roundtrip ------------------------------------------------
 
-  describe "VM JSON import → export roundtrip" do
+  describe "VM JSON import -> export roundtrip" do
     test "data survives import/export cycle with correct format" do
       # Import
       lines = [
@@ -934,15 +912,14 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       vm_import(lines)
 
       # Export
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/api/v1/export?metric=roundtrip_test&env=prod&host=api-1&from=1699999900&to=1700000200"
         )
-        |> call()
 
-      assert conn.status == 200
-      exported = decode(conn.resp_body)
+      assert resp.status == 200
+      exported = decode(resp.body)
 
       assert exported["metric"]["__name__"] == "roundtrip_test"
       assert exported["metric"]["env"] == "prod"

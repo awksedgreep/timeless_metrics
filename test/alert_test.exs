@@ -2,10 +2,13 @@ defmodule TimelessMetrics.AlertTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_alert_test_#{System.os_time(:millisecond)}"
+  @port 18_405
 
   setup do
     TimelessMetrics.TestHelper.await_down(:alert_test_sup)
     start_supervised!({TimelessMetrics, name: :alert_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics.HTTP, store: :alert_test, port: @port})
+    Process.sleep(50)
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
 
@@ -44,7 +47,6 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write data that exceeds threshold
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "cpu_usage", %{"host" => "web-1"}, 95.0 + i * 0.1,
         timestamp: base + i * 60
@@ -53,7 +55,6 @@ defmodule TimelessMetrics.AlertTest do
 
     TimelessMetrics.flush(:alert_test)
 
-    # Create alert rule — threshold 90, no duration requirement
     {:ok, rule_id} =
       TimelessMetrics.create_alert(:alert_test,
         name: "High CPU",
@@ -62,10 +63,8 @@ defmodule TimelessMetrics.AlertTest do
         threshold: 90.0
       )
 
-    # Evaluate alerts
     TimelessMetrics.evaluate_alerts(:alert_test)
 
-    # Check state — should be firing (no duration requirement)
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
     rule = Enum.find(rules, &(&1.id == rule_id))
     assert length(rule.states) > 0
@@ -79,7 +78,6 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write data below threshold
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "cpu_usage", %{"host" => "web-1"}, 50.0 + i * 0.1,
         timestamp: base + i * 60
@@ -100,7 +98,6 @@ defmodule TimelessMetrics.AlertTest do
 
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
     rule = List.first(rules)
-    # No state rows because value never breached threshold
     assert rule.states == [] or Enum.all?(rule.states, &(&1.state == "ok"))
   end
 
@@ -108,7 +105,6 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write low data (below threshold)
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "cpu_usage", %{"host" => "web-1"}, 50.0,
         timestamp: base + i * 60
@@ -125,7 +121,6 @@ defmodule TimelessMetrics.AlertTest do
         threshold: 90.0
       )
 
-    # Manually set state to "firing" to simulate a previously-fired alert
     series_key = :json.encode(%{"host" => "web-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
@@ -134,7 +129,6 @@ defmodule TimelessMetrics.AlertTest do
       [rule_id, series_key, now - 300]
     )
 
-    # Evaluate — value is now below threshold, should resolve
     TimelessMetrics.evaluate_alerts(:alert_test)
 
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
@@ -146,7 +140,6 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write low data
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "disk_free", %{"host" => "db-1"}, 5.0,
         timestamp: base + i * 60
@@ -174,14 +167,12 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write high data for web-1
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "cpu_usage", %{"host" => "web-1"}, 95.0,
         timestamp: base + i * 60
       )
     end
 
-    # Write low data for web-2
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "cpu_usage", %{"host" => "web-2"}, 30.0,
         timestamp: base + i * 60
@@ -204,7 +195,6 @@ defmodule TimelessMetrics.AlertTest do
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
     rule = List.first(rules)
 
-    # Only web-1 should have a state entry, and it should be firing
     assert length(rule.states) == 1
     state = List.first(rule.states)
     assert state.state == "firing"
@@ -214,50 +204,43 @@ defmodule TimelessMetrics.AlertTest do
 
   test "alert CRUD via HTTP" do
     # Create
-    conn =
-      Plug.Test.conn(
-        :post,
-        "/api/v1/alerts",
-        :json.encode(%{
-          name: "HTTP Alert",
-          metric: "cpu_usage",
-          condition: "above",
-          threshold: 80.0,
-          webhook_url: "http://localhost:9999/hook"
-        })
-        |> IO.iodata_to_binary()
-      )
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> TimelessMetrics.HTTP.call(store: :alert_test)
+    body =
+      :json.encode(%{
+        name: "HTTP Alert",
+        metric: "cpu_usage",
+        condition: "above",
+        threshold: 80.0,
+        webhook_url: "http://localhost:9999/hook"
+      })
+      |> IO.iodata_to_binary()
 
-    assert conn.status == 201
-    result = :json.decode(conn.resp_body)
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/alerts", body,
+        content_type: "application/json"
+      )
+
+    assert resp.status == 201
+    result = :json.decode(resp.body)
     id = result["id"]
     assert is_integer(id)
 
     # List
-    conn =
-      Plug.Test.conn(:get, "/api/v1/alerts")
-      |> TimelessMetrics.HTTP.call(store: :alert_test)
+    resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/alerts")
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert length(result["data"]) == 1
     assert List.first(result["data"])["name"] == "HTTP Alert"
 
     # Delete
-    conn =
-      Plug.Test.conn(:delete, "/api/v1/alerts/#{id}")
-      |> TimelessMetrics.HTTP.call(store: :alert_test)
+    resp = TimelessMetrics.TestHTTP.delete(@port, "/api/v1/alerts/#{id}")
 
-    assert conn.status == 200
+    assert resp.status == 200
 
     # Verify deleted
-    conn =
-      Plug.Test.conn(:get, "/api/v1/alerts")
-      |> TimelessMetrics.HTTP.call(store: :alert_test)
+    resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/alerts")
 
-    result = :json.decode(conn.resp_body)
+    result = :json.decode(resp.body)
     assert length(result["data"]) == 0
   end
 
@@ -265,7 +248,6 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write high data
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "cpu_usage", %{"host" => "web-1"}, 95.0,
         timestamp: base + i * 60
@@ -274,7 +256,6 @@ defmodule TimelessMetrics.AlertTest do
 
     TimelessMetrics.flush(:alert_test)
 
-    # Duration of 300s — must breach for 5 minutes before firing
     {:ok, rule_id} =
       TimelessMetrics.create_alert(:alert_test,
         name: "Sustained High CPU",
@@ -284,7 +265,6 @@ defmodule TimelessMetrics.AlertTest do
         duration: 300
       )
 
-    # First evaluation: should go to pending (not firing)
     TimelessMetrics.evaluate_alerts(:alert_test)
 
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
@@ -295,7 +275,6 @@ defmodule TimelessMetrics.AlertTest do
       assert state.state == "pending"
     end
 
-    # Manually set triggered_at to 6 minutes ago to simulate passage of time
     series_key = :json.encode(%{"host" => "web-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
@@ -304,7 +283,6 @@ defmodule TimelessMetrics.AlertTest do
       [now - 360, rule_id, series_key]
     )
 
-    # Re-evaluate — duration should now be exceeded
     TimelessMetrics.evaluate_alerts(:alert_test)
 
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
@@ -316,7 +294,6 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write data exceeding threshold
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "cpu_usage", %{"host" => "transition-1"}, 95.0,
         timestamp: base + i * 60
@@ -325,7 +302,6 @@ defmodule TimelessMetrics.AlertTest do
 
     TimelessMetrics.flush(:alert_test)
 
-    # Create alert with 300s duration requirement
     {:ok, rule_id} =
       TimelessMetrics.create_alert(:alert_test,
         name: "Transition Test",
@@ -336,7 +312,6 @@ defmodule TimelessMetrics.AlertTest do
         labels: %{"host" => "transition-1"}
       )
 
-    # 1st eval: ok → pending
     TimelessMetrics.evaluate_alerts(:alert_test)
 
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
@@ -344,7 +319,6 @@ defmodule TimelessMetrics.AlertTest do
     assert length(rule.states) == 1
     assert List.first(rule.states).state == "pending"
 
-    # Simulate time passing by backdating triggered_at
     series_key = :json.encode(%{"host" => "transition-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
@@ -353,7 +327,6 @@ defmodule TimelessMetrics.AlertTest do
       [now - 600, rule_id, series_key]
     )
 
-    # 2nd eval: pending → firing (duration exceeded)
     TimelessMetrics.evaluate_alerts(:alert_test)
 
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
@@ -365,7 +338,6 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write data BELOW threshold so it resolves
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "cpu_usage", %{"host" => "cleanup-1"}, 50.0,
         timestamp: base + i * 60
@@ -383,7 +355,6 @@ defmodule TimelessMetrics.AlertTest do
         labels: %{"host" => "cleanup-1"}
       )
 
-    # Manually set state to "firing"
     series_key = :json.encode(%{"host" => "cleanup-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
@@ -392,14 +363,12 @@ defmodule TimelessMetrics.AlertTest do
       [rule_id, series_key, now - 300]
     )
 
-    # Eval: firing → resolved (value below threshold)
     TimelessMetrics.evaluate_alerts(:alert_test)
 
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
     rule = Enum.find(rules, &(&1.id == rule_id))
     assert List.first(rule.states).state == "resolved"
 
-    # Eval again: resolved → ok (still below threshold, state row should be deleted)
     TimelessMetrics.evaluate_alerts(:alert_test)
 
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
@@ -411,7 +380,6 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write data ABOVE threshold
     for i <- 0..5 do
       TimelessMetrics.write(:alert_test, "cpu_usage", %{"host" => "retrigger-1"}, 95.0,
         timestamp: base + i * 60
@@ -429,7 +397,6 @@ defmodule TimelessMetrics.AlertTest do
         labels: %{"host" => "retrigger-1"}
       )
 
-    # Manually set state to "resolved" (simulating previous resolution)
     series_key = :json.encode(%{"host" => "retrigger-1"}) |> IO.iodata_to_binary()
 
     TimelessMetrics.DB.write(
@@ -438,7 +405,6 @@ defmodule TimelessMetrics.AlertTest do
       [rule_id, series_key, now - 600, now - 300]
     )
 
-    # Eval: resolved → firing (value is above threshold again, duration=0)
     TimelessMetrics.evaluate_alerts(:alert_test)
 
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
@@ -450,7 +416,6 @@ defmodule TimelessMetrics.AlertTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write high data for multiple hosts
     for host <- ["h1", "h2", "h3"] do
       for i <- 0..5 do
         TimelessMetrics.write(:alert_test, "cpu_all", %{"host" => host}, 95.0,
@@ -461,7 +426,6 @@ defmodule TimelessMetrics.AlertTest do
 
     TimelessMetrics.flush(:alert_test)
 
-    # Alert with empty labels — should match all series
     {:ok, rule_id} =
       TimelessMetrics.create_alert(:alert_test,
         name: "All Hosts CPU",
@@ -476,7 +440,6 @@ defmodule TimelessMetrics.AlertTest do
     {:ok, rules} = TimelessMetrics.list_alerts(:alert_test)
     rule = Enum.find(rules, &(&1.id == rule_id))
 
-    # All 3 series should have fired
     assert length(rule.states) == 3
     assert Enum.all?(rule.states, &(&1.state == "firing"))
   end

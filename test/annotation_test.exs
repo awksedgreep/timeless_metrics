@@ -2,9 +2,12 @@ defmodule TimelessMetrics.AnnotationTest do
   use ExUnit.Case, async: false
 
   @data_dir "/tmp/timeless_annot_test_#{System.os_time(:millisecond)}"
+  @port 18_404
 
   setup do
     start_supervised!({TimelessMetrics, name: :annot_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics.HTTP, store: :annot_test, port: @port})
+    Process.sleep(50)
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
 
@@ -68,58 +71,55 @@ defmodule TimelessMetrics.AnnotationTest do
     now = System.os_time(:second)
 
     # Create
-    conn =
-      Plug.Test.conn(
-        :post,
-        "/api/v1/annotations",
-        :json.encode(%{
-          timestamp: now,
-          title: "HTTP Deploy",
-          description: "Deployed via CI",
-          tags: ["deploy", "ci"]
-        })
-        |> IO.iodata_to_binary()
-      )
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> TimelessMetrics.HTTP.call(store: :annot_test)
+    body =
+      :json.encode(%{
+        timestamp: now,
+        title: "HTTP Deploy",
+        description: "Deployed via CI",
+        tags: ["deploy", "ci"]
+      })
+      |> IO.iodata_to_binary()
 
-    assert conn.status == 201
-    result = :json.decode(conn.resp_body)
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/annotations", body,
+        content_type: "application/json"
+      )
+
+    assert resp.status == 201
+    result = :json.decode(resp.body)
     id = result["id"]
     assert is_integer(id)
 
     # List
-    conn =
-      Plug.Test.conn(:get, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}")
-      |> TimelessMetrics.HTTP.call(store: :annot_test)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}")
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert length(result["data"]) == 1
     assert List.first(result["data"])["title"] == "HTTP Deploy"
 
     # Filter by tags
-    conn =
-      Plug.Test.conn(:get, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}&tags=deploy")
-      |> TimelessMetrics.HTTP.call(store: :annot_test)
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
+        "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}&tags=deploy"
+      )
 
-    assert conn.status == 200
-    result = :json.decode(conn.resp_body)
+    assert resp.status == 200
+    result = :json.decode(resp.body)
     assert length(result["data"]) == 1
 
     # Delete
-    conn =
-      Plug.Test.conn(:delete, "/api/v1/annotations/#{id}")
-      |> TimelessMetrics.HTTP.call(store: :annot_test)
+    resp = TimelessMetrics.TestHTTP.delete(@port, "/api/v1/annotations/#{id}")
 
-    assert conn.status == 200
+    assert resp.status == 200
 
     # Verify deleted
-    conn =
-      Plug.Test.conn(:get, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}")
-      |> TimelessMetrics.HTTP.call(store: :annot_test)
+    resp =
+      TimelessMetrics.TestHTTP.get(@port, "/api/v1/annotations?from=#{now - 60}&to=#{now + 60}")
 
-    result = :json.decode(conn.resp_body)
+    result = :json.decode(resp.body)
     assert length(result["data"]) == 0
   end
 
@@ -127,7 +127,6 @@ defmodule TimelessMetrics.AnnotationTest do
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
-    # Write some data
     for i <- 0..9 do
       TimelessMetrics.write(:annot_test, "cpu", %{"host" => "web-1"}, 50.0 + i,
         timestamp: base + i * 60
@@ -136,34 +135,29 @@ defmodule TimelessMetrics.AnnotationTest do
 
     TimelessMetrics.flush(:annot_test)
 
-    # Create an annotation in the middle of the data range
     TimelessMetrics.annotate(:annot_test, base + 300, "Deploy v3")
 
-    # Render chart
-    conn =
-      Plug.Test.conn(:get, "/chart?metric=cpu&from=#{base}&to=#{base + 600}")
-      |> TimelessMetrics.HTTP.call(store: :annot_test)
+    resp = TimelessMetrics.TestHTTP.get(@port, "/chart?metric=cpu&from=#{base}&to=#{base + 600}")
 
-    assert conn.status == 200
-    assert String.contains?(conn.resp_body, "Deploy v3")
-    assert String.contains?(conn.resp_body, "#f59e0b")
-    assert String.contains?(conn.resp_body, "stroke-dasharray=\"3,3\"")
+    assert resp.status == 200
+    assert String.contains?(resp.body, "Deploy v3")
+    assert String.contains?(resp.body, "#f59e0b")
+    assert String.contains?(resp.body, "stroke-dasharray=\"3,3\"")
   end
 
   test "annotation with default timestamp" do
-    conn =
-      Plug.Test.conn(
-        :post,
-        "/api/v1/annotations",
-        :json.encode(%{
-          title: "Now annotation"
-        })
-        |> IO.iodata_to_binary()
-      )
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> TimelessMetrics.HTTP.call(store: :annot_test)
+    body =
+      :json.encode(%{
+        title: "Now annotation"
+      })
+      |> IO.iodata_to_binary()
 
-    assert conn.status == 201
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/annotations", body,
+        content_type: "application/json"
+      )
+
+    assert resp.status == 201
 
     now = System.os_time(:second)
     {:ok, results} = TimelessMetrics.annotations(:annot_test, now - 5, now + 5)

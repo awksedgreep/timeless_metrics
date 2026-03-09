@@ -6,9 +6,12 @@ defmodule TimelessMetrics.InfluxTest do
   """
 
   @data_dir "/tmp/timeless_influx_test_#{System.os_time(:millisecond)}"
+  @port 18_407
 
   setup do
     start_supervised!({TimelessMetrics, name: :influx_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics.HTTP, store: :influx_test, port: @port})
+    Process.sleep(50)
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
 
@@ -20,11 +23,9 @@ defmodule TimelessMetrics.InfluxTest do
       # cpu,hostname=host_0,region=us-east usage_user=73.2 1700000000000000000
       body = "cpu,hostname=host_0,region=us-east usage_user=73.2 1700000000000000000\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
 
       TimelessMetrics.flush(:influx_test)
 
@@ -46,11 +47,9 @@ defmodule TimelessMetrics.InfluxTest do
     test "ingests multi-field measurement — each field becomes a metric" do
       body = "cpu,hostname=host_0 usage_user=73.2,usage_system=12.5 1700000000000000000\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
       TimelessMetrics.flush(:influx_test)
 
       {:ok, user_results} =
@@ -77,11 +76,9 @@ defmodule TimelessMetrics.InfluxTest do
     test "ingests single field named 'value' — uses measurement as metric" do
       body = "temperature,sensor=t1 value=22.5 1700000000000000000\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
       TimelessMetrics.flush(:influx_test)
 
       {:ok, results} =
@@ -103,11 +100,9 @@ defmodule TimelessMetrics.InfluxTest do
 
       body = Enum.join(lines, "\n") <> "\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
       TimelessMetrics.flush(:influx_test)
 
       {:ok, results} =
@@ -122,11 +117,9 @@ defmodule TimelessMetrics.InfluxTest do
     test "handles integer field values with 'i' suffix" do
       body = "mem,hostname=host_0 total=8589934592i 1700000000000000000\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
       TimelessMetrics.flush(:influx_test)
 
       {:ok, results} =
@@ -143,11 +136,9 @@ defmodule TimelessMetrics.InfluxTest do
     test "skips string and boolean field values" do
       body = "status,host=h1 message=\"ok\",healthy=true,code=200i 1700000000000000000\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
       TimelessMetrics.flush(:influx_test)
 
       # Only code=200 should be ingested (string and bool skipped)
@@ -174,11 +165,9 @@ defmodule TimelessMetrics.InfluxTest do
     test "handles no tags" do
       body = "uptime value=12345.0 1700000000000000000\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
       TimelessMetrics.flush(:influx_test)
 
       {:ok, results} =
@@ -194,11 +183,9 @@ defmodule TimelessMetrics.InfluxTest do
     test "handles no timestamp — uses current time" do
       body = "cpu,hostname=host_0 usage_user=50.0\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
       TimelessMetrics.flush(:influx_test)
 
       now = System.os_time(:second)
@@ -215,11 +202,9 @@ defmodule TimelessMetrics.InfluxTest do
     test "handles millisecond timestamps" do
       body = "cpu,hostname=host_0 usage_user=50.0 1700000000000\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
       TimelessMetrics.flush(:influx_test)
 
       {:ok, results} =
@@ -242,11 +227,9 @@ defmodule TimelessMetrics.InfluxTest do
       cpu,hostname=host_1 usage_user=60.0 1700000000000000000
       """
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert conn.status == 204
+      assert resp.status == 204
       TimelessMetrics.flush(:influx_test)
 
       {:ok, results} =
@@ -261,15 +244,13 @@ defmodule TimelessMetrics.InfluxTest do
     test "reports partial failures" do
       body = "cpu,hostname=host_0 usage_user=50.0 1700000000000000000\nnot_valid_at_all\n"
 
-      conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
       # Partial success returns 200 with error info
-      assert conn.status == 200
-      resp = :json.decode(conn.resp_body)
-      assert resp["samples"] == 1
-      assert resp["errors"] == 1
+      assert resp.status == 200
+      decoded = :json.decode(resp.body)
+      assert decoded["samples"] == 1
+      assert decoded["errors"] == 1
     end
   end
 
@@ -297,15 +278,14 @@ defmodule TimelessMetrics.InfluxTest do
     test "routes to PromQL parser when query= present", %{base_ts: ts} do
       query = URI.encode("cpu_usage_user{hostname=\"host_0\"}")
 
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/api/v1/query_range?query=#{query}&start=#{ts}&end=#{ts + 100}&step=100"
         )
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
 
-      assert conn.status == 200
-      body = :json.decode(conn.resp_body)
+      assert resp.status == 200
+      body = :json.decode(resp.body)
       assert body["status"] == "success"
       assert body["data"]["resultType"] == "matrix"
       assert length(body["data"]["result"]) == 1
@@ -316,35 +296,33 @@ defmodule TimelessMetrics.InfluxTest do
     end
 
     test "still uses native params when query= absent", %{base_ts: ts} do
-      conn =
-        Plug.Test.conn(
-          :get,
+      resp =
+        TimelessMetrics.TestHTTP.get(
+          @port,
           "/api/v1/query_range?metric=cpu_usage_user&hostname=host_0&start=#{ts}&end=#{ts + 100}&step=100"
         )
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
 
-      assert conn.status == 200
-      body = :json.decode(conn.resp_body)
+      assert resp.status == 200
+      body = :json.decode(resp.body)
       # Native response format (not Prometheus format)
       assert body["metric"] == "cpu_usage_user"
       assert length(body["series"]) == 1
     end
 
     test "handles PromQL with group-by on /api/v1/query_range", %{base_ts: ts} do
-      query =
-        URI.encode(
-          "max(max_over_time(cpu_usage_user{hostname=~\"host_0|host_1|host_2\"}[1h])) by (hostname)"
-        )
+      qs =
+        URI.encode_query(%{
+          "query" =>
+            "max(max_over_time(cpu_usage_user{hostname=~\"host_0|host_1|host_2\"}[1h])) by (hostname)",
+          "start" => ts,
+          "end" => ts + 100,
+          "step" => "100"
+        })
 
-      conn =
-        Plug.Test.conn(
-          :get,
-          "/api/v1/query_range?query=#{query}&start=#{ts}&end=#{ts + 100}&step=100"
-        )
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/query_range?#{qs}")
 
-      assert conn.status == 200
-      body = :json.decode(conn.resp_body)
+      assert resp.status == 200
+      body = :json.decode(resp.body)
       assert body["status"] == "success"
       assert length(body["data"]["result"]) == 3
 
@@ -370,30 +348,27 @@ defmodule TimelessMetrics.InfluxTest do
 
       body = Enum.join(lines, "\n") <> "\n"
 
-      load_conn =
-        Plug.Test.conn(:post, "/write", body)
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      load_resp = TimelessMetrics.TestHTTP.post(@port, "/write", body)
 
-      assert load_conn.status == 204
+      assert load_resp.status == 204
 
       TimelessMetrics.flush(:influx_test)
 
       # 2. Query via PromQL on /api/v1/query_range (what tsbs_run_queries does)
       # GroupByTime pattern: max of all cpu metrics grouped by __name__
-      query =
-        URI.encode(
-          "max(max_over_time(cpu_usage_user{hostname=~\"host_0|host_1|host_2|host_3|host_4\"}[1h])) by (hostname)"
-        )
+      qs =
+        URI.encode_query(%{
+          "query" =>
+            "max(max_over_time(cpu_usage_user{hostname=~\"host_0|host_1|host_2|host_3|host_4\"}[1h])) by (hostname)",
+          "start" => ts_base,
+          "end" => ts_base + 600,
+          "step" => "600"
+        })
 
-      query_conn =
-        Plug.Test.conn(
-          :get,
-          "/api/v1/query_range?query=#{query}&start=#{ts_base}&end=#{ts_base + 600}&step=600"
-        )
-        |> TimelessMetrics.HTTP.call(store: :influx_test)
+      query_resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/query_range?#{qs}")
 
-      assert query_conn.status == 200
-      body = :json.decode(query_conn.resp_body)
+      assert query_resp.status == 200
+      body = :json.decode(query_resp.body)
       assert body["status"] == "success"
       assert length(body["data"]["result"]) == 5
 
