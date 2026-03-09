@@ -29,7 +29,7 @@ defmodule TimelessMetrics.Actor.Engine do
   end
 
   @doc "Write a batch of metric points."
-  def write_batch(store, entries) do
+  def write_batch(store, entries) when is_list(entries) do
     Stats.incr_writes(store)
     Stats.add_points(store, length(entries))
     %{manager: manager} = :persistent_term.get({SeriesManager, store})
@@ -46,6 +46,20 @@ defmodule TimelessMetrics.Actor.Engine do
       end
     )
     |> Enum.each(fn {{metric_name, labels}, batch} ->
+      {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
+      send(pid, {:write_batch, batch})
+    end)
+
+    :ok
+  end
+
+  def write_batch(store, groups) when is_map(groups) do
+    count = groups |> Map.values() |> Enum.reduce(0, &(length(&1) + &2))
+    Stats.incr_writes(store)
+    Stats.add_points(store, count)
+    %{manager: manager} = :persistent_term.get({SeriesManager, store})
+
+    Enum.each(groups, fn {{metric_name, labels}, batch} ->
       {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
       send(pid, {:write_batch, batch})
     end)

@@ -6,9 +6,9 @@
 # Measures native API, HTTP ingest (apples-to-apples), storage, and query latency.
 
 defmodule VsBench do
-  @vm_url "http://localhost:9428"
+  @vm_url "http://127.0.0.1:9428"
   @tm_http_port 19_428
-  @tm_http_url "http://localhost:#{@tm_http_port}"
+  @tm_http_url "http://127.0.0.1:#{@tm_http_port}"
   @metrics ~w(cpu_usage mem_usage disk_usage load_avg if_in_octets if_out_octets
               temperature signal_power ping_latency bandwidth_util)
   @interval 300

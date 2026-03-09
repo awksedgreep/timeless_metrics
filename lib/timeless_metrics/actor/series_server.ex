@@ -45,6 +45,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     merge_block_max_points: 10_000,
     merge_block_min_age_seconds: 300,
     merge_compression_level: 19,
+    gc_on_compress: true,
     series_type: :numeric
   ]
 
@@ -77,6 +78,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     merge_block_min_age_seconds = Keyword.get(opts, :merge_block_min_age_seconds, 300)
     merge_compression_level = Keyword.get(opts, :merge_compression_level, 19)
     merge_interval = Keyword.get(opts, :merge_interval, @merge_check_ms)
+    gc_on_compress = Keyword.get(opts, :gc_on_compress, true)
     series_type = Keyword.get(opts, :series_type, :numeric)
 
     state = %__MODULE__{
@@ -93,6 +95,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       merge_block_max_points: merge_block_max_points,
       merge_block_min_age_seconds: merge_block_min_age_seconds,
       merge_compression_level: merge_compression_level,
+      gc_on_compress: gc_on_compress,
       series_type: series_type
     }
 
@@ -210,7 +213,15 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       end
 
     stale_ref = Process.send_after(self(), :maybe_compress_stale, @stale_check_ms)
-    {:noreply, %{state | stale_ref: stale_ref}}
+    state = %{state | stale_ref: stale_ref}
+
+    if wrote_recently do
+      {:noreply, state}
+    else
+      # Hibernate idle processes to compact heap and release memory.
+      # The next message (write, timer, or query) restores the process.
+      {:noreply, state, :hibernate}
+    end
   end
 
   def handle_info(:maybe_merge_blocks, state) do
@@ -536,6 +547,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
             {blocks, block_count}
           end
 
+        if state.gc_on_compress, do: :erlang.garbage_collect()
+
         %{
           state
           | blocks: blocks,
@@ -579,6 +592,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
           else
             {blocks, block_count}
           end
+
+        if state.gc_on_compress, do: :erlang.garbage_collect()
 
         %{
           state

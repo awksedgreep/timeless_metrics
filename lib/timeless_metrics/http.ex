@@ -323,32 +323,56 @@ defmodule TimelessMetrics.HTTP do
     store = conn.private.timeless_metrics
     TimelessMetrics.Stats.incr_http_queries(store)
     conn = Plug.Conn.fetch_query_params(conn)
+    params = conn.query_params
 
-    case extract_metric_and_labels(conn.query_params) do
-      {:ok, metric, labels} ->
-        {:ok, results} = TimelessMetrics.query_multi(store, metric, labels)
+    if params["query"] do
+      # PromQL instant query — evaluate at `time` (default: now)
+      now = System.os_time(:second)
+      eval_time = parse_prom_time(params["time"], now)
+      lookback = 300
 
-        data =
-          results
-          |> Enum.flat_map(fn %{labels: l, points: pts} ->
-            case List.last(Enum.sort_by(pts, &elem(&1, 0))) do
-              {ts, val} -> [%{labels: l, timestamp: ts, value: val}]
-              nil -> []
+      case TimelessMetrics.PromQL.parse(params["query"]) do
+        {:ok, plan} ->
+          {:ok, response} =
+            TimelessMetrics.PromQL.execute(plan, store, eval_time - lookback, eval_time, lookback)
+
+          # Convert range response to instant: keep only the last point per series
+          instant_response = to_instant_response(response, eval_time)
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, json_encode!(instant_response))
+
+        {:error, reason} ->
+          json_error(conn, 400, "PromQL parse error: #{reason}")
+      end
+    else
+      case extract_metric_and_labels(params) do
+        {:ok, metric, labels} ->
+          {:ok, results} = TimelessMetrics.query_multi(store, metric, labels)
+
+          data =
+            results
+            |> Enum.flat_map(fn %{labels: l, points: pts} ->
+              case List.last(Enum.sort_by(pts, &elem(&1, 0))) do
+                {ts, val} -> [%{labels: l, timestamp: ts, value: val}]
+                nil -> []
+              end
+            end)
+
+          body =
+            case data do
+              [single] -> json_encode!(single)
+              multiple -> json_encode!(%{data: multiple})
             end
-          end)
 
-        body =
-          case data do
-            [single] -> json_encode!(single)
-            multiple -> json_encode!(%{data: multiple})
-          end
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, body)
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(200, body)
-
-      {:error, msg} ->
-        json_error(conn, 400, msg)
+        {:error, msg} ->
+          json_error(conn, 400, msg)
+      end
     end
   end
 
@@ -1683,7 +1707,7 @@ defmodule TimelessMetrics.HTTP do
   @parallel_parse_threshold 2_000
 
   defp ingest_json_lines(store, body) do
-    lines = String.split(body, "\n", trim: true)
+    lines = :binary.split(body, <<"\n">>, [:global, :trim_all])
 
     {all_entries, errors, error_samples} =
       if length(lines) >= @parallel_parse_threshold do
@@ -1789,11 +1813,11 @@ defmodule TimelessMetrics.HTTP do
   # Skips comments (#) and empty lines.
 
   defp ingest_prometheus_text(store, body) do
-    {all_entries, errors, error_samples} =
+    {groups, count, errors, error_samples} =
       if TimelessMetrics.PrometheusNif.available?() do
         parse_prometheus_body_nif(body)
       else
-        lines = String.split(body, "\n", trim: true)
+        lines = :binary.split(body, <<"\n">>, [:global, :trim_all])
 
         if length(lines) >= @parallel_parse_threshold do
           parse_prometheus_lines_parallel(lines)
@@ -1808,39 +1832,50 @@ defmodule TimelessMetrics.HTTP do
       )
     end
 
-    if all_entries != [] do
-      TimelessMetrics.write_batch(store, all_entries)
+    if count > 0 do
+      TimelessMetrics.Stats.incr_writes(store)
+      TimelessMetrics.Stats.add_points(store, count)
+      %{manager: manager} = :persistent_term.get({TimelessMetrics.Actor.SeriesManager, store})
+
+      Enum.each(groups, fn {{metric_name, labels}, batch} ->
+        {_id, pid} = TimelessMetrics.Actor.SeriesManager.get_or_start(manager, metric_name, labels)
+        send(pid, {:write_batch, batch})
+      end)
     end
 
-    {length(all_entries), errors, error_samples}
+    {count, errors, error_samples}
   end
 
   defp parse_prometheus_body_nif(body) do
     {entries, error_count} = TimelessMetrics.PrometheusNif.parse(body)
-
     now = System.os_time(:second)
 
-    converted =
-      Enum.map(entries, fn {name, labels_proplist, value, ts} ->
+    {groups, count} =
+      Enum.reduce(entries, {%{}, 0}, fn {name, labels_proplist, value, ts}, {groups, count} ->
         labels = Map.new(labels_proplist)
         timestamp = if ts == 0, do: now, else: div(ts, 1000)
-        {name, labels, value, timestamp}
+        key = {name, labels}
+        point = {timestamp, value}
+        {Map.update(groups, key, [point], &[point | &1]), count + 1}
       end)
 
-    {converted, error_count, []}
+    {groups, count, error_count, []}
   end
 
   defp parse_prometheus_lines_sequential(lines) do
-    {entries, errors, samples} =
-      Enum.reduce(lines, {[], 0, []}, fn line, {entries_acc, errors, samples} ->
+    {groups, count, errors, samples} =
+      Enum.reduce(lines, {%{}, 0, 0, []}, fn line, {groups, count, errors, samples} ->
         line = String.trim(line)
 
         if line == "" or String.starts_with?(line, "#") do
-          {entries_acc, errors, samples}
+          {groups, count, errors, samples}
         else
           case parse_prometheus_line(line) do
             {:ok, metric, labels, value, timestamp} ->
-              {[{metric, labels, value, timestamp} | entries_acc], errors, samples}
+              key = {metric, labels}
+              point = {timestamp, value}
+              groups = Map.update(groups, key, [point], &[point | &1])
+              {groups, count + 1, errors, samples}
 
             :error ->
               samples =
@@ -1850,12 +1885,12 @@ defmodule TimelessMetrics.HTTP do
                   samples
                 end
 
-              {entries_acc, errors + 1, samples}
+              {groups, count, errors + 1, samples}
           end
         end
       end)
 
-    {entries, errors, Enum.take(Enum.reverse(samples), @max_error_samples)}
+    {groups, count, errors, Enum.take(Enum.reverse(samples), @max_error_samples)}
   end
 
   defp parse_prometheus_lines_parallel(lines) do
@@ -1869,7 +1904,7 @@ defmodule TimelessMetrics.HTTP do
       end)
 
     results = Task.await_many(chunks, :timer.seconds(30))
-    merge_parse_results(results)
+    merge_grouped_results(results)
   end
 
   defp merge_parse_results(results) do
@@ -1878,6 +1913,19 @@ defmodule TimelessMetrics.HTTP do
       merged_entries = :lists.reverse(entries, all_entries)
       merged_samples = Enum.take(all_samples ++ samples, @max_error_samples)
       {merged_entries, total_errors + errors, merged_samples}
+    end)
+  end
+
+  defp merge_grouped_results(results) do
+    Enum.reduce(results, {%{}, 0, 0, []}, fn {groups, count, errors, samples},
+                                              {all_groups, total_count, total_errors, all_samples} ->
+      merged =
+        Map.merge(all_groups, groups, fn _key, existing, new ->
+          new ++ existing
+        end)
+
+      merged_samples = Enum.take(all_samples ++ samples, @max_error_samples)
+      {merged, total_count + count, total_errors + errors, merged_samples}
     end)
   end
 
@@ -2159,6 +2207,30 @@ defmodule TimelessMetrics.HTTP do
   end
 
   defp nanoseconds_to_seconds(ts), do: ts
+
+  # Convert a range (matrix) response to an instant (vector) response
+  # by keeping only the last value from each series.
+  defp to_instant_response(
+         %{"status" => "success", "data" => %{"result" => results}},
+         eval_time
+       ) do
+    vector =
+      results
+      |> Enum.flat_map(fn %{"metric" => metric, "values" => values} ->
+        case List.last(values) do
+          [_ts, val] -> [%{"metric" => metric, "value" => [eval_time, val]}]
+          _ -> []
+        end
+      end)
+
+    %{
+      "status" => "success",
+      "data" => %{
+        "resultType" => "vector",
+        "result" => vector
+      }
+    }
+  end
 
   # Parse Prometheus time params — can be unix timestamps (float or int)
   defp parse_prom_time(nil, default), do: default

@@ -526,6 +526,7 @@ defmodule Mix.Tasks.Bench.Actor do
     per_series =
       if series_count > 0, do: div(mem_delta, series_count), else: 0
 
+    IO.puts("  Before GC:")
     IO.puts("  Total memory:     #{fmt_bytes(mem[:total])}")
     IO.puts("  Process memory:   #{fmt_bytes(mem[:processes])}")
     IO.puts("  ETS memory:       #{fmt_bytes(mem[:ets])}")
@@ -540,6 +541,32 @@ defmodule Mix.Tasks.Bench.Actor do
     IO.puts("  Per-series est:   #{fmt_bytes(per_series)}")
     IO.puts("  Memory delta:     #{fmt_bytes(mem_delta)}")
 
+    # Force GC on all processes
+    IO.puts("")
+    IO.puts("  Forcing GC on #{fmt_int(proc_count)} processes...")
+
+    {gc_us, _} =
+      :timer.tc(fn ->
+        Process.list() |> Enum.each(&:erlang.garbage_collect/1)
+      end)
+
+    mem_gc = :erlang.memory()
+    mem_delta_gc = mem_gc[:total] - mem_baseline
+
+    per_series_gc =
+      if series_count > 0, do: div(mem_delta_gc, series_count), else: 0
+
+    reclaimed = mem[:total] - mem_gc[:total]
+
+    IO.puts("")
+    IO.puts("  After GC (#{fmt_dur(gc_us)}):")
+    IO.puts("  Total memory:     #{fmt_bytes(mem_gc[:total])}")
+    IO.puts("  Process memory:   #{fmt_bytes(mem_gc[:processes])}")
+    IO.puts("  Binary memory:    #{fmt_bytes(mem_gc[:binary])}")
+    IO.puts("  Per-series est:   #{fmt_bytes(per_series_gc)}")
+    IO.puts("  Memory delta:     #{fmt_bytes(mem_delta_gc)}")
+    IO.puts("  Reclaimed:        #{fmt_bytes(reclaimed)} (#{Float.round(reclaimed / max(mem[:total], 1) * 100, 1)}%)")
+
     # Registry + index ETS memory
     actor_index = :bench_actor_actor_index
 
@@ -549,6 +576,7 @@ defmodule Mix.Tasks.Bench.Actor do
         words -> words * :erlang.system_info(:wordsize)
       end
 
+    IO.puts("")
     IO.puts("  Index ETS:        #{fmt_bytes(index_mem)}")
   end
 
