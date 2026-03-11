@@ -63,6 +63,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
+    Process.flag(:message_queue_data, :off_heap)
     series_id = Keyword.fetch!(opts, :series_id)
     metric_name = Keyword.fetch!(opts, :metric_name)
     labels = Keyword.fetch!(opts, :labels)

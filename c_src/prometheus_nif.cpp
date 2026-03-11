@@ -236,7 +236,7 @@ static ERL_NIF_TERM nif_parse(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
 }
 
 static ErlNifFunc nif_funcs[] = {
-    {"parse", 1, nif_parse, 0}
+    {"parse", 1, nif_parse, ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(Elixir.TimelessMetrics.PrometheusNif, nif_funcs, NULL, NULL, NULL, NULL)

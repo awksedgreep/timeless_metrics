@@ -190,7 +190,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       :named_table,
       :set,
       :public,
-      read_concurrency: true
+      read_concurrency: true,
+      write_concurrency: :auto
     ])
 
     state = %__MODULE__{
