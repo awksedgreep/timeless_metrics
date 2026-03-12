@@ -152,41 +152,51 @@ defmodule TimelessMetrics.Actor.Engine do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
 
-    # Fast path: exact labels → single ETS lookup
+    # Fast path: exact labels → try O(1) lookups before scan
     if exact_label_filter?(label_filter) do
       %{index: index} = :persistent_term.get({SeriesManager, store})
-      key = {metric_name, label_filter}
 
-      case :ets.lookup(index, key) do
-        [{^key, _series_id, pid}] when is_pid(pid) ->
-          if Process.alive?(pid) do
-            try do
-              {:ok, points} = GenServer.call(pid, {:query_raw, from, to})
-
-              if points == [],
-                do: {:ok, []},
-                else: {:ok, [%{labels: label_filter, points: points}]}
-            catch
-              :exit, reason ->
-                Logger.error("TimelessMetrics: query_multi fast-path crashed: #{inspect(reason)}")
-                {:ok, []}
-            end
-          else
-            query_multi_scan(store, metric_name, label_filter, from, to)
-          end
+      case :ets.lookup(index, {metric_name, label_filter}) do
+        [{_key, _series_id, pid}] when is_pid(pid) and is_atom(pid) == false ->
+          query_multi_direct(pid, label_filter, from, to, store, metric_name)
 
         _ ->
-          query_multi_scan(store, metric_name, label_filter, from, to)
+          manager = manager_name(store)
+          case SeriesManager.find_series(manager, metric_name, label_filter) do
+            [{_id, labels, pid}] ->
+              query_multi_direct(pid, labels, from, to, store, metric_name)
+
+            [] ->
+              {:ok, []}
+
+            matching ->
+              query_multi_fanout(matching, from, to)
+          end
       end
     else
       query_multi_scan(store, metric_name, label_filter, from, to)
     end
   end
 
-  defp query_multi_scan(store, metric_name, label_filter, from, to) do
-    manager = manager_name(store)
-    matching = SeriesManager.find_series(manager, metric_name, label_filter)
+  defp query_multi_direct(pid, labels, from, to, store, metric_name) do
+    if Process.alive?(pid) do
+      try do
+        {:ok, points} = GenServer.call(pid, {:query_raw, from, to})
 
+        if points == [],
+          do: {:ok, []},
+          else: {:ok, [%{labels: labels, points: points}]}
+      catch
+        :exit, reason ->
+          Logger.error("TimelessMetrics: query_multi direct call crashed: #{inspect(reason)}")
+          {:ok, []}
+      end
+    else
+      query_multi_scan(store, metric_name, labels, from, to)
+    end
+  end
+
+  defp query_multi_fanout(matching, from, to) do
     results =
       matching
       |> Task.async_stream(
@@ -211,6 +221,22 @@ defmodule TimelessMetrics.Actor.Engine do
     {:ok, results}
   end
 
+  defp query_multi_scan(store, metric_name, label_filter, from, to) do
+    manager = manager_name(store)
+    matching = SeriesManager.find_series(manager, metric_name, label_filter)
+
+    case matching do
+      [{_id, labels, pid}] ->
+        query_multi_direct(pid, labels, from, to, store, metric_name)
+
+      [] ->
+        {:ok, []}
+
+      _ ->
+        query_multi_fanout(matching, from, to)
+    end
+  end
+
   @doc "Query with time-bucket aggregation for a single series."
   def query_aggregate(store, metric_name, labels, opts) do
     Stats.incr_queries(store)
@@ -232,45 +258,57 @@ defmodule TimelessMetrics.Actor.Engine do
     agg_fn = Keyword.fetch!(opts, :aggregate)
     transform = Keyword.get(opts, :transform)
 
-    # Fast path: exact label filter can resolve to a single series via ETS lookup
-    # instead of scanning all series for this metric
+    # Fast path: exact label filter → try O(1) lookups before falling to scan
     if exact_label_filter?(label_filter) and map_size(label_filter) > 0 do
       %{index: index} = :persistent_term.get({SeriesManager, store})
-      key = {metric_name, label_filter}
 
-      case :ets.lookup(index, key) do
-        [{^key, _series_id, pid}] when is_pid(pid) ->
-          if Process.alive?(pid) do
-            try do
-              {:ok, buckets} = GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
-
-              case TimelessMetrics.Transform.apply(buckets, transform) do
-                [] -> {:ok, []}
-                data -> {:ok, [%{labels: label_filter, data: data}]}
-              end
-            catch
-              :exit, reason ->
-                Logger.error("TimelessMetrics: query_aggregate_multi fast-path crashed: #{inspect(reason)}")
-                {:ok, []}
-            end
-          else
-            # Process dead — fall through to slow path to restart it
-            query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform)
-          end
+      # Try 1: full key match (query labels == stored labels)
+      case :ets.lookup(index, {metric_name, label_filter}) do
+        [{_key, _series_id, pid}] when is_pid(pid) and is_atom(pid) == false ->
+          query_aggregate_multi_direct(pid, label_filter, from, to, bucket, agg_fn, transform, store, metric_name)
 
         _ ->
-          # Not found — could be a new series or partial label match
-          query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform)
+          # Try 2: partial label match via label index
+          manager = manager_name(store)
+          case SeriesManager.find_series(manager, metric_name, label_filter) do
+            [{_id, labels, pid}] ->
+              query_aggregate_multi_direct(pid, labels, from, to, bucket, agg_fn, transform, store, metric_name)
+
+            [] ->
+              {:ok, []}
+
+            matching ->
+              # Multiple matches — use the full fan-out path
+              query_aggregate_multi_fanout(matching, from, to, bucket, agg_fn, transform)
+          end
       end
     else
       query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform)
     end
   end
 
-  defp query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform) do
-    manager = manager_name(store)
-    matching = SeriesManager.find_series(manager, metric_name, label_filter)
+  # Direct call to a single known-alive series — no Task.async_stream overhead
+  defp query_aggregate_multi_direct(pid, labels, from, to, bucket, agg_fn, transform, store, metric_name) do
+    if Process.alive?(pid) do
+      try do
+        {:ok, buckets} = GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
 
+        case TimelessMetrics.Transform.apply(buckets, transform) do
+          [] -> {:ok, []}
+          data -> {:ok, [%{labels: labels, data: data}]}
+        end
+      catch
+        :exit, reason ->
+          Logger.error("TimelessMetrics: query_aggregate_multi direct call crashed: #{inspect(reason)}")
+          {:ok, []}
+      end
+    else
+      query_aggregate_multi_scan(store, metric_name, labels, from, to, bucket, agg_fn, transform)
+    end
+  end
+
+  # Fan-out to multiple series via Task.async_stream
+  defp query_aggregate_multi_fanout(matching, from, to, bucket, agg_fn, transform) do
     results =
       matching
       |> Task.async_stream(
@@ -299,6 +337,22 @@ defmodule TimelessMetrics.Actor.Engine do
       end)
 
     {:ok, results}
+  end
+
+  defp query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform) do
+    manager = manager_name(store)
+    matching = SeriesManager.find_series(manager, metric_name, label_filter)
+
+    case matching do
+      [{_id, labels, pid}] ->
+        query_aggregate_multi_direct(pid, labels, from, to, bucket, agg_fn, transform, store, metric_name)
+
+      [] ->
+        {:ok, []}
+
+      _ ->
+        query_aggregate_multi_fanout(matching, from, to, bucket, agg_fn, transform)
+    end
   end
 
   # Returns true if the label filter contains only exact string matches
