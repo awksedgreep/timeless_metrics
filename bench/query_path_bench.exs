@@ -99,6 +99,22 @@ IO.puts("Total:      #{Float.round(direct_us / 1000, 1)} ms")
 IO.puts("Per query:  #{Float.round(direct_per, 1)} us (#{Float.round(direct_per / 1000, 3)} ms)")
 
 # --- Benchmark: forced scan path (empty filter = wildcard) ---
+# --- Benchmark: partial label match via label index (PromQL pattern: metric{host="X"}) ---
+IO.puts("\n--- query_aggregate_multi PARTIAL label (host only, label index) ---")
+
+{partial_us, _} =
+  :timer.tc(fn ->
+    Enum.each(query_samples, fn {metric, labels} ->
+      host_only = Map.take(labels, ["host"])
+      {:ok, _} = TimelessMetrics.Actor.Engine.query_aggregate_multi(:bench_store, metric, host_only, query_opts)
+    end)
+  end)
+
+partial_per = partial_us / length(query_samples)
+IO.puts("Queries:    #{length(query_samples)}")
+IO.puts("Total:      #{Float.round(partial_us / 1000, 1)} ms")
+IO.puts("Per query:  #{Float.round(partial_per, 1)} us (#{Float.round(partial_per / 1000, 3)} ms)")
+
 IO.puts("\n--- query_aggregate_multi SCAN path (empty filter, all series for metric) ---")
 
 scan_samples = Enum.take_random(query_samples, min(20, length(query_samples)))
@@ -116,10 +132,11 @@ IO.puts("Total:      #{Float.round(scan_us / 1000, 1)} ms")
 IO.puts("Per query:  #{Float.round(scan_per, 1)} us (#{Float.round(scan_per / 1000, 3)} ms)")
 
 IO.puts("\n--- Summary ---")
-IO.puts("Fast path (multi):  #{Float.round(multi_per, 1)} us")
-IO.puts("Direct (single):    #{Float.round(direct_per, 1)} us")
-IO.puts("Scan (all series):  #{Float.round(scan_per, 1)} us")
-IO.puts("Fast path speedup:  #{Float.round(scan_per / multi_per, 1)}x vs scan")
+IO.puts("Full labels (ETS key):   #{Float.round(multi_per, 1)} us")
+IO.puts("Partial label (index):   #{Float.round(partial_per, 1)} us")
+IO.puts("Direct (single):         #{Float.round(direct_per, 1)} us")
+IO.puts("Scan (all series):       #{Float.round(scan_per, 1)} us")
+IO.puts("Label index speedup:     #{Float.round(scan_per / partial_per, 1)}x vs scan")
 
 File.rm_rf!(data_dir)
 System.halt(0)

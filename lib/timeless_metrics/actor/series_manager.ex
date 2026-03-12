@@ -71,15 +71,61 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   """
   def find_series(manager, metric_name, label_filter) do
     state_info = :persistent_term.get({__MODULE__, manager})
+
+    if exact_label_filter?(label_filter) do
+      find_series_indexed(state_info, metric_name, label_filter)
+    else
+      find_series_scan(state_info, metric_name, label_filter)
+    end
+  end
+
+  # Fast path: use label index for O(matches) lookup instead of O(all_series_for_metric) scan
+  defp find_series_indexed(state_info, metric_name, label_filter) when map_size(label_filter) == 0 do
+    find_series_scan(state_info, metric_name, label_filter)
+  end
+
+  defp find_series_indexed(state_info, metric_name, label_filter) do
+    label_index = state_info.label_index
+
+    # Look up by the first filter key, then intersect with remaining keys
+    [{first_key, first_val} | rest] = Enum.to_list(label_filter)
+
+    candidates =
+      :ets.lookup(label_index, {metric_name, first_key, first_val})
+      |> Enum.map(fn {_key, series_id, labels, pid} -> {series_id, labels, pid} end)
+
+    # Intersect with remaining filter keys
+    result =
+      Enum.reduce(rest, candidates, fn {k, v}, acc ->
+        match_set =
+          :ets.lookup(label_index, {metric_name, k, v})
+          |> MapSet.new(fn {_key, sid, _labels, _pid} -> sid end)
+
+        Enum.filter(acc, fn {sid, _labels, _pid} -> MapSet.member?(match_set, sid) end)
+      end)
+
+    Enum.filter(result, fn {_series_id, _labels, pid} -> Process.alive?(pid) end)
+  end
+
+  # Slow path: full ETS scan for regex/complex filters
+  defp find_series_scan(state_info, metric_name, label_filter) do
     index = state_info.index
 
-    # Get all series for this metric — labels are maps, PID is cached
     :ets.match_object(index, {{metric_name, :_}, :_, :_})
     |> Enum.map(fn {{_metric, labels}, series_id, pid} ->
       {series_id, labels, pid}
     end)
     |> filter_by_labels(label_filter)
     |> Enum.filter(fn {_series_id, _labels, pid} -> Process.alive?(pid) end)
+  end
+
+  defp exact_label_filter?(filter) when map_size(filter) == 0, do: false
+
+  defp exact_label_filter?(filter) do
+    Enum.all?(filter, fn
+      {_k, v} when is_binary(v) -> true
+      _ -> false
+    end)
   end
 
   @doc "List all unique metric names."
@@ -198,6 +244,18 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       write_concurrency: :auto
     ])
 
+    # Label index: {metric_name, label_key, label_value} => {series_id, labels, pid}
+    # duplicate_bag allows multiple series to share the same label value
+    label_index = :"#{store}_label_index"
+
+    :ets.new(label_index, [
+      :named_table,
+      :duplicate_bag,
+      :public,
+      read_concurrency: true,
+      write_concurrency: :auto
+    ])
+
     state = %__MODULE__{
       store: store,
       db: db,
@@ -221,7 +279,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
     # Store in persistent_term for fast client-side access
     # Keyed by manager name (for get_or_start) and by store atom (for hot-path writes)
-    info = %{index: index, registry: registry, db: db, manager: name}
+    info = %{index: index, label_index: label_index, registry: registry, db: db, manager: name}
     :persistent_term.put({__MODULE__, name}, info)
     :persistent_term.put({__MODULE__, store}, info)
 
@@ -245,6 +303,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
             start_series_process(state, series_id, metric_name, labels, series_type)
 
           :ets.insert(state.index, {key, series_id, new_pid})
+          update_label_index_pid(state.store, metric_name, labels, series_id, new_pid)
           {:reply, {series_id, new_pid}, state}
         end
 
@@ -267,6 +326,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
           start_series_process(state, series_id, metric_name, labels, series_type)
 
         :ets.insert(state.index, {key, series_id, pid})
+        insert_label_index(state.store, metric_name, labels, series_id, pid)
         {:reply, {series_id, pid}, state}
     end
   end
@@ -277,6 +337,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
     # Update ETS with new PID (process restarted)
     :ets.insert(state.index, {{metric_name, labels}, series_id, pid})
+    update_label_index_pid(state.store, metric_name, labels, series_id, pid)
     {:reply, {series_id, pid}, state}
   end
 
@@ -294,6 +355,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       series_type = String.to_existing_atom(type_str)
       {_id, pid} = start_series_process(state, id, metric_name, labels, series_type)
       :ets.insert(state.index, {{metric_name, labels}, id, pid})
+      insert_label_index(state.store, metric_name, labels, id, pid)
     end)
   end
 
@@ -374,6 +436,24 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
       {k, v} ->
         {k, v}
+    end)
+  end
+
+  defp insert_label_index(store, metric_name, labels, series_id, pid) do
+    label_index = :"#{store}_label_index"
+
+    Enum.each(labels, fn {k, v} ->
+      :ets.insert(label_index, {{metric_name, k, v}, series_id, labels, pid})
+    end)
+  end
+
+  defp update_label_index_pid(store, metric_name, labels, series_id, new_pid) do
+    label_index = :"#{store}_label_index"
+
+    Enum.each(labels, fn {k, v} ->
+      # Delete old entries for this series, insert new
+      :ets.match_delete(label_index, {{metric_name, k, v}, series_id, :_, :_})
+      :ets.insert(label_index, {{metric_name, k, v}, series_id, labels, new_pid})
     end)
   end
 
