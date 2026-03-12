@@ -189,7 +189,7 @@ defmodule RealisticWorkload do
 
     Finch.start_link(
       name: finch_name,
-      pools: %{default: [size: pool_size, count: 1]}
+      pools: %{default: [size: pool_size, count: 1, conn_opts: [transport_opts: [timeout: 10_000]]]}
     )
 
     client = build_client(url, finch_name)
@@ -551,7 +551,6 @@ defmodule RealisticWorkload do
     Req.new(
       base_url: url,
       retry: false,
-      connect_options: [timeout: 10_000],
       receive_timeout: 30_000,
       finch: finch_name
     )
