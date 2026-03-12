@@ -11,8 +11,30 @@ defmodule TimelessMetrics.Application do
           port = Keyword.get(config, :port, 8428)
           bearer_token = Keyword.get(config, :bearer_token)
 
+          store_opts =
+            config
+            |> Keyword.take([
+              :compression,
+              :max_blocks,
+              :block_size,
+              :flush_interval,
+              :merge_block_min_count,
+              :merge_block_max_points,
+              :merge_block_min_age_seconds,
+              :merge_compression_level,
+              :merge_interval,
+              :gc_on_compress,
+              :defer_compression,
+              :raw_buffer_max,
+              :raw_retention_seconds,
+              :daily_retention_seconds,
+              :rollup_interval,
+              :retention_interval
+            ])
+            |> Keyword.merge(name: :timeless_metrics, data_dir: data_dir)
+
           [
-            {TimelessMetrics, name: :timeless_metrics, data_dir: data_dir},
+            {TimelessMetrics, store_opts},
             {TimelessMetrics.HTTP,
              store: :timeless_metrics, port: port, bearer_token: bearer_token}
           ]

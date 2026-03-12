@@ -46,6 +46,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     merge_block_min_age_seconds: 300,
     merge_compression_level: 19,
     gc_on_compress: true,
+    defer_compression: false,
+    raw_buffer_max: 100_000,
     series_type: :numeric
   ]
 
@@ -80,6 +82,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     merge_compression_level = Keyword.get(opts, :merge_compression_level, 19)
     merge_interval = Keyword.get(opts, :merge_interval, @merge_check_ms)
     gc_on_compress = Keyword.get(opts, :gc_on_compress, true)
+    defer_compression = Keyword.get(opts, :defer_compression, false)
+    raw_buffer_max = Keyword.get(opts, :raw_buffer_max, 100_000)
     series_type = Keyword.get(opts, :series_type, :numeric)
 
     state = %__MODULE__{
@@ -97,6 +101,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       merge_block_min_age_seconds: merge_block_min_age_seconds,
       merge_compression_level: merge_compression_level,
       gc_on_compress: gc_on_compress,
+      defer_compression: defer_compression,
+      raw_buffer_max: raw_buffer_max,
       series_type: series_type
     }
 
@@ -125,10 +131,14 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     }
 
     state =
-      if state.raw_count >= state.block_size do
-        compress_buffer(state)
+      if state.defer_compression do
+        maybe_trim_raw(state)
       else
-        state
+        if state.raw_count >= state.block_size do
+          compress_buffer(state)
+        else
+          state
+        end
       end
 
     {:noreply, state}
@@ -147,10 +157,14 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     state = %{state | dirty: true, wrote_recently: true}
 
     state =
-      if state.raw_count >= state.block_size do
-        compress_buffer(state)
+      if state.defer_compression do
+        maybe_trim_raw(state)
       else
-        state
+        if state.raw_count >= state.block_size do
+          compress_buffer(state)
+        else
+          state
+        end
       end
 
     {:noreply, state}
@@ -166,10 +180,14 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     }
 
     state =
-      if state.raw_count >= state.block_size do
-        compress_buffer(state)
+      if state.defer_compression do
+        maybe_trim_raw(state)
       else
-        state
+        if state.raw_count >= state.block_size do
+          compress_buffer(state)
+        else
+          state
+        end
       end
 
     {:noreply, state}
@@ -188,10 +206,14 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     state = %{state | dirty: true, wrote_recently: true}
 
     state =
-      if state.raw_count >= state.block_size do
-        compress_buffer(state)
+      if state.defer_compression do
+        maybe_trim_raw(state)
       else
-        state
+        if state.raw_count >= state.block_size do
+          compress_buffer(state)
+        else
+          state
+        end
       end
 
     {:noreply, state}
@@ -207,7 +229,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     {state, wrote_recently} = {%{state | wrote_recently: false}, state.wrote_recently}
 
     state =
-      if state.raw_count > 0 && !wrote_recently do
+      if not state.defer_compression and state.raw_count > 0 and not wrote_recently do
         compress_buffer(state)
       else
         state
@@ -226,7 +248,9 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   end
 
   def handle_info(:maybe_merge_blocks, state) do
-    {_result, state} = maybe_merge_blocks(state)
+    {_result, state} =
+      if state.defer_compression, do: {:noop, state}, else: maybe_merge_blocks(state)
+
     merge_ref = Process.send_after(self(), :maybe_merge_blocks, @merge_check_ms)
     {:noreply, %{state | merge_ref: merge_ref}}
   end
@@ -613,6 +637,15 @@ defmodule TimelessMetrics.Actor.SeriesServer do
         state
     end
   end
+
+  # In defer_compression mode, trim the raw buffer when it exceeds the max.
+  # Keeps the newest points (head of list). Trims 25% at a time to amortize.
+  defp maybe_trim_raw(%{raw_count: count, raw_buffer_max: max} = state) when count > max do
+    keep = div(max * 3, 4)
+    %{state | raw_buffer: Enum.take(state.raw_buffer, keep), raw_count: keep}
+  end
+
+  defp maybe_trim_raw(state), do: state
 
   defp query_raw_points(%{series_type: :text} = state, from, to) do
     block_points =

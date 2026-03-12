@@ -27,7 +27,9 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     :merge_block_min_age_seconds,
     :merge_compression_level,
     :merge_interval,
-    :gc_on_compress
+    :gc_on_compress,
+    :defer_compression,
+    :raw_buffer_max
   ]
 
   # --- Client API ---
@@ -182,6 +184,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     merge_compression_level = Keyword.get(opts, :merge_compression_level, 19)
     merge_interval = Keyword.get(opts, :merge_interval, 300_000)
     gc_on_compress = Keyword.get(opts, :gc_on_compress, true)
+    defer_compression = Keyword.get(opts, :defer_compression, false)
+    raw_buffer_max = Keyword.get(opts, :raw_buffer_max, 100_000)
 
     # Create ETS index: {metric_name, encoded_labels} => series_id
     index = :"#{store}_actor_index"
@@ -210,7 +214,9 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       merge_block_min_age_seconds: merge_block_min_age_seconds,
       merge_compression_level: merge_compression_level,
       merge_interval: merge_interval,
-      gc_on_compress: gc_on_compress
+      gc_on_compress: gc_on_compress,
+      defer_compression: defer_compression,
+      raw_buffer_max: raw_buffer_max
     }
 
     # Store in persistent_term for fast client-side access
@@ -314,6 +320,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
              merge_compression_level: state.merge_compression_level,
              merge_interval: state.merge_interval,
              gc_on_compress: state.gc_on_compress,
+             defer_compression: state.defer_compression,
+             raw_buffer_max: state.raw_buffer_max,
              series_type: series_type
            ]
          ]},
