@@ -14,8 +14,16 @@
 #     --vm-url http://127.0.0.1:9428 \
 #     --devices 500 --metrics 20 --step-seconds 20 --query-workers 20
 #
+# Firehose mode (500K series, aggressive ramp):
+#   mix run bench/realistic_workload.exs \
+#     --devices 25000 --metrics 20 --batch 50 \
+#     --start-interval 0.5 --ramp-factor 4 --warmup 5
+#
 # All flags optional. --vm-url "" to skip VictoriaMetrics.
 # --steps "5,2,1,0.5" overrides auto-ramp with fixed steps.
+# --batch N groups N devices per HTTP POST (reduces client overhead at high cardinality)
+# --start-interval S start at S seconds instead of 4s (default)
+# --ramp-factor N divide interval by N each step instead of 2 (default)
 
 defmodule RealisticWorkload do
   @metric_pool ~w(
@@ -80,7 +88,11 @@ defmodule RealisticWorkload do
           metrics: :integer,
           step_seconds: :integer,
           steps: :string,
-          query_workers: :integer
+          query_workers: :integer,
+          start_interval: :float,
+          ramp_factor: :integer,
+          warmup: :integer,
+          batch: :integer
         ]
       )
 
@@ -93,7 +105,10 @@ defmodule RealisticWorkload do
     step_dur = opts[:step_seconds] || 20
     query_workers = opts[:query_workers] || 20
     settle_s = 5
-    warmup_s = 10
+    warmup_s = opts[:warmup] || 10
+    start_interval = opts[:start_interval] || 4.0
+    ramp_factor = opts[:ramp_factor] || 2
+    batch_size = opts[:batch] || 1
 
     fixed_steps =
       case opts[:steps] do
@@ -116,7 +131,10 @@ defmodule RealisticWorkload do
       settle_s: settle_s,
       warmup_s: warmup_s,
       query_workers: query_workers,
-      fixed_steps: fixed_steps
+      fixed_steps: fixed_steps,
+      start_interval: start_interval,
+      ramp_factor: ramp_factor,
+      batch_size: batch_size
     }
 
     # --- Header ---
@@ -124,16 +142,17 @@ defmodule RealisticWorkload do
     IO.puts("  " <> String.duplicate("=", 64))
     IO.puts("  Realistic Workload Benchmark — Sequential Load Ramp")
     IO.puts("  " <> String.duplicate("=", 64))
-    IO.puts("  Devices:     #{devices}")
+    IO.puts("  Devices:     #{fmt_int(devices)}")
     IO.puts("  Metrics:     #{metrics_count} per device (#{fmt_int(series_count)} series)")
 
     if fixed_steps do
       IO.puts("  Steps:       #{fixed_steps |> Enum.map(&format_interval/1) |> Enum.join(" -> ")} (fixed)")
     else
-      IO.puts("  Ramp:        auto (halve interval until saturation)")
+      IO.puts("  Ramp:        auto (÷#{ramp_factor} from #{format_interval(start_interval)} until saturation)")
     end
 
-    IO.puts("  Step dur:    #{step_dur}s (#{settle_s}s settle)")
+    IO.puts("  Step dur:    #{step_dur}s (#{settle_s}s settle, #{warmup_s}s warmup)")
+    IO.puts("  Batch:       #{batch_size} device#{if batch_size > 1, do: "s", else: ""}/POST")
     IO.puts("  Queries:     #{query_workers} workers (ramped with writes)")
     IO.puts("  Mode:        sequential (full client capacity per target)")
     IO.puts("  TM:          #{tm_url}")
@@ -177,7 +196,7 @@ defmodule RealisticWorkload do
     interval_ms = :atomics.new(1, [])
 
     initial_ms =
-      if cfg.fixed_steps, do: trunc(hd(cfg.fixed_steps) * 1000), else: 4000
+      if cfg.fixed_steps, do: trunc(hd(cfg.fixed_steps) * 1000), else: trunc(cfg.start_interval * 1000)
 
     :atomics.put(interval_ms, 1, initial_ms)
 
@@ -194,14 +213,18 @@ defmodule RealisticWorkload do
       devices: cfg.devices,
       metrics_count: cfg.metrics_count,
       step_dur: cfg.step_dur,
-      settle_s: cfg.settle_s
+      settle_s: cfg.settle_s,
+      ramp_factor: cfg.ramp_factor,
+      batch_size: cfg.batch_size
     }
 
-    # Spawn writers
+    # Spawn writers — batch devices into writer groups for high cardinality
+    writer_groups = Enum.chunk_every(device_structs, cfg.batch_size)
+
     writer_tasks =
-      for dev <- device_structs do
+      for group <- writer_groups do
         Task.async(fn ->
-          writer_loop(dev, cfg.metrics_count, client, stop, interval_ms,
+          batch_writer_loop(group, cfg.metrics_count, client, stop, interval_ms,
             write_ets, write_id, write_ctr)
         end)
       end
@@ -257,7 +280,8 @@ defmodule RealisticWorkload do
 
       case check_saturation(result, ctx.devices) do
         :ok ->
-          do_auto(max(div(int_ms, 2), 1), ctx, n + 1, acc ++ [result])
+          next_ms = max(div(int_ms, ctx.ramp_factor), 1)
+          do_auto(next_ms, ctx, n + 1, acc ++ [result])
 
         {:saturated, reason} ->
           IO.puts("  >> Saturated: #{reason}")
@@ -268,10 +292,11 @@ defmodule RealisticWorkload do
 
   defp run_one_step(int_ms, ctx) do
     int_s = int_ms / 1000
-    target_rps = trunc(ctx.devices / int_s)
-    target_pts = target_rps * ctx.metrics_count
+    writer_count = ceil(ctx.devices / ctx.batch_size)
+    target_rps = trunc(writer_count / int_s)
+    target_pts = target_rps * ctx.metrics_count * ctx.batch_size
 
-    IO.write("#{format_interval(int_s)} (~#{fmt_int(target_rps)} req/s, #{fmt_int(target_pts)} pts/s) ...")
+    IO.write("#{format_interval(int_s)} (~#{fmt_int(target_pts)} pts/s) ...")
 
     :atomics.put(ctx.interval_ms, 1, int_ms)
     Process.sleep(ctx.settle_s * 1_000)
@@ -301,6 +326,7 @@ defmodule RealisticWorkload do
       w_reqs: w_reqs,
       w_errs: w_errs,
       w_pts: w_pts,
+      w_pts_target: target_pts,
       w_lats: ets_values(ctx.write_ets),
       q_count: q_count,
       q_errs: q_errs,
@@ -315,10 +341,10 @@ defmodule RealisticWorkload do
     result
   end
 
-  defp check_saturation(r, devices) do
-    target_rps = devices / r.interval_s
-    actual_rps = r.w_reqs / r.elapsed_s
-    ratio = actual_rps / max(target_rps, 1)
+  defp check_saturation(r, _devices) do
+    target_pts = r.w_pts_target
+    actual_pts = r.w_pts / r.elapsed_s
+    ratio = actual_pts / max(target_pts, 1)
 
     w_p99 = percentile(r.w_lats, 99)
     err_rate = if r.w_reqs > 0, do: r.w_errs / r.w_reqs, else: 0
@@ -331,7 +357,7 @@ defmodule RealisticWorkload do
         {:saturated, "error rate #{Float.round(err_rate * 100, 1)}%"}
 
       ratio < @throughput_floor ->
-        {:saturated, "throughput #{trunc(ratio * 100)}% of target (client-bound)"}
+        {:saturated, "throughput #{trunc(ratio * 100)}% of target (#{fmt_int(actual_pts)} vs #{fmt_int(target_pts)} pts/s)"}
 
       true ->
         :ok
@@ -342,7 +368,7 @@ defmodule RealisticWorkload do
 
   defp pre_generate_devices(count, metrics) do
     for dev_id <- 0..(count - 1) do
-      host = "device_#{String.pad_leading(Integer.to_string(dev_id), 4, "0")}"
+      host = "device_#{String.pad_leading(Integer.to_string(dev_id), 6, "0")}"
       region = Enum.at(["us-east", "us-west", "eu-west", "ap-south"], rem(dev_id, 4))
       env = Enum.at(["prod", "staging"], rem(dev_id, 2))
       label_str = ~s(host="#{host}",region="#{region}",env="#{env}")
@@ -351,37 +377,41 @@ defmodule RealisticWorkload do
     end
   end
 
-  # --- Writer loop (single target) ---
+  # --- Writer loop (batched — one task handles N devices) ---
 
-  defp writer_loop(dev, mc, client, stop, int_ms, ets, wid, ctr) do
+  defp batch_writer_loop(devs, mc, client, stop, int_ms, ets, wid, ctr) do
     Process.sleep(:rand.uniform(:atomics.get(int_ms, 1)))
-    do_write(dev, mc, client, stop, int_ms, ets, wid, ctr)
+    do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr)
   end
 
-  defp do_write(dev, mc, client, stop, int_ms, ets, wid, ctr) do
+  defp do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr) do
     if :atomics.get(stop, 1) == 1 do
       :ok
     else
-      payload = build_payload(dev, System.os_time(:millisecond))
-      post_write(client, payload, ets, wid, ctr, mc)
+      ts_ms = System.os_time(:millisecond)
+      total_mc = mc * length(devs)
+
+      payload =
+        devs
+        |> Enum.map(&build_payload(&1, ts_ms))
+        |> IO.iodata_to_binary()
+
+      post_write(client, payload, ets, wid, ctr, total_mc)
 
       base = :atomics.get(int_ms, 1)
       jitter = max(trunc(base * 0.2), 1)
       sleep = max(base - jitter + :rand.uniform(jitter * 2), 1)
       Process.sleep(sleep)
 
-      do_write(dev, mc, client, stop, int_ms, ets, wid, ctr)
+      do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr)
     end
   end
 
   defp build_payload(dev, ts_ms) do
-    lines =
-      for {metric, labeled} <- dev.metric_lines do
-        val = gen_value(metric, ts_ms, dev.id)
-        [labeled, ?\s, Float.to_string(val), ?\s, Integer.to_string(ts_ms), ?\n]
-      end
-
-    IO.iodata_to_binary(lines)
+    for {metric, labeled} <- dev.metric_lines do
+      val = gen_value(metric, ts_ms, dev.id)
+      [labeled, ?\s, Float.to_string(val), ?\s, Integer.to_string(ts_ms), ?\n]
+    end
   end
 
   defp post_write(client, payload, ets, wid, ctr, mc) do
@@ -576,20 +606,20 @@ defmodule RealisticWorkload do
     c = @c
 
     IO.puts("  Write Latency")
-    IO.puts("  " <> String.duplicate("-", 64))
+    IO.puts("  " <> String.duplicate("-", 80))
 
     if skip_vm do
       IO.puts(
         "  " <>
           pad_r("Interval", c) <> pad_l("Req/s", c) <> pad_l("Pts/s", c) <>
-          pad_l("p50", c) <> pad_l("p99", c)
+          pad_l("p50", c) <> pad_l("p99", c) <> pad_l("p999", c)
       )
     else
       IO.puts(
         "  " <>
           pad_r("Interval", c) <>
-          pad_l("TM Req/s", c) <> pad_l("TM Pts/s", c) <> pad_l("TM p50", c) <> pad_l("TM p99", c) <>
-          pad_l("VM Req/s", c) <> pad_l("VM Pts/s", c) <> pad_l("VM p50", c) <> pad_l("VM p99", c)
+          pad_l("TM Pts/s", c) <> pad_l("TM p50", c) <> pad_l("TM p99", c) <> pad_l("TM p999", c) <>
+          pad_l("VM Pts/s", c) <> pad_l("VM p50", c) <> pad_l("VM p99", c) <> pad_l("VM p999", c)
       )
     end
 
@@ -607,26 +637,27 @@ defmodule RealisticWorkload do
               pad_l(fmt_int(tm_r.w_pts / tm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(tm_r.w_lats, 50)), c) <>
               pad_l(fmt_us(percentile(tm_r.w_lats, 99)), c) <>
+              pad_l(fmt_us(percentile(tm_r.w_lats, 99.9)), c) <>
               err_suffix(tm_r.w_errs, nil)
           )
         end
       else
         tm_part =
           if tm_r do
-            pad_l(fmt_int(tm_r.w_reqs / tm_r.elapsed_s), c) <>
-              pad_l(fmt_int(tm_r.w_pts / tm_r.elapsed_s), c) <>
+            pad_l(fmt_int(tm_r.w_pts / tm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(tm_r.w_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(tm_r.w_lats, 99)), c)
+              pad_l(fmt_us(percentile(tm_r.w_lats, 99)), c) <>
+              pad_l(fmt_us(percentile(tm_r.w_lats, 99.9)), c)
           else
             pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
           end
 
         vm_part =
           if vm_r do
-            pad_l(fmt_int(vm_r.w_reqs / vm_r.elapsed_s), c) <>
-              pad_l(fmt_int(vm_r.w_pts / vm_r.elapsed_s), c) <>
+            pad_l(fmt_int(vm_r.w_pts / vm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(vm_r.w_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(vm_r.w_lats, 99)), c)
+              pad_l(fmt_us(percentile(vm_r.w_lats, 99)), c) <>
+              pad_l(fmt_us(percentile(vm_r.w_lats, 99.9)), c)
           else
             pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
           end
@@ -644,13 +675,13 @@ defmodule RealisticWorkload do
 
     IO.puts("")
     IO.puts("  Query Latency Under Write Load")
-    IO.puts("  " <> String.duplicate("-", 64))
+    IO.puts("  " <> String.duplicate("-", 80))
 
     if skip_vm do
       IO.puts(
         "  " <>
           pad_r("W Pts/s", c) <> pad_l("Q/s", c) <>
-          pad_l("p50", c) <> pad_l("p99", c)
+          pad_l("p50", c) <> pad_l("p99", c) <> pad_l("p999", c)
       )
 
       for int_ms <- intervals do
@@ -660,7 +691,8 @@ defmodule RealisticWorkload do
               pad_r(fmt_int(tm_r.w_pts / tm_r.elapsed_s), c) <>
               pad_l(fmt_int(tm_r.q_count / tm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(tm_r.q_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(tm_r.q_lats, 99)), c)
+              pad_l(fmt_us(percentile(tm_r.q_lats, 99)), c) <>
+              pad_l(fmt_us(percentile(tm_r.q_lats, 99.9)), c)
           )
         end
       end
@@ -668,8 +700,8 @@ defmodule RealisticWorkload do
       IO.puts(
         "  " <>
           pad_r("W Pts/s", c) <>
-          pad_l("TM Q/s", c) <> pad_l("TM p50", c) <> pad_l("TM p99", c) <>
-          pad_l("VM Q/s", c) <> pad_l("VM p50", c) <> pad_l("VM p99", c)
+          pad_l("TM Q/s", c) <> pad_l("TM p50", c) <> pad_l("TM p99", c) <> pad_l("TM p999", c) <>
+          pad_l("VM Q/s", c) <> pad_l("VM p50", c) <> pad_l("VM p99", c) <> pad_l("VM p999", c)
       )
 
       for int_ms <- intervals do
@@ -684,18 +716,20 @@ defmodule RealisticWorkload do
           if tm_r && tm_r.q_count > 0 do
             pad_l(fmt_int(tm_r.q_count / tm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(tm_r.q_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(tm_r.q_lats, 99)), c)
+              pad_l(fmt_us(percentile(tm_r.q_lats, 99)), c) <>
+              pad_l(fmt_us(percentile(tm_r.q_lats, 99.9)), c)
           else
-            pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
+            pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
           end
 
         vm_q =
           if vm_r && vm_r.q_count > 0 do
             pad_l(fmt_int(vm_r.q_count / vm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(vm_r.q_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(vm_r.q_lats, 99)), c)
+              pad_l(fmt_us(percentile(vm_r.q_lats, 99)), c) <>
+              pad_l(fmt_us(percentile(vm_r.q_lats, 99.9)), c)
           else
-            pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
+            pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
           end
 
         IO.puts("  " <> pad_r(pts_label, c) <> tm_q <> vm_q)
@@ -705,7 +739,7 @@ defmodule RealisticWorkload do
 
   defp print_summary(tm_url, series_count, tm_steps, vm_steps, skip_vm) do
     IO.puts("")
-    IO.puts("  Summary")
+    IO.puts("  Summary (#{fmt_int(series_count)} series)")
     IO.puts("  " <> String.duplicate("=", 64))
 
     tm_peak = Enum.max_by(tm_steps, &(&1.w_pts / &1.elapsed_s))
