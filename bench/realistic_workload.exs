@@ -184,7 +184,8 @@ defmodule RealisticWorkload do
   # --- Run one target to saturation ---
 
   defp run_target(url, device_structs, cfg) do
-    client = build_client(url)
+    writer_count = ceil(length(device_structs) / cfg.batch_size) + cfg.query_workers + 10
+    client = build_client(url, writer_count)
 
     write_ets = :ets.new(:write, [:ordered_set, :public, {:write_concurrency, true}])
     query_ets = :ets.new(:query, [:ordered_set, :public, {:write_concurrency, true}])
@@ -417,8 +418,12 @@ defmodule RealisticWorkload do
   defp post_write(client, payload, ets, wid, ctr, mc) do
     {us, result} =
       :timer.tc(fn ->
-        Req.post(client, url: "/api/v1/import/prometheus", body: payload,
-          headers: [{"content-type", "text/plain"}])
+        try do
+          Req.post(client, url: "/api/v1/import/prometheus", body: payload,
+            headers: [{"content-type", "text/plain"}])
+        rescue
+          e -> {:error, e}
+        end
       end)
 
     id = :atomics.add_get(wid, 1, 1)
@@ -461,15 +466,19 @@ defmodule RealisticWorkload do
     query = ~s(#{metric}{host="#{dev.host}"})
 
     {us, result} =
-      case type do
-        :instant ->
-          :timer.tc(fn -> Req.get(client, url: "/api/v1/query", params: [query: query]) end)
+      try do
+        case type do
+          :instant ->
+            :timer.tc(fn -> Req.get(client, url: "/api/v1/query", params: [query: query]) end)
 
-        :range ->
-          :timer.tc(fn ->
-            Req.get(client, url: "/api/v1/query_range",
-              params: [query: query, start: now - range_s, end: now, step: step])
-          end)
+          :range ->
+            :timer.tc(fn ->
+              Req.get(client, url: "/api/v1/query_range",
+                params: [query: query, start: now - range_s, end: now, step: step])
+            end)
+        end
+      rescue
+        _ -> {0, {:error, :crashed}}
       end
 
     id = :atomics.add_get(qid, 1, 1)
@@ -526,12 +535,13 @@ defmodule RealisticWorkload do
 
   # --- Helpers ---
 
-  defp build_client(url) do
+  defp build_client(url, pool_size \\ 100) do
     Req.new(
       base_url: url,
       retry: false,
       connect_options: [timeout: 10_000],
-      receive_timeout: 30_000
+      receive_timeout: 30_000,
+      pool_size: pool_size
     )
   end
 
