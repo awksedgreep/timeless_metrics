@@ -440,7 +440,12 @@ defmodule RealisticWorkload do
 
     case result do
       {:ok, %{status: s}} when s in 200..299 -> :ok
-      _ -> :counters.add(ctr, 2, 1)
+      other ->
+        if :counters.get(ctr, 2) == 0 do
+          IO.puts("  [WRITE ERR] #{inspect(other, limit: 300)}")
+        end
+
+        :counters.add(ctr, 2, 1)
     end
   end
 
