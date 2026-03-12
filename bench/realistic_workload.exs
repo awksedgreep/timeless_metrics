@@ -184,8 +184,15 @@ defmodule RealisticWorkload do
   # --- Run one target to saturation ---
 
   defp run_target(url, device_structs, cfg) do
-    writer_count = ceil(length(device_structs) / cfg.batch_size) + cfg.query_workers + 10
-    client = build_client(url, writer_count)
+    pool_size = ceil(length(device_structs) / cfg.batch_size) + cfg.query_workers + 10
+    finch_name = :"BenchFinch_#{System.unique_integer([:positive])}"
+
+    Finch.start_link(
+      name: finch_name,
+      pools: %{default: [size: pool_size, count: 1]}
+    )
+
+    client = build_client(url, finch_name)
 
     write_ets = :ets.new(:write, [:ordered_set, :public, {:write_concurrency, true}])
     query_ets = :ets.new(:query, [:ordered_set, :public, {:write_concurrency, true}])
@@ -535,18 +542,18 @@ defmodule RealisticWorkload do
 
   # --- Helpers ---
 
-  defp build_client(url, pool_size \\ 100) do
+  defp build_client(url, finch_name) do
     Req.new(
       base_url: url,
       retry: false,
       connect_options: [timeout: 10_000],
       receive_timeout: 30_000,
-      pool_size: pool_size
+      finch: finch_name
     )
   end
 
   defp verify_target(name, url) do
-    case Req.get("#{url}/health") do
+    case Req.get("#{url}/health", retry: false) do
       {:ok, %{status: 200}} -> IO.puts("  #{name} OK at #{url}")
       other ->
         IO.puts("  ERROR: #{name} not reachable at #{url}: #{inspect(other)}")
