@@ -196,14 +196,23 @@ defmodule TimelessMetrics.Actor.Engine do
     end
   end
 
-  # Try ETS read buffer for raw points, fall back to GenServer.call
+  # Try ETS read buffer for raw points, fall back to GenServer.call.
+  # ETS only holds raw buffer points (not compressed blocks), so we can only
+  # use the fast path when we know the series has no compressed blocks.
   defp query_raw_single(store, pid, from, to) do
     %{read_buffer: read_buffer} = :persistent_term.get({SeriesManager, store})
 
     if read_buffer do
       case Registry.keys(:"#{store}_actor_registry", pid) do
         [series_id] ->
-          {:ok, read_buffer_points(read_buffer, series_id, from, to)}
+          points = read_buffer_points(read_buffer, series_id, from, to)
+
+          if points != [] do
+            {:ok, points}
+          else
+            # ETS empty — data may be in compressed blocks, ask the GenServer
+            GenServer.call(pid, {:query_raw, from, to})
+          end
 
         _ ->
           GenServer.call(pid, {:query_raw, from, to})
@@ -324,18 +333,24 @@ defmodule TimelessMetrics.Actor.Engine do
     end
   end
 
-  # Try ETS read buffer for raw points, fall back to GenServer.call
+  # Try ETS read buffer for raw points, fall back to GenServer.call.
+  # ETS only holds raw buffer points (not compressed blocks), so we can only
+  # use the fast path when we know there's data in the buffer.
   defp query_aggregate_single(store, pid, from, to, bucket, agg_fn) do
     %{read_buffer: read_buffer} = :persistent_term.get({SeriesManager, store})
 
     if read_buffer do
-      # Get series_id from the pid's registry entry
       case Registry.keys(:"#{store}_actor_registry", pid) do
         [series_id] ->
           raw_points = read_buffer_points(read_buffer, series_id, from, to)
-          bucket_seconds = TimelessMetrics.Actor.Aggregation.bucket_to_seconds(bucket)
-          buckets = TimelessMetrics.Actor.Aggregation.bucket_points(raw_points, bucket_seconds, agg_fn)
-          {:ok, buckets}
+
+          if raw_points != [] do
+            bucket_seconds = TimelessMetrics.Actor.Aggregation.bucket_to_seconds(bucket)
+            buckets = TimelessMetrics.Actor.Aggregation.bucket_points(raw_points, bucket_seconds, agg_fn)
+            {:ok, buckets}
+          else
+            GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
+          end
 
         _ ->
           GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})

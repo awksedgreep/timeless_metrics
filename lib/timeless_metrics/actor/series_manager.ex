@@ -29,7 +29,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     :merge_interval,
     :gc_on_compress,
     :defer_compression,
-    :raw_buffer_max
+    :raw_buffer_max,
+    :read_buffer
   ]
 
   # --- Client API ---
@@ -259,15 +260,25 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     # Read buffer: non-blocking read path for raw points.
     # Each series actor writes {series_id, ts, val} entries here.
     # Queries read directly from ETS, bypassing the actor mailbox.
-    read_buffer = :"#{store}_read_buffer"
+    # Default on — negligible cost at low cardinality, major win at high cardinality.
+    ets_read_buffer = Keyword.get(opts, :ets_read_buffer, true)
 
-    :ets.new(read_buffer, [
-      :named_table,
-      :duplicate_bag,
-      :public,
-      read_concurrency: true,
-      write_concurrency: :auto
-    ])
+    read_buffer =
+      if ets_read_buffer do
+        name = :"#{store}_read_buffer"
+
+        :ets.new(name, [
+          :named_table,
+          :duplicate_bag,
+          :public,
+          read_concurrency: true,
+          write_concurrency: :auto
+        ])
+
+        name
+      else
+        nil
+      end
 
     state = %__MODULE__{
       store: store,
@@ -287,7 +298,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       merge_interval: merge_interval,
       gc_on_compress: gc_on_compress,
       defer_compression: defer_compression,
-      raw_buffer_max: raw_buffer_max
+      raw_buffer_max: raw_buffer_max,
+      read_buffer: read_buffer
     }
 
     # Store in persistent_term for fast client-side access
@@ -398,7 +410,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
              defer_compression: state.defer_compression,
              raw_buffer_max: state.raw_buffer_max,
              series_type: series_type,
-             read_buffer: :"#{state.store}_read_buffer"
+             read_buffer: state.read_buffer
            ]
          ]},
       restart: :transient

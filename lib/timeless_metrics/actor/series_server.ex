@@ -722,6 +722,12 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       {:ok, {blocks, raw_buffer, _series_type}} ->
         block_count = :queue.len(blocks)
 
+        # Populate the ETS read buffer with recovered raw points
+        if state.read_buffer && raw_buffer != [] do
+          entries = Enum.map(raw_buffer, fn {ts, val} -> {state.series_id, ts, val} end)
+          :ets.insert(state.read_buffer, entries)
+        end
+
         %{
           state
           | blocks: blocks,

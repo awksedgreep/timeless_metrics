@@ -26,6 +26,7 @@ defmodule TimelessMetrics.Supervisor do
     gc_on_compress = Keyword.get(opts, :gc_on_compress, true)
     defer_compression = Keyword.get(opts, :defer_compression, false)
     raw_buffer_max = Keyword.get(opts, :raw_buffer_max, 100_000)
+    ets_read_buffer = Keyword.get(opts, :ets_read_buffer, true)
 
     raw_retention_seconds = Keyword.get(opts, :raw_retention_seconds, 604_800)
     daily_retention_seconds = Keyword.get(opts, :daily_retention_seconds, 31_536_000)
@@ -72,7 +73,8 @@ defmodule TimelessMetrics.Supervisor do
        merge_interval: merge_interval,
        gc_on_compress: gc_on_compress,
        defer_compression: defer_compression,
-       raw_buffer_max: raw_buffer_max},
+       raw_buffer_max: raw_buffer_max,
+       ets_read_buffer: ets_read_buffer},
       {TimelessMetrics.Actor.Rollup,
        name: :"#{name}_rollup",
        store: name,
