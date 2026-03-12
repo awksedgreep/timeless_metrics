@@ -151,6 +151,39 @@ defmodule TimelessMetrics.Actor.Engine do
     Stats.incr_queries(store)
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
+
+    # Fast path: exact labels → single ETS lookup
+    if exact_label_filter?(label_filter) do
+      %{index: index} = :persistent_term.get({SeriesManager, store})
+      key = {metric_name, label_filter}
+
+      case :ets.lookup(index, key) do
+        [{^key, _series_id, pid}] when is_pid(pid) ->
+          if Process.alive?(pid) do
+            try do
+              {:ok, points} = GenServer.call(pid, {:query_raw, from, to})
+
+              if points == [],
+                do: {:ok, []},
+                else: {:ok, [%{labels: label_filter, points: points}]}
+            catch
+              :exit, reason ->
+                Logger.error("TimelessMetrics: query_multi fast-path crashed: #{inspect(reason)}")
+                {:ok, []}
+            end
+          else
+            query_multi_scan(store, metric_name, label_filter, from, to)
+          end
+
+        _ ->
+          query_multi_scan(store, metric_name, label_filter, from, to)
+      end
+    else
+      query_multi_scan(store, metric_name, label_filter, from, to)
+    end
+  end
+
+  defp query_multi_scan(store, metric_name, label_filter, from, to) do
     manager = manager_name(store)
     matching = SeriesManager.find_series(manager, metric_name, label_filter)
 
@@ -198,6 +231,43 @@ defmodule TimelessMetrics.Actor.Engine do
     bucket = Keyword.fetch!(opts, :bucket)
     agg_fn = Keyword.fetch!(opts, :aggregate)
     transform = Keyword.get(opts, :transform)
+
+    # Fast path: exact label filter can resolve to a single series via ETS lookup
+    # instead of scanning all series for this metric
+    if exact_label_filter?(label_filter) and map_size(label_filter) > 0 do
+      %{index: index} = :persistent_term.get({SeriesManager, store})
+      key = {metric_name, label_filter}
+
+      case :ets.lookup(index, key) do
+        [{^key, _series_id, pid}] when is_pid(pid) ->
+          if Process.alive?(pid) do
+            try do
+              {:ok, buckets} = GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
+
+              case TimelessMetrics.Transform.apply(buckets, transform) do
+                [] -> {:ok, []}
+                data -> {:ok, [%{labels: label_filter, data: data}]}
+              end
+            catch
+              :exit, reason ->
+                Logger.error("TimelessMetrics: query_aggregate_multi fast-path crashed: #{inspect(reason)}")
+                {:ok, []}
+            end
+          else
+            # Process dead — fall through to slow path to restart it
+            query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform)
+          end
+
+        _ ->
+          # Not found — could be a new series or partial label match
+          query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform)
+      end
+    else
+      query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform)
+    end
+  end
+
+  defp query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform) do
     manager = manager_name(store)
     matching = SeriesManager.find_series(manager, metric_name, label_filter)
 
@@ -229,6 +299,17 @@ defmodule TimelessMetrics.Actor.Engine do
       end)
 
     {:ok, results}
+  end
+
+  # Returns true if the label filter contains only exact string matches
+  # (no regex, not_regex, not_equal, or other special operators)
+  defp exact_label_filter?(filter) when map_size(filter) == 0, do: false
+
+  defp exact_label_filter?(filter) do
+    Enum.all?(filter, fn
+      {_k, v} when is_binary(v) -> true
+      _ -> false
+    end)
   end
 
   @doc "Query with cross-series aggregation, grouping by label key."
