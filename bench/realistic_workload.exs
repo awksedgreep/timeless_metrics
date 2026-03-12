@@ -228,10 +228,16 @@ defmodule RealisticWorkload do
 
     # Spawn writers — batch devices into writer groups for high cardinality
     writer_groups = Enum.chunk_every(device_structs, cfg.batch_size)
+    num_groups = length(writer_groups)
+    # Stagger startup across warmup to avoid thundering herd on series creation
+    stagger_ms = max(cfg.warmup_s * 500, 1000)
 
     writer_tasks =
-      for group <- writer_groups do
+      for {group, idx} <- Enum.with_index(writer_groups) do
+        delay = div(stagger_ms * idx, max(num_groups, 1))
+
         Task.async(fn ->
+          Process.sleep(delay)
           batch_writer_loop(group, cfg.metrics_count, client, stop, interval_ms,
             write_ets, write_id, write_ctr)
         end)
@@ -440,11 +446,7 @@ defmodule RealisticWorkload do
 
     case result do
       {:ok, %{status: s}} when s in 200..299 -> :ok
-      other ->
-        if :counters.get(ctr, 2) == 0 do
-          IO.puts("  [WRITE ERR] #{inspect(other, limit: 300)}")
-        end
-
+      _ ->
         :counters.add(ctr, 2, 1)
     end
   end
