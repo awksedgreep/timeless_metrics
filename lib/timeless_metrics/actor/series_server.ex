@@ -125,7 +125,10 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
   @impl true
   def handle_info({:write, ts, val}, state) do
-    if state.read_buffer, do: :ets.insert(state.read_buffer, {state.series_id, ts, val})
+    if state.read_buffer do
+      seq = :erlang.unique_integer([:monotonic])
+      :ets.insert(state.read_buffer, {{state.series_id, ts, seq}, val})
+    end
 
     state = %{
       state
@@ -141,7 +144,11 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
   def handle_info({:write_batch, points}, state) do
     if state.read_buffer do
-      entries = Enum.map(points, fn {ts, val} -> {state.series_id, ts, val} end)
+      entries =
+        Enum.map(points, fn {ts, val} ->
+          {{state.series_id, ts, :erlang.unique_integer([:monotonic])}, val}
+        end)
+
       :ets.insert(state.read_buffer, entries)
     end
 
@@ -160,7 +167,10 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   end
 
   def handle_info({:write_text, ts, val}, state) do
-    if state.read_buffer, do: :ets.insert(state.read_buffer, {state.series_id, ts, val})
+    if state.read_buffer do
+      seq = :erlang.unique_integer([:monotonic])
+      :ets.insert(state.read_buffer, {{state.series_id, ts, seq}, val})
+    end
 
     state = %{
       state
@@ -176,7 +186,11 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
   def handle_info({:write_text_batch, points}, state) do
     if state.read_buffer do
-      entries = Enum.map(points, fn {ts, val} -> {state.series_id, ts, val} end)
+      entries =
+        Enum.map(points, fn {ts, val} ->
+          {{state.series_id, ts, :erlang.unique_integer([:monotonic])}, val}
+        end)
+
       :ets.insert(state.read_buffer, entries)
     end
 
@@ -589,8 +603,14 @@ defmodule TimelessMetrics.Actor.SeriesServer do
         {blocks, block_count}
       end
 
-    # Clear the ETS read buffer — these points are now in the compressed block
-    if state.read_buffer, do: :ets.delete(state.read_buffer, state.series_id)
+    # Delete the compressed entries from ETS (they're now in the block).
+    # Only removes entries up to last_ts, preserving any points written
+    # between the start of compression and now.
+    if state.read_buffer do
+      :ets.select_delete(state.read_buffer, [
+        {{{state.series_id, :"$1", :_}, :_}, [{:"=<", :"$1", last_ts}], [true]}
+      ])
+    end
 
     if state.gc_on_compress, do: :erlang.garbage_collect()
 
@@ -608,14 +628,18 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   # Keeps the newest points (head of list). Trims 25% at a time to amortize.
   defp maybe_trim_raw(%{raw_count: count, raw_buffer_max: max} = state) when count > max do
     keep = div(max * 3, 4)
-    # Rebuild ETS read buffer with only the kept points
-    if state.read_buffer do
-      kept = Enum.take(state.raw_buffer, keep)
-      :ets.delete(state.read_buffer, state.series_id)
-      entries = Enum.map(kept, fn {ts, val} -> {state.series_id, ts, val} end)
-      if entries != [], do: :ets.insert(state.read_buffer, entries)
+    kept = Enum.take(state.raw_buffer, keep)
+
+    # Trim ETS to match: delete entries older than the oldest kept point
+    if state.read_buffer && kept != [] do
+      {oldest_ts, _} = List.last(kept)
+
+      :ets.select_delete(state.read_buffer, [
+        {{{state.series_id, :"$1", :_}, :_}, [{:<, :"$1", oldest_ts}], [true]}
+      ])
     end
-    %{state | raw_buffer: Enum.take(state.raw_buffer, keep), raw_count: keep}
+
+    %{state | raw_buffer: kept, raw_count: keep}
   end
 
   defp maybe_trim_raw(state), do: state
@@ -724,7 +748,11 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
         # Populate the ETS read buffer with recovered raw points
         if state.read_buffer && raw_buffer != [] do
-          entries = Enum.map(raw_buffer, fn {ts, val} -> {state.series_id, ts, val} end)
+          entries =
+            Enum.map(raw_buffer, fn {ts, val} ->
+              {{state.series_id, ts, :erlang.unique_integer([:monotonic])}, val}
+            end)
+
           :ets.insert(state.read_buffer, entries)
         end
 

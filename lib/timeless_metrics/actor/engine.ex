@@ -197,8 +197,10 @@ defmodule TimelessMetrics.Actor.Engine do
   end
 
   # Try ETS read buffer for raw points, fall back to GenServer.call.
-  # ETS only holds raw buffer points (not compressed blocks), so we can only
-  # use the fast path when we know the series has no compressed blocks.
+  # ETS retains points through compression (trimmed only by raw retention),
+  # so this fast path serves most queries within the retention window.
+  # Falls back to GenServer.call only when ETS has no data for the range
+  # (e.g., series just started, or query extends beyond retention).
   defp query_raw_single(store, pid, from, to) do
     %{read_buffer: read_buffer} = :persistent_term.get({SeriesManager, store})
 
@@ -210,7 +212,6 @@ defmodule TimelessMetrics.Actor.Engine do
           if points != [] do
             {:ok, points}
           else
-            # ETS empty — data may be in compressed blocks, ask the GenServer
             GenServer.call(pid, {:query_raw, from, to})
           end
 
@@ -333,9 +334,9 @@ defmodule TimelessMetrics.Actor.Engine do
     end
   end
 
-  # Try ETS read buffer for raw points, fall back to GenServer.call.
-  # ETS only holds raw buffer points (not compressed blocks), so we can only
-  # use the fast path when we know there's data in the buffer.
+  # Try ETS read buffer for aggregate queries, fall back to GenServer.call.
+  # ETS retains points through compression, so the fast path covers most
+  # queries within the raw retention window without touching the mailbox.
   defp query_aggregate_single(store, pid, from, to, bucket, agg_fn) do
     %{read_buffer: read_buffer} = :persistent_term.get({SeriesManager, store})
 
@@ -360,14 +361,15 @@ defmodule TimelessMetrics.Actor.Engine do
     end
   end
 
-  # Read raw points from the ETS read buffer — no mailbox, no blocking
+  # Read raw points from the ETS read buffer — no mailbox, no blocking.
+  # Uses :ets.select on an ordered_set with composite key {series_id, ts, seq}
+  # for efficient range scans. Results are pre-sorted by timestamp.
   defp read_buffer_points(read_buffer, series_id, from, to) do
-    :ets.lookup(read_buffer, series_id)
-    |> Enum.flat_map(fn
-      {_sid, ts, val} when ts >= from and ts <= to -> [{ts, val}]
-      _ -> []
-    end)
-    |> Enum.sort_by(&elem(&1, 0))
+    :ets.select(read_buffer, [
+      {{{series_id, :"$1", :_}, :"$2"},
+       [{:andalso, {:>=, :"$1", from}, {:"=<", :"$1", to}}],
+       [{{:"$1", :"$2"}}]}
+    ])
   end
 
   # Fan-out to multiple series via Task.async_stream

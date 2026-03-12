@@ -269,7 +269,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
         :ets.new(name, [
           :named_table,
-          :duplicate_bag,
+          :ordered_set,
           :public,
           read_concurrency: true,
           write_concurrency: :auto
