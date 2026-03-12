@@ -48,7 +48,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     gc_on_compress: true,
     defer_compression: false,
     raw_buffer_max: 100_000,
-    series_type: :numeric
+    series_type: :numeric,
+    read_buffer: nil
   ]
 
   # --- Client API ---
@@ -85,6 +86,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     defer_compression = Keyword.get(opts, :defer_compression, false)
     raw_buffer_max = Keyword.get(opts, :raw_buffer_max, 100_000)
     series_type = Keyword.get(opts, :series_type, :numeric)
+    read_buffer = Keyword.get(opts, :read_buffer)
 
     state = %__MODULE__{
       series_id: series_id,
@@ -103,7 +105,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       gc_on_compress: gc_on_compress,
       defer_compression: defer_compression,
       raw_buffer_max: raw_buffer_max,
-      series_type: series_type
+      series_type: series_type,
+      read_buffer: read_buffer
     }
 
     # Load existing data from disk
@@ -122,6 +125,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
   @impl true
   def handle_info({:write, ts, val}, state) do
+    if state.read_buffer, do: :ets.insert(state.read_buffer, {state.series_id, ts, val})
+
     state = %{
       state
       | raw_buffer: [{ts, val} | state.raw_buffer],
@@ -130,21 +135,16 @@ defmodule TimelessMetrics.Actor.SeriesServer do
         wrote_recently: true
     }
 
-    state =
-      if state.defer_compression do
-        maybe_trim_raw(state)
-      else
-        if state.raw_count >= state.block_size do
-          compress_buffer(state)
-        else
-          state
-        end
-      end
-
+    state = maybe_compress(state)
     {:noreply, state}
   end
 
   def handle_info({:write_batch, points}, state) do
+    if state.read_buffer do
+      entries = Enum.map(points, fn {ts, val} -> {state.series_id, ts, val} end)
+      :ets.insert(state.read_buffer, entries)
+    end
+
     state =
       Enum.reduce(points, state, fn {ts, val}, acc ->
         %{
@@ -155,22 +155,13 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       end)
 
     state = %{state | dirty: true, wrote_recently: true}
-
-    state =
-      if state.defer_compression do
-        maybe_trim_raw(state)
-      else
-        if state.raw_count >= state.block_size do
-          compress_buffer(state)
-        else
-          state
-        end
-      end
-
+    state = maybe_compress(state)
     {:noreply, state}
   end
 
   def handle_info({:write_text, ts, val}, state) do
+    if state.read_buffer, do: :ets.insert(state.read_buffer, {state.series_id, ts, val})
+
     state = %{
       state
       | raw_buffer: [{ts, val} | state.raw_buffer],
@@ -179,21 +170,16 @@ defmodule TimelessMetrics.Actor.SeriesServer do
         wrote_recently: true
     }
 
-    state =
-      if state.defer_compression do
-        maybe_trim_raw(state)
-      else
-        if state.raw_count >= state.block_size do
-          compress_buffer(state)
-        else
-          state
-        end
-      end
-
+    state = maybe_compress(state)
     {:noreply, state}
   end
 
   def handle_info({:write_text_batch, points}, state) do
+    if state.read_buffer do
+      entries = Enum.map(points, fn {ts, val} -> {state.series_id, ts, val} end)
+      :ets.insert(state.read_buffer, entries)
+    end
+
     state =
       Enum.reduce(points, state, fn {ts, val}, acc ->
         %{
@@ -204,18 +190,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       end)
 
     state = %{state | dirty: true, wrote_recently: true}
-
-    state =
-      if state.defer_compression do
-        maybe_trim_raw(state)
-      else
-        if state.raw_count >= state.block_size do
-          compress_buffer(state)
-        else
-          state
-        end
-      end
-
+    state = maybe_compress(state)
     {:noreply, state}
   end
 
@@ -387,6 +362,20 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     :ok
   end
 
+  # --- Write helpers ---
+
+  defp maybe_compress(state) do
+    if state.defer_compression do
+      maybe_trim_raw(state)
+    else
+      if state.raw_count >= state.block_size do
+        compress_buffer(state)
+      else
+        state
+      end
+    end
+  end
+
   # --- Internals ---
 
   defp maybe_merge_blocks(state) do
@@ -551,37 +540,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
     case TextCodec.compress(sorted) do
       {:ok, data} ->
-        {first_ts, _} = List.first(sorted)
-        {last_ts, _} = List.last(sorted)
-
-        block = %{
-          start_ts: first_ts,
-          end_ts: last_ts,
-          point_count: state.raw_count,
-          data: data
-        }
-
-        blocks = :queue.in(block, state.blocks)
-        block_count = state.block_count + 1
-
-        {blocks, block_count} =
-          if block_count > state.max_blocks do
-            {{:value, _dropped}, remaining} = :queue.out(blocks)
-            {remaining, block_count - 1}
-          else
-            {blocks, block_count}
-          end
-
-        if state.gc_on_compress, do: :erlang.garbage_collect()
-
-        %{
-          state
-          | blocks: blocks,
-            block_count: block_count,
-            raw_buffer: [],
-            raw_count: 0,
-            dirty: true
-        }
+        finalize_compression(state, sorted, data)
 
       {:error, reason} ->
         Logger.error(
@@ -597,37 +556,7 @@ defmodule TimelessMetrics.Actor.SeriesServer do
 
     case GorillaStream.compress(sorted, compression: state.compression) do
       {:ok, data} ->
-        {first_ts, _} = List.first(sorted)
-        {last_ts, _} = List.last(sorted)
-
-        block = %{
-          start_ts: first_ts,
-          end_ts: last_ts,
-          point_count: state.raw_count,
-          data: data
-        }
-
-        blocks = :queue.in(block, state.blocks)
-        block_count = state.block_count + 1
-
-        {blocks, block_count} =
-          if block_count > state.max_blocks do
-            {{:value, _dropped}, remaining} = :queue.out(blocks)
-            {remaining, block_count - 1}
-          else
-            {blocks, block_count}
-          end
-
-        if state.gc_on_compress, do: :erlang.garbage_collect()
-
-        %{
-          state
-          | blocks: blocks,
-            block_count: block_count,
-            raw_buffer: [],
-            raw_count: 0,
-            dirty: true
-        }
+        finalize_compression(state, sorted, data)
 
       {:error, reason} ->
         Logger.error(
@@ -638,10 +567,54 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     end
   end
 
+  defp finalize_compression(state, sorted, data) do
+    {first_ts, _} = List.first(sorted)
+    {last_ts, _} = List.last(sorted)
+
+    block = %{
+      start_ts: first_ts,
+      end_ts: last_ts,
+      point_count: state.raw_count,
+      data: data
+    }
+
+    blocks = :queue.in(block, state.blocks)
+    block_count = state.block_count + 1
+
+    {blocks, block_count} =
+      if block_count > state.max_blocks do
+        {{:value, _dropped}, remaining} = :queue.out(blocks)
+        {remaining, block_count - 1}
+      else
+        {blocks, block_count}
+      end
+
+    # Clear the ETS read buffer — these points are now in the compressed block
+    if state.read_buffer, do: :ets.delete(state.read_buffer, state.series_id)
+
+    if state.gc_on_compress, do: :erlang.garbage_collect()
+
+    %{
+      state
+      | blocks: blocks,
+        block_count: block_count,
+        raw_buffer: [],
+        raw_count: 0,
+        dirty: true
+    }
+  end
+
   # In defer_compression mode, trim the raw buffer when it exceeds the max.
   # Keeps the newest points (head of list). Trims 25% at a time to amortize.
   defp maybe_trim_raw(%{raw_count: count, raw_buffer_max: max} = state) when count > max do
     keep = div(max * 3, 4)
+    # Rebuild ETS read buffer with only the kept points
+    if state.read_buffer do
+      kept = Enum.take(state.raw_buffer, keep)
+      :ets.delete(state.read_buffer, state.series_id)
+      entries = Enum.map(kept, fn {ts, val} -> {state.series_id, ts, val} end)
+      if entries != [], do: :ets.insert(state.read_buffer, entries)
+    end
     %{state | raw_buffer: Enum.take(state.raw_buffer, keep), raw_count: keep}
   end
 

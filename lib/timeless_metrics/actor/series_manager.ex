@@ -256,6 +256,19 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       write_concurrency: :auto
     ])
 
+    # Read buffer: non-blocking read path for raw points.
+    # Each series actor writes {series_id, ts, val} entries here.
+    # Queries read directly from ETS, bypassing the actor mailbox.
+    read_buffer = :"#{store}_read_buffer"
+
+    :ets.new(read_buffer, [
+      :named_table,
+      :duplicate_bag,
+      :public,
+      read_concurrency: true,
+      write_concurrency: :auto
+    ])
+
     state = %__MODULE__{
       store: store,
       db: db,
@@ -279,7 +292,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
     # Store in persistent_term for fast client-side access
     # Keyed by manager name (for get_or_start) and by store atom (for hot-path writes)
-    info = %{index: index, label_index: label_index, registry: registry, db: db, manager: name}
+    info = %{index: index, label_index: label_index, read_buffer: read_buffer, registry: registry, db: db, manager: name}
     :persistent_term.put({__MODULE__, name}, info)
     :persistent_term.put({__MODULE__, store}, info)
 
@@ -384,7 +397,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
              gc_on_compress: state.gc_on_compress,
              defer_compression: state.defer_compression,
              raw_buffer_max: state.raw_buffer_max,
-             series_type: series_type
+             series_type: series_type,
+             read_buffer: :"#{state.store}_read_buffer"
            ]
          ]},
       restart: :transient

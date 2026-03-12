@@ -143,7 +143,7 @@ defmodule TimelessMetrics.Actor.Engine do
     to = Keyword.get(opts, :to, System.os_time(:second))
     manager = manager_name(store)
     {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
-    GenServer.call(pid, {:query_raw, from, to})
+    query_raw_single(store, pid, from, to)
   end
 
   @doc "Query raw points across multiple series matching a label filter."
@@ -181,7 +181,7 @@ defmodule TimelessMetrics.Actor.Engine do
   defp query_multi_direct(pid, labels, from, to, store, metric_name) do
     if Process.alive?(pid) do
       try do
-        {:ok, points} = GenServer.call(pid, {:query_raw, from, to})
+        {:ok, points} = query_raw_single(store, pid, from, to)
 
         if points == [],
           do: {:ok, []},
@@ -193,6 +193,23 @@ defmodule TimelessMetrics.Actor.Engine do
       end
     else
       query_multi_scan(store, metric_name, labels, from, to)
+    end
+  end
+
+  # Try ETS read buffer for raw points, fall back to GenServer.call
+  defp query_raw_single(store, pid, from, to) do
+    %{read_buffer: read_buffer} = :persistent_term.get({SeriesManager, store})
+
+    if read_buffer do
+      case Registry.keys(:"#{store}_actor_registry", pid) do
+        [series_id] ->
+          {:ok, read_buffer_points(read_buffer, series_id, from, to)}
+
+        _ ->
+          GenServer.call(pid, {:query_raw, from, to})
+      end
+    else
+      GenServer.call(pid, {:query_raw, from, to})
     end
   end
 
@@ -246,7 +263,7 @@ defmodule TimelessMetrics.Actor.Engine do
     agg_fn = Keyword.fetch!(opts, :aggregate)
     manager = manager_name(store)
     {_id, pid} = SeriesManager.get_or_start(manager, metric_name, labels)
-    GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
+    query_aggregate_single(store, pid, from, to, bucket, agg_fn)
   end
 
   @doc "Query with aggregation across multiple series matching a label filter."
@@ -287,11 +304,11 @@ defmodule TimelessMetrics.Actor.Engine do
     end
   end
 
-  # Direct call to a single known-alive series — no Task.async_stream overhead
+  # Direct query for a single series — tries ETS read buffer first, falls back to GenServer.call
   defp query_aggregate_multi_direct(pid, labels, from, to, bucket, agg_fn, transform, store, metric_name) do
     if Process.alive?(pid) do
       try do
-        {:ok, buckets} = GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
+        {:ok, buckets} = query_aggregate_single(store, pid, from, to, bucket, agg_fn)
 
         case TimelessMetrics.Transform.apply(buckets, transform) do
           [] -> {:ok, []}
@@ -305,6 +322,37 @@ defmodule TimelessMetrics.Actor.Engine do
     else
       query_aggregate_multi_scan(store, metric_name, labels, from, to, bucket, agg_fn, transform)
     end
+  end
+
+  # Try ETS read buffer for raw points, fall back to GenServer.call
+  defp query_aggregate_single(store, pid, from, to, bucket, agg_fn) do
+    %{read_buffer: read_buffer} = :persistent_term.get({SeriesManager, store})
+
+    if read_buffer do
+      # Get series_id from the pid's registry entry
+      case Registry.keys(:"#{store}_actor_registry", pid) do
+        [series_id] ->
+          raw_points = read_buffer_points(read_buffer, series_id, from, to)
+          bucket_seconds = TimelessMetrics.Actor.Aggregation.bucket_to_seconds(bucket)
+          buckets = TimelessMetrics.Actor.Aggregation.bucket_points(raw_points, bucket_seconds, agg_fn)
+          {:ok, buckets}
+
+        _ ->
+          GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
+      end
+    else
+      GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
+    end
+  end
+
+  # Read raw points from the ETS read buffer — no mailbox, no blocking
+  defp read_buffer_points(read_buffer, series_id, from, to) do
+    :ets.lookup(read_buffer, series_id)
+    |> Enum.flat_map(fn
+      {_sid, ts, val} when ts >= from and ts <= to -> [{ts, val}]
+      _ -> []
+    end)
+    |> Enum.sort_by(&elem(&1, 0))
   end
 
   # Fan-out to multiple series via Task.async_stream
