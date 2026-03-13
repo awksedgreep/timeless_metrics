@@ -92,7 +92,7 @@ defmodule TimelessMetrics.Supervisor do
     children =
       [
         {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
-        {TimelessMetrics.SeriesRegistry, name: registry_name, db: db_name},
+        {TimelessMetrics.SeriesRegistry, name: registry_name, db: db_name, store: name},
         {TimelessMetrics.DictTrainer, name: dict_trainer_name, store: name, data_dir: data_dir}
       ] ++
         builder_and_buffer_shards ++

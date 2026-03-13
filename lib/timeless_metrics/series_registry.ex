@@ -13,7 +13,7 @@ defmodule TimelessMetrics.SeriesRegistry do
 
   @publish_interval_ms 5_000
 
-  defstruct [:forward_key, :reverse_key, :overflow, :db, :name, :dirty]
+  defstruct [:forward_key, :reverse_key, :overflow, :db, :name, :store, :dirty]
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -76,6 +76,7 @@ defmodule TimelessMetrics.SeriesRegistry do
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
     db = Keyword.fetch!(opts, :db)
+    store = Keyword.get(opts, :store)
     fwd_key = forward_key(name)
     rev_key = reverse_key(name)
 
@@ -104,6 +105,7 @@ defmodule TimelessMetrics.SeriesRegistry do
        overflow: overflow,
        db: db,
        name: name,
+       store: store,
        dirty: false
      }}
   end
@@ -132,6 +134,8 @@ defmodule TimelessMetrics.SeriesRegistry do
               )
 
             {:ok, [[id]]} = result
+
+            if state.store, do: TimelessMetrics.Stats.incr_series_created(state.store)
 
             # Write to ETS overflow (immediate visibility, no literal-heap cost)
             :ets.insert(state.overflow, {key, id})

@@ -54,6 +54,7 @@ defmodule TimelessMetrics do
     series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
     shard_count = buffer_shard_count(store)
     shard_idx = rem(abs(series_id), shard_count)
+    TimelessMetrics.Stats.incr_writes(store)
     TimelessMetrics.Stats.add_points(store, 1)
     TimelessMetrics.Buffer.write(:"#{store}_shard_#{shard_idx}", series_id, timestamp, value)
   end
@@ -67,6 +68,7 @@ defmodule TimelessMetrics do
   def write_batch(store, entries) do
     registry = :"#{store}_registry"
     shard_count = buffer_shard_count(store)
+    TimelessMetrics.Stats.incr_writes(store)
     TimelessMetrics.Stats.add_points(store, length(entries))
 
     if length(entries) >= @parallel_batch_threshold do
