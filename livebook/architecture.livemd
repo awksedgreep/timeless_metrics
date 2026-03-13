@@ -45,7 +45,10 @@ A write enters through `TimelessMetrics.write/4` (numeric) or `write_text/5` (te
 which delegates to `Engine`. The engine resolves each `{metric, labels}` pair to a
 `SeriesServer` pid via `SeriesManager.get_or_start` — a hot path using ETS + Registry
 that completes in microseconds. For text series, `get_or_start` receives `:text` as the
-series type. The actual write is a non-blocking `GenServer.cast`, so callers never wait.
+series type. The actual write is a fire-and-forget `send/2`, so callers never wait.
+Each write also inserts into a shared **ETS read buffer** — an `ordered_set` table with
+composite key `{series_id, ts, seq}` — enabling lock-free query reads without touching
+the series process mailbox (see ETS Read Buffer section below).
 Inside the `SeriesServer`, points accumulate in `raw_buffer` until `block_size` (default
 
 1. is reached, at which point they are compressed into a block — using GorillaStream +
@@ -75,10 +78,11 @@ flowchart TD
         StartChild --> PID
     end
 
-    PID --> Cast["GenServer.cast(pid, {:write, ts, val})"]
+    PID --> Cast["send(pid, {:write, ts, val})"]
 
     subgraph SeriesServer
-        Cast --> Prepend["Prepend {ts, val} to raw_buffer"]
+        Cast --> ETSBuf[":ets.insert(read_buffer,<br/>{{series_id, ts, seq}, val})"]
+        ETSBuf --> Prepend["Prepend {ts, val} to raw_buffer"]
         Prepend --> Check{"raw_count >= block_size?"}
         Check -->|yes| Compress["compress_buffer/1"]
         Check -->|no| Wait["Await more writes"]
@@ -105,51 +109,111 @@ flowchart TD
 
 ## Read / Query Path
 
-Queries enter through `TimelessMetrics.query*/4` functions. For multi-series queries,
-`SeriesManager.find_series` pattern-matches the ETS index to discover all series matching
-a metric name and label filter. The engine then fans out `GenServer.call` requests in
-parallel via `Task.async_stream` (concurrency = scheduler count). Each `SeriesServer`
-decompresses overlapping blocks, filters the raw buffer by time range, merges and sorts
-the results. For aggregation queries, bucketing and aggregate computation happen
-in-process before the reply. Cross-series aggregation (group-by) merges results after
-the fan-out completes.
+Queries enter through `TimelessMetrics.query*/4` functions. For single-series queries
+(the common case for dashboard polling), the engine first tries the **ETS read buffer** —
+a shared `ordered_set` table that holds recent points for all series. A `:ets.select`
+call with a match specification performs an efficient range scan using the composite key
+`{series_id, ts, seq}`, returning results pre-sorted by timestamp with zero mailbox
+contention. This lock-free fast path serves the vast majority of queries that target
+the raw retention window (24-48 hours). The engine falls back to `GenServer.call` only
+when the ETS buffer has no data for the requested range (e.g., series just started, or
+query extends beyond retention).
+
+For multi-series queries, `SeriesManager.find_series` pattern-matches the ETS index to
+discover all matching series, then fans out in parallel via `Task.async_stream`.
+Single-match results use the ETS fast path; multi-match results fan out `GenServer.call`
+requests. Cross-series aggregation (group-by) merges results after the fan-out completes.
 
 ```mermaid
 sequenceDiagram
     participant C as Caller
     participant E as Engine
+    participant RB as ETS Read Buffer
     participant SM as SeriesManager
     participant ETS as ETS Index
     participant T as Task.async_stream
     participant SS1 as SeriesServer 1
     participant SS2 as SeriesServer N
-    participant A as Aggregation
 
     C->>E: query_aggregate_multi(store, metric, label_filter, opts)
     E->>SM: find_series(manager, metric, label_filter)
     SM->>ETS: match_object({metric, :_}, :_)
     ETS-->>SM: [{key, series_id}, ...]
-    SM->>SM: decode labels, filter by label_filter
-    SM->>SM: Registry.lookup each series_id
     SM-->>E: [{series_id, labels, pid}, ...]
 
-    E->>T: async_stream(matching, max_concurrency: schedulers)
+    alt Single series match (fast path)
+        E->>RB: :ets.select(read_buffer, match_spec)
+        Note over RB: ordered_set range scan on<br/>{series_id, from..to, _seq}
+        RB-->>E: [{ts, value}, ...] pre-sorted
 
-    par Fan-out to all matching series
-        T->>SS1: GenServer.call({:query_aggregate, from, to, bucket, agg_fn})
-        SS1->>SS1: Decompress overlapping blocks
-        SS1->>SS1: Filter raw_buffer by [from, to]
-        SS1->>SS1: Merge + sort by timestamp
-        SS1->>A: bucket_points(points, bucket_seconds, agg_fn)
-        A-->>SS1: [{bucket_ts, agg_value}, ...]
-        SS1-->>T: {:ok, buckets}
-    and
-        T->>SS2: GenServer.call({:query_aggregate, from, to, bucket, agg_fn})
-        SS2-->>T: {:ok, buckets}
+        alt ETS has data
+            E->>E: bucket_points + aggregate
+            E-->>C: {:ok, [%{labels, data}]}
+        else ETS empty — fallback
+            E->>SS1: GenServer.call({:query_aggregate, ...})
+            SS1-->>E: {:ok, buckets}
+            E-->>C: {:ok, [%{labels, data}]}
+        end
+    else Multiple series match (fan-out)
+        E->>T: async_stream(matching, max_concurrency: schedulers)
+        par
+            T->>SS1: GenServer.call({:query_aggregate, ...})
+            SS1-->>T: {:ok, buckets}
+        and
+            T->>SS2: GenServer.call({:query_aggregate, ...})
+            SS2-->>T: {:ok, buckets}
+        end
+        T-->>E: [%{labels, data}, ...]
+        E-->>C: {:ok, results}
     end
+```
 
-    T-->>E: [%{labels: l, data: [...]}, ...]
-    E-->>C: {:ok, results}
+## ETS Read Buffer
+
+The ETS read buffer decouples query reads from series process mailboxes. Without it,
+every query requires a `GenServer.call` into the series process, competing with queued
+write messages and blocking under high write throughput.
+
+SeriesManager creates a single ETS table per store:
+
+| Property | Value | Rationale |
+| --- | --- | --- |
+| Type | `ordered_set` | Efficient range scans via `:ets.select` |
+| Key | `{series_id, timestamp, seq}` | Composite key for per-series range queries |
+| Value | `value` (float) | Single numeric value per entry |
+| Access | `:public`, `read_concurrency: true` | Lock-free concurrent reads from any process |
+| Write concurrency | `:auto` | BEAM tunes write locks per scheduler |
+
+The monotonic sequence number (`seq = :erlang.unique_integer([:monotonic])`) ensures
+duplicate timestamps within the same series are preserved — without it, `ordered_set`
+would overwrite entries with identical `{series_id, ts}` keys.
+
+**Query match specification:**
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+:ets.select(read_buffer, [
+  {{{series_id, :"$1", :_}, :"$2"},
+   [{:andalso, {:>=, :"$1", from}, {:"=<", :"$1", to}}],
+   [{{:"$1", :"$2"}}]}
+])
+```
+
+This pushes timestamp filtering into C-level ETS code. The `ordered_set` returns
+results pre-sorted by `{series_id, ts, seq}`, so no additional sorting is needed.
+
+**Range-aware compression cleanup:** when a series compresses its raw buffer into a
+block, only ETS entries up to the block's `last_ts` are removed — not all entries for
+that series. This prevents a brief window where the ETS buffer is empty, which would
+force queries to fall back to `GenServer.call` and contend with the write message queue.
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+:ets.select_delete(read_buffer, [
+  {{{series_id, :"$1", :_}, :_}, [{:"=<", :"$1", last_ts}], [true]}
+])
 ```
 
 ## Storage Layer

@@ -50,12 +50,14 @@ write(store, metric_name, labels, value)
 Engine.write/5
   │
   ▼
-SeriesManager.ensure_series/4
-  ├── Registry lookup (fast path: actor already exists)
-  └── Start new SeriesServer via DynamicSupervisor (cold path)
+SeriesManager.get_or_start/4
+  ├── ETS index lookup (fast path: actor already exists)
+  └── GenServer.call → SQLite INSERT → DynamicSupervisor.start_child (cold path)
   │
   ▼
-SeriesServer.write/2
+send(pid, {:write, ts, val})       ← fire-and-forget, caller never blocks
+  │
+  ├──► :ets.insert(read_buffer, {{series_id, ts, seq}, val})   ← shared ETS read buffer
   │
   ▼
 Raw buffer (in-process list)
@@ -63,11 +65,12 @@ Raw buffer (in-process list)
   ▼
 Block compression (Gorilla delta-of-delta + XOR encoding, then Zstd)
   │
+  ├──► :ets.select_delete(read_buffer, entries ≤ last_ts)      ← range-aware cleanup
   ▼
 BlockStore: append compressed block to .dat file on disk
 ```
 
-**Batch writes** (`write_batch/2`) group entries by series key and send one message per series, avoiding per-point message overhead.
+**Batch writes** (`write_batch/2`) group entries by series key and send one message per series, avoiding per-point message overhead. Each point is also inserted into the shared ETS read buffer for lock-free query access.
 
 ## Read path
 
@@ -75,21 +78,62 @@ BlockStore: append compressed block to .dat file on disk
 query(store, metric_name, labels, opts)
   │
   ▼
-Engine dispatches to the series actor
+Engine resolves series_id via SeriesManager
   │
-  ▼
-SeriesServer reads from:
-  1. Compressed blocks (decompress on the fly)
-  2. Current raw buffer (not yet compressed)
+  ├──► ETS read buffer (fast path, no mailbox):
+  │      :ets.select(read_buffer, match_spec)
+  │      ordered_set range scan on {series_id, from..to, _seq}
+  │      → [{ts, value}, ...] pre-sorted by timestamp
   │
-  ▼
-Merge + filter by time range [from, to]
+  │    If ETS has data → return immediately (lock-free, sub-millisecond)
   │
-  ▼
-Return [{timestamp, value}, ...]
+  └──► GenServer.call fallback (only when ETS is empty for this range):
+         SeriesServer reads from:
+           1. Compressed blocks (decompress on the fly)
+           2. Current raw buffer (not yet compressed)
+         Merge + filter by time range [from, to]
+         → [{timestamp, value}, ...]
 ```
 
-**Multi-series queries** (`query_multi`, `query_aggregate_multi`, etc.) fan out to all matching series actors via `Task.async_stream` for parallel reads, then merge results.
+**Single-series queries** (the common case for dashboard polling) use the ETS read buffer fast path — a lock-free `:ets.select` with a match specification that pushes timestamp filtering into C-level ETS code. This serves the vast majority of queries within the raw retention window without touching the series process mailbox.
+
+**Multi-series queries** (`query_multi`, `query_aggregate_multi`, etc.) fan out to all matching series actors via `Task.async_stream` for parallel reads, then merge results. Single-match results also use the ETS fast path.
+
+## ETS read buffer
+
+The ETS read buffer decouples query reads from series process mailboxes. Without it, every query requires a `GenServer.call` into the series process, competing with queued write messages and blocking under high write throughput.
+
+SeriesManager creates a single ETS table per store:
+
+| Property | Value | Rationale |
+| --- | --- | --- |
+| Type | `ordered_set` | Efficient range scans via `:ets.select` |
+| Key | `{series_id, timestamp, seq}` | Composite key for per-series range queries |
+| Value | `value` (float) | Single numeric value per entry |
+| Access | `:public`, `read_concurrency: true` | Lock-free concurrent reads from any process |
+| Write concurrency | `:auto` | BEAM tunes write locks per scheduler |
+
+The monotonic sequence number (`seq = :erlang.unique_integer([:monotonic])`) ensures duplicate timestamps within the same series are preserved — without it, `ordered_set` would overwrite entries with identical `{series_id, ts}` keys.
+
+**Query match specification:**
+
+```elixir
+:ets.select(read_buffer, [
+  {{{series_id, :"$1", :_}, :"$2"},
+   [{:andalso, {:>=, :"$1", from}, {:"=<", :"$1", to}}],
+   [{{:"$1", :"$2"}}]}
+])
+```
+
+This pushes timestamp filtering into C-level ETS code. The `ordered_set` returns results pre-sorted by `{series_id, ts, seq}`, so no additional sorting is needed.
+
+**Range-aware compression cleanup:** when a series compresses its raw buffer into a block, only ETS entries up to the block's `last_ts` are removed — not all entries for that series. This prevents a brief window where the ETS buffer is empty, which would force queries to fall back to `GenServer.call` and contend with the write message queue.
+
+```elixir
+:ets.select_delete(read_buffer, [
+  {{{series_id, :"$1", :_}, :_}, [{:"=<", :"$1", last_ts}], [true]}
+])
+```
 
 ## Storage format
 
