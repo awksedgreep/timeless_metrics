@@ -393,7 +393,9 @@ defmodule TimelessMetrics.SegmentBuilder do
     {completed, pending} = split_completed(state.segments, state.segment_duration)
 
     if completed != [] do
-      write_and_seal(completed, state)
+      # Offload compression + disk write to a Task so we stay responsive
+      segment_state = %{store: state.store, compression: state.compression, compression_level: state.compression_level, shard_store: state.shard_store, segment_duration: state.segment_duration}
+      Task.start(fn -> write_and_seal_async(completed, segment_state) end)
     end
 
     Process.send_after(self(), :check_segments, :timer.seconds(10))
@@ -406,7 +408,9 @@ defmodule TimelessMetrics.SegmentBuilder do
     pending = Map.values(state.segments)
 
     if pending != [] do
-      write_segments(pending, state)
+      # Offload compression + disk write to a Task
+      segment_state = %{store: state.store, compression: state.compression, compression_level: state.compression_level, shard_store: state.shard_store}
+      Task.start(fn -> write_segments_async(pending, segment_state) end)
     end
 
     Process.send_after(self(), :flush_pending, state.pending_flush_interval)
@@ -522,7 +526,28 @@ defmodule TimelessMetrics.SegmentBuilder do
     end
   end
 
-  # Write segments to WAL (for in-progress / pending flush)
+  # Async variants for periodic flushes — run in a Task to avoid blocking the GenServer
+  defp write_segments_async(segments, state) do
+    compressed = compress_segments(segments, state)
+    if compressed != [], do: TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
+  end
+
+  defp write_and_seal_async(segments, state) do
+    compressed = compress_segments(segments, state)
+
+    if compressed != [] do
+      TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
+
+      compressed
+      |> Enum.map(fn {_sid, start, _, _, _} -> segment_bucket(start, state.segment_duration) end)
+      |> Enum.uniq()
+      |> Enum.each(fn window ->
+        TimelessMetrics.ShardStore.seal_window(state.shard_store, window)
+      end)
+    end
+  end
+
+  # Write segments to WAL (for in-progress / pending flush) — synchronous, used by flush/terminate
   defp write_segments(segments, state) do
     compressed = compress_segments(segments, state)
 
