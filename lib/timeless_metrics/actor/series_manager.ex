@@ -81,7 +81,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   end
 
   # Fast path: use label index for O(matches) lookup instead of O(all_series_for_metric) scan
-  defp find_series_indexed(state_info, metric_name, label_filter) when map_size(label_filter) == 0 do
+  defp find_series_indexed(state_info, metric_name, label_filter)
+       when map_size(label_filter) == 0 do
     find_series_scan(state_info, metric_name, label_filter)
   end
 
@@ -304,7 +305,15 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
     # Store in persistent_term for fast client-side access
     # Keyed by manager name (for get_or_start) and by store atom (for hot-path writes)
-    info = %{index: index, label_index: label_index, read_buffer: read_buffer, registry: registry, db: db, manager: name}
+    info = %{
+      index: index,
+      label_index: label_index,
+      read_buffer: read_buffer,
+      registry: registry,
+      db: db,
+      manager: name
+    }
+
     :persistent_term.put({__MODULE__, name}, info)
     :persistent_term.put({__MODULE__, store}, info)
 

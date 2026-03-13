@@ -162,6 +162,7 @@ defmodule TimelessMetrics.Actor.Engine do
 
         _ ->
           manager = manager_name(store)
+
           case SeriesManager.find_series(manager, metric_name, label_filter) do
             [{_id, labels, pid}] ->
               query_multi_direct(pid, labels, from, to, store, metric_name)
@@ -292,14 +293,35 @@ defmodule TimelessMetrics.Actor.Engine do
       # Try 1: full key match (query labels == stored labels)
       case :ets.lookup(index, {metric_name, label_filter}) do
         [{_key, _series_id, pid}] when is_pid(pid) and is_atom(pid) == false ->
-          query_aggregate_multi_direct(pid, label_filter, from, to, bucket, agg_fn, transform, store, metric_name)
+          query_aggregate_multi_direct(
+            pid,
+            label_filter,
+            from,
+            to,
+            bucket,
+            agg_fn,
+            transform,
+            store,
+            metric_name
+          )
 
         _ ->
           # Try 2: partial label match via label index
           manager = manager_name(store)
+
           case SeriesManager.find_series(manager, metric_name, label_filter) do
             [{_id, labels, pid}] ->
-              query_aggregate_multi_direct(pid, labels, from, to, bucket, agg_fn, transform, store, metric_name)
+              query_aggregate_multi_direct(
+                pid,
+                labels,
+                from,
+                to,
+                bucket,
+                agg_fn,
+                transform,
+                store,
+                metric_name
+              )
 
             [] ->
               {:ok, []}
@@ -310,12 +332,31 @@ defmodule TimelessMetrics.Actor.Engine do
           end
       end
     else
-      query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform)
+      query_aggregate_multi_scan(
+        store,
+        metric_name,
+        label_filter,
+        from,
+        to,
+        bucket,
+        agg_fn,
+        transform
+      )
     end
   end
 
   # Direct query for a single series — tries ETS read buffer first, falls back to GenServer.call
-  defp query_aggregate_multi_direct(pid, labels, from, to, bucket, agg_fn, transform, store, metric_name) do
+  defp query_aggregate_multi_direct(
+         pid,
+         labels,
+         from,
+         to,
+         bucket,
+         agg_fn,
+         transform,
+         store,
+         metric_name
+       ) do
     if Process.alive?(pid) do
       try do
         {:ok, buckets} = query_aggregate_single(store, pid, from, to, bucket, agg_fn)
@@ -326,7 +367,10 @@ defmodule TimelessMetrics.Actor.Engine do
         end
       catch
         :exit, reason ->
-          Logger.error("TimelessMetrics: query_aggregate_multi direct call crashed: #{inspect(reason)}")
+          Logger.error(
+            "TimelessMetrics: query_aggregate_multi direct call crashed: #{inspect(reason)}"
+          )
+
           {:ok, []}
       end
     else
@@ -347,7 +391,10 @@ defmodule TimelessMetrics.Actor.Engine do
 
           if raw_points != [] do
             bucket_seconds = TimelessMetrics.Actor.Aggregation.bucket_to_seconds(bucket)
-            buckets = TimelessMetrics.Actor.Aggregation.bucket_points(raw_points, bucket_seconds, agg_fn)
+
+            buckets =
+              TimelessMetrics.Actor.Aggregation.bucket_points(raw_points, bucket_seconds, agg_fn)
+
             {:ok, buckets}
           else
             GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
@@ -366,8 +413,7 @@ defmodule TimelessMetrics.Actor.Engine do
   # for efficient range scans. Results are pre-sorted by timestamp.
   defp read_buffer_points(read_buffer, series_id, from, to) do
     :ets.select(read_buffer, [
-      {{{series_id, :"$1", :_}, :"$2"},
-       [{:andalso, {:>=, :"$1", from}, {:"=<", :"$1", to}}],
+      {{{series_id, :"$1", :_}, :"$2"}, [{:andalso, {:>=, :"$1", from}, {:"=<", :"$1", to}}],
        [{{:"$1", :"$2"}}]}
     ])
   end
@@ -404,13 +450,32 @@ defmodule TimelessMetrics.Actor.Engine do
     {:ok, results}
   end
 
-  defp query_aggregate_multi_scan(store, metric_name, label_filter, from, to, bucket, agg_fn, transform) do
+  defp query_aggregate_multi_scan(
+         store,
+         metric_name,
+         label_filter,
+         from,
+         to,
+         bucket,
+         agg_fn,
+         transform
+       ) do
     manager = manager_name(store)
     matching = SeriesManager.find_series(manager, metric_name, label_filter)
 
     case matching do
       [{_id, labels, pid}] ->
-        query_aggregate_multi_direct(pid, labels, from, to, bucket, agg_fn, transform, store, metric_name)
+        query_aggregate_multi_direct(
+          pid,
+          labels,
+          from,
+          to,
+          bucket,
+          agg_fn,
+          transform,
+          store,
+          metric_name
+        )
 
       [] ->
         {:ok, []}
