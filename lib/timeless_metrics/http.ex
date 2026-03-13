@@ -229,8 +229,7 @@ defmodule TimelessMetrics.HTTP do
   get "/health" do
     store = store()
     stats = TimelessMetrics.Stats.snapshot(store)
-    registry = :"#{store}_actor_registry"
-    series_count = Registry.count(registry)
+    series_count = TimelessMetrics.SeriesRegistry.count(:"#{store}_registry")
 
     json_resp(req, 200, %{
       status: "ok",
@@ -1816,17 +1815,18 @@ defmodule TimelessMetrics.HTTP do
       )
     end
 
-    # Send directly to series — same pattern as Prometheus path
+    # Write to sharded buffers
     if count > 0 do
       TimelessMetrics.Stats.incr_writes(store)
       TimelessMetrics.Stats.add_points(store, count)
-      %{manager: manager} = :persistent_term.get({TimelessMetrics.Actor.SeriesManager, store})
+      registry = :"#{store}_registry"
+      shard_count = :persistent_term.get({TimelessMetrics, store, :shard_count})
 
       Enum.each(groups, fn {{metric_name, labels}, batch} ->
-        {_id, pid} =
-          TimelessMetrics.Actor.SeriesManager.get_or_start(manager, metric_name, labels)
-
-        send(pid, {:write_batch, batch})
+        series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+        shard_idx = rem(abs(series_id), shard_count)
+        points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
+        TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
       end)
     end
 
@@ -1904,13 +1904,14 @@ defmodule TimelessMetrics.HTTP do
     if count > 0 do
       TimelessMetrics.Stats.incr_writes(store)
       TimelessMetrics.Stats.add_points(store, count)
-      %{manager: manager} = :persistent_term.get({TimelessMetrics.Actor.SeriesManager, store})
+      registry = :"#{store}_registry"
+      shard_count = :persistent_term.get({TimelessMetrics, store, :shard_count})
 
       Enum.each(groups, fn {{metric_name, labels}, batch} ->
-        {_id, pid} =
-          TimelessMetrics.Actor.SeriesManager.get_or_start(manager, metric_name, labels)
-
-        send(pid, {:write_batch, batch})
+        series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+        shard_idx = rem(abs(series_id), shard_count)
+        points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
+        TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
       end)
     end
 

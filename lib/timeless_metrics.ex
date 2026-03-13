@@ -22,7 +22,8 @@ defmodule TimelessMetrics do
       )
   """
 
-  alias TimelessMetrics.Actor.Engine
+  # Batch sizes above this threshold use parallel resolution + shard writes
+  @parallel_batch_threshold 1_000
 
   @doc "Start a TimelessMetrics instance as part of a supervision tree."
   def child_spec(opts) do
@@ -48,7 +49,13 @@ defmodule TimelessMetrics do
       * `:timestamp` - Unix timestamp in seconds (default: now)
   """
   def write(store, metric_name, labels, value, opts \\ []) do
-    Engine.write(store, metric_name, labels, value, opts)
+    timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
+    registry = :"#{store}_registry"
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    shard_count = buffer_shard_count(store)
+    shard_idx = rem(abs(series_id), shard_count)
+    TimelessMetrics.Stats.add_points(store, 1)
+    TimelessMetrics.Buffer.write(:"#{store}_shard_#{shard_idx}", series_id, timestamp, value)
   end
 
   @doc """
@@ -58,39 +65,64 @@ defmodule TimelessMetrics do
   `{metric_name, labels, value, timestamp}`.
   """
   def write_batch(store, entries) do
-    Engine.write_batch(store, entries)
+    registry = :"#{store}_registry"
+    shard_count = buffer_shard_count(store)
+    TimelessMetrics.Stats.add_points(store, length(entries))
+
+    if length(entries) >= @parallel_batch_threshold do
+      chunk_size = max(div(length(entries), System.schedulers_online()), 1)
+
+      entries
+      |> Enum.chunk_every(chunk_size)
+      |> Enum.map(fn chunk ->
+        Task.async(fn ->
+          chunk
+          |> Enum.map(&resolve_and_normalize(registry, &1))
+          |> Enum.group_by(fn {sid, _, _} -> rem(abs(sid), shard_count) end)
+          |> Enum.each(fn {shard_idx, points} ->
+            TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+          end)
+        end)
+      end)
+      |> Task.await_many()
+
+      :ok
+    else
+      entries
+      |> Enum.map(&resolve_and_normalize(registry, &1))
+      |> group_and_write_shards(store, shard_count)
+    end
   end
 
   @doc """
-  Write entries directly, one per unique series. Faster than `write_batch/2`
-  for collection-cycle workloads (SNMP polling, Prometheus scraping) where
-  each entry targets a different series — skips grouping overhead.
-
-  Each entry is a tuple of `{metric_name, labels, value}` or
-  `{metric_name, labels, value, timestamp}`.
+  Write entries directly, one per unique series. Same as write_batch/2
+  for the sharded engine.
   """
   def write_each(store, entries) do
-    Engine.write_each(store, entries)
+    write_batch(store, entries)
   end
 
   @doc """
-  Resolve a series to a PID for use with `write_resolved/3`.
+  Resolve a series to an integer ID for use with `write_resolved/4`.
 
-  Cache the result for repeated writes to the same series (collection
-  cycles, polling loops). Re-resolve if the process dies.
+  Cache the result for repeated writes to the same series.
   """
   def resolve_series(store, metric_name, labels) do
-    Engine.resolve_series(store, metric_name, labels)
+    registry = :"#{store}_registry"
+    TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
   end
 
   @doc """
-  Write directly to a pre-resolved PID. Zero lookup cost per write.
+  Write directly using a pre-resolved series ID. Zero lookup cost.
 
-      pid = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
-      TimelessMetrics.write_resolved(pid, 73.2, System.os_time(:second))
+      sid = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
+      TimelessMetrics.write_resolved(:metrics, sid, 73.2, timestamp: ts)
   """
-  def write_resolved(pid, value, timestamp) do
-    Engine.write_resolved(pid, value, timestamp)
+  def write_resolved(store, series_id, value, opts \\ []) do
+    timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
+    shard_count = buffer_shard_count(store)
+    shard_idx = rem(abs(series_id), shard_count)
+    TimelessMetrics.Buffer.write(:"#{store}_shard_#{shard_idx}", series_id, timestamp, value)
   end
 
   @doc """
@@ -104,7 +136,10 @@ defmodule TimelessMetrics do
   Returns `{:ok, [{timestamp, value}, ...]}`.
   """
   def query(store, metric_name, labels, opts \\ []) do
-    Engine.query(store, metric_name, labels, opts)
+    registry = :"#{store}_registry"
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    TimelessMetrics.Stats.incr_queries(store)
+    TimelessMetrics.Query.raw(store, series_id, opts)
   end
 
   @doc """
@@ -113,7 +148,23 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{labels: %{...}, points: [{ts, val}, ...]}, ...]}`.
   """
   def query_multi(store, metric_name, label_filter \\ %{}, opts \\ []) do
-    Engine.query_multi(store, metric_name, label_filter, opts)
+    TimelessMetrics.Stats.incr_queries(store)
+    matching = find_matching_series(store, metric_name, label_filter)
+
+    results =
+      matching
+      |> Task.async_stream(
+        fn {series_id, labels} ->
+          {:ok, points} = TimelessMetrics.Query.raw(store, series_id, opts)
+          %{labels: labels, points: points}
+        end,
+        max_concurrency: System.schedulers_online(),
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+      |> Enum.reject(fn %{points: pts} -> pts == [] end)
+
+    {:ok, results}
   end
 
   @doc """
@@ -129,7 +180,11 @@ defmodule TimelessMetrics do
   Returns `{:ok, [{bucket_timestamp, aggregate_value}, ...]}`.
   """
   def query_aggregate(store, metric_name, labels, opts) do
-    Engine.query_aggregate(store, metric_name, labels, opts)
+    registry = :"#{store}_registry"
+    schema = get_schema(store)
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    TimelessMetrics.Stats.incr_queries(store)
+    TimelessMetrics.Query.aggregate(store, series_id, Keyword.put(opts, :schema, schema))
   end
 
   @doc """
@@ -138,7 +193,46 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{labels: %{...}, data: [{bucket_ts, agg_value}, ...]}, ...]}`.
   """
   def query_aggregate_multi(store, metric_name, label_filter \\ %{}, opts) do
-    Engine.query_aggregate_multi(store, metric_name, label_filter, opts)
+    TimelessMetrics.Stats.incr_queries(store)
+    schema = get_schema(store)
+    transform = Keyword.get(opts, :transform)
+    matching = find_matching_series(store, metric_name, label_filter)
+    shard_count = buffer_shard_count(store)
+    query_opts = Keyword.put(opts, :schema, schema)
+
+    by_shard =
+      Enum.group_by(matching, fn {series_id, _labels} ->
+        rem(abs(series_id), shard_count)
+      end)
+
+    results =
+      by_shard
+      |> Task.async_stream(
+        fn {_shard_idx, shard_series} ->
+          shard_series
+          |> Task.async_stream(
+            fn {series_id, labels} ->
+              {:ok, buckets} = TimelessMetrics.Query.aggregate(store, series_id, query_opts)
+
+              case TimelessMetrics.Transform.apply(buckets, transform) do
+                [] -> nil
+                data -> %{labels: labels, data: data}
+              end
+            end,
+            max_concurrency: System.schedulers_online(),
+            ordered: false
+          )
+          |> Enum.flat_map(fn
+            {:ok, nil} -> []
+            {:ok, result} -> [result]
+          end)
+        end,
+        max_concurrency: shard_count,
+        ordered: false
+      )
+      |> Enum.flat_map(fn {:ok, shard_results} -> shard_results end)
+
+    {:ok, results}
   end
 
   @doc """
@@ -147,7 +241,19 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{group: %{"hostname" => "host_0"}, data: [{ts, val}]}, ...]}`.
   """
   def query_aggregate_grouped(store, metric_name, label_filter \\ %{}, opts) do
-    Engine.query_aggregate_grouped(store, metric_name, label_filter, opts)
+    group_by = Keyword.fetch!(opts, :group_by)
+    {:ok, results} = query_aggregate_multi(store, metric_name, label_filter, opts)
+
+    grouped =
+      results
+      |> Enum.group_by(fn %{labels: l} -> Map.take(l, List.wrap(group_by)) end)
+      |> Enum.map(fn {group, series_results} ->
+        aggregate_fn = Keyword.get(opts, :aggregate, :avg)
+        data = cross_aggregate(series_results, aggregate_fn)
+        %{group: group, data: data}
+      end)
+
+    {:ok, grouped}
   end
 
   @doc """
@@ -157,7 +263,26 @@ defmodule TimelessMetrics do
   """
   def query_aggregate_grouped_metrics(store, metric_names, label_filter \\ %{}, opts)
       when is_list(metric_names) do
-    Engine.query_aggregate_grouped_metrics(store, metric_names, label_filter, opts)
+    all_results =
+      metric_names
+      |> Task.async_stream(fn metric ->
+        {:ok, results} = query_aggregate_multi(store, metric, label_filter, opts)
+        results
+      end)
+      |> Enum.flat_map(fn {:ok, results} -> results end)
+
+    group_by = Keyword.fetch!(opts, :group_by)
+    aggregate_fn = Keyword.get(opts, :aggregate, :avg)
+
+    grouped =
+      all_results
+      |> Enum.group_by(fn %{labels: l} -> Map.take(l, List.wrap(group_by)) end)
+      |> Enum.map(fn {group, series_results} ->
+        data = cross_aggregate(series_results, aggregate_fn)
+        %{group: group, data: data}
+      end)
+
+    {:ok, grouped}
   end
 
   @doc """
@@ -166,7 +291,25 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{labels: %{...}, data: [{ts, val}]}, ...]}`.
   """
   def query_aggregate_multi_filtered(store, metric_name, label_filter \\ %{}, opts) do
-    Engine.query_aggregate_multi_filtered(store, metric_name, label_filter, opts)
+    threshold = Keyword.get(opts, :threshold)
+    threshold_fn = Keyword.get(opts, :threshold_fn, :last)
+    {:ok, results} = query_aggregate_multi(store, metric_name, label_filter, opts)
+
+    filtered =
+      if threshold do
+        Enum.filter(results, fn %{data: data} ->
+          val = case threshold_fn do
+            :last -> data |> List.last() |> elem(1)
+            :max -> data |> Enum.map(&elem(&1, 1)) |> Enum.max(fn -> 0 end)
+            :avg -> data |> Enum.map(&elem(&1, 1)) |> then(&(Enum.sum(&1) / max(length(&1), 1)))
+          end
+          val >= threshold
+        end)
+      else
+        results
+      end
+
+    {:ok, filtered}
   end
 
   @doc """
@@ -188,7 +331,13 @@ defmodule TimelessMetrics do
   """
   def query_aggregate_multi_metrics(store, metric_names, label_filter \\ %{}, opts)
       when is_list(metric_names) do
-    Engine.query_aggregate_multi_metrics(store, metric_names, label_filter, opts)
+    metric_names
+    |> Task.async_stream(fn metric ->
+      {:ok, results} = query_aggregate_multi(store, metric, label_filter, opts)
+      Enum.map(results, &Map.put(&1, :metric, metric))
+    end)
+    |> Enum.flat_map(fn {:ok, results} -> results end)
+    |> then(&{:ok, &1})
   end
 
   @doc """
@@ -197,7 +346,9 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{bucket: ts, avg: v, min: v, max: v, count: n, sum: v, last: v}, ...]}`.
   """
   def query_daily(store, metric_name, labels, from, to) do
-    Engine.query_daily(store, metric_name, labels, from, to)
+    registry = :"#{store}_registry"
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    TimelessMetrics.Query.read_tier(store, :daily, series_id, from: from, to: to)
   end
 
   @doc """
@@ -206,7 +357,10 @@ defmodule TimelessMetrics do
   Returns `{:ok, {timestamp, value}}` or `{:ok, nil}`.
   """
   def latest(store, metric_name, labels) do
-    Engine.latest(store, metric_name, labels)
+    registry = :"#{store}_registry"
+    schema = get_schema(store)
+    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    TimelessMetrics.Query.latest(store, series_id, schema: schema)
   end
 
   @doc """
@@ -215,107 +369,144 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{labels: %{...}, timestamp: ts, value: val}, ...]}`.
   """
   def latest_multi(store, metric_name, label_filter \\ %{}) do
-    Engine.latest_multi(store, metric_name, label_filter)
+    schema = get_schema(store)
+    matching = find_matching_series(store, metric_name, label_filter)
+
+    results =
+      matching
+      |> Task.async_stream(
+        fn {series_id, labels} ->
+          case TimelessMetrics.Query.latest(store, series_id, schema: schema) do
+            {:ok, {ts, val}} -> %{labels: labels, timestamp: ts, value: val}
+            {:ok, nil} -> nil
+          end
+        end,
+        max_concurrency: System.schedulers_online(),
+        ordered: false
+      )
+      |> Enum.flat_map(fn
+        {:ok, nil} -> []
+        {:ok, result} -> [result]
+      end)
+
+    {:ok, results}
   end
 
   # --- Text series API ---
+  # Text series use the same write/query path — the sharded engine stores
+  # values as-is in ETS and the SegmentBuilder handles codec selection.
 
-  @doc """
-  Write a single text metric point.
-
-  ## Parameters
-
-    * `store` - The store name (atom)
-    * `metric_name` - String metric name
-    * `labels` - Map of string labels
-    * `value` - String value
-    * `opts` - Optional keyword list:
-      * `:timestamp` - Unix timestamp in seconds (default: now)
-  """
+  @doc "Write a single text metric point."
   def write_text(store, metric_name, labels, value, opts \\ []) do
-    Engine.write_text(store, metric_name, labels, value, opts)
+    write(store, metric_name, labels, value, opts)
   end
 
-  @doc """
-  Write a batch of text metric points.
-
-  Each entry is `{metric_name, labels, value}` or `{metric_name, labels, value, timestamp}`.
-  """
+  @doc "Write a batch of text metric points."
   def write_text_batch(store, entries) do
-    Engine.write_text_batch(store, entries)
+    write_batch(store, entries)
   end
 
-  @doc """
-  Query text time series points for a single series (exact label match).
-
-  Returns `{:ok, [{timestamp, string_value}, ...]}`.
-  """
+  @doc "Query text time series points for a single series."
   def query_text(store, metric_name, labels, opts \\ []) do
-    Engine.query_text(store, metric_name, labels, opts)
+    query(store, metric_name, labels, opts)
   end
 
-  @doc """
-  Query text points across multiple series matching a label filter.
-
-  Returns `{:ok, [%{labels: %{...}, points: [{ts, string_value}, ...]}, ...]}`.
-  """
+  @doc "Query text points across multiple series matching a label filter."
   def query_text_multi(store, metric_name, label_filter \\ %{}, opts \\ []) do
-    Engine.query_text_multi(store, metric_name, label_filter, opts)
+    query_multi(store, metric_name, label_filter, opts)
   end
 
-  @doc """
-  Get the latest text value for a series.
-
-  Returns `{:ok, {timestamp, string_value}}` or `{:ok, nil}`.
-  """
+  @doc "Get the latest text value for a series."
   def latest_text(store, metric_name, labels) do
-    Engine.latest_text(store, metric_name, labels)
+    latest(store, metric_name, labels)
   end
 
-  @doc """
-  Merge multiple small compressed blocks into fewer, larger blocks across all series.
+  @doc "No-op for sharded engine (no per-series blocks to merge)."
+  def merge_now(_store), do: :noop
 
-  Returns `:ok` if any series merged blocks, `:noop` if no merge was needed.
-  """
-  def merge_now(store) do
-    Engine.merge_now(store)
-  end
-
-  @doc """
-  Force flush all buffered data to disk.
-  """
+  @doc "Force flush all buffered data to disk."
   def flush(store) do
-    Engine.flush(store)
+    shard_count = buffer_shard_count(store)
+
+    # Flush buffers → SegmentBuilder (sync)
+    for i <- 0..(shard_count - 1) do
+      GenServer.call(:"#{store}_shard_#{i}", :flush_sync, :infinity)
+    end
+
+    # Flush SegmentBuilder → disk (sync)
+    for i <- 0..(shard_count - 1) do
+      TimelessMetrics.SegmentBuilder.flush(:"#{store}_builder_#{i}")
+    end
+
+    :ok
   end
 
-  @doc """
-  Create a consistent online backup.
-
-  Returns `{:ok, %{path: target_dir, files: [filenames], total_bytes: n}}`.
-  """
+  @doc "Create a consistent online backup."
   def backup(store, target_dir) do
-    Engine.backup(store, target_dir)
+    # TODO: implement sharded backup
+    {:error, :not_implemented}
   end
 
-  @doc """
-  Get store info and statistics.
-  """
+  @doc "Get store info and statistics."
   def info(store) do
-    Engine.info(store)
+    stats = TimelessMetrics.Stats.snapshot(store)
+    registry = :"#{store}_registry"
+    series_count = TimelessMetrics.SeriesRegistry.count(registry)
+    data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir})
+
+    storage_bytes =
+      case File.ls(data_dir) do
+        {:ok, entries} ->
+          entries
+          |> Enum.reduce(0, fn entry, acc ->
+            path = Path.join(data_dir, entry)
+            case File.stat(path) do
+              {:ok, %{size: s, type: :regular}} -> acc + s
+              _ -> acc + dir_file_bytes(path)
+            end
+          end)
+        _ -> 0
+      end
+
+    %{
+      series_count: series_count,
+      total_points: stats.points_ingested,
+      raw_buffer_points: stats.points_ingested - stats.points_merged,
+      storage_bytes: storage_bytes,
+      points_ingested: stats.points_ingested,
+      queries: stats.queries,
+      buffer_points: stats.points_ingested - stats.points_merged,
+      db_path: Path.join(data_dir, "metrics.db"),
+      block_count: 0,
+      bytes_per_point: 0.0
+    }
   end
 
-  @doc """
-  Force a daily rollup run.
-  """
+  defp dir_file_bytes(dir) do
+    case File.ls(dir) do
+      {:ok, files} ->
+        Enum.reduce(files, 0, fn f, acc ->
+          path = Path.join(dir, f)
+          case File.stat(path) do
+            {:ok, %{size: size, type: :regular}} -> acc + size
+            {:ok, %{type: :directory}} -> acc + dir_file_bytes(path)
+            _ -> acc
+          end
+        end)
+      _ -> 0
+    end
+  end
+
+  @doc "Force a daily rollup run."
   def rollup(store) do
-    TimelessMetrics.Actor.Rollup.run(:"#{store}_rollup")
+    GenServer.call(:"#{store}_rollup", :run_now, :infinity)
   end
 
   @doc """
   Force retention enforcement now.
   """
   def enforce_retention(store) do
-    TimelessMetrics.Actor.Retention.enforce(:"#{store}_retention")
+    GenServer.call(:"#{store}_retention", :enforce_now, :infinity)
   end
 
   @doc """
@@ -324,7 +515,9 @@ defmodule TimelessMetrics do
   Returns `{:ok, ["cpu_usage", "mem_usage", ...]}`.
   """
   def list_metrics(store) do
-    Engine.list_metrics(store)
+    db = :"#{store}_db"
+    {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+    {:ok, Enum.map(rows, fn [name] -> name end)}
   end
 
   @doc """
@@ -333,7 +526,9 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{labels: %{"host" => "web-1"}, ...}, ...]}`.
   """
   def list_series(store, metric_name) do
-    Engine.list_series(store, metric_name)
+    db = :"#{store}_db"
+    {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT labels FROM series WHERE metric_name = ?1 ORDER BY labels", [metric_name])
+    {:ok, Enum.map(rows, fn [labels_str] -> %{labels: decode_labels(labels_str)} end)}
   end
 
   @doc """
@@ -342,7 +537,17 @@ defmodule TimelessMetrics do
   Returns `{:ok, ["web-1", "web-2", ...]}`.
   """
   def label_values(store, metric_name, label_key) do
-    Engine.label_values(store, metric_name, label_key)
+    db = :"#{store}_db"
+    {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT labels FROM series WHERE metric_name = ?1", [metric_name])
+
+    result =
+      rows
+      |> Enum.map(fn [labels_str] -> decode_labels(labels_str) end)
+      |> Enum.flat_map(fn labels -> Map.get(labels, label_key) |> List.wrap() end)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    {:ok, result}
   end
 
   @doc """
@@ -604,4 +809,84 @@ defmodule TimelessMetrics do
   defp apply_cross_aggregate(vals, :sum), do: Enum.sum(vals)
   defp apply_cross_aggregate(vals, :count), do: length(vals) / 1
   defp apply_cross_aggregate(vals, :avg), do: Enum.sum(vals) / length(vals)
+
+  # --- Sharded engine helpers ---
+
+  defp get_schema(store) do
+    :persistent_term.get({TimelessMetrics, store, :schema})
+  end
+
+  defp find_matching_series(store, metric_name, label_filter) do
+    db = :"#{store}_db"
+
+    {:ok, rows} =
+      TimelessMetrics.DB.read(
+        db,
+        "SELECT id, labels FROM series WHERE metric_name = ?1",
+        [metric_name]
+      )
+
+    rows
+    |> Enum.map(fn [id, labels_str] -> {id, decode_labels(labels_str)} end)
+    |> Enum.filter(fn {_id, labels} ->
+      Enum.all?(label_filter, fn
+        {k, {:regex, pattern}} ->
+          case Map.get(labels, k) do
+            nil -> false
+            val -> Regex.match?(~r/^(?:#{pattern})$/, val)
+          end
+        {k, v} -> Map.get(labels, k) == v
+      end)
+    end)
+  end
+
+  defp decode_labels(""), do: %{}
+
+  defp decode_labels(labels_str) do
+    labels_str
+    |> String.split(",")
+    |> Enum.map(fn pair ->
+      case String.split(pair, "=", parts: 2) do
+        [k, v] -> {k, v}
+        [k] -> {k, ""}
+      end
+    end)
+    |> Map.new()
+  end
+
+  defp cross_aggregate(series_results, aggregate_fn) do
+    series_data_list = Enum.map(series_results, fn %{data: data} -> data end)
+
+    series_data_list
+    |> Enum.flat_map(& &1)
+    |> Enum.group_by(fn {ts, _val} -> ts end, fn {_ts, val} -> val end)
+    |> Enum.sort_by(fn {ts, _vals} -> ts end)
+    |> Enum.map(fn {ts, vals} ->
+      {ts, apply_cross_aggregate(vals, aggregate_fn)}
+    end)
+  end
+
+  defp buffer_shard_count(store) do
+    :persistent_term.get({TimelessMetrics, store, :shard_count})
+  end
+
+  defp resolve_and_normalize(registry, {metric_name, labels, value}) do
+    sid = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    {sid, System.os_time(:second), value}
+  end
+
+  defp resolve_and_normalize(registry, {metric_name, labels, value, ts}) do
+    sid = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    {sid, ts, value}
+  end
+
+  defp group_and_write_shards(resolved_points, store, shard_count) do
+    resolved_points
+    |> Enum.group_by(fn {sid, _, _} -> rem(abs(sid), shard_count) end)
+    |> Enum.each(fn {shard_idx, points} ->
+      TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+    end)
+
+    :ok
+  end
 end
