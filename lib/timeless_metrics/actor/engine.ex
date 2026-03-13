@@ -179,21 +179,17 @@ defmodule TimelessMetrics.Actor.Engine do
     end
   end
 
-  defp query_multi_direct(pid, labels, from, to, store, metric_name) do
-    if Process.alive?(pid) do
-      try do
-        {:ok, points} = query_raw_single(store, pid, from, to)
+  defp query_multi_direct(pid, labels, from, to, store, _metric_name) do
+    try do
+      {:ok, points} = query_raw_single(store, pid, from, to)
 
-        if points == [],
-          do: {:ok, []},
-          else: {:ok, [%{labels: labels, points: points}]}
-      catch
-        :exit, reason ->
-          Logger.error("TimelessMetrics: query_multi direct call crashed: #{inspect(reason)}")
-          {:ok, []}
-      end
-    else
-      query_multi_scan(store, metric_name, labels, from, to)
+      if points == [],
+        do: {:ok, []},
+        else: {:ok, [%{labels: labels, points: points}]}
+    catch
+      :exit, reason ->
+        Logger.error("TimelessMetrics: query_multi direct call crashed: #{inspect(reason)}")
+        {:ok, []}
     end
   end
 
@@ -328,7 +324,7 @@ defmodule TimelessMetrics.Actor.Engine do
 
             matching ->
               # Multiple matches — use the full fan-out path
-              query_aggregate_multi_fanout(matching, from, to, bucket, agg_fn, transform)
+              query_aggregate_multi_fanout(store, matching, from, to, bucket, agg_fn, transform)
           end
       end
     else
@@ -355,26 +351,22 @@ defmodule TimelessMetrics.Actor.Engine do
          agg_fn,
          transform,
          store,
-         metric_name
+         _metric_name
        ) do
-    if Process.alive?(pid) do
-      try do
-        {:ok, buckets} = query_aggregate_single(store, pid, from, to, bucket, agg_fn)
+    try do
+      {:ok, buckets} = query_aggregate_single(store, pid, from, to, bucket, agg_fn)
 
-        case TimelessMetrics.Transform.apply(buckets, transform) do
-          [] -> {:ok, []}
-          data -> {:ok, [%{labels: labels, data: data}]}
-        end
-      catch
-        :exit, reason ->
-          Logger.error(
-            "TimelessMetrics: query_aggregate_multi direct call crashed: #{inspect(reason)}"
-          )
-
-          {:ok, []}
+      case TimelessMetrics.Transform.apply(buckets, transform) do
+        [] -> {:ok, []}
+        data -> {:ok, [%{labels: labels, data: data}]}
       end
-    else
-      query_aggregate_multi_scan(store, metric_name, labels, from, to, bucket, agg_fn, transform)
+    catch
+      :exit, reason ->
+        Logger.error(
+          "TimelessMetrics: query_aggregate_multi direct call crashed: #{inspect(reason)}"
+        )
+
+        {:ok, []}
     end
   end
 
@@ -390,6 +382,7 @@ defmodule TimelessMetrics.Actor.Engine do
           raw_points = read_buffer_points(read_buffer, series_id, from, to)
 
           if raw_points != [] do
+            Stats.incr_query_fast_path(store)
             bucket_seconds = TimelessMetrics.Actor.Aggregation.bucket_to_seconds(bucket)
 
             buckets =
@@ -397,13 +390,16 @@ defmodule TimelessMetrics.Actor.Engine do
 
             {:ok, buckets}
           else
+            Stats.incr_query_slow_path(store)
             GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
           end
 
         _ ->
+          Stats.incr_query_slow_path(store)
           GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
       end
     else
+      Stats.incr_query_slow_path(store)
       GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
     end
   end
@@ -419,11 +415,12 @@ defmodule TimelessMetrics.Actor.Engine do
   end
 
   # Fan-out to multiple series via Task.async_stream
-  defp query_aggregate_multi_fanout(matching, from, to, bucket, agg_fn, transform) do
+  defp query_aggregate_multi_fanout(store, matching, from, to, bucket, agg_fn, transform) do
     results =
       matching
       |> Task.async_stream(
         fn {_id, labels, pid} ->
+          Stats.incr_query_slow_path(store)
           {:ok, buckets} = GenServer.call(pid, {:query_aggregate, from, to, bucket, agg_fn})
 
           case TimelessMetrics.Transform.apply(buckets, transform) do
@@ -481,7 +478,7 @@ defmodule TimelessMetrics.Actor.Engine do
         {:ok, []}
 
       _ ->
-        query_aggregate_multi_fanout(matching, from, to, bucket, agg_fn, transform)
+        query_aggregate_multi_fanout(store, matching, from, to, bucket, agg_fn, transform)
     end
   end
 

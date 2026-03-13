@@ -225,19 +225,43 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
-  # Health check with store stats (no auth required)
+  # Fast health check — no fan-out, just counters + registry size (no auth required)
   get "/health" do
     store = store()
-    info = TimelessMetrics.info(store)
+    stats = TimelessMetrics.Stats.snapshot(store)
+    registry = :"#{store}_actor_registry"
+    series_count = Registry.count(registry)
 
     json_resp(req, 200, %{
       status: "ok",
-      series: info.series_count,
-      points: info.total_points,
-      storage_bytes: info.storage_bytes,
-      buffer_points: info.raw_buffer_points,
-      bytes_per_point: info.bytes_per_point
+      series: series_count,
+      points: stats.points_ingested,
+      buffer_points: stats.points_ingested - stats.points_merged,
+      queries: stats.queries,
+      query_fast_path: stats.query_fast_path,
+      query_slow_path: stats.query_slow_path
     })
+  end
+
+  # Full diagnostic info — expensive, fans out to all series (auth required)
+  get "/health/detailed" do
+    case check_auth(req) do
+      :halt ->
+        :ok
+
+      :ok ->
+        store = store()
+        info = TimelessMetrics.info(store)
+
+        json_resp(req, 200, %{
+          status: "ok",
+          series: info.series_count,
+          points: info.total_points,
+          storage_bytes: info.storage_bytes,
+          buffer_points: info.raw_buffer_points,
+          bytes_per_point: info.bytes_per_point
+        })
+    end
   end
 
   # Online backup — creates consistent snapshot of all databases
@@ -1762,34 +1786,17 @@ defmodule TimelessMetrics.HTTP do
   defp ingest_json_lines(store, body) do
     lines = :binary.split(body, <<"\n">>, [:global, :trim_all])
 
-    {all_entries, errors, error_samples} =
-      if length(lines) >= @parallel_parse_threshold do
-        parse_json_lines_parallel(lines)
-      else
-        parse_json_lines_sequential(lines)
-      end
+    # Parse and group in one pass — avoid flat list + re-grouping
+    {groups, count, errors, error_samples} =
+      Enum.reduce(lines, {%{}, 0, 0, []}, fn line, {groups, count, errors, samples} ->
+        case parse_vm_line_grouped(line) do
+          {:ok, line_groups, line_count} ->
+            merged =
+              Enum.reduce(line_groups, groups, fn {key, points}, acc ->
+                Map.update(acc, key, points, &(points ++ &1))
+              end)
 
-    if errors > 0 do
-      Logger.warning(
-        "Import: #{errors} line(s) failed to parse, sample: #{inspect(error_samples)}"
-      )
-    end
-
-    if all_entries != [] do
-      {text, numeric} = Enum.split_with(all_entries, fn {_, _, v, _} -> is_binary(v) end)
-      if numeric != [], do: TimelessMetrics.write_batch(store, numeric)
-      if text != [], do: TimelessMetrics.write_text_batch(store, text)
-    end
-
-    {length(all_entries), errors, error_samples}
-  end
-
-  defp parse_json_lines_sequential(lines) do
-    {entries, errors, samples} =
-      Enum.reduce(lines, {[], 0, []}, fn line, {entries_acc, errors, samples} ->
-        case parse_vm_line(line) do
-          {:ok, entries} ->
-            {:lists.reverse(entries, entries_acc), errors, samples}
+            {merged, count + line_count, errors, samples}
 
           :error ->
             samples =
@@ -1799,35 +1806,44 @@ defmodule TimelessMetrics.HTTP do
                 samples
               end
 
-            {entries_acc, errors + 1, samples}
+            {groups, count, errors + 1, samples}
         end
       end)
 
-    {entries, errors, Enum.take(Enum.reverse(samples), @max_error_samples)}
-  end
+    if errors > 0 do
+      Logger.warning(
+        "Import: #{errors} line(s) failed to parse, sample: #{inspect(error_samples)}"
+      )
+    end
 
-  defp parse_json_lines_parallel(lines) do
-    chunk_count = System.schedulers_online()
+    # Send directly to series — same pattern as Prometheus path
+    if count > 0 do
+      TimelessMetrics.Stats.incr_writes(store)
+      TimelessMetrics.Stats.add_points(store, count)
+      %{manager: manager} = :persistent_term.get({TimelessMetrics.Actor.SeriesManager, store})
 
-    chunks =
-      lines
-      |> Enum.chunk_every(div(length(lines), chunk_count) + 1)
-      |> Enum.map(fn chunk ->
-        Task.async(fn -> parse_json_lines_sequential(chunk) end)
+      Enum.each(groups, fn {{metric_name, labels}, batch} ->
+        {_id, pid} =
+          TimelessMetrics.Actor.SeriesManager.get_or_start(manager, metric_name, labels)
+
+        send(pid, {:write_batch, batch})
       end)
+    end
 
-    results = Task.await_many(chunks, :timer.seconds(30))
-    merge_parse_results(results)
+    {count, errors, Enum.take(Enum.reverse(error_samples), @max_error_samples)}
   end
 
-  defp parse_vm_line(line) do
+  # Parse a VM JSON line directly into grouped {key, points} pairs
+  defp parse_vm_line_grouped(line) do
     case safe_json_decode(line) do
       %{"metric" => metric_map, "values" => values, "timestamps" => timestamps}
       when is_list(values) and is_list(timestamps) and length(values) == length(timestamps) ->
         {name, labels} = extract_metric(metric_map)
+        key = {name, labels}
 
         try do
-          {:ok, zip_entries(name, labels, timestamps, values, [])}
+          points = zip_points(timestamps, values, [])
+          {:ok, [{key, points}], length(values)}
         catch
           :throw, :bad_entry -> :error
         end
@@ -1837,23 +1853,23 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
+  defp zip_points([], [], acc), do: acc
+
+  defp zip_points([ts | tsr], [v | vr], acc) when is_integer(ts) and is_number(v) do
+    zip_points(tsr, vr, [{div(ts, 1000), ensure_float(v)} | acc])
+  end
+
+  defp zip_points([ts | tsr], [v | vr], acc) when is_integer(ts) and is_binary(v) do
+    zip_points(tsr, vr, [{div(ts, 1000), v} | acc])
+  end
+
+  defp zip_points(_, _, _), do: throw(:bad_entry)
+
   defp safe_json_decode(bin) do
     :json.decode(bin)
   catch
     :error, _ -> :error
   end
-
-  defp zip_entries(_n, _l, [], [], acc), do: acc
-
-  defp zip_entries(n, l, [ts | tsr], [v | vr], acc) when is_integer(ts) and is_number(v) do
-    zip_entries(n, l, tsr, vr, [{n, l, ensure_float(v), ts} | acc])
-  end
-
-  defp zip_entries(n, l, [ts | tsr], [v | vr], acc) when is_integer(ts) and is_binary(v) do
-    zip_entries(n, l, tsr, vr, [{n, l, v, ts} | acc])
-  end
-
-  defp zip_entries(_, _, _, _, _), do: throw(:bad_entry)
 
   defp extract_metric(metric_map) do
     {name, labels} = Map.pop(metric_map, "__name__", "unknown")

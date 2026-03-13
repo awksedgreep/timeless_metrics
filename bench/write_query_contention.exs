@@ -206,5 +206,16 @@ IO.puts("Queries:       #{total_q}")
 IO.puts("Query rate:    #{Float.round(total_q / duration_s, 1)} q/s")
 IO.puts("Avg query lat: #{Float.round(avg_q_ms, 2)}ms")
 
+# Fast path vs slow path stats
+stats = TimelessMetrics.Stats.snapshot(:bench_store)
+fast = stats.query_fast_path
+slow = stats.query_slow_path
+total_lookups = fast + slow
+hit_rate = if total_lookups > 0, do: Float.round(fast / total_lookups * 100, 1), else: 0.0
+IO.puts("\n=== Read Path ===")
+IO.puts("Fast path (ETS):   #{fast}")
+IO.puts("Slow path (GenServer): #{slow}")
+IO.puts("Fast path hit rate: #{hit_rate}%")
+
 File.rm_rf!(data_dir)
 System.halt(0)

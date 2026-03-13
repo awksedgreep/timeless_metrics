@@ -54,12 +54,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
     case :ets.lookup(index, key) do
       [{^key, series_id, pid}] ->
-        if Process.alive?(pid) do
-          {series_id, pid}
-        else
-          # Process died — restart via GenServer (will update ETS with new PID)
-          GenServer.call(manager, {:start_series, series_id, metric_name, labels, series_type})
-        end
+        # Trust the ETS entry — callers handle :noproc lazily
+        {series_id, pid}
 
       [] ->
         GenServer.call(manager, {:get_or_start, metric_name, labels, series_type})
@@ -106,7 +102,7 @@ defmodule TimelessMetrics.Actor.SeriesManager do
         Enum.filter(acc, fn {sid, _labels, _pid} -> MapSet.member?(match_set, sid) end)
       end)
 
-    Enum.filter(result, fn {_series_id, _labels, pid} -> Process.alive?(pid) end)
+    result
   end
 
   # Slow path: full ETS scan for regex/complex filters
@@ -118,7 +114,6 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       {series_id, labels, pid}
     end)
     |> filter_by_labels(label_filter)
-    |> Enum.filter(fn {_series_id, _labels, pid} -> Process.alive?(pid) end)
   end
 
   defp exact_label_filter?(filter) when map_size(filter) == 0, do: false
