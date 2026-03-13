@@ -517,6 +517,7 @@ defmodule TimelessMetrics do
   Returns `{:ok, ["cpu_usage", "mem_usage", ...]}`.
   """
   def list_metrics(store) do
+    TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
     {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
     {:ok, Enum.map(rows, fn [name] -> name end)}
@@ -528,6 +529,7 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{labels: %{"host" => "web-1"}, ...}, ...]}`.
   """
   def list_series(store, metric_name) do
+    TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
     {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT labels FROM series WHERE metric_name = ?1 ORDER BY labels", [metric_name])
     {:ok, Enum.map(rows, fn [labels_str] -> %{labels: decode_labels(labels_str)} end)}
@@ -539,6 +541,7 @@ defmodule TimelessMetrics do
   Returns `{:ok, ["web-1", "web-2", ...]}`.
   """
   def label_values(store, metric_name, label_key) do
+    TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
     {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT labels FROM series WHERE metric_name = ?1", [metric_name])
 
@@ -819,18 +822,44 @@ defmodule TimelessMetrics do
   end
 
   defp find_matching_series(store, metric_name, label_filter) do
-    db = :"#{store}_db"
+    registry = :"#{store}_registry"
 
-    {:ok, rows} =
-      TimelessMetrics.DB.read(
-        db,
-        "SELECT id, labels FROM series WHERE metric_name = ?1",
-        [metric_name]
-      )
+    # Read from persistent_term (published) + ETS overflow (recent)
+    # This is O(all_series) but avoids SQLite entirely on the hot path
+    fwd_key = {TimelessMetrics.SeriesRegistry, registry, :forward}
+    rev_key = {TimelessMetrics.SeriesRegistry, registry, :reverse}
+    overflow = :"#{registry}_series_overflow"
 
-    rows
-    |> Enum.map(fn [id, labels_str] -> {id, decode_labels(labels_str)} end)
-    |> Enum.filter(fn {_id, labels} ->
+    # Collect all series from persistent_term
+    fwd_map = :persistent_term.get(fwd_key)
+    rev_map = :persistent_term.get(rev_key)
+
+    # Series from persistent_term matching this metric
+    published =
+      fwd_map
+      |> Enum.filter(fn {{m, _labels}, _id} -> m == metric_name end)
+      |> Enum.map(fn {{_m, labels}, id} -> {id, labels} end)
+
+    # Series from ETS overflow matching this metric
+    overflow_entries =
+      try do
+        :ets.tab2list(overflow)
+        |> Enum.flat_map(fn
+          {{^metric_name, labels}, id} -> [{id, labels}]
+          _ -> []
+        end)
+      rescue
+        _ -> []
+      end
+
+    # Merge (overflow may duplicate published — dedup by ID)
+    published_ids = MapSet.new(published, &elem(&1, 0))
+
+    all_series =
+      published ++ Enum.reject(overflow_entries, fn {id, _} -> MapSet.member?(published_ids, id) end)
+
+    # Apply label filter
+    Enum.filter(all_series, fn {_id, labels} ->
       Enum.all?(label_filter, fn
         {k, {:regex, pattern}} ->
           case Map.get(labels, k) do

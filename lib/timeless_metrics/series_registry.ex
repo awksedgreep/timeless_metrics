@@ -13,7 +13,7 @@ defmodule TimelessMetrics.SeriesRegistry do
 
   @publish_interval_ms 5_000
 
-  defstruct [:forward_key, :reverse_key, :overflow, :db, :name, :store, :dirty]
+  defstruct [:forward_key, :reverse_key, :overflow, :db, :name, :store, :dirty, :next_id, :pending_inserts]
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -50,6 +50,11 @@ defmodule TimelessMetrics.SeriesRegistry do
     fwd_key = forward_key(registry)
     overflow = overflow_table(registry)
     map_size(:persistent_term.get(fwd_key)) + div(:ets.info(overflow, :size), 2)
+  end
+
+  @doc "Flush pending series registrations to SQLite synchronously."
+  def flush_pending(registry) do
+    GenServer.call(registry, :flush_pending, :infinity)
   end
 
   @doc "Lookup series metadata by ID."
@@ -96,6 +101,13 @@ defmodule TimelessMetrics.SeriesRegistry do
     :persistent_term.put(rev_key, %{})
     load_from_db(fwd_key, rev_key, db)
 
+    # Seed ID counter from SQLite max
+    next_id =
+      case TimelessMetrics.DB.read(db, "SELECT COALESCE(MAX(id), 0) FROM series") do
+        {:ok, [[max_id]]} -> max_id + 1
+        _ -> 1
+      end
+
     schedule_publish()
 
     {:ok,
@@ -106,11 +118,18 @@ defmodule TimelessMetrics.SeriesRegistry do
        db: db,
        name: name,
        store: store,
-       dirty: false
+       dirty: false,
+       next_id: next_id,
+       pending_inserts: []
      }}
   end
 
   @impl true
+  def handle_call(:flush_pending, _from, state) do
+    flush_pending_inserts(state)
+    {:reply, :ok, %{state | pending_inserts: []}}
+  end
+
   def handle_call({:register, metric_name, labels, key}, _from, state) do
     # Double-check persistent_term (may have been published since caller checked)
     forward_map = :persistent_term.get(state.forward_key)
@@ -123,25 +142,21 @@ defmodule TimelessMetrics.SeriesRegistry do
             {:reply, id, state}
 
           [] ->
+            # Assign ID from counter — no SQLite on hot path
+            id = state.next_id
             labels_json = encode_labels(labels)
             now = System.os_time(:second)
 
-            result =
-              TimelessMetrics.DB.write(
-                state.db,
-                "INSERT INTO series (metric_name, labels, created_at) VALUES (?1, ?2, ?3) ON CONFLICT(metric_name, labels) DO UPDATE SET created_at = created_at RETURNING id",
-                [metric_name, labels_json, now]
-              )
-
-            {:ok, [[id]]} = result
-
             if state.store, do: TimelessMetrics.Stats.incr_series_created(state.store)
 
-            # Write to ETS overflow (immediate visibility, no literal-heap cost)
+            # Write to ETS overflow (immediate visibility)
             :ets.insert(state.overflow, {key, id})
             :ets.insert(state.overflow, {{:reverse, id}, metric_name, labels})
 
-            {:reply, id, %{state | dirty: true}}
+            # Queue for async bulk SQLite insert
+            pending = [{id, metric_name, labels_json, now} | state.pending_inserts]
+
+            {:reply, id, %{state | next_id: id + 1, dirty: true, pending_inserts: pending}}
         end
 
       id ->
@@ -156,12 +171,35 @@ defmodule TimelessMetrics.SeriesRegistry do
   end
 
   def handle_info(:publish, state) do
+    flush_pending_inserts(state)
     publish_overflow(state)
     schedule_publish()
-    {:noreply, %{state | dirty: false}}
+    {:noreply, %{state | dirty: false, pending_inserts: []}}
   end
 
   # --- Internals ---
+
+  defp flush_pending_inserts(%{pending_inserts: []}), do: :ok
+
+  defp flush_pending_inserts(state) do
+    inserts = Enum.reverse(state.pending_inserts)
+
+    # Bulk INSERT OR IGNORE — IDs were pre-assigned from the counter
+    {placeholders, params} =
+      inserts
+      |> Enum.with_index(1)
+      |> Enum.reduce({[], []}, fn {{id, metric, labels_json, ts}, i}, {ph, pa} ->
+        base = (i - 1) * 4
+        placeholder = "(?#{base + 1}, ?#{base + 2}, ?#{base + 3}, ?#{base + 4})"
+        {[placeholder | ph], pa ++ [id, metric, labels_json, ts]}
+      end)
+
+    sql =
+      "INSERT OR IGNORE INTO series (id, metric_name, labels, created_at) VALUES " <>
+        Enum.join(Enum.reverse(placeholders), ", ")
+
+    TimelessMetrics.DB.write(state.db, sql, params)
+  end
 
   defp publish_overflow(state) do
     entries = :ets.tab2list(state.overflow)
