@@ -19,7 +19,7 @@ defmodule TimelessMetrics.Supervisor do
     segment_duration = Keyword.get(opts, :segment_duration, 14_400)
     pending_flush_interval = Keyword.get(opts, :pending_flush_interval, :timer.seconds(60))
     compression = Keyword.get(opts, :compression, :zstd)
-    compression_level = Keyword.get(opts, :compression_level, 9)
+    compression_level = Keyword.get(opts, :compression_level, 2)
 
     raw_retention_seconds = Keyword.get(opts, :raw_retention_seconds, 604_800)
     daily_retention_seconds = Keyword.get(opts, :daily_retention_seconds, 31_536_000)

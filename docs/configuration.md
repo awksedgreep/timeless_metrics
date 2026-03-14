@@ -13,7 +13,7 @@ All options are passed to the `TimelessMetrics` child spec:
   flush_threshold: 10_000,
   segment_duration: 14_400,
   compression: :zstd,
-  compression_level: 9,
+  compression_level: 2,
   raw_retention_seconds: 604_800,
   daily_retention_seconds: 31_536_000,
   rollup_interval: 300_000,
@@ -34,7 +34,7 @@ All options are passed to the `TimelessMetrics` child spec:
 | `flush_threshold` | `pos_integer()` | `10_000` | Points per shard before triggering an immediate flush |
 | `segment_duration` | `pos_integer()` | `14_400` | Seconds per time window for segment files (default: 4 hours) |
 | `compression` | `:zstd` | `:zstd` | Compression algorithm for stored segments |
-| `compression_level` | `pos_integer()` | `9` | Zstd compression level (1-19, higher = smaller + slower) |
+| `compression_level` | `pos_integer()` | `2` | Zstd compression level (1-19). ALP encoding does the heavy lifting; higher zstd levels add minimal benefit |
 | `raw_retention_seconds` | `pos_integer()` | `604_800` | How long to keep raw data (default: 7 days) |
 | `daily_retention_seconds` | `pos_integer()` | `31_536_000` | How long to keep daily rollup data (default: 365 days) |
 | `rollup_interval` | `pos_integer()` | `300_000` | Milliseconds between automatic rollup runs (default: 5 minutes) |
@@ -67,7 +67,7 @@ config :my_app, :metrics,
   data_dir: "/var/lib/my_app/metrics",
   buffer_shards: 16,
   flush_threshold: 20_000,
-  compression_level: 12,
+  compression_level: 2,
   raw_retention_seconds: 14 * 86_400,
   daily_retention_seconds: 2 * 365 * 86_400
 ```
@@ -140,11 +140,11 @@ Time window size for segment files in seconds. Completed windows are sealed into
 
 ### `compression_level`
 
-Zstd compression level (1-19). Higher levels produce smaller output but use more CPU.
+Zstd container compression level (1-19). ALP encoding handles the bulk of compression — zstd is a secondary pass that adds marginal gains. Higher levels produce negligibly smaller output at significant CPU cost.
 
-- **9 (default)**: good balance of size and speed
-- **3-5**: for CPU-constrained environments
-- **15-19**: for storage-constrained environments with CPU to spare
+- **2 (default)**: optimal. ALP output compresses equally well at all levels.
+- **1**: marginally faster, same ratio
+- **9+**: not recommended. Adds CPU cost with <0.2 B/pt improvement.
 
 ### `raw_retention_seconds` / `daily_retention_seconds`
 
