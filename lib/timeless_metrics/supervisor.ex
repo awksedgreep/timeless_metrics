@@ -102,7 +102,7 @@ defmodule TimelessMetrics.Supervisor do
       |> List.flatten()
 
     # Ingest workers: background processors that drain the ETS queue
-    ingest_worker_count = Keyword.get(opts, :ingest_workers, max(div(System.schedulers_online(), 4), 2))
+    ingest_worker_count = Keyword.get(opts, :ingest_workers, max(div(System.schedulers_online(), 2), 2))
 
     ingest_workers =
       for i <- 0..(ingest_worker_count - 1) do
