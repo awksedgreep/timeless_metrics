@@ -16,6 +16,7 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   defstruct [
     :segments,
+    :dirty_keys,
     :segment_duration,
     :pending_flush_interval,
     :compression,
@@ -282,6 +283,7 @@ defmodule TimelessMetrics.SegmentBuilder do
 
     state = %__MODULE__{
       segments: %{},
+      dirty_keys: MapSet.new(),
       segment_duration: segment_duration,
       pending_flush_interval: pending_flush_interval,
       compression: compression,
@@ -305,9 +307,9 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   @impl true
   def handle_cast({:ingest, grouped_points}, state) do
-    new_segments =
-      Enum.reduce(grouped_points, state.segments, fn {series_id, points}, segments ->
-        Enum.reduce(points, segments, fn {ts, val}, segs ->
+    {new_segments, new_dirty} =
+      Enum.reduce(grouped_points, {state.segments, state.dirty_keys}, fn {series_id, points}, {segments, dirty} ->
+        Enum.reduce(points, {segments, dirty}, fn {ts, val}, {segs, d} ->
           bucket = segment_bucket(ts, state.segment_duration)
           key = {series_id, bucket}
 
@@ -320,14 +322,11 @@ defmodule TimelessMetrics.SegmentBuilder do
             })
 
           updated = %{seg | points: [{ts, val} | seg.points]}
-          Map.put(segs, key, updated)
+          {Map.put(segs, key, updated), MapSet.put(d, key)}
         end)
       end)
 
-    # Accumulate only — sealing happens on flush or :check_segments timer.
-    # This ensures all points for a series+window are compressed into one
-    # gorilla stream, regardless of how many buffer flushes delivered them.
-    {:noreply, %{state | segments: new_segments}}
+    {:noreply, %{state | segments: new_segments, dirty_keys: new_dirty}}
   end
 
   @impl true
@@ -351,7 +350,7 @@ defmodule TimelessMetrics.SegmentBuilder do
       write_and_seal(completed, state)
     end
 
-    {:reply, :ok, %{state | segments: pending}}
+    {:reply, :ok, %{state | segments: pending, dirty_keys: MapSet.new()}}
   end
 
   def handle_call(:pending_point_count, _from, state) do
@@ -403,18 +402,23 @@ defmodule TimelessMetrics.SegmentBuilder do
   end
 
   def handle_info(:flush_pending, state) do
-    # Write in-progress segments to WAL so fresh data is queryable,
-    # but keep them in memory for continued accumulation.
-    pending = Map.values(state.segments)
+    # Only compress segments that received new data since last flush
+    dirty_segments =
+      state.dirty_keys
+      |> Enum.flat_map(fn key ->
+        case Map.get(state.segments, key) do
+          nil -> []
+          seg -> [seg]
+        end
+      end)
 
-    if pending != [] do
-      # Offload compression + disk write to a Task
+    if dirty_segments != [] do
       segment_state = %{store: state.store, compression: state.compression, compression_level: state.compression_level, shard_store: state.shard_store}
-      Task.start(fn -> write_segments_async(pending, segment_state) end)
+      Task.start(fn -> write_segments_async(dirty_segments, segment_state) end)
     end
 
     Process.send_after(self(), :flush_pending, state.pending_flush_interval)
-    {:noreply, state}
+    {:noreply, %{state | dirty_keys: MapSet.new()}}
   end
 
   @impl true
