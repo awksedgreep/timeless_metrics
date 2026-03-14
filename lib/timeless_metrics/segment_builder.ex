@@ -17,6 +17,7 @@ defmodule TimelessMetrics.SegmentBuilder do
   defstruct [
     :segments,
     :dirty_keys,
+    :flushed_keys,
     :segment_duration,
     :pending_flush_interval,
     :compression,
@@ -284,6 +285,7 @@ defmodule TimelessMetrics.SegmentBuilder do
     state = %__MODULE__{
       segments: %{},
       dirty_keys: MapSet.new(),
+      flushed_keys: MapSet.new(),
       segment_duration: segment_duration,
       pending_flush_interval: pending_flush_interval,
       compression: compression,
@@ -350,7 +352,7 @@ defmodule TimelessMetrics.SegmentBuilder do
       write_and_seal(completed, state)
     end
 
-    {:reply, :ok, %{state | segments: pending, dirty_keys: MapSet.new()}}
+    {:reply, :ok, %{state | segments: pending, dirty_keys: MapSet.new(), flushed_keys: MapSet.new(Map.keys(pending))}}
   end
 
   def handle_call(:pending_point_count, _from, state) do
@@ -397,28 +399,53 @@ defmodule TimelessMetrics.SegmentBuilder do
       Task.start(fn -> write_and_seal_async(completed, segment_state) end)
     end
 
+    # Remove sealed segment keys from flushed tracking
+    completed_keys = Enum.map(completed, fn seg -> {seg.series_id, seg.start_time} end) |> MapSet.new()
+    new_flushed = MapSet.difference(state.flushed_keys, completed_keys)
+
     Process.send_after(self(), :check_segments, :timer.seconds(10))
-    {:noreply, %{state | segments: pending}}
+    {:noreply, %{state | segments: pending, flushed_keys: new_flushed}}
   end
 
   def handle_info(:flush_pending, state) do
-    # Only compress segments that received new data since last flush
-    dirty_segments =
-      state.dirty_keys
-      |> Enum.flat_map(fn key ->
-        case Map.get(state.segments, key) do
-          nil -> []
-          seg -> [seg]
-        end
-      end)
+    {segments_to_flush, new_flushed_keys} =
+      if MapSet.size(state.dirty_keys) > 0 do
+        # Active writes — flush only dirty segments
+        segs = state.dirty_keys
+          |> Enum.flat_map(fn key ->
+            case Map.get(state.segments, key) do
+              nil -> []
+              seg -> [seg]
+            end
+          end)
+        {segs, MapSet.union(state.flushed_keys, state.dirty_keys)}
+      else
+        # No new writes — check for unflushed segments
+        unflushed_keys = Map.keys(state.segments)
+          |> MapSet.new()
+          |> MapSet.difference(state.flushed_keys)
 
-    if dirty_segments != [] do
+        if MapSet.size(unflushed_keys) > 0 do
+          segs = unflushed_keys
+            |> Enum.flat_map(fn key ->
+              case Map.get(state.segments, key) do
+                nil -> []
+                seg -> [seg]
+              end
+            end)
+          {segs, MapSet.union(state.flushed_keys, unflushed_keys)}
+        else
+          {[], state.flushed_keys}
+        end
+      end
+
+    if segments_to_flush != [] do
       segment_state = %{store: state.store, compression: state.compression, compression_level: state.compression_level, shard_store: state.shard_store}
-      Task.start(fn -> write_segments_async(dirty_segments, segment_state) end)
+      Task.start(fn -> write_segments_async(segments_to_flush, segment_state) end)
     end
 
     Process.send_after(self(), :flush_pending, state.pending_flush_interval)
-    {:noreply, %{state | dirty_keys: MapSet.new()}}
+    {:noreply, %{state | dirty_keys: MapSet.new(), flushed_keys: new_flushed_keys}}
   end
 
   @impl true
