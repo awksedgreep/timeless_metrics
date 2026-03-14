@@ -216,23 +216,26 @@ defmodule TimelessMetrics.SeriesRegistry do
   defp flush_pending_inserts(%{pending_inserts: []}), do: :ok
 
   defp flush_pending_inserts(state) do
-    inserts = Enum.reverse(state.pending_inserts)
+    # SQLite has a 32,766 parameter limit. 4 params per row = 8,000 rows per batch.
+    state.pending_inserts
+    |> Enum.reverse()
+    |> Enum.chunk_every(8000)
+    |> Enum.each(fn chunk ->
+      {placeholders, params} =
+        chunk
+        |> Enum.with_index(1)
+        |> Enum.reduce({[], []}, fn {{id, metric, labels_json, ts}, i}, {ph, pa} ->
+          base = (i - 1) * 4
+          placeholder = "(?#{base + 1}, ?#{base + 2}, ?#{base + 3}, ?#{base + 4})"
+          {[placeholder | ph], pa ++ [id, metric, labels_json, ts]}
+        end)
 
-    # Bulk INSERT OR IGNORE — IDs were pre-assigned from the counter
-    {placeholders, params} =
-      inserts
-      |> Enum.with_index(1)
-      |> Enum.reduce({[], []}, fn {{id, metric, labels_json, ts}, i}, {ph, pa} ->
-        base = (i - 1) * 4
-        placeholder = "(?#{base + 1}, ?#{base + 2}, ?#{base + 3}, ?#{base + 4})"
-        {[placeholder | ph], pa ++ [id, metric, labels_json, ts]}
-      end)
+      sql =
+        "INSERT OR IGNORE INTO series (id, metric_name, labels, created_at) VALUES " <>
+          Enum.join(Enum.reverse(placeholders), ", ")
 
-    sql =
-      "INSERT OR IGNORE INTO series (id, metric_name, labels, created_at) VALUES " <>
-        Enum.join(Enum.reverse(placeholders), ", ")
-
-    TimelessMetrics.DB.write(state.db, sql, params)
+      TimelessMetrics.DB.write(state.db, sql, params)
+    end)
   end
 
   defp publish_overflow(state) do

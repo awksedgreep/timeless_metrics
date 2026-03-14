@@ -64,6 +64,8 @@ defmodule TimelessMetrics.MixProject do
   defp deps do
     [
       {:gorilla_stream, "~> 2.2"},
+      {:ex_alp, "~> 0.1"},
+      {:ex_openzl, "~> 0.4"},
       {:exqlite, "~> 0.27"},
       {:ezstd, "~> 1.2"},
       {:rocket, github: "awksedgreep/rocket"},

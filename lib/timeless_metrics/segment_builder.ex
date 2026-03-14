@@ -486,13 +486,10 @@ defmodule TimelessMetrics.SegmentBuilder do
             error -> error
           end
         else
-          if cdict && dict_version > 0 do
-            compress_with_dict(sorted_points, cdict, dict_version)
-          else
-            GorillaStream.compress(sorted_points,
-              compression: state.compression,
-              compression_level: state.compression_level
-            )
+          # ALP encoding with zstd container compression
+          case ExAlp.compress(sorted_points, compression: :zstd, compression_level: state.compression_level) do
+            {:ok, blob} -> {:ok, <<0xA1, blob::binary>>}
+            error -> error
           end
         end
 

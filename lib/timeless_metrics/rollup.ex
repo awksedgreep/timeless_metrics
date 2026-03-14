@@ -184,7 +184,7 @@ defmodule TimelessMetrics.Rollup do
     points_by_series =
       rows
       |> Enum.flat_map(fn [series_id, _start, _end, blob] ->
-        case GorillaStream.decompress(blob, compression: state.compression) do
+        case decompress_segment(blob, state.compression) do
           {:ok, points} ->
             Enum.map(points, fn {ts, val} -> {series_id, ts, val} end)
 
@@ -401,6 +401,19 @@ defmodule TimelessMetrics.Rollup do
     else
       {:tier, Enum.at(all_tiers, idx - 1)}
     end
+  end
+
+  # Auto-detect segment format: ALP (0xA1), text (0xFE), or legacy gorilla
+  defp decompress_segment(<<0xA1, alp_blob::binary>>, _compression) do
+    ExAlp.decompress(alp_blob, compression: :zstd)
+  end
+
+  defp decompress_segment(<<0xFE, text_blob::binary>>, _compression) do
+    TimelessMetrics.TextCodec.decompress(text_blob)
+  end
+
+  defp decompress_segment(blob, compression) do
+    GorillaStream.decompress(blob, compression: compression)
   end
 
   defp schedule_tick(interval) do

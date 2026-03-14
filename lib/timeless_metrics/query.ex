@@ -423,13 +423,18 @@ defmodule TimelessMetrics.Query do
 
   # Text series marker: <<0xFE, text_codec_blob...>>
   @text_marker 0xFE
+  # ALP marker: <<0xA1, alp_zstd_blob...>>
+  @alp_marker 0xA1
 
   defp decompress_blob(<<@text_marker, text_blob::binary>>, _store, _compression) do
     TimelessMetrics.TextCodec.decompress(text_blob)
   end
 
-  # Decompress a segment blob, auto-detecting dict-compressed vs standard format.
-  # Dict-compressed blobs start with <<0xFF, dict_version, data...>>
+  defp decompress_blob(<<@alp_marker, alp_blob::binary>>, _store, _compression) do
+    ExAlp.decompress(alp_blob, compression: :zstd)
+  end
+
+  # Legacy: dict-compressed gorilla blobs (<<0xFF, dict_version, data...>>)
   defp decompress_blob(
          <<@dict_marker, _dict_version::8, compressed::binary>>,
          store,
@@ -447,6 +452,7 @@ defmodule TimelessMetrics.Query do
     end
   end
 
+  # Legacy: standard gorilla blobs
   defp decompress_blob(blob, _store, compression) do
     GorillaStream.decompress(blob, compression: compression)
   end
