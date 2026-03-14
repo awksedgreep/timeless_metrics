@@ -30,7 +30,7 @@ defmodule TimelessMetrics.IngestWorker do
   """
   def enqueue(queue_table, body, format) do
     key = :erlang.unique_integer([:positive, :monotonic])
-    :ets.insert(queue_table, {key, body, format})
+    :ets.insert(queue_table, {key, :ezstd.compress(body, 2), format})
     :ok
   end
 
@@ -115,7 +115,9 @@ defmodule TimelessMetrics.IngestWorker do
     registry = :"#{state.store}_registry"
     shard_count = :persistent_term.get({TimelessMetrics, state.store, :shard_count})
 
-    Enum.each(entries, fn {_key, body, format} ->
+    Enum.each(entries, fn {_key, compressed_body, format} ->
+      body = :ezstd.decompress(compressed_body)
+
       case format do
         :prometheus -> process_prometheus(body, state.store, registry, shard_count)
         :json -> process_json(body, state.store, registry, shard_count)
