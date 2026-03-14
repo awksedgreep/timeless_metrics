@@ -1029,7 +1029,13 @@ defmodule TimelessMetrics.HTTP do
         TimelessMetrics.Stats.incr_http_imports(store)
         body = req.body
 
-        {count, errors, error_samples} = ingest_prometheus_text(store, body)
+        {us, {count, errors, error_samples}} = :timer.tc(fn -> ingest_prometheus_text(store, body) end)
+
+        if us > 100_000 do
+          require Logger
+          Logger.warning("Slow prometheus import: #{div(us, 1000)}ms for #{count} points")
+        end
+
         TimelessMetrics.Stats.add_http_import_errors(store, errors)
 
         :telemetry.execute(
@@ -1907,12 +1913,19 @@ defmodule TimelessMetrics.HTTP do
       registry = :"#{store}_registry"
       shard_count = :persistent_term.get({TimelessMetrics, store, :shard_count})
 
-      Enum.each(groups, fn {{metric_name, labels}, batch} ->
-        series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-        shard_idx = rem(abs(series_id), shard_count)
-        points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
-        TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+      {resolve_us, _} = :timer.tc(fn ->
+        Enum.each(groups, fn {{metric_name, labels}, batch} ->
+          series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+          shard_idx = rem(abs(series_id), shard_count)
+          points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
+          TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+        end)
       end)
+
+      if resolve_us > 100_000 do
+        require Logger
+        Logger.warning("Slow write dispatch: #{div(resolve_us, 1000)}ms for #{map_size(groups)} series")
+      end
     end
 
     {count, errors, error_samples}
