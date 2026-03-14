@@ -36,8 +36,29 @@ defmodule TimelessMetrics.SeriesRegistry do
         overflow = overflow_table(registry)
 
         case :ets.lookup(overflow, key) do
-          [{^key, id}] -> id
-          [] -> GenServer.call(registry, {:register, metric_name, labels, key})
+          [{^key, id}] ->
+            id
+
+          [] ->
+            # Lock-free creation: atomically assign an ID and CAS into ETS
+            id_counter = :persistent_term.get({__MODULE__, registry, :id_counter})
+            id = :atomics.add_get(id_counter, 1, 1)
+
+            # insert_new is atomic — if another process beat us, use their ID
+            case :ets.insert_new(overflow, {key, id}) do
+              true ->
+                # We won the race — register reverse lookup and queue for SQLite
+                :ets.insert(overflow, {{:reverse, id}, metric_name, labels})
+                store = :persistent_term.get({__MODULE__, registry, :store})
+                if store, do: TimelessMetrics.Stats.incr_series_created(store)
+                GenServer.cast(registry, {:queue_insert, id, metric_name, labels})
+                id
+
+              false ->
+                # Another process registered it — use their ID
+                [{^key, existing_id}] = :ets.lookup(overflow, key)
+                existing_id
+            end
         end
 
       id ->
@@ -101,12 +122,18 @@ defmodule TimelessMetrics.SeriesRegistry do
     :persistent_term.put(rev_key, %{})
     load_from_db(fwd_key, rev_key, db)
 
-    # Seed ID counter from SQLite max
-    next_id =
+    # Atomics counter for lock-free ID generation from any process
+    id_counter = :atomics.new(1, signed: true)
+    seed =
       case TimelessMetrics.DB.read(db, "SELECT COALESCE(MAX(id), 0) FROM series") do
-        {:ok, [[max_id]]} -> max_id + 1
-        _ -> 1
+        {:ok, [[max_id]]} -> max_id
+        _ -> 0
       end
+    :atomics.put(id_counter, 1, seed)
+    :persistent_term.put({__MODULE__, name, :id_counter}, id_counter)
+
+    # Store name for Stats calls from lock-free path
+    :persistent_term.put({__MODULE__, name, :store}, store)
 
     schedule_publish()
 
@@ -119,12 +146,19 @@ defmodule TimelessMetrics.SeriesRegistry do
        name: name,
        store: store,
        dirty: false,
-       next_id: next_id,
+       next_id: nil,
        pending_inserts: []
      }}
   end
 
   @impl true
+  def handle_cast({:queue_insert, id, metric_name, labels}, state) do
+    labels_json = encode_labels(labels)
+    now = System.os_time(:second)
+    pending = [{id, metric_name, labels_json, now} | state.pending_inserts]
+    {:noreply, %{state | dirty: true, pending_inserts: pending}}
+  end
+
   def handle_call(:flush_pending, _from, state) do
     flush_pending_inserts(state)
     {:reply, :ok, %{state | pending_inserts: []}}
