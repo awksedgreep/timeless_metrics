@@ -41,10 +41,10 @@ All options are passed to the supervisor child spec:
 | -------------------------- | ------------ | ----------------------------------------- |
 | `:name`                    | *required*   | Atom identifier for this store instance   |
 | `:data_dir`                | *required*   | Directory for persisted data              |
-| `:compression`             | `:zstd`      | Compression algorithm for data blocks     |
-| `:max_blocks`              | `100`        | Maximum data blocks in memory per series  |
-| `:block_size`              | `1000`       | Points per data block                     |
-| `:flush_interval`          | `60_000`     | Flush to disk interval (ms)               |
+| `:compression`             | `:zstd`      | Compression algorithm for segments        |
+| `:buffer_shards`           | `cpus / 2`   | Number of ETS write buffer shards         |
+| `:flush_threshold`         | `10_000`     | Points per shard before immediate flush   |
+| `:flush_interval`          | `5_000`      | Buffer flush interval (ms)                |
 | `:raw_retention_seconds`   | `604_800`    | Raw data retention (default 7 days)       |
 | `:daily_retention_seconds` | `31_536_000` | Daily rollup retention (default 1 year)   |
 | `:rollup_interval`         | `300_000`    | Daily rollup computation interval (ms)    |
@@ -64,9 +64,9 @@ children = [
    name: :metrics,
    data_dir: "/var/data/metrics",
    compression: :zstd,
-   max_blocks: 200,
-   block_size: 2000,
-   flush_interval: 30_000,
+   buffer_shards: 16,
+   flush_threshold: 20_000,
+   flush_interval: 5_000,
    raw_retention_seconds: 30 * 86_400,
    daily_retention_seconds: 365 * 86_400,
    rollup_interval: :timer.minutes(5),

@@ -8,19 +8,17 @@ All options are passed to the `TimelessMetrics` child spec:
 {TimelessMetrics,
   name: :metrics,
   data_dir: "/var/lib/metrics",
+  buffer_shards: 48,
+  flush_interval: 5_000,
+  flush_threshold: 10_000,
+  segment_duration: 14_400,
   compression: :zstd,
-  max_blocks: 100,
-  block_size: 1000,
-  flush_interval: 60_000,
+  compression_level: 9,
   raw_retention_seconds: 604_800,
   daily_retention_seconds: 31_536_000,
   rollup_interval: 300_000,
   retention_interval: 3_600_000,
   alert_interval: 60_000,
-  merge_block_min_count: 4,
-  merge_block_max_points: 10_000,
-  merge_block_min_age_seconds: 300,
-  merge_interval: 300_000,
   self_monitor: true,
   scraping: true}
 ```
@@ -30,20 +28,18 @@ All options are passed to the `TimelessMetrics` child spec:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | `atom` | **(required)** | Store name used to reference this instance in all API calls |
-| `data_dir` | `String.t()` | **(required)** | Directory for SQLite databases and block data files |
-| `compression` | `:zstd` | `:zstd` | Compression algorithm for stored blocks |
-| `max_blocks` | `pos_integer()` | `100` | Maximum number of compressed blocks per series (ring buffer) |
-| `block_size` | `pos_integer()` | `1000` | Points per compressed block before flushing |
-| `flush_interval` | `pos_integer()` | `60_000` | Milliseconds between automatic buffer flushes |
+| `data_dir` | `String.t()` | **(required)** | Directory for SQLite databases and segment data files |
+| `buffer_shards` | `pos_integer()` | `schedulers / 2` | Number of ETS write buffer shards (and paired SegmentBuilder workers) |
+| `flush_interval` | `pos_integer()` | `5_000` | Milliseconds between automatic buffer flushes to SegmentBuilder |
+| `flush_threshold` | `pos_integer()` | `10_000` | Points per shard before triggering an immediate flush |
+| `segment_duration` | `pos_integer()` | `14_400` | Seconds per time window for segment files (default: 4 hours) |
+| `compression` | `:zstd` | `:zstd` | Compression algorithm for stored segments |
+| `compression_level` | `pos_integer()` | `9` | Zstd compression level (1-19, higher = smaller + slower) |
 | `raw_retention_seconds` | `pos_integer()` | `604_800` | How long to keep raw data (default: 7 days) |
 | `daily_retention_seconds` | `pos_integer()` | `31_536_000` | How long to keep daily rollup data (default: 365 days) |
 | `rollup_interval` | `pos_integer()` | `300_000` | Milliseconds between automatic rollup runs (default: 5 minutes) |
 | `retention_interval` | `pos_integer()` | `3_600_000` | Milliseconds between retention enforcement runs (default: 1 hour) |
 | `alert_interval` | `pos_integer()` | `60_000` | Milliseconds between alert evaluation cycles (default: 60 seconds) |
-| `merge_block_min_count` | `pos_integer()` | `4` | Minimum eligible blocks before merge compaction triggers |
-| `merge_block_max_points` | `pos_integer()` | `10_000` | Target points per merged block |
-| `merge_block_min_age_seconds` | `non_neg_integer()` | `300` | Only merge blocks older than this (avoids churning recent data) |
-| `merge_interval` | `pos_integer()` | `300_000` | Milliseconds between merge compaction checks (default: 5 minutes) |
 | `self_monitor` | `boolean()` | `true` | Enable self-monitoring (writes internal metrics about the store) |
 | `scraping` | `boolean()` | `true` | Enable the Prometheus scraping subsystem |
 
@@ -69,9 +65,9 @@ All options are passed to the `TimelessMetrics` child spec:
 config :my_app, :metrics,
   name: :metrics,
   data_dir: "/var/lib/my_app/metrics",
-  max_blocks: 200,
-  block_size: 2000,
-  flush_interval: 30_000,
+  buffer_shards: 16,
+  flush_threshold: 20_000,
+  compression_level: 12,
   raw_retention_seconds: 14 * 86_400,
   daily_retention_seconds: 2 * 365 * 86_400
 ```
@@ -110,30 +106,45 @@ When running as a container, these environment variables configure the instance:
 
 ## Tuning guidance
 
-### `block_size`
+### `buffer_shards`
 
-Controls how many points accumulate in the raw buffer before being compressed into a block. Larger blocks compress better but use more memory per series and increase write latency during compression.
+Number of independent ETS write buffer + SegmentBuilder pairs. More shards = more write parallelism but more file descriptors and compression threads.
 
-- **1000 (default)**: good balance for most workloads
-- **500**: lower latency flushes, slightly worse compression
-- **2000-5000**: better compression for high-volume series
+- **Default (`schedulers / 2`)**: good for most workloads. On a 96-core machine this is 48 shards.
+- **Lower (4-8)**: for embedded/low-core deployments
+- **Higher**: rarely needed, the default scales well
 
-### `max_blocks`
+### `flush_threshold`
 
-The ring buffer size per series. When exceeded, the oldest block is evicted. Combined with `block_size`, this determines how much raw data each series holds in memory.
+Points per shard before triggering an immediate flush to the SegmentBuilder. Lower values reduce data-in-buffer time, higher values reduce flush overhead.
 
-Total in-memory points per series = `max_blocks * block_size`
-
-- **100 (default)**: 100K points per series (at 5s intervals, ~5.8 days)
-- **200+**: for longer raw retention windows
+- **10,000 (default)**: good balance
+- **5,000**: for lower-latency query visibility
+- **50,000+**: for very high throughput write-heavy workloads
 
 ### `flush_interval`
 
-How often buffered data is flushed to compressed blocks. Shorter intervals reduce data loss risk on crashes but increase I/O.
+How often each buffer shard flushes to its SegmentBuilder regardless of point count. Acts as a ceiling on data visibility latency.
 
-- **60_000 (default)**: flush every minute
-- **30_000**: for lower data loss tolerance
-- **120_000**: for write-heavy workloads where batching helps
+- **5,000 (default)**: data queryable within 5 seconds
+- **1,000**: near-real-time visibility
+- **30,000**: for write-heavy workloads where batching helps
+
+### `segment_duration`
+
+Time window size for segment files in seconds. Completed windows are sealed into immutable `.seg` files.
+
+- **14,400 (default / 4 hours)**: good compression, reasonable file count
+- **3,600 (1 hour)**: more granular retention, smaller files
+- **86,400 (1 day)**: maximum compression, fewer files
+
+### `compression_level`
+
+Zstd compression level (1-19). Higher levels produce smaller output but use more CPU.
+
+- **9 (default)**: good balance of size and speed
+- **3-5**: for CPU-constrained environments
+- **15-19**: for storage-constrained environments with CPU to spare
 
 ### `raw_retention_seconds` / `daily_retention_seconds`
 
@@ -141,17 +152,6 @@ Configure how long data is kept at each resolution tier:
 
 - **Raw**: detailed point-level data. Default 7 days. Increase for operational dashboards that need fine granularity over longer periods.
 - **Daily**: aggregated daily rollups (avg, min, max, sum, count, last). Default 365 days. Increase for long-term capacity planning.
-
-### Merge compaction
-
-Each series actor periodically consolidates multiple small compressed blocks into fewer, larger ones. Larger blocks achieve better Gorilla + zstd compression and reduce decompression overhead during large-range queries.
-
-- **`merge_block_min_count` (default 4)**: minimum blocks needed to trigger a merge. Lower for faster consolidation, higher to batch more blocks together.
-- **`merge_block_max_points` (default 10,000)**: target size of merged blocks. Increase for better compression at the cost of more memory during merge.
-- **`merge_block_min_age_seconds` (default 300)**: only merge blocks older than this. Prevents churning recently-written blocks that are still being queried individually.
-- **`merge_interval` (default 300,000 / 5 min)**: how often each series process checks for mergeable blocks.
-
-Merge compaction can also be triggered manually via `TimelessMetrics.merge_now(store)`.
 
 ### Multiple store instances
 

@@ -65,9 +65,9 @@ All subsequent API calls reference the store by its name (`:metrics` above).
 |--------|------|---------|-------------|
 | `:name` | atom | **required** | Store name used in all API calls |
 | `:data_dir` | string | **required** | Directory for block data files and metadata database |
-| `:block_size` | integer | `1000` | Points per compressed block |
-| `:max_blocks` | integer | `100` | Maximum compressed blocks per series (ring buffer) |
-| `:flush_interval` | integer | `60_000` | Flush to disk interval in ms |
+| `:buffer_shards` | integer | `cpus / 2` | Number of ETS write buffer shards |
+| `:flush_threshold` | integer | `10_000` | Points per shard before immediate flush |
+| `:flush_interval` | integer | `5_000` | Buffer flush interval in ms |
 | `:compression` | atom | `:zstd` | Compression algorithm |
 | `:schema` | module/struct | `TimelessMetrics.Schema.default()` | Rollup tier configuration |
 
@@ -942,9 +942,9 @@ When starting TimelessMetrics as a library:
 {TimelessMetrics,
   name: :metrics,
   data_dir: "/var/lib/metrics",
-  block_size: 1000,
-  max_blocks: 100,
-  flush_interval: 60_000,
+  buffer_shards: 16,
+  flush_threshold: 10_000,
+  flush_interval: 5_000,
   compression: :zstd,
   schema: MyApp.MetricsSchema}
 ```

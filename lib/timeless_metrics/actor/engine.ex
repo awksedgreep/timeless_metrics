@@ -709,6 +709,9 @@ defmodule TimelessMetrics.Actor.Engine do
     db = :"#{store}_db"
     data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir})
 
+    # Flush pending series registrations before counting
+    TimelessMetrics.Actor.SeriesWriter.flush_sync(:"#{store}_series_writer")
+
     # Series count from DB
     {:ok, [[series_count]]} = TimelessMetrics.DB.read(db, "SELECT COUNT(*) FROM series")
 
@@ -853,7 +856,8 @@ defmodule TimelessMetrics.Actor.Engine do
     db = :"#{store}_db"
     data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir})
 
-    # 1. Flush all dirty state to disk
+    # 1. Flush pending series registrations + dirty state to disk
+    TimelessMetrics.Actor.SeriesWriter.flush_sync(:"#{store}_series_writer")
     SeriesManager.flush_all(manager)
 
     File.mkdir_p!(target_dir)

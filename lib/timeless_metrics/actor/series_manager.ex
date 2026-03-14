@@ -18,6 +18,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     :registry,
     :dynamic_sup,
     :index,
+    :series_writer,
+    :next_id,
     :max_blocks,
     :block_size,
     :compression,
@@ -128,10 +130,10 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   @doc "List all unique metric names."
   def list_metrics(manager) do
     state_info = :persistent_term.get({__MODULE__, manager})
-    db = state_info.db
+    flush_writer(state_info)
 
     {:ok, rows} =
-      TimelessMetrics.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+      TimelessMetrics.DB.read(state_info.db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
 
     Enum.map(rows, fn [name] -> name end)
   end
@@ -139,11 +141,11 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   @doc "List all series (labels) for a given metric."
   def list_series(manager, metric_name) do
     state_info = :persistent_term.get({__MODULE__, manager})
-    db = state_info.db
+    flush_writer(state_info)
 
     {:ok, rows} =
       TimelessMetrics.DB.read(
-        db,
+        state_info.db,
         "SELECT labels FROM series WHERE metric_name = ?1 ORDER BY labels",
         [metric_name]
       )
@@ -191,11 +193,11 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   @doc "Get label values for a specific label key across all series of a metric."
   def label_values(manager, metric_name, label_key) do
     state_info = :persistent_term.get({__MODULE__, manager})
-    db = state_info.db
+    flush_writer(state_info)
 
     {:ok, rows} =
       TimelessMetrics.DB.read(
-        db,
+        state_info.db,
         "SELECT labels FROM series WHERE metric_name = ?1",
         [metric_name]
       )
@@ -276,6 +278,15 @@ defmodule TimelessMetrics.Actor.SeriesManager do
         nil
       end
 
+    # Seed ID counter from SQLite max
+    next_id =
+      case TimelessMetrics.DB.read(db, "SELECT COALESCE(MAX(id), 0) FROM series") do
+        {:ok, [[max_id]]} -> max_id + 1
+        _ -> 1
+      end
+
+    series_writer = :"#{store}_series_writer"
+
     state = %__MODULE__{
       store: store,
       db: db,
@@ -283,6 +294,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       registry: registry,
       dynamic_sup: dynamic_sup,
       index: index,
+      series_writer: series_writer,
+      next_id: next_id,
       max_blocks: max_blocks,
       block_size: block_size,
       compression: compression,
@@ -306,7 +319,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
       read_buffer: read_buffer,
       registry: registry,
       db: db,
-      manager: name
+      manager: name,
+      series_writer: series_writer
     }
 
     :persistent_term.put({__MODULE__, name}, info)
@@ -337,25 +351,26 @@ defmodule TimelessMetrics.Actor.SeriesManager do
         end
 
       [] ->
-        # Create in SQLite
+        # Assign ID from counter, start process immediately
         TimelessMetrics.Stats.incr_series_created(state.store)
-        encoded = encode_labels(labels)
-        now = System.os_time(:second)
-        type_str = Atom.to_string(series_type)
+        series_id = state.next_id
+        state = %{state | next_id: state.next_id + 1}
 
-        {:ok, [[series_id]]} =
-          TimelessMetrics.DB.write(
-            state.db,
-            "INSERT INTO series (metric_name, labels, created_at, series_type) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(metric_name, labels) DO UPDATE SET created_at = created_at RETURNING id",
-            [metric_name, encoded, now, type_str]
-          )
-
-        # Start process, then insert into ETS with PID
         {series_id, pid} =
           start_series_process(state, series_id, metric_name, labels, series_type)
 
         :ets.insert(state.index, {key, series_id, pid})
         insert_label_index(state.store, metric_name, labels, series_id, pid)
+
+        # Async bulk write to SQLite (non-blocking)
+        encoded = encode_labels(labels)
+        now = System.os_time(:second)
+        type_str = Atom.to_string(series_type)
+
+        TimelessMetrics.Actor.SeriesWriter.register(
+          state.series_writer, series_id, metric_name, encoded, now, type_str
+        )
+
         {:reply, {series_id, pid}, state}
     end
   end
@@ -371,6 +386,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
   end
 
   # --- Internals ---
+
+  defp flush_writer(%{series_writer: writer}), do: TimelessMetrics.Actor.SeriesWriter.flush_sync(writer)
 
   defp recover_series(state) do
     {:ok, rows} =

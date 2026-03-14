@@ -8,15 +8,17 @@ This document describes the internal architecture of TimelessMetrics. For the pu
 TimelessMetrics.Supervisor (:metrics_sup)
 ├── TimelessMetrics.DB (:metrics_db)
 │     SQLite database (WAL mode) for series registry, metadata, annotations, alerts
-├── Registry (:metrics_actor_registry)
-│     Maps {metric_name, labels} → series actor PID
-├── DynamicSupervisor (:metrics_actor_sup)
-│     Supervises per-series actor processes
-├── TimelessMetrics.Actor.SeriesManager (:metrics_actor_manager)
-│     Creates/finds series actors, routes writes
-├── TimelessMetrics.Actor.Rollup (:metrics_rollup)
-│     Periodic daily rollup aggregation
-├── TimelessMetrics.Actor.Retention (:metrics_retention)
+├── TimelessMetrics.SeriesRegistry (:metrics_registry)
+│     Series ID lookup (persistent_term + ETS overflow + SQLite backing)
+├── TimelessMetrics.DictTrainer (:metrics_dict_trainer)
+│     Trains zstd dictionaries for improved compression
+├── TimelessMetrics.SegmentBuilder (:metrics_builder_0..N)
+│     Per-shard compression worker (accumulates → gorilla + zstd → disk)
+├── TimelessMetrics.Buffer (:metrics_shard_0..N)
+│     Per-shard ETS write buffer (lock-free inserts)
+├── TimelessMetrics.Rollup (:metrics_rollup)
+│     Periodic rollup aggregation (hourly, daily tiers)
+├── TimelessMetrics.Retention (:metrics_retention)
 │     Periodic cleanup of expired raw and rollup data
 ├── TimelessMetrics.AlertEvaluator (:metrics_alert_evaluator)
 │     Periodic alert rule evaluation
@@ -30,16 +32,13 @@ TimelessMetrics.Supervisor (:metrics_sup)
 
 The supervisor uses `:rest_for_one` strategy, so a crash in the DB or registry restarts everything downstream.
 
-## Per-series actor model
+Buffer and SegmentBuilder are paired — each shard has one of each. The default shard count is `max(schedulers_online / 2, 2)`, so a 96-core machine gets 48 shards.
 
-Every unique combination of `{metric_name, labels}` gets its own GenServer process (a "series actor"). This design provides:
+## Sharded write architecture
 
-- **Write isolation**: writes to different series never contend
-- **Natural backpressure**: if a series falls behind, only that series is affected
-- **Memory control**: each actor manages its own ring buffer and can be individually garbage collected
-- **Crash isolation**: a corrupted series doesn't affect others
+Every write is routed to one of N ETS buffer shards by series ID. This distributes write contention across independent tables, each with its own lock striping via `write_concurrency: :auto`.
 
-Series actors are started on-demand by the `SeriesManager` when a write arrives for a new series, and are registered in an Elixir `Registry` for fast lookup.
+There are no per-series processes. The hot write path is entirely lock-free ETS operations.
 
 ## Write path
 
@@ -47,30 +46,29 @@ Series actors are started on-demand by the `SeriesManager` when a write arrives 
 write(store, metric_name, labels, value)
   │
   ▼
-Engine.write/5
+SeriesRegistry.get_or_create/3
+  ├── persistent_term Map lookup (fast path: series exists)
+  ├── ETS overflow lookup (warm path: recently created)
+  └── atomics counter + :ets.insert_new (cold path: new series, lock-free)
   │
   ▼
-SeriesManager.get_or_start/4
-  ├── ETS index lookup (fast path: actor already exists)
-  └── GenServer.call → SQLite INSERT → DynamicSupervisor.start_child (cold path)
+series_id → shard routing: rem(abs(series_id), shard_count)
   │
   ▼
-send(pid, {:write, ts, val})       ← fire-and-forget, caller never blocks
-  │
-  ├──► :ets.insert(read_buffer, {{series_id, ts, seq}, val})   ← shared ETS read buffer
-  │
+Buffer.write/4 → :ets.insert(shard_table, {{series_id, ts, seq}, value})
+  │  (when buffer reaches flush_threshold or flush_interval fires)
   ▼
-Raw buffer (in-process list)
-  │  (when buffer reaches block_size or flush_interval fires)
+SegmentBuilder.ingest/2 (GenServer cast — non-blocking)
+  │  (accumulates in memory, grouped by {series_id, time_window})
+  │  (periodic flush_pending compresses dirty segments → WAL)
+  │  (periodic check_segments seals completed windows → .seg files)
   ▼
-Block compression (Gorilla delta-of-delta + XOR encoding, then Zstd)
-  │
-  ├──► :ets.select_delete(read_buffer, entries ≤ last_ts)      ← range-aware cleanup
-  ▼
-BlockStore: append compressed block to .dat file on disk
+ShardStore: gorilla + zstd compressed segments on disk
 ```
 
-**Batch writes** (`write_batch/2`) group entries by series key and send one message per series, avoiding per-point message overhead. Each point is also inserted into the shared ETS read buffer for lock-free query access.
+**Batch writes** (`write_batch/2`) resolve all series IDs, group by shard, and call `Buffer.write_bulk/2` per shard — one ETS insert per shard regardless of batch size.
+
+**Series creation** is lock-free: new series get IDs from an `:atomics` counter and register via `:ets.insert_new` (atomic CAS). SQLite metadata writes are batched asynchronously on a periodic timer.
 
 ## Read path
 
@@ -78,133 +76,99 @@ BlockStore: append compressed block to .dat file on disk
 query(store, metric_name, labels, opts)
   │
   ▼
-Engine resolves series_id via SeriesManager
+SeriesRegistry resolves series_id
   │
-  ├──► ETS read buffer (fast path, no mailbox):
-  │      :ets.select(read_buffer, match_spec)
-  │      ordered_set range scan on {series_id, from..to, _seq}
-  │      → [{ts, value}, ...] pre-sorted by timestamp
+  ▼
+Query.raw/3 → routes to the series' shard's SegmentBuilder
   │
-  │    If ETS has data → return immediately (lock-free, sub-millisecond)
+  ├── ShardStore.read_segments(series_id, from, to)
+  │     Reads compressed .seg files + WAL
+  │     Lock-free file I/O, no GenServer involved
   │
-  └──► GenServer.call fallback (only when ETS is empty for this range):
-         SeriesServer reads from:
-           1. Compressed blocks (decompress on the fly)
-           2. Current raw buffer (not yet compressed)
-         Merge + filter by time range [from, to]
-         → [{timestamp, value}, ...]
+  ▼
+Decompress segments (gorilla + zstd)
+  │
+  ▼
+Filter by time range, merge, return [{timestamp, value}, ...]
 ```
 
-**Single-series queries** (the common case for dashboard polling) use the ETS read buffer fast path — a lock-free `:ets.select` with a match specification that pushes timestamp filtering into C-level ETS code. This serves the vast majority of queries within the raw retention window without touching the series process mailbox.
+**Single-series queries** read from the SegmentBuilder's shard storage via lock-free file operations. No process mailbox is involved, so queries don't compete with writes.
 
-**Multi-series queries** (`query_multi`, `query_aggregate_multi`, etc.) fan out to all matching series actors via `Task.async_stream` for parallel reads, then merge results. Single-match results also use the ETS fast path.
+**Multi-series queries** (`query_multi`, `query_aggregate_multi`, etc.) group matching series by shard and fan out via `Task.async_stream`. Each shard's series are queried together, eliminating cross-shard file contention.
 
-## ETS read buffer
+## Series Registry
 
-The ETS read buffer decouples query reads from series process mailboxes. Without it, every query requires a `GenServer.call` into the series process, competing with queued write messages and blocking under high write throughput.
+The SeriesRegistry uses a three-tier lookup for maximum throughput:
 
-SeriesManager creates a single ETS table per store:
+| Tier | Mechanism | Latency | When |
+|------|-----------|---------|------|
+| Published | `persistent_term` Map | Zero-copy, sub-microsecond | Steady state (after publish timer) |
+| Overflow | ETS `:set` with `write_concurrency: :auto` | Lock-free read | Recently created series |
+| Creation | `:atomics.add_get` + `:ets.insert_new` | Lock-free CAS | First write to a new series |
 
-| Property | Value | Rationale |
-| --- | --- | --- |
-| Type | `ordered_set` | Efficient range scans via `:ets.select` |
-| Key | `{series_id, timestamp, seq}` | Composite key for per-series range queries |
-| Value | `value` (float) | Single numeric value per entry |
-| Access | `:public`, `read_concurrency: true` | Lock-free concurrent reads from any process |
-| Write concurrency | `:auto` | BEAM tunes write locks per scheduler |
+Every 5 seconds, the overflow table is merged into the persistent_term map and cleared. In steady state, 100% of lookups hit the persistent_term fast path.
 
-The monotonic sequence number (`seq = :erlang.unique_integer([:monotonic])`) ensures duplicate timestamps within the same series are preserved — without it, `ordered_set` would overwrite entries with identical `{series_id, ts}` keys.
-
-**Query match specification:**
-
-```elixir
-:ets.select(read_buffer, [
-  {{{series_id, :"$1", :_}, :"$2"},
-   [{:andalso, {:>=, :"$1", from}, {:"=<", :"$1", to}}],
-   [{{:"$1", :"$2"}}]}
-])
-```
-
-This pushes timestamp filtering into C-level ETS code. The `ordered_set` returns results pre-sorted by `{series_id, ts, seq}`, so no additional sorting is needed.
-
-**Range-aware compression cleanup:** when a series compresses its raw buffer into a block, only ETS entries up to the block's `last_ts` are removed — not all entries for that series. This prevents a brief window where the ETS buffer is empty, which would force queries to fall back to `GenServer.call` and contend with the write message queue.
-
-```elixir
-:ets.select_delete(read_buffer, [
-  {{{series_id, :"$1", :_}, :_}, [{:"=<", :"$1", last_ts}], [true]}
-])
-```
+SQLite writes are batched asynchronously — they never block the write path.
 
 ## Storage format
 
-### Compressed blocks
+### Segments
 
-Each series stores data in a ring buffer of compressed blocks:
+Data is stored in time-windowed segments per shard:
 
-1. **Gorilla encoding**: timestamps use delta-of-delta encoding; values use XOR encoding (same as Facebook's Gorilla paper). This exploits the regularity of time series data.
-2. **Zstd compression**: the Gorilla-encoded binary is further compressed with Zstd for additional ~2-3x reduction.
-3. **Block files**: compressed blocks are persisted to `.dat` files in the data directory, one file per series.
+```
+shard_N/
+  raw/
+    1706000000.seg    # immutable segment file per window
+    current.wal       # pending data not yet sealed
+  tier_hourly/
+    chunks.dat        # append-only tier data
+    index.ets
+  tier_daily/
+    chunks.dat
+    index.ets
+```
 
-Typical compression ratio is ~11.5x (0.67 bytes per point).
+Each segment file contains gorilla-compressed data for multiple series within a time window (default: 4 hours). The compression pipeline:
 
-### Ring buffer
+1. **Gorilla encoding**: timestamps use delta-of-delta; values use XOR encoding (Facebook's Gorilla paper)
+2. **Zstd compression**: the gorilla-encoded binary is further compressed with zstd
+3. **Optional dictionary compression**: trained zstd dictionaries for additional gains on small segments
 
-Each series maintains up to `max_blocks` compressed blocks. When the limit is reached, the oldest block is evicted. This bounds memory usage per series to `max_blocks * block_size` points worth of compressed data.
+Text series use an RLE + zstd codec instead of gorilla encoding, identified by a `0xFE` byte prefix.
 
-### SQLite index
+Measured compression: **0.7 bytes per point** on production-like workloads (739 MB for 1.13 billion points).
 
-SQLite (in WAL mode with mmap) stores:
+### WAL and sealing
 
-- **Series registry**: maps `{metric_name, labels_hash}` to series IDs
+The SegmentBuilder accumulates points in memory. Periodically:
+
+- **flush_pending** (every 60s): compresses only dirty segments (those with new data since last flush) and writes to WAL, making data queryable
+- **check_segments** (every 10s): seals completed time windows into immutable `.seg` files
+
+Compression is offloaded to Tasks to avoid blocking the SegmentBuilder's ingest path.
+
+### SQLite
+
+SQLite (WAL mode with mmap) stores metadata only:
+
+- **Series registry**: maps `{metric_name, labels}` to series IDs
 - **Metric metadata**: type, unit, description
 - **Annotations**: event markers with timestamps and tags
 - **Alert rules and history**: threshold conditions, evaluation state
 - **Scrape targets and health**: Prometheus target configuration
-- **Daily rollup data**: pre-aggregated daily statistics
 
-SQLite is not used for raw time series data -- that goes directly to compressed block files for maximum throughput.
-
-## Block merge compaction
-
-Each series actor accumulates many small compressed blocks over time (one per `block_size` points or stale-buffer flush). The merge compaction pass consolidates adjacent old blocks into fewer, larger blocks. Larger blocks achieve better compression ratios (bigger Gorilla + zstd dictionary window) and reduce per-block decompression overhead during large-range queries.
-
-Merge runs inside each `SeriesServer` process -- there is no centralized compactor. It is triggered by a periodic timer (default every 5 minutes) and can also be forced across all series via `TimelessMetrics.merge_now(store)`.
-
-```
-Per-series compressed block queue: [b1] [b2] [b3] [b4] [b5] [b6] ... [bN]
-  │
-  ▼
-Age check: only blocks with end_ts older than merge_block_min_age_seconds
-  │
-  ▼
-Count check: eligible blocks >= merge_block_min_count
-  │
-  ▼
-Group into batches of ≈ merge_block_max_points
-  │
-  ▼
-For each batch:
-  Decompress blocks → concatenate points → sort by timestamp → recompress
-  │
-  ▼
-Replace batch entries in queue with single merged block
-```
-
-| Configuration | Default | Description |
-|---------------|---------|-------------|
-| `merge_block_min_count` | 4 | Minimum eligible blocks before merge triggers |
-| `merge_block_max_points` | 10,000 | Target points per merged block |
-| `merge_block_min_age_seconds` | 300 | Only merge blocks older than this (avoids churning recent data) |
-| `merge_interval` | 300,000 | Merge check timer interval in ms |
-
-The age threshold ensures recent blocks (still likely to be queried individually) are left alone, while older blocks that are typically scanned in bulk are consolidated for efficiency.
+SQLite is not used for raw time series data — that goes directly to compressed segment files for maximum throughput.
 
 ## Rollup pipeline
 
-The `Rollup` actor runs periodically (default: every 5 minutes) and computes daily aggregates:
+The `Rollup` process runs periodically (default: every 5 minutes) and computes tiered aggregates per shard:
 
 ```
-Raw points for each series
+Raw segments per shard
+  │
+  ▼
+Read segments since last watermark
   │
   ▼
 Group by day (UTC midnight boundaries)
@@ -213,28 +177,25 @@ Group by day (UTC midnight boundaries)
 Compute aggregates: avg, min, max, sum, count, last
   │
   ▼
-Store in SQLite daily_rollups table
+Write tier chunks to ShardStore (binary files, not SQLite)
 ```
 
-Daily rollups enable efficient long-range queries. A 90-day query that would scan millions of raw points instead reads ~90 pre-computed rows.
-
-Query daily rollups via:
-- `TimelessMetrics.query_daily(store, metric, labels, from, to)`
+Rollup data is stored in the same shard directory as raw segments, enabling parallel per-shard reads for long-range queries.
 
 ## Retention
 
-The `Retention` actor runs periodically (default: every hour) and enforces two retention policies:
+The `Retention` process runs periodically (default: every hour) and enforces retention policies per shard:
 
 | Tier | Default retention | What's deleted |
 |------|-------------------|----------------|
-| Raw | 7 days | Compressed blocks older than the cutoff |
-| Daily | 365 days | Daily rollup rows older than the cutoff |
+| Raw | 7 days | Segment files older than the cutoff |
+| Daily | 365 days | Tier chunk data older than the cutoff |
 
 Configure via `raw_retention_seconds` and `daily_retention_seconds` supervisor options.
 
 ## Further reading
 
-- [Configuration Reference](configuration.md) -- all supervisor options and tuning guidance
-- [API Reference](API.md) -- complete Elixir and HTTP API
-- [Operations](operations.md) -- monitoring, backup, troubleshooting
-- Architecture livebook at `livebook/architecture.livemd` for interactive diagrams
+- [Configuration Reference](configuration.md) — all supervisor options and tuning guidance
+- [API Reference](API.md) — complete Elixir and HTTP API
+- [Operations](operations.md) — monitoring, backup, troubleshooting
+- [Benchmark Comparison](../notes/blog_benchmark_comparison.md) — Timeless vs VictoriaMetrics on 96-core ARM

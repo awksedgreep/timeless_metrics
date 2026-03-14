@@ -1,54 +1,49 @@
 # TimelessMetrics Scaling Options
 
-Current performance baseline (28-core laptop, DDR5-5600):
+Performance on AWS i8g.24xlarge (96 vCPU ARM, 768 GiB RAM), 200K series:
 
 | Metric | Value |
 |--------|-------|
-| Sequential writes (10K series) | 746K pts/sec |
-| Concurrent saturation (28 cores) | 5.7M pts/sec |
-| Single-series query | ~441us |
-| Fan-out 100 series | ~1ms |
-| Fan-out 1K series | ~10ms |
-| Latest value | ~171us |
-| Storage efficiency | ~0.67 B/pt |
+| Sustained writes (256 writers) | 4.39M pts/sec |
+| Query rate (24 workers + writes) | 7,853 q/sec |
+| Query latency | 3.06ms |
+| Storage efficiency | 0.7 bytes/pt |
 
 ---
 
 ## Architecture Overview
 
-TimelessMetrics uses a **per-series actor model**: every unique `{metric_name, labels}` combination gets its own GenServer process (`SeriesServer`). Writes are non-blocking `GenServer.cast` calls, reads are `GenServer.call` with parallel fan-out via `Task.async_stream`.
+TimelessMetrics uses a **sharded ETS write buffer** architecture: incoming points land in one of N lock-free ETS tables, paired with N SegmentBuilder workers that compress and write segments to disk. No per-series processes exist.
 
 ```
 write(store, metric, labels, value)
-  → SeriesManager.get_or_start (ETS + Registry lookup)
-  → GenServer.cast(pid, {:write, ts, val})
-  → SeriesServer accumulates in raw_buffer
-  → On block_size reached: Gorilla + zstd compress → ring buffer
-  → Periodic flush: BlockStore.write → .dat file on disk
+  → SeriesRegistry.get_or_create (persistent_term + ETS lookup)
+  → Buffer.write (ETS insert, lock-free)
+  → SegmentBuilder accumulates, compresses, writes to disk
 ```
 
 ---
 
 ## Write Path Scaling
 
-### Current bottlenecks
+### How it scales
 
-1. **Series resolution**: Each write resolves `{metric, labels}` to a PID via ETS index + Registry lookup. This is fast (microseconds) but sequential per write call.
+1. **Sharded ETS buffers**: N independent ETS tables with `write_concurrency: :auto`. Each table has its own lock striping, so more shards = less contention. Default is `schedulers / 2`.
 
-2. **Batch write grouping**: `write_batch/2` groups entries by series and sends one cast per series. Grouping cost is O(N) but sequential.
+2. **Lock-free series creation**: New series get IDs from `:atomics` and register via `:ets.insert_new` (CAS). No GenServer in the creation hot path.
 
-3. **Per-series compression**: Gorilla + zstd compression happens inside each SeriesServer when `block_size` is reached. This is naturally parallel across series.
+3. **Parallel compression**: Each shard has its own SegmentBuilder that compresses independently. Compression is offloaded to Tasks to avoid blocking ingestion.
 
-4. **Disk flush**: `BlockStore.write` does atomic tmp + rename per series. Flushes are staggered by the 60s timer per actor.
+4. **Disk writes**: each shard writes to its own directory. No cross-shard contention on disk I/O.
 
 ### Scaling strategies
 
 | Strategy | When needed | Expected gain |
 |----------|-------------|---------------|
-| Increase `block_size` | Compression ratio matters more than flush latency | Better compression (larger Gorilla windows) |
-| Pre-resolved writes (`write_resolved`) | Hot path with known series IDs | Skip ETS + Registry lookup |
+| Increase `buffer_shards` | Write contention on high-core machines | More parallel write paths |
+| Increase `flush_threshold` | Reduce flush overhead | Larger batches to SegmentBuilder |
+| Pre-resolved writes (`write_resolved`) | Hot path with known series IDs | Skip registry lookup |
 | Concurrent `write_batch` callers | Multiple data sources | Linear scaling with caller count |
-| Reduce `flush_interval` | Lower data loss tolerance | More frequent disk writes |
 
 ### Pre-resolved writes
 
@@ -56,7 +51,7 @@ For hot paths where you write to the same series repeatedly, resolve the series 
 
 ```elixir
 series_id = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
-TimelessMetrics.write_resolved(:metrics, series_id, 73.2)
+TimelessMetrics.write_resolved(:metrics, series_id, 73.2, timestamp: ts)
 ```
 
 ---
@@ -65,43 +60,34 @@ TimelessMetrics.write_resolved(:metrics, series_id, 73.2)
 
 ### Current approach
 
-Multi-series queries fan out `GenServer.call` requests to all matching series via `Task.async_stream` with `max_concurrency: System.schedulers_online()`.
-
-### Scaling characteristics
-
-| Series count | Fan-out latency | Bottleneck |
-|-------------|----------------|------------|
-| 1 | ~441us | None |
-| 100 | ~1ms | None |
-| 1K | ~10ms | Scheduler saturation |
-| 10K | ~1.8s | Process scheduling + decompression |
+Queries read from compressed segments on disk via lock-free file operations. Multi-series queries group by shard and fan out via `Task.async_stream` — each shard's series are queried together to avoid cross-shard file contention.
 
 ### Strategies
 
 - **Label filters**: Always filter by labels to reduce fan-out scope
 - **Aggregated queries**: Use `query_aggregate_multi` instead of raw queries for dashboards
-- **Daily rollups**: Use `query_daily` for long time ranges (reads ~N rows from SQLite instead of decompressing blocks)
-- **Merge compaction**: Consolidate small blocks into larger ones for faster large-range queries (`TimelessMetrics.merge_now/1`)
+- **Daily rollups**: Use `query_daily` for long time ranges (reads pre-computed tier data instead of decompressing raw segments)
 
 ---
 
 ## Memory Scaling
 
-Each series actor consumes memory for:
-- Process overhead: ~2KB base
-- Raw buffer: up to `block_size` points (16 bytes each for numeric)
-- Compressed block ring: up to `max_blocks` compressed blocks
-- ETS index entry: ~100 bytes
+Memory usage is primarily in the ETS buffer shards and SegmentBuilder in-memory segments:
+
+- **ETS buffers**: each shard holds points between flushes. Bounded by `flush_threshold × shard_count`.
+- **SegmentBuilder**: accumulates points in memory until the segment window completes. Bounded by `segment_duration` × write rate per shard.
+- **Series registry**: persistent_term map + ETS overflow. ~100 bytes per series.
 
 ### Estimates
 
-| Series count | Base memory | With 100 blocks × 1K points |
-|-------------|------------|---------------------------|
-| 1K | ~20 MB | ~200 MB |
-| 10K | ~200 MB | ~2 GB |
-| 100K | ~2 GB | ~20 GB |
+| Series count | Registry memory | Buffer memory (default settings) |
+|-------------|----------------|----------------------------------|
+| 10K | ~1 MB | ~50 MB |
+| 100K | ~10 MB | ~50 MB |
+| 500K | ~50 MB | ~50 MB |
+| 1M+ | ~100 MB | ~50 MB |
 
-Reduce `max_blocks` or `block_size` to bound per-series memory.
+Buffer memory is independent of series count — it depends on write rate and flush settings.
 
 ---
 
@@ -110,19 +96,16 @@ Reduce `max_blocks` or `block_size` to bound per-series memory.
 | Series Count | Expected Bottleneck | Mitigation |
 |-------------|-------------------|------------|
 | 10K | None | Current architecture works well |
-| 50K | Memory (per-series actors) | Reduce `max_blocks`, increase `block_size` |
-| 100K | BEAM process count | Monitor scheduler run queues |
-| 500K | ETS index + process memory | Consider partitioning by metric namespace |
-| 1M+ | Single-node limits | Multiple store instances or clustering |
+| 100K | Series creation time | Already lock-free, scales with cores |
+| 500K | Registry persistent_term size | Monitor publish cycle times |
+| 1M+ | Single-node limits | Multiple store instances or partitioning |
 
 ---
 
 ## What NOT to Do
 
-- **Don't add a connection pool for SQLite writes.** SQLite fundamentally only supports one writer. SQLite is only used for metadata — raw data goes to per-series `.dat` files.
+- **Don't add a connection pool for SQLite writes.** SQLite is only used for metadata. Raw data goes to segment files via SegmentBuilder.
 
 - **Don't switch to PostgreSQL/TimescaleDB.** The whole point is embedded, zero-dependency. Network round-trips to an external DB would negate the query latency advantage.
 
-- **Don't pre-optimize for 500K+ series.** The current architecture handles 10K-100K well. Optimize when you hit actual bottlenecks, not hypothetical ones.
-
-- **Don't add GenStage/Flow.** The current cast-based write path with per-series actors is simpler and faster than a pull-based pipeline for this workload.
+- **Don't pre-optimize for 1M+ series.** The current architecture handles 200K series at 4.39M pts/sec. Optimize when you hit actual bottlenecks, not hypothetical ones.

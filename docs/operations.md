@@ -69,7 +69,7 @@ Returns:
 ```elixir
 {:ok, %{
   path: "/tmp/metrics_backup",
-  files: ["metrics.db", "series_1.dat", "series_2.dat", ...],
+  files: ["metrics.db", "shard_0/raw/current.wal", ...],
   total_bytes: 24000000
 }}
 ```
@@ -92,7 +92,7 @@ Response:
 {
   "status": "ok",
   "path": "/tmp/metrics_backup",
-  "files": ["metrics.db", "series_1.dat"],
+  "files": ["metrics.db", "shard_0/raw/current.wal"],
   "total_bytes": 24000000
 }
 ```
@@ -112,7 +112,7 @@ Response:
 
 ## Merge compaction
 
-Each series actor periodically consolidates multiple small compressed blocks into fewer, larger blocks for better compression and faster large-range queries. This runs automatically (default: every 5 minutes) but can be triggered manually.
+Each SegmentBuilder periodically seals completed time windows into immutable `.seg` files for better compression and faster large-range queries. This runs automatically (every 10 seconds for completed windows, every 60 seconds for pending data).
 
 ### Manual trigger
 
@@ -125,10 +125,9 @@ TimelessMetrics.merge_now(:metrics)
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `merge_block_min_count` | 4 | Min eligible blocks before merge triggers |
-| `merge_block_max_points` | 10,000 | Target points per merged block |
-| `merge_block_min_age_seconds` | 300 | Only merge blocks older than this |
-| `merge_interval` | 300,000 (5 min) | Merge check interval |
+| `segment_duration` | 14,400 (4 hours) | Time window per segment file |
+| `flush_threshold` | 10,000 | Points per shard before immediate buffer flush |
+| `flush_interval` | 5,000 (5 sec) | Buffer flush interval |
 
 See [Configuration Reference](configuration.md) for tuning guidance.
 
@@ -266,13 +265,13 @@ Self-monitoring metrics written per scrape target:
 ### High memory usage
 
 - Check `timeless_series_count` -- high cardinality (many unique label combinations) creates many processes
-- Reduce `max_blocks` to limit per-series memory
-- Reduce `block_size` to flush more frequently
+- Reduce `buffer_shards` or `flush_threshold` to limit buffer memory
+- Reduce `flush_interval` to flush more frequently
 - Disable `self_monitor: false` if the store is monitoring itself recursively
 
 ### Slow queries
 
-- Multi-series queries fan out to all matching series actors. Use label filters to narrow the query.
+- Multi-series queries fan out across shards. Use label filters to narrow the query.
 - Use aggregated queries (`query_aggregate_multi`) instead of raw queries for dashboards
 - For long time ranges, use daily rollups (`query_daily`) instead of raw data
 - Trigger merge compaction to consolidate small blocks: `TimelessMetrics.merge_now(:metrics)`

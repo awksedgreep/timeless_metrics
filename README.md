@@ -40,44 +40,25 @@ Run it as a library inside your Elixir app or as a standalone container.
 
 ## Performance
 
-Run on a 28-core laptop (DDR5-5600). Benchmarks simulate real-world data collection cycles (N series polled repeatedly, like SNMP or Prometheus scraping). Reproduce with `mix bench.actor`.
+Benchmarked on AWS i8g.24xlarge (96 vCPU ARM, 768 GiB RAM) against VictoriaMetrics v1.108.1, 200K series, 256 concurrent writers + 24 query workers:
 
-### Write Throughput
+| Metric | Timeless | VictoriaMetrics |
+|---|---|---|
+| **Write rate** | 4.39M pts/s | 4.47M pts/s |
+| **Write latency** | 2.94ms | 2.85ms |
+| **Query rate** | **7,853 q/s** | 3,045 q/s |
+| **Query latency** | **3.06ms** | 7.88ms |
+| **Storage** | **0.7 bytes/pt** | — |
 
-Collection cycle pattern: poll all series, write one point per series per cycle, repeat.
+2.6x faster queries at half the latency. Matches VictoriaMetrics on writes within 2%.
 
-| Workload | Throughput |
-|---|---|
-| 2K series × 500 cycles (write_batch) | ~634K pts/sec |
-| 10K series × 200 cycles (write_batch) | ~523K pts/sec |
-| 10K series × 200 cycles (individual writes) | ~617K pts/sec |
-| Concurrent saturation (28 writers × 5s) | 5.3-6.5M pts/sec |
-
-### Query Latency (10K series, 50 iterations)
-
-| Query | Avg | P50 | P99 |
-|---|---|---|---|
-| Raw single series | 532us | 515us | 881us |
-| Fan-out 100 series | 1.08ms | 996us | 2.30ms |
-| Fan-out 1K series | 10.37ms | 10.41ms | 16.10ms |
-| Aggregation single | 705us | 667us | 1.02ms |
-| Latest value | 13us | 13us | 20us |
-
-### Storage Efficiency
-
-| Metric | Value |
-|---|---|
-| Compression ratio | 11.5x (~95% reduction) |
-| Bytes per point | ~0.67 |
-| Compression engine | Gorilla (delta-of-delta + XOR) + zstd |
-
-Run `mix bench.actor` to reproduce on your hardware. Use `--tier large` for 100K series, `--tier moon` for 500K.
+See [full benchmark writeup](notes/blog_benchmark_comparison.md) for methodology and analysis.
 
 ## Features
 
-- **High throughput** — 5.7M+ points/sec concurrent writes, per-series actor isolation
-- **Compact storage** — Gorilla + zstd compression, 11.5x ratio (~95% reduction)
-- **Per-series actors** — one GenServer per metric/label combination, lock-free routing via ETS + Registry
+- **High throughput** — 4.39M points/sec writes, 7,853 queries/sec on 96 cores
+- **Compact storage** — Gorilla + zstd compression, 0.7 bytes per point
+- **Sharded architecture** — lock-free ETS write buffers with parallel compression workers
 - **Automatic rollups** — configurable tiers (hourly, daily, monthly) with retention policies
 - **VictoriaMetrics compatible** — JSON line import, works with Vector, Grafana, and existing VM tooling
 - **Prometheus compatible** — text exposition import and PromQL-compatible query endpoint for Grafana
@@ -349,20 +330,22 @@ systemctl --user start timeless
 ## Architecture
 
 ```
-Writes ──> Engine ──> SeriesManager (ETS + Registry) ──> SeriesServer (per-series)
+Writes ──> SeriesRegistry (persistent_term + ETS) ──> Buffer shards (lock-free ETS)
                                                               │
-                                                    BlockStore (.dat files)
+                                                    SegmentBuilder (gorilla + zstd)
                                                               │
-                                              Rollup Engine ──┤── daily tier
+                                                    ShardStore (.seg files per shard)
+                                                              │
+                                              Rollup Engine ──┤── tier chunks
                                                               │
 Main DB (SQLite): series registry, metadata, annotations, alerts
 ```
 
-- **Per-series actors** — one GenServer per `{metric, labels}`, write isolation, natural backpressure
-- **ETS + Registry routing** — microsecond series resolution, lock-free hot path
-- **BlockStore** — Gorilla + zstd compressed blocks in per-series `.dat` files (ring buffer)
-- **Rollup engine** — periodic daily aggregation with watermark tracking
-- **Retention enforcer** — periodic cleanup of expired blocks and rollup rows
+- **Sharded ETS buffers** — N lock-free write shards with `write_concurrency: :auto`
+- **Lock-free series creation** — `:atomics` counter + `:ets.insert_new` CAS, no GenServer
+- **SegmentBuilder** — per-shard compression workers (gorilla + zstd), async Task offload
+- **Rollup engine** — periodic tier aggregation with watermark tracking
+- **Retention enforcer** — periodic cleanup of expired segments and tier data
 - **SQLite** — WAL mode, mmap, used only for series registry + metadata (not raw data)
 
 ## Custom Rollup Schema

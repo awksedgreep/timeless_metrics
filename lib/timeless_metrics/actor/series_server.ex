@@ -49,7 +49,8 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     defer_compression: false,
     raw_buffer_max: 100_000,
     series_type: :numeric,
-    read_buffer: nil
+    read_buffer: nil,
+    compress_scheduled: false
   ]
 
   # --- Client API ---
@@ -212,6 +213,12 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     state = flush_to_disk(state)
     flush_ref = Process.send_after(self(), :flush_to_disk, @flush_interval_ms)
     {:noreply, %{state | flush_ref: flush_ref}}
+  end
+
+  def handle_info(:run_compress, state) do
+    state = %{state | compress_scheduled: false}
+    state = compress_pending(state)
+    {:noreply, state}
   end
 
   def handle_info(:maybe_compress_stale, state) do
@@ -382,8 +389,9 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     if state.defer_compression do
       maybe_trim_raw(state)
     else
-      if state.raw_count >= state.block_size do
-        compress_buffer(state)
+      if state.raw_count >= state.block_size and not state.compress_scheduled do
+        send(self(), :run_compress)
+        %{state | compress_scheduled: true}
       else
         state
       end
@@ -547,14 +555,24 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     end
   end
 
+  defp compress_pending(state) do
+    if state.raw_count >= state.block_size do
+      state = compress_buffer(state)
+      compress_pending(state)
+    else
+      state
+    end
+  end
+
   defp compress_buffer(%{raw_count: 0} = state), do: state
 
   defp compress_buffer(%{series_type: :text} = state) do
     sorted = Enum.sort_by(state.raw_buffer, &elem(&1, 0))
+    {to_compress, remaining} = Enum.split(sorted, state.block_size)
 
-    case TextCodec.compress(sorted) do
+    case TextCodec.compress(to_compress) do
       {:ok, data} ->
-        finalize_compression(state, sorted, data)
+        finalize_compression(state, to_compress, remaining, data)
 
       {:error, reason} ->
         Logger.error(
@@ -568,9 +586,12 @@ defmodule TimelessMetrics.Actor.SeriesServer do
   defp compress_buffer(state) do
     sorted = Enum.sort_by(state.raw_buffer, &elem(&1, 0))
 
-    case GorillaStream.compress(sorted, compression: state.compression) do
+    # Take only block_size points to maintain consistent block sizes
+    {to_compress, remaining} = Enum.split(sorted, state.block_size)
+
+    case GorillaStream.compress(to_compress, compression: state.compression) do
       {:ok, data} ->
-        finalize_compression(state, sorted, data)
+        finalize_compression(state, to_compress, remaining, data)
 
       {:error, reason} ->
         Logger.error(
@@ -581,14 +602,15 @@ defmodule TimelessMetrics.Actor.SeriesServer do
     end
   end
 
-  defp finalize_compression(state, sorted, data) do
-    {first_ts, _} = List.first(sorted)
-    {last_ts, _} = List.last(sorted)
+  defp finalize_compression(state, compressed_points, remaining, data) do
+    {first_ts, _} = List.first(compressed_points)
+    {last_ts, _} = List.last(compressed_points)
+    compressed_count = length(compressed_points)
 
     block = %{
       start_ts: first_ts,
       end_ts: last_ts,
-      point_count: state.raw_count,
+      point_count: compressed_count,
       data: data
     }
 
@@ -612,14 +634,12 @@ defmodule TimelessMetrics.Actor.SeriesServer do
       ])
     end
 
-    if state.gc_on_compress, do: :erlang.garbage_collect()
-
     %{
       state
       | blocks: blocks,
         block_count: block_count,
-        raw_buffer: [],
-        raw_count: 0,
+        raw_buffer: remaining,
+        raw_count: length(remaining),
         dirty: true
     }
   end
