@@ -204,24 +204,9 @@ defmodule TimelessMetrics.HTTP do
         TimelessMetrics.Stats.incr_http_imports(store)
         body = req.body
 
-        {count, errors, error_samples} = ingest_json_lines(store, body)
-        TimelessMetrics.Stats.add_http_import_errors(store, errors)
-
-        :telemetry.execute(
-          [:timeless_metrics, :http, :import],
-          %{sample_count: count, error_count: errors},
-          %{store: store}
-        )
-
-        if errors > 0 do
-          json_resp(req, 200, %{
-            samples: count,
-            errors: errors,
-            failed_lines: error_samples
-          })
-        else
-          send_resp(req, 204)
-        end
+        queue = :persistent_term.get({TimelessMetrics, store, :ingest_queue})
+        TimelessMetrics.IngestWorker.enqueue(queue, body, :json)
+        send_resp(req, 204)
     end
   end
 
@@ -1029,24 +1014,10 @@ defmodule TimelessMetrics.HTTP do
         TimelessMetrics.Stats.incr_http_imports(store)
         body = req.body
 
-        {count, errors, error_samples} = ingest_prometheus_text(store, body)
-        TimelessMetrics.Stats.add_http_import_errors(store, errors)
-
-        :telemetry.execute(
-          [:timeless_metrics, :http, :import],
-          %{sample_count: count, error_count: errors},
-          %{store: store, format: :prometheus}
-        )
-
-        if errors > 0 do
-          json_resp(req, 200, %{
-            samples: count,
-            errors: errors,
-            failed_lines: error_samples
-          })
-        else
-          send_resp(req, 204)
-        end
+        # Queue for background processing — return 204 immediately
+        queue = :persistent_term.get({TimelessMetrics, store, :ingest_queue})
+        TimelessMetrics.IngestWorker.enqueue(queue, body, :prometheus)
+        send_resp(req, 204)
     end
   end
 

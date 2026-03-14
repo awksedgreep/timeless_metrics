@@ -41,6 +41,18 @@ defmodule TimelessMetrics.Supervisor do
 
     TimelessMetrics.Stats.init(name)
 
+    # Ingest queue: ETS table for raw HTTP bodies awaiting background processing
+    ingest_queue = :"#{name}_ingest_queue"
+
+    :ets.new(ingest_queue, [
+      :named_table,
+      :ordered_set,
+      :public,
+      write_concurrency: :auto
+    ])
+
+    :persistent_term.put({TimelessMetrics, name, :ingest_queue}, ingest_queue)
+
     db_name = :"#{name}_db"
     registry_name = :"#{name}_registry"
     dict_trainer_name = :"#{name}_dict_trainer"
@@ -89,6 +101,19 @@ defmodule TimelessMetrics.Supervisor do
       end
       |> List.flatten()
 
+    # Ingest workers: background processors that drain the ETS queue
+    ingest_worker_count = Keyword.get(opts, :ingest_workers, max(div(System.schedulers_online(), 4), 2))
+
+    ingest_workers =
+      for i <- 0..(ingest_worker_count - 1) do
+        %{
+          id: :"#{name}_ingest_worker_#{i}",
+          start:
+            {TimelessMetrics.IngestWorker, :start_link,
+             [[name: :"#{name}_ingest_worker_#{i}", store: name, queue: ingest_queue, worker_id: i]]}
+        }
+      end
+
     children =
       [
         {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
@@ -96,6 +121,7 @@ defmodule TimelessMetrics.Supervisor do
         {TimelessMetrics.DictTrainer, name: dict_trainer_name, store: name, data_dir: data_dir}
       ] ++
         builder_and_buffer_shards ++
+        ingest_workers ++
         [
           {TimelessMetrics.Rollup,
            name: :"#{name}_rollup",
