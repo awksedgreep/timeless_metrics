@@ -1,4 +1,4 @@
-defmodule Mix.Tasks.Bench.Actor do
+defmodule Mix.Tasks.Bench do
   @shortdoc "Run actor engine scale benchmark"
   @moduledoc """
   Benchmarks the actor engine to find the single-node ceiling.
@@ -49,7 +49,7 @@ defmodule Mix.Tasks.Bench.Actor do
 
     {:ok, _} =
       TimelessMetrics.Supervisor.start_link(
-        name: :bench_actor,
+        name: :bench_store,
         data_dir: data_dir,
         block_size: 1000,
         max_blocks: 100,
@@ -93,7 +93,7 @@ defmodule Mix.Tasks.Bench.Actor do
       :timer.tc(fn ->
         for n <- 0..(series_count - 1) do
           labels = %{"id" => Integer.to_string(n)}
-          TimelessMetrics.write(:bench_actor, "scale_metric", labels, gen_value(), timestamp: now)
+          TimelessMetrics.write(:bench_store, "scale_metric", labels, gen_value(), timestamp: now)
         end
       end)
 
@@ -141,7 +141,7 @@ defmodule Mix.Tasks.Bench.Actor do
               {"scale_metric", labels_by_id[n], gen_value(), ts}
             end
 
-          TimelessMetrics.write_batch(:bench_actor, entries)
+          TimelessMetrics.write_batch(:bench_store, entries)
         end
       end)
 
@@ -165,7 +165,7 @@ defmodule Mix.Tasks.Bench.Actor do
           ts = base_ts + 200 + cycle
 
           for n <- 0..(series_count - 1) do
-            TimelessMetrics.write(:bench_actor, "scale_metric", labels_by_id[n], gen_value(),
+            TimelessMetrics.write(:bench_store, "scale_metric", labels_by_id[n], gen_value(),
               timestamp: ts
             )
           end
@@ -221,7 +221,7 @@ defmodule Mix.Tasks.Bench.Actor do
               {"scale_metric", labels_by_id[n], gen_value(), ts}
             end
 
-          TimelessMetrics.write_each(:bench_actor, entries)
+          TimelessMetrics.write_each(:bench_store, entries)
         end
       end)
 
@@ -241,7 +241,7 @@ defmodule Mix.Tasks.Bench.Actor do
     # Resolve all PIDs once
     pids_list =
       for n <- 0..(series_count - 1) do
-        TimelessMetrics.resolve_series(:bench_actor, "scale_metric", labels_by_id[n])
+        TimelessMetrics.resolve_series(:bench_store, "scale_metric", labels_by_id[n])
       end
 
     {us, _} =
@@ -266,7 +266,7 @@ defmodule Mix.Tasks.Bench.Actor do
     IO.puts("  Write path breakdown (1 cycle × #{fmt_int(series_count)} series):")
     IO.puts("")
 
-    manager = :bench_actor_actor_manager
+    manager = :bench_store_actor_manager
     state_info = :persistent_term.get({TimelessMetrics.Actor.SeriesManager, manager})
     index = state_info.index
 
@@ -309,7 +309,7 @@ defmodule Mix.Tasks.Bench.Actor do
 
     {us_full_each, _} =
       :timer.tc(fn ->
-        TimelessMetrics.write_each(:bench_actor, full_entries)
+        TimelessMetrics.write_each(:bench_store, full_entries)
       end)
 
     # Full write_batch for comparison
@@ -322,7 +322,7 @@ defmodule Mix.Tasks.Bench.Actor do
 
     {us_full_batch, _} =
       :timer.tc(fn ->
-        TimelessMetrics.write_batch(:bench_actor, full_entries2)
+        TimelessMetrics.write_batch(:bench_store, full_entries2)
       end)
 
     IO.puts("    Build entries:         #{String.pad_leading(fmt_dur(us_build), 10)}")
@@ -358,7 +358,7 @@ defmodule Mix.Tasks.Bench.Actor do
       n = :rand.uniform(series_count) - 1
       labels = %{"id" => Integer.to_string(n)}
 
-      TimelessMetrics.write(:bench_actor, "scale_metric", labels, gen_value(),
+      TimelessMetrics.write(:bench_store, "scale_metric", labels, gen_value(),
         timestamp: base_ts + :rand.uniform(1000)
       )
 
@@ -403,7 +403,7 @@ defmodule Mix.Tasks.Bench.Actor do
 
           subset_entries = fan_100_entries ++ fan_1k_entries
 
-          TimelessMetrics.write_batch(:bench_actor, main_entries ++ subset_entries)
+          TimelessMetrics.write_batch(:bench_store, main_entries ++ subset_entries)
 
           if rem(pt, 25) == 0 do
             IO.write("\r    #{pt + 1}/100 batches written...")
@@ -424,23 +424,23 @@ defmodule Mix.Tasks.Bench.Actor do
     queries = [
       {"raw single",
        fn ->
-         TimelessMetrics.query(:bench_actor, "scale_metric", test_labels, from: from, to: to)
+         TimelessMetrics.query(:bench_store, "scale_metric", test_labels, from: from, to: to)
        end},
       {"fan-out #{fmt_int(fan_100)}",
        fn ->
-         TimelessMetrics.query_multi(:bench_actor, "scale_fan_100", %{}, from: from, to: to)
+         TimelessMetrics.query_multi(:bench_store, "scale_fan_100", %{}, from: from, to: to)
        end},
       {"fan-out #{fmt_int(fan_1k)}",
        fn ->
-         TimelessMetrics.query_multi(:bench_actor, "scale_fan_1k", %{}, from: from, to: to)
+         TimelessMetrics.query_multi(:bench_store, "scale_fan_1k", %{}, from: from, to: to)
        end},
       {"fan-out ALL",
        fn ->
-         TimelessMetrics.query_multi(:bench_actor, "scale_metric", %{}, from: from, to: to)
+         TimelessMetrics.query_multi(:bench_store, "scale_metric", %{}, from: from, to: to)
        end},
       {"agg single",
        fn ->
-         TimelessMetrics.query_aggregate(:bench_actor, "scale_metric", test_labels,
+         TimelessMetrics.query_aggregate(:bench_store, "scale_metric", test_labels,
            from: from,
            to: to,
            bucket: {60, :seconds},
@@ -449,7 +449,7 @@ defmodule Mix.Tasks.Bench.Actor do
        end},
       {"agg fan-out ALL",
        fn ->
-         TimelessMetrics.query_aggregate_multi(:bench_actor, "scale_metric", %{},
+         TimelessMetrics.query_aggregate_multi(:bench_store, "scale_metric", %{},
            from: from,
            to: to,
            bucket: {60, :seconds},
@@ -458,11 +458,11 @@ defmodule Mix.Tasks.Bench.Actor do
        end},
       {"latest single",
        fn ->
-         TimelessMetrics.latest(:bench_actor, "scale_metric", test_labels)
+         TimelessMetrics.latest(:bench_store, "scale_metric", test_labels)
        end},
       {"latest ALL",
        fn ->
-         TimelessMetrics.latest_multi(:bench_actor, "scale_metric", %{})
+         TimelessMetrics.latest_multi(:bench_store, "scale_metric", %{})
        end}
     ]
 
@@ -571,7 +571,7 @@ defmodule Mix.Tasks.Bench.Actor do
     )
 
     # Registry + index ETS memory
-    actor_index = :bench_actor_actor_index
+    actor_index = :bench_store_actor_index
 
     index_mem =
       case :ets.info(actor_index, :memory) do
@@ -603,7 +603,7 @@ defmodule Mix.Tasks.Bench.Actor do
               {"scale_metric", %{"id" => Integer.to_string(n)}, gen_value(), ts}
             end
 
-          TimelessMetrics.write_batch(:bench_actor, entries)
+          TimelessMetrics.write_batch(:bench_store, entries)
         end
       end)
 
@@ -619,7 +619,7 @@ defmodule Mix.Tasks.Bench.Actor do
   defp phase5_storage_stats do
     header("Phase 5: Storage Stats")
 
-    info = TimelessMetrics.info(:bench_actor)
+    info = TimelessMetrics.info(:bench_store)
 
     IO.puts("  Series count:      #{fmt_int(info.series_count)}")
     IO.puts("  Total points:      #{fmt_int(info.total_points)}")
@@ -637,7 +637,7 @@ defmodule Mix.Tasks.Bench.Actor do
   defp drain_mailboxes do
     # Wait for all actor GenServers to process pending casts,
     # then force a GC so memory numbers reflect actual retention.
-    registry = :bench_actor_actor_registry
+    registry = :bench_store_actor_registry
 
     Registry.select(registry, [{{:_, :"$1", :_}, [], [:"$1"]}])
     |> Enum.each(fn pid ->

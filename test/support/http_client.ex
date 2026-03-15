@@ -12,7 +12,14 @@ defmodule TimelessMetrics.TestHTTP do
   end
 
   def post(port, path, body, opts \\ []) do
-    request(:post, port, path, body, opts)
+    result = request(:post, port, path, body, opts)
+
+    # Wait for async ingest queue to process after import POSTs
+    if String.contains?(path, "/import") do
+      Process.sleep(50)
+    end
+
+    result
   end
 
   def put(port, path, body, opts \\ []) do
