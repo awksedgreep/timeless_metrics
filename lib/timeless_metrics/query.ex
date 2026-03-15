@@ -430,8 +430,9 @@ defmodule TimelessMetrics.Query do
     TimelessMetrics.TextCodec.decompress(text_blob)
   end
 
-  defp decompress_blob(<<@alp_marker, alp_blob::binary>>, _store, _compression) do
-    ExAlp.decompress(alp_blob, compression: :zstd)
+  defp decompress_blob(<<@alp_marker, _alp_blob::binary>>, _store, _compression) do
+    # ExAlp disabled for ARM segfault investigation
+    {:error, :alp_disabled}
   end
 
   # Legacy: dict-compressed gorilla blobs (<<0xFF, dict_version, data...>>)
