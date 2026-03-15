@@ -18,7 +18,8 @@ defmodule TimelessMetrics.HTTPTest do
   end
 
   test "POST /api/v1/import ingests JSON lines" do
-    now = 1_700_000_000
+    now_s = 1_700_000_000
+    now_ms = now_s * 1000
 
     lines =
       Enum.join(
@@ -26,13 +27,13 @@ defmodule TimelessMetrics.HTTPTest do
           :json.encode(%{
             metric: %{__name__: "cpu_usage", host: "web-1"},
             values: [73.2, 74.1],
-            timestamps: [now, now + 60]
+            timestamps: [now_ms, now_ms + 60_000]
           })
           |> IO.iodata_to_binary(),
           :json.encode(%{
             metric: %{__name__: "mem_usage", host: "web-1"},
             values: [45.0],
-            timestamps: [now]
+            timestamps: [now_ms]
           })
           |> IO.iodata_to_binary()
         ],
@@ -47,21 +48,21 @@ defmodule TimelessMetrics.HTTPTest do
 
     {:ok, cpu_points} =
       TimelessMetrics.query(:http_test, "cpu_usage", %{"host" => "web-1"},
-        from: now - 60,
-        to: now + 120
+        from: now_s - 60,
+        to: now_s + 120
       )
 
     assert length(cpu_points) == 2
-    assert {^now, v1} = List.first(cpu_points)
+    assert {^now_s, v1} = List.first(cpu_points)
     assert_in_delta v1, 73.2, 0.01
 
     {:ok, mem_points} =
       TimelessMetrics.query(:http_test, "mem_usage", %{"host" => "web-1"},
-        from: now - 60,
-        to: now + 60
+        from: now_s - 60,
+        to: now_s + 60
       )
 
-    assert [{^now, 45.0}] = mem_points
+    assert [{^now_s, 45.0}] = mem_points
   end
 
   test "POST /api/v1/import handles multiple series in batch" do
@@ -96,7 +97,7 @@ defmodule TimelessMetrics.HTTPTest do
     assert body["status"] == "ok"
     assert is_integer(body["series"])
     assert is_integer(body["points"])
-    assert is_integer(body["storage_bytes"])
+    assert is_integer(body["queries"])
   end
 
   test "unknown route returns 404" do
@@ -470,7 +471,7 @@ defmodule TimelessMetrics.HTTPTest do
       :json.encode(%{
         metric: %{host: "web-1"},
         values: [99.0],
-        timestamps: [1_700_000_000]
+        timestamps: [1_700_000_000_000]
       })
       |> IO.iodata_to_binary()
 

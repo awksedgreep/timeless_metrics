@@ -69,7 +69,7 @@ defmodule TimelessMetrics.VMetricsCompatTest do
         :json.encode(%{
           "metric" => %{"__name__" => "cpu_usage", "host" => "web-1"},
           "values" => [73.2, 74.1, 75.0],
-          "timestamps" => [1_700_000_000, 1_700_000_060, 1_700_000_120]
+          "timestamps" => [1_700_000_000_000, 1_700_000_060_000, 1_700_000_120_000]
         })
         |> IO.iodata_to_binary()
 
@@ -82,17 +82,17 @@ defmodule TimelessMetrics.VMetricsCompatTest do
         %{
           "metric" => %{"__name__" => "cpu", "host" => "a"},
           "values" => [1.0],
-          "timestamps" => [1_700_000_000]
+          "timestamps" => [1_700_000_000_000]
         },
         %{
           "metric" => %{"__name__" => "cpu", "host" => "b"},
           "values" => [2.0],
-          "timestamps" => [1_700_000_000]
+          "timestamps" => [1_700_000_000_000]
         },
         %{
           "metric" => %{"__name__" => "mem", "host" => "a"},
           "values" => [50.0],
-          "timestamps" => [1_700_000_000]
+          "timestamps" => [1_700_000_000_000]
         }
       ]
 
@@ -712,7 +712,7 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       assert result["status"] == "ok"
       assert is_integer(result["series"])
       assert is_integer(result["points"])
-      assert is_integer(result["storage_bytes"])
+      assert is_integer(result["queries"])
     end
 
     test "404 for unknown routes" do
@@ -890,7 +890,7 @@ defmodule TimelessMetrics.VMetricsCompatTest do
         %{
           "metric" => %{"__name__" => "roundtrip_test", "env" => "prod", "host" => "api-1"},
           "values" => [10.0, 20.0, 30.0],
-          "timestamps" => [1_700_000_000, 1_700_000_060, 1_700_000_120]
+          "timestamps" => [1_700_000_000_000, 1_700_000_060_000, 1_700_000_120_000]
         }
       ]
 

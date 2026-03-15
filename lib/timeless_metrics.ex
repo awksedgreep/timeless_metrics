@@ -307,7 +307,7 @@ defmodule TimelessMetrics do
               :avg -> data |> Enum.map(&elem(&1, 1)) |> then(&(Enum.sum(&1) / max(length(&1), 1)))
             end
 
-          val >= threshold
+          compare_threshold(val, threshold)
         end)
       else
         results
@@ -324,6 +324,12 @@ defmodule TimelessMetrics do
     |> Enum.sort_by(order_fn, :desc)
     |> Enum.take(n)
   end
+
+  defp compare_threshold(val, {:gt, t}), do: val > t
+  defp compare_threshold(val, {:lt, t}), do: val < t
+  defp compare_threshold(val, {:gte, t}), do: val >= t
+  defp compare_threshold(val, {:lte, t}), do: val <= t
+  defp compare_threshold(val, t) when is_number(t), do: val >= t
 
   defp last_value(%{data: []}), do: 0.0
   defp last_value(%{data: data}), do: data |> List.last() |> elem(1)
@@ -550,7 +556,8 @@ defmodule TimelessMetrics do
       buffer_points: stats.points_ingested - stats.points_merged,
       db_path: Path.join(data_dir, "metrics.db"),
       block_count: 0,
-      bytes_per_point: 0.0,
+      bytes_per_point:
+        if(stats.points_ingested > 0, do: storage_bytes / stats.points_ingested, else: 0.0),
       compressed_bytes: storage_bytes,
       daily_rollup_rows: 0
     }
