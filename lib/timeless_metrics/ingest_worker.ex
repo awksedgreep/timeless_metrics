@@ -212,7 +212,9 @@ defmodule TimelessMetrics.IngestWorker do
           case parse_prometheus_line(line, now) do
             {:ok, metric, labels, value, ts} ->
               key = {metric, labels}
-              {Map.update(groups, key, [{ts, value}], fn e -> [{ts, value} | e] end), count + 1, errors, samples}
+
+              {Map.update(groups, key, [{ts, value}], fn e -> [{ts, value} | e] end), count + 1,
+               errors, samples}
 
             :error ->
               {groups, count, errors + 1, samples}
@@ -295,7 +297,7 @@ defmodule TimelessMetrics.IngestWorker do
   defp zip_points([], [], _name, _labels), do: []
 
   defp zip_points([ts | tsr], [v | vr], name, labels) when is_integer(ts) do
-    val = if is_number(v), do: (if is_integer(v), do: v / 1, else: v), else: throw(:bad_entry)
+    val = if is_number(v), do: if(is_integer(v), do: v / 1, else: v), else: throw(:bad_entry)
     [{{name, labels}, {div(ts, 1000), val}} | zip_points(tsr, vr, name, labels)]
   end
 

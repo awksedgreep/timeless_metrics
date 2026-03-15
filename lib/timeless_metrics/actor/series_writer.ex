@@ -18,7 +18,10 @@ defmodule TimelessMetrics.Actor.SeriesWriter do
 
   @doc "Queue a series registration for bulk insert."
   def register(writer, series_id, metric_name, encoded_labels, created_at, series_type) do
-    GenServer.cast(writer, {:register, series_id, metric_name, encoded_labels, created_at, series_type})
+    GenServer.cast(
+      writer,
+      {:register, series_id, metric_name, encoded_labels, created_at, series_type}
+    )
   end
 
   @doc "Flush pending writes synchronously. Used before metadata queries."
@@ -37,7 +40,10 @@ defmodule TimelessMetrics.Actor.SeriesWriter do
   end
 
   @impl true
-  def handle_cast({:register, series_id, metric_name, encoded_labels, created_at, series_type}, state) do
+  def handle_cast(
+        {:register, series_id, metric_name, encoded_labels, created_at, series_type},
+        state
+      ) do
     state = %{
       state
       | buffer: [{series_id, metric_name, encoded_labels, created_at, series_type} | state.buffer],

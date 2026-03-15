@@ -133,7 +133,10 @@ defmodule TimelessMetrics.Actor.SeriesManager do
     flush_writer(state_info)
 
     {:ok, rows} =
-      TimelessMetrics.DB.read(state_info.db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+      TimelessMetrics.DB.read(
+        state_info.db,
+        "SELECT DISTINCT metric_name FROM series ORDER BY metric_name"
+      )
 
     Enum.map(rows, fn [name] -> name end)
   end
@@ -368,7 +371,12 @@ defmodule TimelessMetrics.Actor.SeriesManager do
         type_str = Atom.to_string(series_type)
 
         TimelessMetrics.Actor.SeriesWriter.register(
-          state.series_writer, series_id, metric_name, encoded, now, type_str
+          state.series_writer,
+          series_id,
+          metric_name,
+          encoded,
+          now,
+          type_str
         )
 
         {:reply, {series_id, pid}, state}
@@ -387,7 +395,8 @@ defmodule TimelessMetrics.Actor.SeriesManager do
 
   # --- Internals ---
 
-  defp flush_writer(%{series_writer: writer}), do: TimelessMetrics.Actor.SeriesWriter.flush_sync(writer)
+  defp flush_writer(%{series_writer: writer}),
+    do: TimelessMetrics.Actor.SeriesWriter.flush_sync(writer)
 
   defp recover_series(state) do
     {:ok, rows} =

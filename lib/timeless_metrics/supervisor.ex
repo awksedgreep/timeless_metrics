@@ -37,7 +37,11 @@ defmodule TimelessMetrics.Supervisor do
     :persistent_term.put({TimelessMetrics, name, :shard_count}, shard_count)
     :persistent_term.put({TimelessMetrics, name, :data_dir}, data_dir)
     :persistent_term.put({TimelessMetrics, name, :raw_retention_seconds}, raw_retention_seconds)
-    :persistent_term.put({TimelessMetrics, name, :daily_retention_seconds}, daily_retention_seconds)
+
+    :persistent_term.put(
+      {TimelessMetrics, name, :daily_retention_seconds},
+      daily_retention_seconds
+    )
 
     TimelessMetrics.Stats.init(name)
 
@@ -102,7 +106,8 @@ defmodule TimelessMetrics.Supervisor do
       |> List.flatten()
 
     # Ingest workers: background processors that drain the ETS queue
-    ingest_worker_count = Keyword.get(opts, :ingest_workers, max(div(System.schedulers_online(), 2), 2))
+    ingest_worker_count =
+      Keyword.get(opts, :ingest_workers, max(div(System.schedulers_online(), 2), 2))
 
     ingest_workers =
       for i <- 0..(ingest_worker_count - 1) do
@@ -110,7 +115,14 @@ defmodule TimelessMetrics.Supervisor do
           id: :"#{name}_ingest_worker_#{i}",
           start:
             {TimelessMetrics.IngestWorker, :start_link,
-             [[name: :"#{name}_ingest_worker_#{i}", store: name, queue: ingest_queue, worker_id: i]]}
+             [
+               [
+                 name: :"#{name}_ingest_worker_#{i}",
+                 store: name,
+                 queue: ingest_queue,
+                 worker_id: i
+               ]
+             ]}
         }
       end
 
@@ -131,10 +143,7 @@ defmodule TimelessMetrics.Supervisor do
            compression: compression,
            compression_level: compression_level},
           {TimelessMetrics.Retention,
-           name: :"#{name}_retention",
-           db: db_name,
-           store: name,
-           schema: schema}
+           name: :"#{name}_retention", db: db_name, store: name, schema: schema}
         ]
 
     # New features — kept from actor era

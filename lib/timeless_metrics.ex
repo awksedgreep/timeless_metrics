@@ -300,11 +300,13 @@ defmodule TimelessMetrics do
     filtered =
       if threshold do
         Enum.filter(results, fn %{data: data} ->
-          val = case threshold_fn do
-            :last -> data |> List.last() |> elem(1)
-            :max -> data |> Enum.map(&elem(&1, 1)) |> Enum.max(fn -> 0 end)
-            :avg -> data |> Enum.map(&elem(&1, 1)) |> then(&(Enum.sum(&1) / max(length(&1), 1)))
-          end
+          val =
+            case threshold_fn do
+              :last -> data |> List.last() |> elem(1)
+              :max -> data |> Enum.map(&elem(&1, 1)) |> Enum.max(fn -> 0 end)
+              :avg -> data |> Enum.map(&elem(&1, 1)) |> then(&(Enum.sum(&1) / max(length(&1), 1)))
+            end
+
           val >= threshold
         end)
       else
@@ -462,12 +464,15 @@ defmodule TimelessMetrics do
           entries
           |> Enum.reduce(0, fn entry, acc ->
             path = Path.join(data_dir, entry)
+
             case File.stat(path) do
               {:ok, %{size: s, type: :regular}} -> acc + s
               _ -> acc + dir_file_bytes(path)
             end
           end)
-        _ -> 0
+
+        _ ->
+          0
       end
 
     %{
@@ -489,13 +494,16 @@ defmodule TimelessMetrics do
       {:ok, files} ->
         Enum.reduce(files, 0, fn f, acc ->
           path = Path.join(dir, f)
+
           case File.stat(path) do
             {:ok, %{size: size, type: :regular}} -> acc + size
             {:ok, %{type: :directory}} -> acc + dir_file_bytes(path)
             _ -> acc
           end
         end)
-      _ -> 0
+
+      _ ->
+        0
     end
   end
 
@@ -519,7 +527,10 @@ defmodule TimelessMetrics do
   def list_metrics(store) do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
-    {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+
+    {:ok, rows} =
+      TimelessMetrics.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+
     {:ok, Enum.map(rows, fn [name] -> name end)}
   end
 
@@ -531,7 +542,14 @@ defmodule TimelessMetrics do
   def list_series(store, metric_name) do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
-    {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT labels FROM series WHERE metric_name = ?1 ORDER BY labels", [metric_name])
+
+    {:ok, rows} =
+      TimelessMetrics.DB.read(
+        db,
+        "SELECT labels FROM series WHERE metric_name = ?1 ORDER BY labels",
+        [metric_name]
+      )
+
     {:ok, Enum.map(rows, fn [labels_str] -> %{labels: decode_labels(labels_str)} end)}
   end
 
@@ -543,7 +561,11 @@ defmodule TimelessMetrics do
   def label_values(store, metric_name, label_key) do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
-    {:ok, rows} = TimelessMetrics.DB.read(db, "SELECT labels FROM series WHERE metric_name = ?1", [metric_name])
+
+    {:ok, rows} =
+      TimelessMetrics.DB.read(db, "SELECT labels FROM series WHERE metric_name = ?1", [
+        metric_name
+      ])
 
     result =
       rows
@@ -856,7 +878,8 @@ defmodule TimelessMetrics do
     published_ids = MapSet.new(published, &elem(&1, 0))
 
     all_series =
-      published ++ Enum.reject(overflow_entries, fn {id, _} -> MapSet.member?(published_ids, id) end)
+      published ++
+        Enum.reject(overflow_entries, fn {id, _} -> MapSet.member?(published_ids, id) end)
 
     # Apply label filter
     Enum.filter(all_series, fn {_id, labels} ->
@@ -866,7 +889,9 @@ defmodule TimelessMetrics do
             nil -> false
             val -> Regex.match?(~r/^(?:#{pattern})$/, val)
           end
-        {k, v} -> Map.get(labels, k) == v
+
+        {k, v} ->
+          Map.get(labels, k) == v
       end)
     end)
   end

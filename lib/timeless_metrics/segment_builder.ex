@@ -310,7 +310,8 @@ defmodule TimelessMetrics.SegmentBuilder do
   @impl true
   def handle_cast({:ingest, grouped_points}, state) do
     {new_segments, new_dirty} =
-      Enum.reduce(grouped_points, {state.segments, state.dirty_keys}, fn {series_id, points}, {segments, dirty} ->
+      Enum.reduce(grouped_points, {state.segments, state.dirty_keys}, fn {series_id, points},
+                                                                         {segments, dirty} ->
         Enum.reduce(points, {segments, dirty}, fn {ts, val}, {segs, d} ->
           bucket = segment_bucket(ts, state.segment_duration)
           key = {series_id, bucket}
@@ -352,7 +353,13 @@ defmodule TimelessMetrics.SegmentBuilder do
       write_and_seal(completed, state)
     end
 
-    {:reply, :ok, %{state | segments: pending, dirty_keys: MapSet.new(), flushed_keys: MapSet.new(Map.keys(pending))}}
+    {:reply, :ok,
+     %{
+       state
+       | segments: pending,
+         dirty_keys: MapSet.new(),
+         flushed_keys: MapSet.new(Map.keys(pending))
+     }}
   end
 
   def handle_call(:pending_point_count, _from, state) do
@@ -395,12 +402,21 @@ defmodule TimelessMetrics.SegmentBuilder do
 
     if completed != [] do
       # Offload compression + disk write to a Task so we stay responsive
-      segment_state = %{store: state.store, compression: state.compression, compression_level: state.compression_level, shard_store: state.shard_store, segment_duration: state.segment_duration}
+      segment_state = %{
+        store: state.store,
+        compression: state.compression,
+        compression_level: state.compression_level,
+        shard_store: state.shard_store,
+        segment_duration: state.segment_duration
+      }
+
       Task.start(fn -> write_and_seal_async(completed, segment_state) end)
     end
 
     # Remove sealed segment keys from flushed tracking
-    completed_keys = Enum.map(completed, fn seg -> {seg.series_id, seg.start_time} end) |> MapSet.new()
+    completed_keys =
+      Enum.map(completed, fn seg -> {seg.series_id, seg.start_time} end) |> MapSet.new()
+
     new_flushed = MapSet.difference(state.flushed_keys, completed_keys)
 
     Process.send_after(self(), :check_segments, :timer.seconds(10))
@@ -411,28 +427,33 @@ defmodule TimelessMetrics.SegmentBuilder do
     {segments_to_flush, new_flushed_keys} =
       if MapSet.size(state.dirty_keys) > 0 do
         # Active writes — flush only dirty segments
-        segs = state.dirty_keys
+        segs =
+          state.dirty_keys
           |> Enum.flat_map(fn key ->
             case Map.get(state.segments, key) do
               nil -> []
               seg -> [seg]
             end
           end)
+
         {segs, MapSet.union(state.flushed_keys, state.dirty_keys)}
       else
         # No new writes — check for unflushed segments
-        unflushed_keys = Map.keys(state.segments)
+        unflushed_keys =
+          Map.keys(state.segments)
           |> MapSet.new()
           |> MapSet.difference(state.flushed_keys)
 
         if MapSet.size(unflushed_keys) > 0 do
-          segs = unflushed_keys
+          segs =
+            unflushed_keys
             |> Enum.flat_map(fn key ->
               case Map.get(state.segments, key) do
                 nil -> []
                 seg -> [seg]
               end
             end)
+
           {segs, MapSet.union(state.flushed_keys, unflushed_keys)}
         else
           {[], state.flushed_keys}
@@ -440,7 +461,13 @@ defmodule TimelessMetrics.SegmentBuilder do
       end
 
     if segments_to_flush != [] do
-      segment_state = %{store: state.store, compression: state.compression, compression_level: state.compression_level, shard_store: state.shard_store}
+      segment_state = %{
+        store: state.store,
+        compression: state.compression,
+        compression_level: state.compression_level,
+        shard_store: state.shard_store
+      }
+
       Task.start(fn -> write_segments_async(segments_to_flush, segment_state) end)
     end
 
@@ -514,7 +541,10 @@ defmodule TimelessMetrics.SegmentBuilder do
           end
         else
           # ALP encoding with zstd container compression
-          case ExAlp.compress(sorted_points, compression: :zstd, compression_level: state.compression_level) do
+          case ExAlp.compress(sorted_points,
+                 compression: :zstd,
+                 compression_level: state.compression_level
+               ) do
             {:ok, blob} -> {:ok, <<0xA1, blob::binary>>}
             error -> error
           end

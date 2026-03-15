@@ -73,37 +73,98 @@ defmodule TimelessMetrics.DataGenerator do
     dh = :erlang.phash2(dev_id) / 4_294_967_295
 
     case metric do
-      "node_cpu_seconds_total" -> Float.round(1000.0 + ts_ms / 100_000 + dh * 500.0 + n * 10.0, 2)
-      "node_memory_MemAvailable_bytes" -> Float.round(2.0e9 + n * 6.0e9 + dh * 2.0e9, 0)
-      "node_memory_MemTotal_bytes" -> Float.round(8.0e9 + dh * 8.0e9, 0)
-      "node_memory_Buffers_bytes" -> Float.round(1.0e8 + n * 5.0e8, 0)
-      "node_memory_Cached_bytes" -> Float.round(5.0e8 + n * 2.0e9, 0)
-      "node_filesystem_avail_bytes" -> Float.round(5.0e10 + n * 2.0e11 + dh * 1.0e11, 0)
-      "node_filesystem_size_bytes" -> Float.round(5.0e11 + dh * 5.0e11, 0)
-      "node_disk_read_bytes_total" -> Float.round(1.0e9 + ts_ms / 1_000 * 1000 + n * 1.0e5, 0)
-      "node_disk_written_bytes_total" -> Float.round(2.0e9 + ts_ms / 1_000 * 2000 + n * 2.0e5, 0)
-      "node_disk_io_time_seconds_total" -> Float.round(500.0 + ts_ms / 1.0e6 + n * 5.0, 2)
-      "node_network_receive_bytes_total" -> Float.round(5.0e9 + ts_ms / 1_000 * 5000 + n * 5.0e5, 0)
-      "node_network_transmit_bytes_total" -> Float.round(3.0e9 + ts_ms / 1_000 * 3000 + n * 3.0e5, 0)
-      "node_network_receive_errs_total" -> Float.round(n * 100.0, 0)
-      "node_network_transmit_errs_total" -> Float.round(n * 50.0, 0)
-      "node_load1" -> Float.round(0.5 + n * 4.0 + dh * 2.0, 2)
-      "node_load5" -> Float.round(0.4 + n * 3.0 + dh * 1.5, 2)
-      "node_load15" -> Float.round(0.3 + n * 2.0 + dh * 1.0, 2)
-      "node_time_seconds" -> Float.round(ts_ms / 1_000.0, 3)
-      "node_boot_time_seconds" -> Float.round(ts_ms / 1_000 - 86_400.0 * (1 + dh * 30), 0)
-      "node_context_switches_total" -> Float.round(1.0e6 + ts_ms / 100 + n * 1.0e4, 0)
-      "node_entropy_avail_bits" -> Float.round(2000.0 + n * 2000.0, 0)
-      "node_filefd_allocated" -> Float.round(500.0 + n * 2000.0 + dh * 500.0, 0)
-      "node_forks_total" -> Float.round(1.0e5 + ts_ms / 1.0e4 + n * 1000.0, 0)
-      "node_intr_total" -> Float.round(5.0e7 + ts_ms / 100 + n * 1.0e5, 0)
-      "node_procs_running" -> Float.round(1.0 + n * 8.0, 0)
-      "node_procs_blocked" -> Float.round(n * 2.0, 0)
-      "node_scrape_collector_duration_seconds" -> Float.round(0.001 + n * 0.05, 4)
-      "node_scrape_collector_success" -> 1.0
-      "node_nf_conntrack_entries" -> Float.round(100.0 + n * 5000.0 + dh * 1000.0, 0)
-      "node_vmstat_pgfault" -> Float.round(1.0e7 + ts_ms / 1_000 + n * 5.0e4, 0)
-      _ -> Float.round(50.0 + n * 50.0, 2)
+      "node_cpu_seconds_total" ->
+        Float.round(1000.0 + ts_ms / 100_000 + dh * 500.0 + n * 10.0, 2)
+
+      "node_memory_MemAvailable_bytes" ->
+        Float.round(2.0e9 + n * 6.0e9 + dh * 2.0e9, 0)
+
+      "node_memory_MemTotal_bytes" ->
+        Float.round(8.0e9 + dh * 8.0e9, 0)
+
+      "node_memory_Buffers_bytes" ->
+        Float.round(1.0e8 + n * 5.0e8, 0)
+
+      "node_memory_Cached_bytes" ->
+        Float.round(5.0e8 + n * 2.0e9, 0)
+
+      "node_filesystem_avail_bytes" ->
+        Float.round(5.0e10 + n * 2.0e11 + dh * 1.0e11, 0)
+
+      "node_filesystem_size_bytes" ->
+        Float.round(5.0e11 + dh * 5.0e11, 0)
+
+      "node_disk_read_bytes_total" ->
+        Float.round(1.0e9 + ts_ms / 1_000 * 1000 + n * 1.0e5, 0)
+
+      "node_disk_written_bytes_total" ->
+        Float.round(2.0e9 + ts_ms / 1_000 * 2000 + n * 2.0e5, 0)
+
+      "node_disk_io_time_seconds_total" ->
+        Float.round(500.0 + ts_ms / 1.0e6 + n * 5.0, 2)
+
+      "node_network_receive_bytes_total" ->
+        Float.round(5.0e9 + ts_ms / 1_000 * 5000 + n * 5.0e5, 0)
+
+      "node_network_transmit_bytes_total" ->
+        Float.round(3.0e9 + ts_ms / 1_000 * 3000 + n * 3.0e5, 0)
+
+      "node_network_receive_errs_total" ->
+        Float.round(n * 100.0, 0)
+
+      "node_network_transmit_errs_total" ->
+        Float.round(n * 50.0, 0)
+
+      "node_load1" ->
+        Float.round(0.5 + n * 4.0 + dh * 2.0, 2)
+
+      "node_load5" ->
+        Float.round(0.4 + n * 3.0 + dh * 1.5, 2)
+
+      "node_load15" ->
+        Float.round(0.3 + n * 2.0 + dh * 1.0, 2)
+
+      "node_time_seconds" ->
+        Float.round(ts_ms / 1_000.0, 3)
+
+      "node_boot_time_seconds" ->
+        Float.round(ts_ms / 1_000 - 86_400.0 * (1 + dh * 30), 0)
+
+      "node_context_switches_total" ->
+        Float.round(1.0e6 + ts_ms / 100 + n * 1.0e4, 0)
+
+      "node_entropy_avail_bits" ->
+        Float.round(2000.0 + n * 2000.0, 0)
+
+      "node_filefd_allocated" ->
+        Float.round(500.0 + n * 2000.0 + dh * 500.0, 0)
+
+      "node_forks_total" ->
+        Float.round(1.0e5 + ts_ms / 1.0e4 + n * 1000.0, 0)
+
+      "node_intr_total" ->
+        Float.round(5.0e7 + ts_ms / 100 + n * 1.0e5, 0)
+
+      "node_procs_running" ->
+        Float.round(1.0 + n * 8.0, 0)
+
+      "node_procs_blocked" ->
+        Float.round(n * 2.0, 0)
+
+      "node_scrape_collector_duration_seconds" ->
+        Float.round(0.001 + n * 0.05, 4)
+
+      "node_scrape_collector_success" ->
+        1.0
+
+      "node_nf_conntrack_entries" ->
+        Float.round(100.0 + n * 5000.0 + dh * 1000.0, 0)
+
+      "node_vmstat_pgfault" ->
+        Float.round(1.0e7 + ts_ms / 1_000 + n * 5.0e4, 0)
+
+      _ ->
+        Float.round(50.0 + n * 50.0, 2)
     end
   end
 

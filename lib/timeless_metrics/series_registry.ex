@@ -13,7 +13,17 @@ defmodule TimelessMetrics.SeriesRegistry do
 
   @publish_interval_ms 5_000
 
-  defstruct [:forward_key, :reverse_key, :overflow, :db, :name, :store, :dirty, :next_id, :pending_inserts]
+  defstruct [
+    :forward_key,
+    :reverse_key,
+    :overflow,
+    :db,
+    :name,
+    :store,
+    :dirty,
+    :next_id,
+    :pending_inserts
+  ]
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -124,11 +134,13 @@ defmodule TimelessMetrics.SeriesRegistry do
 
     # Atomics counter for lock-free ID generation from any process
     id_counter = :atomics.new(1, signed: true)
+
     seed =
       case TimelessMetrics.DB.read(db, "SELECT COALESCE(MAX(id), 0) FROM series") do
         {:ok, [[max_id]]} -> max_id
         _ -> 0
       end
+
     :atomics.put(id_counter, 1, seed)
     :persistent_term.put({__MODULE__, name, :id_counter}, id_counter)
 
