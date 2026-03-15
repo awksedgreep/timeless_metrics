@@ -404,8 +404,12 @@ defmodule TimelessMetrics.Rollup do
   end
 
   # Auto-detect segment format: ALP (0xA1), text (0xFE), or legacy gorilla
-  defp decompress_segment(<<0xA1, _alp_blob::binary>>, _compression) do
-    {:error, :alp_disabled}
+  defp decompress_segment(<<0xA1, alp_blob::binary>>, _compression) do
+    ExAlp.decompress(alp_blob, compression: :zstd)
+  end
+
+  defp decompress_segment(<<0xA2, ts::signed-64, val::float-64>>, _compression) do
+    {:ok, [{ts, val}]}
   end
 
   defp decompress_segment(<<0xFE, text_blob::binary>>, _compression) do

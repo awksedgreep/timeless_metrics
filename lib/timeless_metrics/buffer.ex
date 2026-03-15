@@ -25,6 +25,8 @@ defmodule TimelessMetrics.Buffer do
 
   @default_flush_interval :timer.seconds(5)
   @default_backpressure_threshold 50_000
+  # Minimum points per series before flushing to SegmentBuilder for compression
+  @min_points_per_series 32
 
   # Number of metadata keys stored in ETS (__builder_pid__, __counter__, __threshold__, __bp_state__, __rate_state__)
   @metadata_key_count 3
@@ -195,27 +197,51 @@ defmodule TimelessMetrics.Buffer do
       {{{:"$1", :"$2", :"$3"}, :"$4"}, [{:"=<", :"$3", cutoff}], [{{:"$1", :"$2", :"$4"}}]}
     ]
 
-    delete_spec = [{{{:_, :_, :"$1"}, :_}, [{:"=<", :"$1", cutoff}], [true]}]
-
     points = :ets.select(state.table, select_spec)
-    :ets.select_delete(state.table, delete_spec)
-    :atomics.put(state.counter, 1, max(:ets.info(state.table, :size) - @metadata_key_count, 0))
 
     if points != [] do
-      count = length(points)
       grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
 
-      :telemetry.execute(
-        [:timeless_metrics, :buffer, :flush],
-        %{point_count: count, series_count: map_size(grouped)},
-        %{shard: state.shard_id}
-      )
+      # Split: series with enough points for compression vs too few
+      {ready, keep} =
+        Enum.split_with(grouped, fn {_series_id, pts} ->
+          length(pts) >= @min_points_per_series
+        end)
 
-      TimelessMetrics.SegmentBuilder.ingest(state.segment_builder, grouped)
-      TimelessMetrics.Stats.add_points_merged(state.store, count)
+      if ready != [] do
+        ready_map = Map.new(ready)
+        ready_count = Enum.reduce(ready, 0, fn {_, pts}, acc -> acc + length(pts) end)
+        ready_series = Map.keys(ready_map) |> MapSet.new()
+
+        # Delete only the flushed points: re-scan for keys belonging to ready series
+        # that are at or before the cutoff, then delete them
+        delete_keys_spec = [
+          {{{:"$1", :"$2", :"$3"}, :_}, [{:"=<", :"$3", cutoff}], [{{:"$1", :"$2", :"$3"}}]}
+        ]
+
+        :ets.select(state.table, delete_keys_spec)
+        |> Enum.each(fn {sid, ts, seq} ->
+          if MapSet.member?(ready_series, sid) do
+            :ets.delete(state.table, {sid, ts, seq})
+          end
+        end)
+
+        :atomics.put(state.counter, 1, max(:ets.info(state.table, :size) - @metadata_key_count, 0))
+
+        :telemetry.execute(
+          [:timeless_metrics, :buffer, :flush],
+          %{point_count: ready_count, series_count: map_size(ready_map)},
+          %{shard: state.shard_id}
+        )
+
+        TimelessMetrics.SegmentBuilder.ingest(state.segment_builder, ready_map)
+        TimelessMetrics.Stats.add_points_merged(state.store, ready_count)
+      end
     end
   end
 
+  # Synchronous flush — flushes ALL points regardless of per-series count.
+  # Used by terminate and explicit flush calls.
   defp do_flush_sync(state) do
     cutoff = :erlang.unique_integer([:positive, :monotonic])
 

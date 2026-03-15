@@ -464,12 +464,12 @@ defmodule TimelessMetrics.SegmentBuilder do
             error -> error
           end
         else
-          # Gorilla fallback — ALP disabled for ARM segfault investigation
-          case GorillaStream.compress(sorted_points,
+          # ALP encoding with zstd container compression
+          case ExAlp.compress(sorted_points,
                  compression: :zstd,
                  compression_level: state.compression_level
                ) do
-            {:ok, blob} -> {:ok, <<0xFF, blob::binary>>}
+            {:ok, blob} -> {:ok, <<0xA1, blob::binary>>}
             error -> error
           end
         end

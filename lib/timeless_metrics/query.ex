@@ -425,14 +425,19 @@ defmodule TimelessMetrics.Query do
   @text_marker 0xFE
   # ALP marker: <<0xA1, alp_zstd_blob...>>
   @alp_marker 0xA1
+  # Raw single-point marker: <<0xA2, ts::int64, val::float64>>
+  @raw_point_marker 0xA2
 
   defp decompress_blob(<<@text_marker, text_blob::binary>>, _store, _compression) do
     TimelessMetrics.TextCodec.decompress(text_blob)
   end
 
-  defp decompress_blob(<<@alp_marker, _alp_blob::binary>>, _store, _compression) do
-    # ExAlp disabled for ARM segfault investigation
-    {:error, :alp_disabled}
+  defp decompress_blob(<<@alp_marker, alp_blob::binary>>, _store, _compression) do
+    ExAlp.decompress(alp_blob, compression: :zstd)
+  end
+
+  defp decompress_blob(<<@raw_point_marker, ts::signed-64, val::float-64>>, _store, _compression) do
+    {:ok, [{ts, val}]}
   end
 
   # Legacy: dict-compressed gorilla blobs (<<0xFF, dict_version, data...>>)
