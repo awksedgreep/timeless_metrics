@@ -6,7 +6,7 @@ defmodule TimelessMetrics.BackupTest do
   @port 18_402
 
   setup do
-    start_supervised!({TimelessMetrics, name: :backup_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :backup_test, data_dir: @data_dir})
 
     on_exit(fn ->
       File.rm_rf!(@data_dir)
@@ -43,7 +43,7 @@ defmodule TimelessMetrics.BackupTest do
     Exqlite.Sqlite3.close(conn)
   end
 
-  test "backup includes actor .dat files" do
+  test "backup includes shard directories" do
     now = System.os_time(:second)
 
     for i <- 0..4 do
@@ -57,28 +57,8 @@ defmodule TimelessMetrics.BackupTest do
     {:ok, result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
     assert "metrics.db" in result.files
-    actor_files = Enum.filter(result.files, &String.starts_with?(&1, "actor/"))
-    assert length(actor_files) >= 1
-  end
-
-  test "backed-up actor files exist on disk" do
-    now = System.os_time(:second)
-
-    for i <- 0..4 do
-      TimelessMetrics.write(:backup_test, "temp", %{"sensor" => "s1"}, 20.0 + i,
-        timestamp: now - 300 + i * 60
-      )
-    end
-
-    TimelessMetrics.flush(:backup_test)
-
-    {:ok, _result} = TimelessMetrics.backup(:backup_test, @backup_dir)
-
-    actor_dir = Path.join(@backup_dir, "actor")
-    assert File.dir?(actor_dir)
-    {:ok, files} = File.ls(actor_dir)
-    dat_files = Enum.filter(files, &String.ends_with?(&1, ".dat"))
-    assert length(dat_files) >= 1
+    shard_dirs = Enum.filter(result.files, &String.starts_with?(&1, "shard_"))
+    assert length(shard_dirs) >= 1
   end
 
   test "backup during active writes does not crash" do

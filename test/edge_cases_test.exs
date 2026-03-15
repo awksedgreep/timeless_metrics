@@ -166,7 +166,7 @@ defmodule TimelessMetrics.EdgeCasesTest do
     end)
   end
 
-  test "info returns actor stats" do
+  test "info returns store stats" do
     info = TimelessMetrics.info(:edge_test)
 
     assert is_integer(info.series_count)

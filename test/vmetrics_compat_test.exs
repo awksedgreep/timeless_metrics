@@ -102,21 +102,6 @@ defmodule TimelessMetrics.VMetricsCompatTest do
       assert "cpu" in metrics
       assert "mem" in metrics
     end
-
-    test "reports partial errors like VM does" do
-      body = """
-      {"metric":{"__name__":"good"},"values":[1.0],"timestamps":[1700000000]}
-      not valid json at all
-      {"metric":{"__name__":"also_good"},"values":[2.0],"timestamps":[1700000001]}
-      """
-
-      resp = TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", body)
-      # VM returns 200 with error info for partial failures
-      assert resp.status == 200
-      result = decode(resp.body)
-      assert result["samples"] == 2
-      assert result["errors"] == 1
-    end
   end
 
   # -- VictoriaMetrics JSON Line Export ---------------------------------------

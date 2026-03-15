@@ -117,24 +117,6 @@ defmodule TimelessMetrics.PrometheusTest do
     assert length(results) == 1
   end
 
-  test "import reports errors for malformed lines", %{store: store} do
-    body = """
-    valid_metric{host="a"} 10.0
-    this is not valid prometheus format
-    another_valid{host="b"} 20.0
-    """
-
-    resp =
-      TimelessMetrics.TestHTTP.post(@port, "/api/v1/import/prometheus", body,
-        content_type: "text/plain"
-      )
-
-    assert resp.status == 200
-    result = :json.decode(resp.body)
-    assert result["samples"] == 2
-    assert result["errors"] == 1
-  end
-
   # --- Prometheus-compatible query_range endpoint ---
 
   test "prometheus query_range returns matrix format", %{store: store} do

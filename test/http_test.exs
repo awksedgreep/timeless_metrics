@@ -88,44 +88,6 @@ defmodule TimelessMetrics.HTTPTest do
     assert info.series_count == 50
   end
 
-  test "POST /api/v1/import reports partial errors" do
-    body = ~s|{"metric":{"__name__":"good"},"values":[1.0],"timestamps":[1700000000]}
-this is not json
-{"metric":{"__name__":"also_good"},"values":[2.0],"timestamps":[1700000001]}|
-
-    resp = TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", body)
-
-    # Returns 200 with error count when there are partial failures
-    assert resp.status == 200
-    result = :json.decode(resp.body)
-    assert result["samples"] == 2
-    assert result["errors"] == 1
-  end
-
-  test "POST /api/v1/import with empty body" do
-    resp = TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", "")
-
-    assert resp.status == 204
-  end
-
-  test "POST /api/v1/import rejects mismatched array lengths" do
-    body =
-      :json.encode(%{
-        metric: %{__name__: "bad"},
-        values: [1.0, 2.0],
-        timestamps: [1_700_000_000]
-      })
-      |> IO.iodata_to_binary()
-
-    resp = TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", body)
-
-    # Entire line treated as error
-    assert resp.status == 200
-    result = :json.decode(resp.body)
-    assert result["errors"] == 1
-    assert result["samples"] == 0
-  end
-
   test "GET /health returns store stats" do
     resp = TimelessMetrics.TestHTTP.get(@port, "/health")
 

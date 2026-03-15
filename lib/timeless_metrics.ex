@@ -447,6 +447,8 @@ defmodule TimelessMetrics do
 
   @doc "Create a consistent online backup."
   def backup(store, target_dir) do
+    # Flush pending series registrations to SQLite
+    TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     # Flush all buffers and segment builders to disk
     flush(store)
 
@@ -574,14 +576,14 @@ defmodule TimelessMetrics do
 
   @doc "Force a daily rollup run."
   def rollup(store) do
-    GenServer.call(:"#{store}_rollup", :run_now, :infinity)
+    GenServer.call(:"#{store}_rollup", {:run, :all}, :infinity)
   end
 
   @doc """
   Force retention enforcement now.
   """
   def enforce_retention(store) do
-    GenServer.call(:"#{store}_retention", :enforce_now, :infinity)
+    GenServer.call(:"#{store}_retention", :enforce, :infinity)
   end
 
   @doc """

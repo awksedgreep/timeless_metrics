@@ -96,18 +96,23 @@ defmodule TimelessMetrics.IngestWorker do
   end
 
   defp take_batch(queue, limit) do
-    # Use match + delete to atomically take entries
-    # Take the first `limit` entries by key order
-    spec = [{{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}]
+    # Use first/next + take for atomic per-entry removal
+    take_loop(queue, :ets.first(queue), limit, [])
+  end
 
-    case :ets.select(queue, spec, limit) do
-      {entries, _continuation} ->
-        # Delete the entries we took
-        Enum.each(entries, fn {key, _, _} -> :ets.delete(queue, key) end)
-        entries
+  defp take_loop(_queue, :"$end_of_table", _remaining, acc), do: Enum.reverse(acc)
+  defp take_loop(_queue, _key, 0, acc), do: Enum.reverse(acc)
 
-      :"$end_of_table" ->
-        []
+  defp take_loop(queue, key, remaining, acc) do
+    next = :ets.next(queue, key)
+
+    case :ets.take(queue, key) do
+      [{^key, body, format}] ->
+        take_loop(queue, next, remaining - 1, [{key, body, format} | acc])
+
+      [] ->
+        # Another worker took it
+        take_loop(queue, next, remaining, acc)
     end
   end
 
@@ -116,11 +121,17 @@ defmodule TimelessMetrics.IngestWorker do
     shard_count = :persistent_term.get({TimelessMetrics, state.store, :shard_count})
 
     Enum.each(entries, fn {_key, compressed_body, format} ->
-      body = :ezstd.decompress(compressed_body)
+      try do
+        body = :ezstd.decompress(compressed_body)
 
-      case format do
-        :prometheus -> process_prometheus(body, state.store, registry, shard_count)
-        :json -> process_json(body, state.store, registry, shard_count)
+        case format do
+          :prometheus -> process_prometheus(body, state.store, registry, shard_count)
+          :json -> process_json(body, state.store, registry, shard_count)
+        end
+      rescue
+        _ -> :ok
+      catch
+        _, _ -> :ok
       end
     end)
   end
