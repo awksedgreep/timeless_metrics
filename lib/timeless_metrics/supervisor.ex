@@ -15,9 +15,7 @@ defmodule TimelessMetrics.Supervisor do
     data_dir = Keyword.fetch!(opts, :data_dir)
     shard_count = Keyword.get(opts, :buffer_shards, max(div(System.schedulers_online(), 2), 2))
     flush_interval = Keyword.get(opts, :flush_interval, :timer.seconds(5))
-    flush_threshold = Keyword.get(opts, :flush_threshold, 10_000)
     segment_duration = Keyword.get(opts, :segment_duration, 14_400)
-    pending_flush_interval = Keyword.get(opts, :pending_flush_interval, :timer.seconds(60))
     compression = Keyword.get(opts, :compression, :zstd)
     compression_level = Keyword.get(opts, :compression_level, 2)
 
@@ -79,7 +77,6 @@ defmodule TimelessMetrics.Supervisor do
                    shard_id: i,
                    data_dir: data_dir,
                    segment_duration: segment_duration,
-                   pending_flush_interval: pending_flush_interval,
                    compression: compression,
                    compression_level: compression_level,
                    schema: schema
@@ -96,8 +93,7 @@ defmodule TimelessMetrics.Supervisor do
                    store: name,
                    shard_id: i,
                    segment_builder: builder_name,
-                   flush_interval: flush_interval,
-                   flush_threshold: flush_threshold
+                   flush_interval: flush_interval
                  ]
                ]}
           }

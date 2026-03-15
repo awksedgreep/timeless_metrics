@@ -16,10 +16,7 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   defstruct [
     :segments,
-    :dirty_keys,
-    :flushed_keys,
     :segment_duration,
-    :pending_flush_interval,
     :compression,
     :compression_level,
     :shard_id,
@@ -32,7 +29,8 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   # 4 hours in seconds
   @default_segment_duration 14_400
-  @default_pending_flush_interval :timer.seconds(60)
+  # Minimum points before compressing and writing to WAL
+  @wal_flush_threshold 10_000
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -250,9 +248,6 @@ defmodule TimelessMetrics.SegmentBuilder do
     store = Keyword.get(opts, :store)
     segment_duration = Keyword.get(opts, :segment_duration, @default_segment_duration)
 
-    pending_flush_interval =
-      Keyword.get(opts, :pending_flush_interval, @default_pending_flush_interval)
-
     compression = Keyword.get(opts, :compression, :zstd)
     compression_level = Keyword.get(opts, :compression_level, 9)
     schema = Keyword.get(opts, :schema)
@@ -284,10 +279,7 @@ defmodule TimelessMetrics.SegmentBuilder do
 
     state = %__MODULE__{
       segments: %{},
-      dirty_keys: MapSet.new(),
-      flushed_keys: MapSet.new(),
       segment_duration: segment_duration,
-      pending_flush_interval: pending_flush_interval,
       compression: compression,
       compression_level: compression_level,
       shard_id: shard_id,
@@ -298,68 +290,40 @@ defmodule TimelessMetrics.SegmentBuilder do
       shard_store: shard_store
     }
 
-    # Periodic check for completed segments
+    # Periodic check for completed segments — seals old windows into .seg files
     Process.send_after(self(), :check_segments, :timer.seconds(10))
-
-    # Periodic flush of in-progress segments to make fresh data queryable
-    Process.send_after(self(), :flush_pending, pending_flush_interval)
 
     {:ok, state}
   end
 
   @impl true
   def handle_cast({:ingest, grouped_points}, state) do
-    {new_segments, new_dirty} =
-      Enum.reduce(grouped_points, {state.segments, state.dirty_keys}, fn {series_id, points},
-                                                                         {segments, dirty} ->
-        Enum.reduce(points, {segments, dirty}, fn {ts, val}, {segs, d} ->
-          bucket = segment_bucket(ts, state.segment_duration)
-          key = {series_id, bucket}
-
-          seg =
-            Map.get(segs, key, %{
-              series_id: series_id,
-              start_time: bucket,
-              end_time: bucket + state.segment_duration,
-              points: []
-            })
-
-          updated = %{seg | points: [{ts, val} | seg.points]}
-          {Map.put(segs, key, updated), MapSet.put(d, key)}
-        end)
-      end)
-
-    {:noreply, %{state | segments: new_segments, dirty_keys: new_dirty}}
+    new_segments = ingest_into_segments(grouped_points, state)
+    new_state = maybe_flush_wal(%{state | segments: new_segments})
+    {:noreply, new_state}
   end
 
   @impl true
   def handle_call({:ingest, grouped_points}, _from, state) do
-    {:noreply, new_state} = handle_cast({:ingest, grouped_points}, state)
+    new_segments = ingest_into_segments(grouped_points, state)
+    new_state = maybe_flush_wal(%{state | segments: new_segments})
     {:reply, :ok, new_state}
   end
 
   def handle_call(:flush, _from, state) do
     {completed, pending} = split_completed(state.segments, state.segment_duration)
 
-    # Write pending segments to WAL (makes fresh data queryable)
     pending_segs = Map.values(pending)
 
     if pending_segs != [] do
       write_segments(pending_segs, state)
     end
 
-    # Seal completed windows into .seg files
     if completed != [] do
       write_and_seal(completed, state)
     end
 
-    {:reply, :ok,
-     %{
-       state
-       | segments: pending,
-         dirty_keys: MapSet.new(),
-         flushed_keys: MapSet.new(Map.keys(pending))
-     }}
+    {:reply, :ok, %{state | segments: pending}}
   end
 
   def handle_call(:pending_point_count, _from, state) do
@@ -401,78 +365,11 @@ defmodule TimelessMetrics.SegmentBuilder do
     {completed, pending} = split_completed(state.segments, state.segment_duration)
 
     if completed != [] do
-      # Offload compression + disk write to a Task so we stay responsive
-      segment_state = %{
-        store: state.store,
-        compression: state.compression,
-        compression_level: state.compression_level,
-        shard_store: state.shard_store,
-        segment_duration: state.segment_duration
-      }
-
-      Task.start(fn -> write_and_seal_async(completed, segment_state) end)
+      write_and_seal(completed, state)
     end
-
-    # Remove sealed segment keys from flushed tracking
-    completed_keys =
-      Enum.map(completed, fn seg -> {seg.series_id, seg.start_time} end) |> MapSet.new()
-
-    new_flushed = MapSet.difference(state.flushed_keys, completed_keys)
 
     Process.send_after(self(), :check_segments, :timer.seconds(10))
-    {:noreply, %{state | segments: pending, flushed_keys: new_flushed}}
-  end
-
-  def handle_info(:flush_pending, state) do
-    {segments_to_flush, new_flushed_keys} =
-      if MapSet.size(state.dirty_keys) > 0 do
-        # Active writes — flush only dirty segments
-        segs =
-          state.dirty_keys
-          |> Enum.flat_map(fn key ->
-            case Map.get(state.segments, key) do
-              nil -> []
-              seg -> [seg]
-            end
-          end)
-
-        {segs, MapSet.union(state.flushed_keys, state.dirty_keys)}
-      else
-        # No new writes — check for unflushed segments
-        unflushed_keys =
-          Map.keys(state.segments)
-          |> MapSet.new()
-          |> MapSet.difference(state.flushed_keys)
-
-        if MapSet.size(unflushed_keys) > 0 do
-          segs =
-            unflushed_keys
-            |> Enum.flat_map(fn key ->
-              case Map.get(state.segments, key) do
-                nil -> []
-                seg -> [seg]
-              end
-            end)
-
-          {segs, MapSet.union(state.flushed_keys, unflushed_keys)}
-        else
-          {[], state.flushed_keys}
-        end
-      end
-
-    if segments_to_flush != [] do
-      segment_state = %{
-        store: state.store,
-        compression: state.compression,
-        compression_level: state.compression_level,
-        shard_store: state.shard_store
-      }
-
-      Task.start(fn -> write_segments_async(segments_to_flush, segment_state) end)
-    end
-
-    Process.send_after(self(), :flush_pending, state.pending_flush_interval)
-    {:noreply, %{state | dirty_keys: MapSet.new(), flushed_keys: new_flushed_keys}}
+    {:noreply, %{state | segments: pending}}
   end
 
   @impl true
@@ -500,6 +397,38 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   # --- Internals ---
 
+  defp maybe_flush_wal(state) do
+    pt_count = Enum.reduce(state.segments, 0, fn {_key, seg}, acc -> acc + length(seg.points) end)
+
+    if pt_count >= @wal_flush_threshold do
+      write_segments(Map.values(state.segments), state)
+      cleared = Map.new(state.segments, fn {key, seg} -> {key, %{seg | points: []}} end)
+      %{state | segments: cleared}
+    else
+      state
+    end
+  end
+
+  defp ingest_into_segments(grouped_points, state) do
+    Enum.reduce(grouped_points, state.segments, fn {series_id, points}, segments ->
+      Enum.reduce(points, segments, fn {ts, val}, segs ->
+        bucket = segment_bucket(ts, state.segment_duration)
+        key = {series_id, bucket}
+
+        seg =
+          Map.get(segs, key, %{
+            series_id: series_id,
+            start_time: bucket,
+            end_time: bucket + state.segment_duration,
+            points: []
+          })
+
+        updated = %{seg | points: [{ts, val} | seg.points]}
+        Map.put(segs, key, updated)
+      end)
+    end)
+  end
+
   defp segment_bucket(timestamp, duration) do
     div(timestamp, duration) * duration
   end
@@ -520,7 +449,9 @@ defmodule TimelessMetrics.SegmentBuilder do
   end
 
   defp compress_segments(segments, state) do
-    Enum.flat_map(segments, fn seg ->
+    segments
+    |> Enum.reject(fn seg -> seg.points == [] end)
+    |> Enum.flat_map(fn seg ->
       sorted_points = Enum.sort_by(seg.points, &elem(&1, 0))
 
       # Detect text series by checking if the first value is a string
@@ -569,27 +500,7 @@ defmodule TimelessMetrics.SegmentBuilder do
   end
 
   # Async variants for periodic flushes — run in a Task to avoid blocking the GenServer
-  defp write_segments_async(segments, state) do
-    compressed = compress_segments(segments, state)
-    if compressed != [], do: TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
-  end
-
-  defp write_and_seal_async(segments, state) do
-    compressed = compress_segments(segments, state)
-
-    if compressed != [] do
-      TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
-
-      compressed
-      |> Enum.map(fn {_sid, start, _, _, _} -> segment_bucket(start, state.segment_duration) end)
-      |> Enum.uniq()
-      |> Enum.each(fn window ->
-        TimelessMetrics.ShardStore.seal_window(state.shard_store, window)
-      end)
-    end
-  end
-
-  # Write segments to WAL (for in-progress / pending flush) — synchronous, used by flush/terminate
+  # Write segments to WAL — synchronous
   defp write_segments(segments, state) do
     compressed = compress_segments(segments, state)
 
