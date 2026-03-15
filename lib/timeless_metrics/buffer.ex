@@ -15,6 +15,7 @@ defmodule TimelessMetrics.Buffer do
   defstruct [
     :table,
     :shard_id,
+    :store,
     :segment_builder,
     :flush_interval,
     :flush_threshold,
@@ -152,6 +153,7 @@ defmodule TimelessMetrics.Buffer do
   def init(opts) do
     shard_id = Keyword.fetch!(opts, :shard_id)
     name = Keyword.fetch!(opts, :name)
+    store = Keyword.fetch!(opts, :store)
     segment_builder = Keyword.fetch!(opts, :segment_builder)
     flush_interval = Keyword.get(opts, :flush_interval, @default_flush_interval)
     flush_threshold = Keyword.get(opts, :flush_threshold, @default_flush_threshold)
@@ -193,6 +195,7 @@ defmodule TimelessMetrics.Buffer do
     state = %__MODULE__{
       table: table,
       shard_id: shard_id,
+      store: store,
       segment_builder: segment_builder,
       flush_interval: flush_interval,
       flush_threshold: flush_threshold,
@@ -281,15 +284,17 @@ defmodule TimelessMetrics.Buffer do
     :atomics.put(state.counter, 1, max(:ets.info(state.table, :size) - @metadata_key_count, 0))
 
     if points != [] do
+      count = length(points)
       grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
 
       :telemetry.execute(
         [:timeless_metrics, :buffer, :flush],
-        %{point_count: length(points), series_count: map_size(grouped)},
+        %{point_count: count, series_count: map_size(grouped)},
         %{shard: state.shard_id}
       )
 
       TimelessMetrics.SegmentBuilder.ingest(state.segment_builder, grouped)
+      TimelessMetrics.Stats.add_points_merged(state.store, count)
     end
   end
 
@@ -307,8 +312,10 @@ defmodule TimelessMetrics.Buffer do
     :atomics.put(state.counter, 1, max(:ets.info(state.table, :size) - @metadata_key_count, 0))
 
     if points != [] do
+      count = length(points)
       grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
       TimelessMetrics.SegmentBuilder.ingest_sync(state.segment_builder, grouped)
+      TimelessMetrics.Stats.add_points_merged(state.store, count)
     end
   end
 
