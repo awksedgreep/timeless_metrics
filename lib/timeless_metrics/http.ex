@@ -271,13 +271,14 @@ defmodule TimelessMetrics.HTTP do
           end
 
         target_dir = parsed_path || default_backup_dir(store)
-        {:ok, result} = TimelessMetrics.backup(store, target_dir)
+
+        {:ok, info} = TimelessMetrics.backup(store, target_dir)
 
         json_resp(req, 200, %{
           status: "ok",
-          path: result.path,
-          files: result.files,
-          total_bytes: result.total_bytes
+          path: info.path,
+          files: info.files,
+          total_bytes: info.total_bytes
         })
     end
   end
@@ -1753,293 +1754,23 @@ defmodule TimelessMetrics.HTTP do
   @max_error_samples 3
   @parallel_parse_threshold 2_000
 
-  defp ingest_json_lines(store, body) do
-    lines = :binary.split(body, <<"\n">>, [:global, :trim_all])
-
-    # Parse and group in one pass — avoid flat list + re-grouping
-    {groups, count, errors, error_samples} =
-      Enum.reduce(lines, {%{}, 0, 0, []}, fn line, {groups, count, errors, samples} ->
-        case parse_vm_line_grouped(line) do
-          {:ok, line_groups, line_count} ->
-            merged =
-              Enum.reduce(line_groups, groups, fn {key, points}, acc ->
-                Map.update(acc, key, points, &(points ++ &1))
-              end)
-
-            {merged, count + line_count, errors, samples}
-
-          :error ->
-            samples =
-              if errors < @max_error_samples do
-                [String.slice(line, 0, 200) | samples]
-              else
-                samples
-              end
-
-            {groups, count, errors + 1, samples}
-        end
-      end)
-
-    if errors > 0 do
-      Logger.warning(
-        "Import: #{errors} line(s) failed to parse, sample: #{inspect(error_samples)}"
-      )
-    end
-
-    # Write to sharded buffers
-    if count > 0 do
-      TimelessMetrics.Stats.incr_writes(store)
-      TimelessMetrics.Stats.add_points(store, count)
-      registry = :"#{store}_registry"
-      shard_count = :persistent_term.get({TimelessMetrics, store, :shard_count})
-
-      Enum.each(groups, fn {{metric_name, labels}, batch} ->
-        series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-        shard_idx = rem(abs(series_id), shard_count)
-        points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
-        TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
-      end)
-    end
-
-    {count, errors, Enum.take(Enum.reverse(error_samples), @max_error_samples)}
-  end
-
-  # Parse a VM JSON line directly into grouped {key, points} pairs
-  defp parse_vm_line_grouped(line) do
-    case safe_json_decode(line) do
-      %{"metric" => metric_map, "values" => values, "timestamps" => timestamps}
-      when is_list(values) and is_list(timestamps) and length(values) == length(timestamps) ->
-        {name, labels} = extract_metric(metric_map)
-        key = {name, labels}
-
-        try do
-          points = zip_points(timestamps, values, [])
-          {:ok, [{key, points}], length(values)}
-        catch
-          :throw, :bad_entry -> :error
-        end
-
-      _ ->
-        :error
-    end
-  end
-
-  defp zip_points([], [], acc), do: acc
-
-  defp zip_points([ts | tsr], [v | vr], acc) when is_integer(ts) and is_number(v) do
-    zip_points(tsr, vr, [{div(ts, 1000), ensure_float(v)} | acc])
-  end
-
-  defp zip_points([ts | tsr], [v | vr], acc) when is_integer(ts) and is_binary(v) do
-    zip_points(tsr, vr, [{div(ts, 1000), v} | acc])
-  end
-
-  defp zip_points(_, _, _), do: throw(:bad_entry)
-
   defp safe_json_decode(bin) do
     :json.decode(bin)
   catch
     :error, _ -> :error
   end
 
-  defp extract_metric(metric_map) do
-    {name, labels} = Map.pop(metric_map, "__name__", "unknown")
-    {name, labels}
-  end
-
-  # --- Prometheus text format parser ---
-  # Handles: metric_name{label1="val1",label2="val2"} value [timestamp_ms]
-  # Also handles: metric_name value [timestamp_ms] (no labels)
-  # Skips comments (#) and empty lines.
-
-  defp ingest_prometheus_text(store, body) do
-    {groups, count, errors, error_samples} =
-      if TimelessMetrics.PrometheusNif.available?() do
-        parse_prometheus_body_nif(body)
-      else
-        lines = :binary.split(body, <<"\n">>, [:global, :trim_all])
-
-        if length(lines) >= @parallel_parse_threshold do
-          parse_prometheus_lines_parallel(lines)
-        else
-          parse_prometheus_lines_sequential(lines)
-        end
-      end
-
-    if errors > 0 do
-      Logger.warning(
-        "Prometheus import: #{errors} line(s) failed to parse, sample: #{inspect(error_samples)}"
-      )
-    end
-
-    if count > 0 do
-      TimelessMetrics.Stats.incr_writes(store)
-      TimelessMetrics.Stats.add_points(store, count)
-      registry = :"#{store}_registry"
-      shard_count = :persistent_term.get({TimelessMetrics, store, :shard_count})
-
-      Enum.each(groups, fn {{metric_name, labels}, batch} ->
-        series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-        shard_idx = rem(abs(series_id), shard_count)
-        points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
-        TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
-      end)
-    end
-
-    {count, errors, error_samples}
-  end
-
-  defp parse_prometheus_body_nif(body) do
-    {entries, error_count} = TimelessMetrics.PrometheusNif.parse(body)
-    now = System.os_time(:second)
-
-    {groups, count} =
-      Enum.reduce(entries, {%{}, 0}, fn {name, labels_proplist, value, ts}, {groups, count} ->
-        labels = Map.new(labels_proplist)
-        timestamp = if ts == 0, do: now, else: div(ts, 1000)
-        key = {name, labels}
-        point = {timestamp, value}
-        {Map.update(groups, key, [point], &[point | &1]), count + 1}
-      end)
-
-    {groups, count, error_count, []}
-  end
-
-  defp parse_prometheus_lines_sequential(lines) do
-    {groups, count, errors, samples} =
-      Enum.reduce(lines, {%{}, 0, 0, []}, fn line, {groups, count, errors, samples} ->
-        line = String.trim(line)
-
-        if line == "" or String.starts_with?(line, "#") do
-          {groups, count, errors, samples}
-        else
-          case parse_prometheus_line(line) do
-            {:ok, metric, labels, value, timestamp} ->
-              key = {metric, labels}
-              point = {timestamp, value}
-              groups = Map.update(groups, key, [point], &[point | &1])
-              {groups, count + 1, errors, samples}
-
-            :error ->
-              samples =
-                if errors < @max_error_samples do
-                  [String.slice(line, 0, 200) | samples]
-                else
-                  samples
-                end
-
-              {groups, count, errors + 1, samples}
-          end
-        end
-      end)
-
-    {groups, count, errors, Enum.take(Enum.reverse(samples), @max_error_samples)}
-  end
-
-  defp parse_prometheus_lines_parallel(lines) do
-    chunk_count = System.schedulers_online()
-
-    chunks =
-      lines
-      |> Enum.chunk_every(div(length(lines), chunk_count) + 1)
-      |> Enum.map(fn chunk ->
-        Task.async(fn -> parse_prometheus_lines_sequential(chunk) end)
-      end)
-
-    results = Task.await_many(chunks, :timer.seconds(30))
-    merge_grouped_results(results)
-  end
-
   defp merge_parse_results(results) do
-    Enum.reduce(results, {[], 0, []}, fn {entries, errors, samples},
-                                         {all_entries, total_errors, all_samples} ->
-      merged_entries = :lists.reverse(entries, all_entries)
-      merged_samples = Enum.take(all_samples ++ samples, @max_error_samples)
-      {merged_entries, total_errors + errors, merged_samples}
-    end)
-  end
-
-  defp merge_grouped_results(results) do
     Enum.reduce(results, {%{}, 0, 0, []}, fn {groups, count, errors, samples},
-                                             {all_groups, total_count, total_errors, all_samples} ->
+                                             {acc_groups, acc_count, acc_errors, acc_samples} ->
       merged =
-        Map.merge(all_groups, groups, fn _key, existing, new ->
-          new ++ existing
+        Enum.reduce(groups, acc_groups, fn {key, points}, acc ->
+          Map.update(acc, key, points, &(points ++ &1))
         end)
 
-      merged_samples = Enum.take(all_samples ++ samples, @max_error_samples)
-      {merged, total_count + count, total_errors + errors, merged_samples}
+      {merged, acc_count + count, acc_errors + errors, acc_samples ++ samples}
     end)
   end
-
-  defp parse_prometheus_line(line) do
-    # Binary matching — split metric{labels} from value [timestamp]
-    case :binary.match(line, <<"{">>) do
-      {brace_pos, 1} ->
-        metric = :binary.part(line, 0, brace_pos)
-        rest = :binary.part(line, brace_pos + 1, byte_size(line) - brace_pos - 1)
-
-        case :binary.split(rest, <<"} ">>) do
-          [labels_str, value_ts] ->
-            labels = parse_prometheus_labels_bin(labels_str)
-            parse_value_timestamp(String.trim(value_ts), metric, labels)
-
-          _ ->
-            :error
-        end
-
-      :nomatch ->
-        # No labels: metric value [timestamp]
-        case :binary.split(line, <<" ">>) do
-          [metric, value_ts] ->
-            parse_value_timestamp(String.trim(value_ts), metric, %{})
-
-          _ ->
-            :error
-        end
-    end
-  end
-
-  defp parse_value_timestamp(str, metric, labels) do
-    case :binary.split(str, <<" ">>) do
-      [value_str, ts_str] ->
-        with {value, _} <- Float.parse(value_str),
-             {ts_ms, _} <- Integer.parse(ts_str) do
-          {:ok, metric, labels, value, div(ts_ms, 1000)}
-        else
-          _ -> :error
-        end
-
-      [value_str] ->
-        case Float.parse(value_str) do
-          {value, _} -> {:ok, metric, labels, value, System.os_time(:second)}
-          _ -> :error
-        end
-    end
-  end
-
-  defp ensure_float(v) when is_float(v), do: v
-  defp ensure_float(v) when is_integer(v), do: v / 1
-
-  defp parse_prometheus_labels_bin(str) when byte_size(str) == 0, do: %{}
-
-  defp parse_prometheus_labels_bin(str) do
-    str
-    |> :binary.split(<<",">>, [:global])
-    |> Enum.reduce(%{}, fn pair, acc ->
-      case :binary.split(pair, <<"=">>) do
-        [key, value] -> Map.put(acc, String.trim(key), strip_quotes(value))
-        _ -> acc
-      end
-    end)
-  end
-
-  defp strip_quotes(<<?\", rest::binary>>) do
-    size = byte_size(rest) - 1
-    if size >= 0, do: :binary.part(rest, 0, size), else: rest
-  end
-
-  defp strip_quotes(v), do: String.trim(v)
 
   # --- InfluxDB line protocol parser ---
   # Format: measurement,tag=val,tag=val field=value[,field=value] [timestamp_ns]

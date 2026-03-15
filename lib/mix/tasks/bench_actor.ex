@@ -623,14 +623,11 @@ defmodule Mix.Tasks.Bench.Actor do
 
     IO.puts("  Series count:      #{fmt_int(info.series_count)}")
     IO.puts("  Total points:      #{fmt_int(info.total_points)}")
-    IO.puts("  Block count:       #{fmt_int(info.block_count)}")
     IO.puts("  Raw buffer pts:    #{fmt_int(info.raw_buffer_points)}")
     IO.puts("  Compressed bytes:  #{fmt_bytes(info.compressed_bytes)}")
     IO.puts("  Bytes/point:       #{info.bytes_per_point}")
     IO.puts("  Storage bytes:     #{fmt_bytes(info.storage_bytes)}")
     IO.puts("  Daily rollup rows: #{fmt_int(info.daily_rollup_rows)}")
-    IO.puts("  Process count:     #{fmt_int(info.process_count)}")
-    IO.puts("  Index ETS bytes:   #{fmt_bytes(info.index_ets_bytes)}")
   end
 
   # ── Data Generation ────────────────────────────────────────────────

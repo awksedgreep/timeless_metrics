@@ -519,14 +519,7 @@ defmodule TimelessMetrics.SegmentBuilder do
     {completed, pending}
   end
 
-  # Dict-compressed blob prefix: <<0xFF, dict_version>>
-  # Standard blobs start with zstd magic (0x28) or gorilla magic (0x47), never 0xFF
-  @dict_marker 0xFF
-
   defp compress_segments(segments, state) do
-    cdict = state.store && TimelessMetrics.DictTrainer.get_cdict(state.store)
-    dict_version = state.store && TimelessMetrics.DictTrainer.get_dict_version(state.store)
-
     Enum.flat_map(segments, fn seg ->
       sorted_points = Enum.sort_by(seg.points, &elem(&1, 0))
 
@@ -573,15 +566,6 @@ defmodule TimelessMetrics.SegmentBuilder do
           []
       end
     end)
-  end
-
-  defp compress_with_dict(sorted_points, cdict, dict_version) do
-    # Gorilla compress without container compression, then dict-compress
-    with {:ok, gorilla_blob} <- GorillaStream.compress(sorted_points, compression: :none),
-         {:ok, compressed} <-
-           GorillaStream.Compression.Container.compress_with_dict(gorilla_blob, cdict) do
-      {:ok, <<@dict_marker, dict_version::8, compressed::binary>>}
-    end
   end
 
   # Async variants for periodic flushes — run in a Task to avoid blocking the GenServer

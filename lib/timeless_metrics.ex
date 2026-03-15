@@ -447,8 +447,71 @@ defmodule TimelessMetrics do
 
   @doc "Create a consistent online backup."
   def backup(store, target_dir) do
-    # TODO: implement sharded backup
-    {:error, :not_implemented}
+    # Flush all buffers and segment builders to disk
+    flush(store)
+
+    data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir})
+    db = :"#{store}_db"
+
+    File.mkdir_p!(target_dir)
+
+    # 1. VACUUM INTO for SQLite
+    db_target = Path.join(target_dir, "metrics.db")
+    TimelessMetrics.DB.write(db, "VACUUM INTO ?1", [db_target])
+
+    # 2. Copy shard directories
+    shard_count = buffer_shard_count(store)
+
+    shard_bytes =
+      for i <- 0..(shard_count - 1) do
+        src = Path.join(data_dir, "shard_#{i}")
+        dst = Path.join(target_dir, "shard_#{i}")
+        copy_dir(src, dst)
+      end
+      |> Enum.sum()
+
+    db_size =
+      case File.stat(db_target) do
+        {:ok, %{size: s}} -> s
+        _ -> 0
+      end
+
+    files =
+      ["metrics.db"] ++
+        for i <- 0..(shard_count - 1), do: "shard_#{i}"
+
+    {:ok, %{path: target_dir, files: files, total_bytes: db_size + shard_bytes}}
+  end
+
+  defp copy_dir(src, dst) do
+    case File.ls(src) do
+      {:ok, entries} ->
+        File.mkdir_p!(dst)
+
+        Enum.reduce(entries, 0, fn entry, acc ->
+          src_path = Path.join(src, entry)
+          dst_path = Path.join(dst, entry)
+
+          case File.stat(src_path) do
+            {:ok, %{type: :directory}} ->
+              acc + copy_dir(src_path, dst_path)
+
+            {:ok, %{type: :regular}} ->
+              File.cp!(src_path, dst_path)
+
+              case File.stat(dst_path) do
+                {:ok, %{size: s}} -> acc + s
+                _ -> acc
+              end
+
+            _ ->
+              acc
+          end
+        end)
+
+      _ ->
+        0
+    end
   end
 
   @doc "Get store info and statistics."
@@ -485,7 +548,9 @@ defmodule TimelessMetrics do
       buffer_points: stats.points_ingested - stats.points_merged,
       db_path: Path.join(data_dir, "metrics.db"),
       block_count: 0,
-      bytes_per_point: 0.0
+      bytes_per_point: 0.0,
+      compressed_bytes: storage_bytes,
+      daily_rollup_rows: 0
     }
   end
 
@@ -854,7 +919,7 @@ defmodule TimelessMetrics do
 
     # Collect all series from persistent_term
     fwd_map = :persistent_term.get(fwd_key)
-    rev_map = :persistent_term.get(rev_key)
+    _rev_map = :persistent_term.get(rev_key)
 
     # Series from persistent_term matching this metric
     published =

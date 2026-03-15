@@ -171,6 +171,7 @@ defmodule TimelessMetrics.SeriesRegistry do
     {:noreply, %{state | dirty: true, pending_inserts: pending}}
   end
 
+  @impl true
   def handle_call(:flush_pending, _from, state) do
     flush_pending_inserts(state)
     {:reply, :ok, %{state | pending_inserts: []}}

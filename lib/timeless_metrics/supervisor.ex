@@ -23,8 +23,8 @@ defmodule TimelessMetrics.Supervisor do
 
     raw_retention_seconds = Keyword.get(opts, :raw_retention_seconds, 604_800)
     daily_retention_seconds = Keyword.get(opts, :daily_retention_seconds, 31_536_000)
-    rollup_interval = Keyword.get(opts, :rollup_interval, :timer.minutes(5))
-    retention_interval = Keyword.get(opts, :retention_interval, :timer.hours(1))
+    _rollup_interval = Keyword.get(opts, :rollup_interval, :timer.minutes(5))
+    _retention_interval = Keyword.get(opts, :retention_interval, :timer.hours(1))
 
     schema =
       case Keyword.get(opts, :schema) do
