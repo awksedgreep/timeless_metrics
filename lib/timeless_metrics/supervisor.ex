@@ -161,10 +161,15 @@ defmodule TimelessMetrics.Supervisor do
     # New features — kept from actor era
     alert_interval = Keyword.get(opts, :alert_interval, :timer.seconds(60))
 
-    alert_children = [
-      {TimelessMetrics.AlertEvaluator,
-       name: :"#{name}_alert_evaluator", store: name, interval: alert_interval}
-    ]
+    alert_children =
+      if memory_only do
+        []
+      else
+        [
+          {TimelessMetrics.AlertEvaluator,
+           name: :"#{name}_alert_evaluator", store: name, interval: alert_interval}
+        ]
+      end
 
     self_monitor_children =
       if Keyword.get(opts, :self_monitor, true) do

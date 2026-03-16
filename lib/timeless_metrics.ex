@@ -527,10 +527,10 @@ defmodule TimelessMetrics do
     stats = TimelessMetrics.Stats.snapshot(store)
     registry = :"#{store}_registry"
     series_count = TimelessMetrics.SeriesRegistry.count(registry)
-    data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir})
+    data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir}, nil)
 
     storage_bytes =
-      case File.ls(data_dir) do
+      case data_dir && File.ls(data_dir) do
         {:ok, entries} ->
           entries
           |> Enum.reduce(0, fn entry, acc ->
@@ -554,7 +554,7 @@ defmodule TimelessMetrics do
       points_ingested: stats.points_ingested,
       queries: stats.queries,
       buffer_points: stats.points_ingested - stats.points_merged,
-      db_path: Path.join(data_dir, "metrics.db"),
+      db_path: if(data_dir, do: Path.join(data_dir, "metrics.db"), else: nil),
       block_count: 0,
       bytes_per_point:
         if(stats.points_ingested > 0, do: storage_bytes / stats.points_ingested, else: 0.0),
