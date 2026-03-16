@@ -26,7 +26,7 @@ defmodule TimelessMetrics.Buffer do
   @default_flush_interval :timer.seconds(5)
   @default_backpressure_threshold 50_000
   # Minimum points per series before flushing to SegmentBuilder for compression
-  @min_points_per_series 32
+  @min_points_per_series 8
 
   # Number of metadata keys stored in ETS (__builder_pid__, __counter__, __threshold__, __bp_state__, __rate_state__)
   @metadata_key_count 3
