@@ -30,14 +30,23 @@ defmodule TimelessMetrics.Query do
 
     {us, points} =
       :timer.tc(fn ->
-        rows
-        |> Enum.map(fn [blob, _start, _end] ->
-          case decompress_blob(blob, store, compression) do
-            {:ok, pts} -> Enum.filter(pts, fn {ts, _} -> ts >= from and ts <= to end)
-            {:error, _} -> []
-          end
-        end)
-        |> :lists.merge()
+        # Read compressed segments from WAL/.seg files
+        seg_points =
+          rows
+          |> Enum.map(fn [blob, _start, _end] ->
+            case decompress_blob(blob, store, compression) do
+              {:ok, pts} -> Enum.filter(pts, fn {ts, _} -> ts >= from and ts <= to end)
+              {:error, _} -> []
+            end
+          end)
+          |> :lists.merge()
+
+        # Read hot data from Buffer ETS
+        shard_name = shard_for_series(store, series_id)
+        buffer_points = TimelessMetrics.Buffer.read_points(shard_name, series_id, from, to)
+
+        # Merge and sort by timestamp
+        :lists.merge(:lists.sort(buffer_points), seg_points)
       end)
 
     :telemetry.execute(
@@ -135,6 +144,12 @@ defmodule TimelessMetrics.Query do
     shard_count = :persistent_term.get({TimelessMetrics, store, :shard_count})
     shard_idx = rem(abs(series_id), shard_count)
     :"#{store}_builder_#{shard_idx}"
+  end
+
+  defp shard_for_series(store, series_id) do
+    shard_count = :persistent_term.get({TimelessMetrics, store, :shard_count})
+    shard_idx = rem(abs(series_id), shard_count)
+    :"#{store}_shard_#{shard_idx}"
   end
 
   # --- Tier-aware aggregation with watermark-based stitching ---

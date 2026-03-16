@@ -103,6 +103,24 @@ defmodule TimelessMetrics.Buffer do
     end
   end
 
+  @doc "Read buffered points for a series within a time range. Lock-free."
+  def read_points(shard_name, series_id, from, to) do
+    table = table_name(shard_name)
+
+    try do
+      # Match: key = {series_id, timestamp, _seq}, guard: ts >= from and ts <= to
+      spec = [
+        {{{:"$1", :"$2", :_}, :"$3"},
+         [{:==, :"$1", series_id}, {:>=, :"$2", from}, {:"=<", :"$2", to}],
+         [{{:"$2", :"$3"}}]}
+      ]
+
+      :ets.select(table, spec)
+    rescue
+      _ -> []
+    end
+  end
+
   @doc "Get the current point count in this shard's buffer."
   def buffer_size(shard_name) do
     table = table_name(shard_name)
