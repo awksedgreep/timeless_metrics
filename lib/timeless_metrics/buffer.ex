@@ -17,16 +17,12 @@ defmodule TimelessMetrics.Buffer do
     :shard_id,
     :store,
     :segment_builder,
-    :flush_interval,
     :backpressure_threshold,
     :counter,
     :builder_pid
   ]
 
-  @default_flush_interval :timer.seconds(5)
   @default_backpressure_threshold 50_000
-  # Minimum points per series before flushing to SegmentBuilder for compression
-  @min_points_per_series 8
 
   # Number of metadata keys stored in ETS (__builder_pid__, __counter__, __threshold__, __bp_state__, __rate_state__)
   @metadata_key_count 3
@@ -146,7 +142,6 @@ defmodule TimelessMetrics.Buffer do
     name = Keyword.fetch!(opts, :name)
     store = Keyword.fetch!(opts, :store)
     segment_builder = Keyword.fetch!(opts, :segment_builder)
-    flush_interval = Keyword.get(opts, :flush_interval, @default_flush_interval)
 
     backpressure_threshold =
       Keyword.get(opts, :backpressure_threshold, @default_backpressure_threshold)
@@ -174,14 +169,11 @@ defmodule TimelessMetrics.Buffer do
     bp_state = :atomics.new(2, signed: true)
     :ets.insert(table, {:__bp_state__, bp_state})
 
-    schedule_flush(flush_interval)
-
     state = %__MODULE__{
       table: table,
       shard_id: shard_id,
       store: store,
       segment_builder: segment_builder,
-      flush_interval: flush_interval,
       backpressure_threshold: backpressure_threshold,
       counter: counter,
       builder_pid: builder_pid
@@ -196,12 +188,6 @@ defmodule TimelessMetrics.Buffer do
     {:reply, :ok, state}
   end
 
-  @impl true
-  def handle_info(:flush, state) do
-    do_flush(state)
-    schedule_flush(state.flush_interval)
-    {:noreply, state}
-  end
 
   @impl true
   def terminate(_reason, state) do
@@ -210,59 +196,6 @@ defmodule TimelessMetrics.Buffer do
   end
 
   # --- Internals ---
-
-  defp do_flush(state) do
-    # Snapshot a monotonic cutoff — any write with seq > cutoff arrived after
-    # this flush started and must NOT be deleted.
-    cutoff = :erlang.unique_integer([:positive, :monotonic])
-
-    select_spec = [
-      {{{:"$1", :"$2", :"$3"}, :"$4"}, [{:"=<", :"$3", cutoff}], [{{:"$1", :"$2", :"$4"}}]}
-    ]
-
-    points = :ets.select(state.table, select_spec)
-
-    if points != [] do
-      grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
-
-      # Only flush series with enough points for ALP compression
-      ready_map =
-        grouped
-        |> Enum.filter(fn {_series_id, pts} -> length(pts) >= @min_points_per_series end)
-        |> Map.new()
-
-      if ready_map != %{} do
-        ready_count = Enum.reduce(ready_map, 0, fn {_, pts}, acc -> acc + length(pts) end)
-
-        # Atomic delete: remove ALL points up to cutoff, then re-insert the ones we're keeping
-        delete_spec = [{{{:_, :_, :"$1"}, :_}, [{:"=<", :"$1", cutoff}], [true]}]
-        :ets.select_delete(state.table, delete_spec)
-
-        # Re-insert points for series below threshold
-        keep_map = Map.drop(grouped, Map.keys(ready_map))
-
-        Enum.each(keep_map, fn {series_id, pts} ->
-          rows =
-            Enum.map(pts, fn {ts, val} ->
-              {{series_id, ts, :erlang.unique_integer([:positive, :monotonic])}, val}
-            end)
-
-          :ets.insert(state.table, rows)
-        end)
-
-        :atomics.put(state.counter, 1, max(:ets.info(state.table, :size) - @metadata_key_count, 0))
-
-        :telemetry.execute(
-          [:timeless_metrics, :buffer, :flush],
-          %{point_count: ready_count, series_count: map_size(ready_map)},
-          %{shard: state.shard_id}
-        )
-
-        TimelessMetrics.SegmentBuilder.ingest(state.segment_builder, ready_map)
-        TimelessMetrics.Stats.add_points_merged(state.store, ready_count)
-      end
-    end
-  end
 
   # Synchronous flush — flushes ALL points regardless of per-series count.
   # Used by terminate and explicit flush calls.
@@ -321,10 +254,6 @@ defmodule TimelessMetrics.Buffer do
     rescue
       _ -> :ok
     end
-  end
-
-  defp schedule_flush(interval) do
-    Process.send_after(self(), :flush, interval)
   end
 
   defp table_name(name) when is_atom(name) do

@@ -14,7 +14,6 @@ defmodule TimelessMetrics.Supervisor do
     name = Keyword.fetch!(opts, :name)
     data_dir = Keyword.fetch!(opts, :data_dir)
     shard_count = Keyword.get(opts, :buffer_shards, max(div(System.schedulers_online(), 2), 2))
-    flush_interval = Keyword.get(opts, :flush_interval, :timer.seconds(5))
     segment_duration = Keyword.get(opts, :segment_duration, 14_400)
     compression = Keyword.get(opts, :compression, :zstd)
     compression_level = Keyword.get(opts, :compression_level, 2)
@@ -92,8 +91,7 @@ defmodule TimelessMetrics.Supervisor do
                    name: shard_name,
                    store: name,
                    shard_id: i,
-                   segment_builder: builder_name,
-                   flush_interval: flush_interval
+                   segment_builder: builder_name
                  ]
                ]}
           }

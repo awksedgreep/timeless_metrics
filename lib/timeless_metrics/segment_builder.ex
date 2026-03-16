@@ -29,8 +29,6 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   # 4 hours in seconds
   @default_segment_duration 14_400
-  # Minimum points per segment before compressing and writing to WAL
-  @segment_write_threshold 5_000
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -290,24 +288,21 @@ defmodule TimelessMetrics.SegmentBuilder do
       shard_store: shard_store
     }
 
-    # Periodic check for completed segments — seals old windows into .seg files
-    Process.send_after(self(), :check_segments, :timer.seconds(10))
+    # Periodic seal — flush Buffer, compress, seal completed 4-hour windows.
+    # Offset from process start to avoid hour-boundary scrape storms.
+    Process.send_after(self(), :check_segments, :timer.hours(4))
 
     {:ok, state}
   end
 
   @impl true
   def handle_cast({:ingest, grouped_points}, state) do
-    new_segments = ingest_into_segments(grouped_points, state)
-    new_state = flush_ready_segments(%{state | segments: new_segments})
-    {:noreply, new_state}
+    {:noreply, %{state | segments: ingest_into_segments(grouped_points, state)}}
   end
 
   @impl true
   def handle_call({:ingest, grouped_points}, _from, state) do
-    new_segments = ingest_into_segments(grouped_points, state)
-    new_state = flush_ready_segments(%{state | segments: new_segments})
-    {:reply, :ok, new_state}
+    {:reply, :ok, %{state | segments: ingest_into_segments(grouped_points, state)}}
   end
 
   def handle_call(:flush, _from, state) do
@@ -362,13 +357,18 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   @impl true
   def handle_info(:check_segments, state) do
+    # Flush Buffer ETS → SegmentBuilder for this shard
+    shard_name = :"#{state.store}_shard_#{state.shard_id}"
+    GenServer.call(shard_name, :flush_sync, :infinity)
+
+    # Seal completed time windows
     {completed, pending} = split_completed(state.segments, state.segment_duration)
 
     if completed != [] do
       write_and_seal(completed, state)
     end
 
-    Process.send_after(self(), :check_segments, :timer.seconds(10))
+    Process.send_after(self(), :check_segments, :timer.hours(4))
     {:noreply, %{state | segments: pending}}
   end
 
@@ -396,22 +396,6 @@ defmodule TimelessMetrics.SegmentBuilder do
   end
 
   # --- Internals ---
-
-  # Write segments that have reached the point threshold, clear them from memory.
-  # Segments below threshold stay and accumulate more points.
-  defp flush_ready_segments(state) do
-    {ready, keep} =
-      Enum.split_with(state.segments, fn {_key, seg} ->
-        length(seg.points) >= @segment_write_threshold
-      end)
-
-    if ready != [] do
-      ready_segs = Enum.map(ready, fn {_key, seg} -> seg end)
-      write_segments(ready_segs, state)
-    end
-
-    %{state | segments: Map.new(keep)}
-  end
 
   defp ingest_into_segments(grouped_points, state) do
     Enum.reduce(grouped_points, state.segments, fn {series_id, points}, segments ->

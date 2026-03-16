@@ -19,10 +19,11 @@ graph TD
     Sup --> DB["TimelessMetrics.DB<br/><i>SQLite writer + reader pool</i>"]
     Sup --> SR["TimelessMetrics.SeriesRegistry<br/><i>persistent_term + ETS overflow</i>"]
     Sup --> DT["TimelessMetrics.DictTrainer<br/><i>zstd dictionary training</i>"]
-    Sup --> SB0["SegmentBuilder 0<br/><i>compression worker</i>"]
+    Sup --> SB0["SegmentBuilder 0<br/><i>compression + WAL writer</i>"]
     Sup --> BUF0["Buffer 0<br/><i>ETS write shard</i>"]
-    Sup --> SBN["SegmentBuilder N<br/><i>compression worker</i>"]
+    Sup --> SBN["SegmentBuilder N<br/><i>compression + WAL writer</i>"]
     Sup --> BUFN["Buffer N<br/><i>ETS write shard</i>"]
+    Sup --> IW["IngestWorker × N<br/><i>background queue processors</i>"]
     Sup --> Rollup["TimelessMetrics.Rollup<br/><i>periodic tier aggregation</i>"]
     Sup --> Ret["TimelessMetrics.Retention<br/><i>1-hr tick</i>"]
     Sup --> AE["TimelessMetrics.AlertEvaluator<br/><i>60-sec tick</i>"]
@@ -38,120 +39,159 @@ graph TD
     style Scraper stroke-dasharray: 5 5
 ```
 
-## Write Path
+## Write Path — HTTP Ingest
 
-A write enters through `TimelessMetrics.write/4` which resolves the series via
-`SeriesRegistry.get_or_create` — a lock-free path using persistent_term, ETS overflow,
-and `:atomics` + `:ets.insert_new` for new series. The resolved series ID determines
-which buffer shard receives the point via `rem(abs(series_id), shard_count)`.
+HTTP import endpoints (`/api/v1/import`, `/api/v1/import/prometheus`) accept the raw
+body, zstd-compress it, and insert it into a shared ETS queue table. The response
+returns **204 immediately** — no parsing, no series resolution, no blocking.
 
-The buffer shard is a `:public` ETS `ordered_set` with `write_concurrency: :auto`.
-Writes are pure ETS inserts — no GenServer, no message passing, no blocking.
-
-When the buffer reaches `flush_threshold` points or the periodic `flush_interval` fires,
-all points are sent to the paired SegmentBuilder via `GenServer.cast` (non-blocking).
-The SegmentBuilder accumulates points in memory grouped by `{series_id, time_window}`,
-then periodically compresses dirty segments and writes them to disk.
+Background `IngestWorker` processes (count: `schedulers / 4`, min 2) drain the queue
+every 10ms, decompress, parse (PrometheusNif or JSON), resolve series IDs, and write
+to the appropriate Buffer shard's ETS table. Multiple workers share one queue via
+atomic `:ets.take`.
 
 ```mermaid
 flowchart TD
-    API["TimelessMetrics.write(store, metric, labels, value)"]
-    API --> Resolve["SeriesRegistry.get_or_create"]
+    subgraph "HTTP Accept (immediate 204)"
+        REQ["POST /api/v1/import/prometheus"]
+        REQ --> ZSTD["ezstd.compress(body, 2)"]
+        ZSTD --> Q[":ets.insert(queue, {seq, compressed_body, format})"]
+    end
+
+    subgraph "IngestWorker (background, every 10ms)"
+        Q -.->|":ets.take (atomic)"| IW["IngestWorker.process_entries"]
+        IW --> DECOMP["ezstd.decompress"]
+        DECOMP --> PARSE["PrometheusNif.parse (dirty CPU scheduler)"]
+        PARSE --> RESOLVE["SeriesRegistry.get_or_create (lock-free)"]
+        RESOLVE --> SHARD["rem(abs(series_id), shard_count)"]
+        SHARD --> BUF[":ets.insert(shard_table, {{sid, ts, seq}, value})"]
+    end
 
     subgraph "Series Resolution (lock-free)"
-        Resolve --> PT[":persistent_term Map lookup"]
+        RESOLVE --> PT[":persistent_term lookup"]
         PT -->|hit| SID["Return series_id"]
-        PT -->|miss| ETS[":ets.lookup(overflow, key)"]
-        ETS -->|hit| SID
-        ETS -->|miss| CAS[":atomics.add_get + :ets.insert_new"]
+        PT -->|miss| OVERFLOW[":ets.lookup(overflow)"]
+        OVERFLOW -->|hit| SID
+        OVERFLOW -->|miss| CAS[":atomics.add_get + :ets.insert_new"]
         CAS --> SID
-    end
-
-    SID --> Route["rem(abs(series_id), shard_count)"]
-    Route --> BUF[":ets.insert(shard_table,<br/>{{series_id, ts, seq}, value})"]
-
-    subgraph "Buffer Flush (periodic or threshold)"
-        BUF --> Flush["GenServer.cast(builder, {:ingest, grouped_points})"]
-        Flush --> Accum["SegmentBuilder accumulates in memory"]
-    end
-
-    subgraph "Compression (async Task)"
-        Accum --> Dirty{"Dirty segments<br/>since last flush?"}
-        Dirty -->|yes| Compress["Gorilla + zstd (numeric)<br/>or RLE + zstd (text)"]
-        Compress --> WAL["Write to WAL<br/>(data queryable)"]
-        Dirty -->|no| Skip["No-op"]
-    end
-
-    subgraph "Sealing (periodic)"
-        WAL --> Seal{"Time window<br/>completed?"}
-        Seal -->|yes| Seg["Seal into immutable .seg file"]
-        Seal -->|no| Keep["Keep in WAL"]
+        CAS -.->|"cast (async)"| SQLite["GenServer queues SQLite INSERT"]
     end
 ```
 
-**Batch writes** (`write_batch/2`) resolve all series IDs, group by shard, and call
-`Buffer.write_bulk/2` per shard — one ETS insert per shard regardless of batch size.
-For batches over 1,000 entries, resolution and shard routing parallelize across schedulers.
+**Data is queryable the instant it enters Buffer ETS.** No flush required.
+
+## Write Path — Programmatic API
+
+`TimelessMetrics.write/5` resolves the series ID and inserts directly into the
+Buffer shard's ETS table. No GenServer, no message passing. `write_batch/2`
+parallelizes across schedulers for batches over 1,000 entries.
+
+## Buffer → SegmentBuilder → Disk
+
+The Buffer GenServer has a periodic flush timer (default: **5 seconds**). When it fires:
+
+1. Select all points up to a monotonic cutoff
+2. Group by `series_id`
+3. **Only flush series with ≥ 8 points** — series below threshold are re-inserted into ETS
+4. Send ready series to SegmentBuilder via `GenServer.cast` (async, non-blocking)
+5. Atomic delete + re-insert for kept series
+
+The SegmentBuilder accumulates points in memory, grouped by `{series_id, time_bucket}`.
+When a segment reaches **5,000 points**, it compresses with ALP + zstd and writes to
+the WAL. The segment is then cleared from memory.
+
+Every **10 seconds**, `check_segments` seals completed time windows (segments whose
+4-hour bucket has passed) into immutable `.seg` files.
+
+On shutdown, `terminate` writes ALL remaining segments regardless of threshold.
+
+```mermaid
+flowchart TD
+    subgraph "Buffer ETS (queryable immediately)"
+        BUF["Ordered ETS: {sid, ts, seq} → value"]
+    end
+
+    subgraph "Buffer Flush (5s timer)"
+        BUF -->|"series with ≥ 8 pts"| CAST["GenServer.cast → SegmentBuilder"]
+        BUF -->|"series with < 8 pts"| KEEP["Re-insert into ETS"]
+    end
+
+    subgraph "SegmentBuilder (per shard)"
+        CAST --> ACCUM["Accumulate in memory<br/>{sid, bucket} → points"]
+        ACCUM -->|"segment ≥ 5000 pts"| COMPRESS["ALP + zstd compress"]
+        COMPRESS --> WAL["ShardStore.write_wal<br/>(atomic file replace)"]
+        WAL --> CLEAR["Clear segment from memory"]
+        ACCUM -->|"segment < 5000 pts"| WAIT["Keep accumulating"]
+    end
+
+    subgraph "Sealing (10s timer)"
+        WAL --> CHECK{"Time window<br/>completed?"}
+        CHECK -->|yes| SEAL["Move from WAL → .seg file"]
+        CHECK -->|no| STAY["Keep in WAL"]
+    end
+```
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Buffer flush threshold (8 pts/series) | ALP needs ≥ 2 points; 8 gives good sampling |
+| Segment write threshold (5000 pts) | Large blocks = better ALP compression ratio |
+| WAL merge: replace by `{sid, start}` | Each write is the complete segment — safe to replace |
+| SegmentBuilder clears after WAL write | Memory stays bounded; segment is fully on disk |
+| Buffer ETS queryable | Hot data available immediately, no flush-to-query gap |
 
 ## Read / Query Path
 
-Queries enter through `TimelessMetrics.query*/4` functions. The engine resolves the
-series ID via `SeriesRegistry`, routes to the appropriate shard's `SegmentBuilder`, and
-reads compressed segments from disk via lock-free `ShardStore` file operations.
+Queries read from **three locations** and merge the results:
 
-For multi-series queries, `find_matching_series` reads from persistent_term + ETS overflow
-(no SQLite on the hot path), groups matching series by shard to avoid cross-shard file
-contention, and fans out in parallel via `Task.async_stream`.
+1. **Buffer ETS** — hot, uncompressed points (O(log n) tree walk on ordered_set)
+2. **current.wal** — compressed segments not yet sealed (lock-free file read)
+3. **.seg files** — immutable sealed time windows (binary search on index)
+
+**No GenServer in the read path.** `SegmentBuilder.read_raw_segments` reads the
+`shard_store` from `:persistent_term` and calls `ShardStore.read_segments` directly.
+Buffer reads use `:ets.next` tree traversal.
 
 ```mermaid
-sequenceDiagram
-    participant C as Caller
-    participant TM as TimelessMetrics
-    participant SR as SeriesRegistry
-    participant Q as Query
-    participant SS as ShardStore (files)
-    participant T as Task.async_stream
+flowchart TD
+    Q["Query.raw(store, series_id, from, to)"]
 
-    C->>TM: query_aggregate_multi(store, metric, label_filter, opts)
-    TM->>SR: find_matching_series (persistent_term + ETS)
-    SR-->>TM: [{series_id, labels}, ...]
+    Q --> DISK["ShardStore.read_segments (lock-free)"]
+    Q --> ETS["Buffer.read_points (lock-free)"]
 
-    TM->>TM: Group by shard
-
-    alt Single shard
-        TM->>Q: Query.aggregate(store, series_id, opts)
-        Q->>SS: ShardStore.read_segments(series_id, from, to)
-        SS-->>Q: compressed segment blobs
-        Q->>Q: Decompress → filter → aggregate
-        Q-->>TM: {:ok, [{bucket_ts, value}, ...]}
-    else Multiple shards (fan-out)
-        TM->>T: async_stream per shard group
-        par Shard 0
-            T->>Q: Query.aggregate per series
-            Q->>SS: read_segments (shard 0 files)
-        and Shard N
-            T->>Q: Query.aggregate per series
-            Q->>SS: read_segments (shard N files)
-        end
-        T-->>TM: [%{labels, data}, ...]
+    subgraph "Disk Read (lock-free)"
+        DISK --> SEG[".seg files: binary search index"]
+        DISK --> WALR["current.wal: scan entries"]
+        SEG --> DECOMP["ALP/Gorilla decompress"]
+        WALR --> DECOMP
     end
-    TM-->>C: {:ok, results}
+
+    subgraph "ETS Read (lock-free)"
+        ETS --> WALK[":ets.next walk from {sid, from, 0}"]
+    end
+
+    DECOMP --> MERGE["lists.merge(buffer_points, seg_points)"]
+    WALK --> MERGE
+    MERGE --> RESULT["{:ok, [{ts, val}, ...]}"]
 ```
 
-## Storage Layer
+For multi-series queries, `find_matching_series` reads from persistent_term + ETS overflow
+(no SQLite on the hot path), and fans out in parallel via `Task.async_stream`.
 
-Data lives in per-shard directories with immutable `.seg` files for completed time
-windows and a WAL for pending data. SQLite stores metadata only — never raw time
-series points. Numeric segments use Gorilla encoding + zstd. Text segments use
-RLE + zstd (identified by a `0xFE` byte prefix).
+Aggregate queries use a tier-aware router: if rollup data exists (hourly/daily tiers),
+it reads from rollup chunks. If the query spans the watermark boundary, it stitches
+rollup data with raw data.
+
+## Storage Layout
 
 ```mermaid
 flowchart LR
     subgraph "Per-Shard Directory (shard_N/)"
         subgraph "raw/"
-            WAL["current.wal<br/><i>pending compressed data</i>"]
-            SEG1["1706000000.seg<br/><i>sealed time window</i>"]
-            SEGN["1706014400.seg<br/><i>sealed time window</i>"]
+            WAL["current.wal<br/><i>pending compressed segments</i>"]
+            SEG1["1706000000.seg<br/><i>sealed 4-hour window</i>"]
+            SEGN["1706014400.seg<br/><i>sealed 4-hour window</i>"]
         end
         subgraph "tier_hourly/"
             TH["chunks.dat + index.ets"]
@@ -168,28 +208,53 @@ flowchart LR
         ScrapeTargets["scrape_targets + scrape_health"]
         Annotations["annotations<br/>id, timestamp, title, tags"]
     end
-
-    BUF["Buffer"] -->|"flush"| SB["SegmentBuilder"]
-    SB -->|"write pending"| WAL
-    SB -->|"seal window"| SEG1
-    SR["SeriesRegistry"] -->|"async batch INSERT"| Series
-    Rollup -->|"write tier chunks"| TD
-    Ret["Retention"] -->|"delete old .seg files"| SEG1
 ```
 
 ### Compression Pipeline
 
-| Series Type | Stage 1 | Stage 2 | Measured |
-|-------------|---------|---------|----------|
-| Numeric | Gorilla (delta-of-delta + XOR) | zstd | 2.2 bytes/point |
-| Text | RLE (run-length encoding) | zstd | Varies by cardinality |
+| Series Type | Encoder | Container | Marker Byte |
+|-------------|---------|-----------|-------------|
+| Numeric | ALP (Adaptive Lossless floating-Point) | zstd level 2 | `0xA1` |
+| Text | RLE (run-length encoding) | zstd | `0xFE` |
+| Single point | Raw (8B ts + 8B val) | none | `0xA2` |
+| Legacy | Gorilla (delta-of-delta + XOR) | zstd | default / `0xFF` |
+
+### Segment File Format (.seg)
+
+```
+Header: "TS" (2) | version (1) | entry_count (4) | index_offset (8) = 15 bytes
+Body:   concatenated compressed blobs
+Index:  40 bytes per entry (sid:i64, start:i64, end:i64, count:u32, offset:u64, len:u32)
+```
+
+### WAL File Format (current.wal)
+
+```
+Entries concatenated, no global header:
+  sid:i64 | start:i64 | end:i64 | count:u32 | data_len:u32 | data:bytes
+Atomic write via tmp + rename.
+```
+
+## Timers and Thresholds
+
+| Component | Timer/Threshold | Default Value | Purpose |
+|-----------|----------------|---------------|---------|
+| IngestWorker | Drain interval | 10ms | Poll ETS queue for new HTTP bodies |
+| IngestWorker | Max batch | 100 entries | Entries per drain cycle |
+| Buffer | Flush interval | 5,000ms | Send accumulated points to SegmentBuilder |
+| Buffer | Min points/series | 8 | Series below this stay in ETS |
+| Buffer | Backpressure | 50,000 msgs | SegmentBuilder mailbox limit |
+| SegmentBuilder | Write threshold | 5,000 pts/segment | Triggers ALP compress + WAL write |
+| SegmentBuilder | Check segments | 10,000ms | Seal completed time windows |
+| SegmentBuilder | Segment duration | 14,400s (4h) | Time window per .seg file |
+| SeriesRegistry | Publish interval | 5,000ms | Merge ETS overflow → persistent_term |
 
 ## HTTP Ingest and Query
 
 `TimelessMetrics.HTTP` is served by Rocket (custom HTTP server using OTP's `:socket`
 module + picohttpparser NIF). Ingest endpoints accept VictoriaMetrics JSON lines and
-Prometheus text exposition format — parsed via C++ NIF (Prometheus) or OTP 29's
-built-in `:json.decode` NIF (JSON), then dispatched to sharded buffers.
+Prometheus text exposition format. Bodies are queued for background processing —
+**the HTTP handler never parses, resolves, or writes data synchronously**.
 
 ```mermaid
 flowchart TD
@@ -197,9 +262,8 @@ flowchart TD
         VMJ["POST /api/v1/import<br/>VM JSON lines"]
         Prom["POST /api/v1/import/prometheus<br/>Prometheus text"]
 
-        VMJ --> Parse["Parse → group by {metric, labels}"]
-        Prom --> Parse
-        Parse --> Resolve["SeriesRegistry → Buffer.write_bulk per shard"]
+        VMJ --> ENQUEUE["zstd compress → ETS queue → 204"]
+        Prom --> ENQUEUE
     end
 
     subgraph Query
@@ -208,7 +272,7 @@ flowchart TD
         QRange["GET /api/v1/query_range<br/>aggregated range"]
         PromQL["GET /prometheus/api/v1/query_range<br/>PromQL (Grafana)"]
 
-        Exp --> QEng["Query.raw/aggregate → ShardStore reads"]
+        Exp --> QEng["Query.raw → Buffer ETS + ShardStore"]
         QLatest --> QEng
         QRange --> QEng
         PromQL --> PQL["PromQL.parse → PromQL.execute"]
@@ -235,36 +299,6 @@ thundering herd. Each scrape tick fetches the target URL via HTTP, parses the
 Prometheus exposition text, applies the metric relabel pipeline, and writes the
 resulting entries through `TimelessMetrics.write_batch`. Workers track their own health
 state and flush it to `scrape_health` periodically.
-
-```mermaid
-sequenceDiagram
-    participant API as HTTP API
-    participant S as Scraper GenServer
-    participant DB as SQLite
-    participant DSup as DynamicSupervisor (:scrape_sup)
-    participant W as Scraper.Worker
-    participant Target as Scrape Target (HTTP)
-    participant R as Relabel
-
-    API->>S: add_target(params)
-    S->>DB: INSERT INTO scrape_targets
-    S->>DSup: start_child({Worker, target: t, store: s})
-    DSup-->>S: {:ok, pid}
-
-    Note over W: Initial scrape with random jitter
-    W->>W: Process.send_after(:scrape, jitter)
-
-    loop Every scrape_interval (default 30s)
-        W->>Target: Req.get!(url, timeout: scrape_timeout)
-        Target-->>W: Prometheus text body
-        W->>W: Parse Prometheus text → [{metric, labels, value, ts}]
-        W->>R: apply_configs(labels, metric_relabel_configs)
-        R-->>W: relabeled entries (or :drop)
-        W->>W: TimelessMetrics.write_batch(store, entries)
-        W->>DB: Flush scrape_health (on state change or every 10 scrapes)
-        W->>W: Reschedule :scrape on fixed anchor
-    end
-```
 
 ## Alert System
 
