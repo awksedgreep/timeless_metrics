@@ -146,16 +146,13 @@ defmodule TimelessMetrics.Supervisor do
        compression: compression,
        compression_level: compression_level},
       {TimelessMetrics.Retention,
-       name: :"#{name}_retention",
-       db: if(!memory_only, do: db_name),
-       store: name,
-       schema: schema}
+       name: :"#{name}_retention", db: if(!memory_only, do: db_name), store: name, schema: schema}
     ]
 
     children =
       foundation ++
         builder_and_buffer_shards ++
-        (if memory_only, do: [], else: ingest_workers) ++
+        if(memory_only, do: [], else: ingest_workers) ++
         management
 
     # New features — kept from actor era

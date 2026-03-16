@@ -82,9 +82,13 @@ defmodule TimelessMetrics.SegmentBuilder do
           case :ets.lookup(cache, key) do
             [{_, {end_time, _count, blob}}] when end_time >= from ->
               [[blob, start, end_time]]
-            _ -> []
+
+            _ ->
+              []
           end
-        _ -> []
+
+        _ ->
+          []
       end
 
     {:ok, pre_results ++ results}
@@ -96,6 +100,7 @@ defmodule TimelessMetrics.SegmentBuilder do
     case :ets.lookup(cache, key) do
       [{_, {end_time, _count, blob}}] ->
         collect_cache_range(cache, :ets.next(cache, key), sid, to, [[blob, start, end_time] | acc])
+
       _ ->
         collect_cache_range(cache, :ets.next(cache, key), sid, to, acc)
     end
@@ -576,7 +581,9 @@ defmodule TimelessMetrics.SegmentBuilder do
         TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
 
         compressed
-        |> Enum.map(fn {_sid, start, _, _, _} -> segment_bucket(start, state.segment_duration) end)
+        |> Enum.map(fn {_sid, start, _, _, _} ->
+          segment_bucket(start, state.segment_duration)
+        end)
         |> Enum.uniq()
         |> Enum.each(fn window ->
           TimelessMetrics.ShardStore.seal_window(state.shard_store, window)

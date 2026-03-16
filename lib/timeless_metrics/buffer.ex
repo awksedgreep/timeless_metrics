@@ -188,7 +188,6 @@ defmodule TimelessMetrics.Buffer do
     {:reply, :ok, state}
   end
 
-
   @impl true
   def terminate(_reason, state) do
     do_flush_sync(state)
