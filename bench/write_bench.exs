@@ -156,11 +156,49 @@ defmodule WriteBench do
 
     conc_rate = trunc(total / (conc_us / 1_000_000))
     IO.puts("  Write (#{writers} workers): #{format_number(conc_rate)}/sec  (#{div(conc_us, 1000)}ms)")
-    IO.puts("")
 
+    # --- Batch writes using write_batch ---
     Supervisor.stop(sup2)
     cleanup_persistent_terms(:bench)
     if not memory_only, do: File.rm_rf!(data_dir2)
+    data_dir3 = "/tmp/timeless_bench_batch_#{System.os_time(:millisecond)}"
+
+    store_opts3 =
+      if memory_only do
+        [name: :bench, mode: :memory, self_monitor: false]
+      else
+        [name: :bench, data_dir: data_dir3, self_monitor: false]
+      end
+
+    {:ok, sup3} =
+      Supervisor.start_link(
+        [{TimelessMetrics, store_opts3}],
+        strategy: :one_for_one
+      )
+
+    {batch_us, _} =
+      :timer.tc(fn ->
+        for ts_offset <- 0..(pts_per_series - 1) do
+          ts = now - pts_per_series + ts_offset
+
+          entries =
+            for s <- 1..series_count do
+              metric = Enum.at(metrics, rem(s, 20))
+              val = TimelessMetrics.DataGenerator.value(metric, ts * 1000, s)
+              {metric, %{"host" => "device_#{s}"}, val, ts}
+            end
+
+          TimelessMetrics.write_batch(:bench, entries)
+        end
+      end)
+
+    batch_rate = trunc(total / (batch_us / 1_000_000))
+    IO.puts("  Write (batch):      #{format_number(batch_rate)}/sec  (#{div(batch_us, 1000)}ms)")
+    IO.puts("")
+
+    Supervisor.stop(sup3)
+    cleanup_persistent_terms(:bench)
+    if not memory_only, do: File.rm_rf!(data_dir3)
   end
 
   defp run_compression_analysis(memory_only) do
