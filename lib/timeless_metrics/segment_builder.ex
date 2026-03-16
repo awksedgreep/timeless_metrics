@@ -29,8 +29,8 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   # 4 hours in seconds
   @default_segment_duration 14_400
-  # Minimum points before compressing and writing to WAL
-  @wal_flush_threshold 10_000
+  # Minimum points per segment before compressing and writing to WAL
+  @segment_write_threshold 5_000
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -299,17 +299,15 @@ defmodule TimelessMetrics.SegmentBuilder do
   @impl true
   def handle_cast({:ingest, grouped_points}, state) do
     new_segments = ingest_into_segments(grouped_points, state)
-    new_state = %{state | segments: new_segments}
-    flush_segments_to_wal(new_state)
-    {:noreply, %{new_state | segments: clear_points(new_state.segments)}}
+    new_state = flush_ready_segments(%{state | segments: new_segments})
+    {:noreply, new_state}
   end
 
   @impl true
   def handle_call({:ingest, grouped_points}, _from, state) do
     new_segments = ingest_into_segments(grouped_points, state)
-    new_state = %{state | segments: new_segments}
-    flush_segments_to_wal(new_state)
-    {:reply, :ok, %{new_state | segments: clear_points(new_state.segments)}}
+    new_state = flush_ready_segments(%{state | segments: new_segments})
+    {:reply, :ok, new_state}
   end
 
   def handle_call(:flush, _from, state) do
@@ -399,13 +397,20 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   # --- Internals ---
 
-  defp flush_segments_to_wal(state) do
-    segs = state.segments |> Map.values() |> Enum.reject(&(&1.points == []))
-    if segs != [], do: write_segments(segs, state)
-  end
+  # Write segments that have reached the point threshold, clear them from memory.
+  # Segments below threshold stay and accumulate more points.
+  defp flush_ready_segments(state) do
+    {ready, keep} =
+      Enum.split_with(state.segments, fn {_key, seg} ->
+        length(seg.points) >= @segment_write_threshold
+      end)
 
-  defp clear_points(segments) do
-    Map.new(segments, fn {key, seg} -> {key, %{seg | points: []}} end)
+    if ready != [] do
+      ready_segs = Enum.map(ready, fn {_key, seg} -> seg end)
+      write_segments(ready_segs, state)
+    end
+
+    %{state | segments: Map.new(keep)}
   end
 
   defp ingest_into_segments(grouped_points, state) do
