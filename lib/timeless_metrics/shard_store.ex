@@ -1039,14 +1039,7 @@ defmodule TimelessMetrics.ShardStore do
   end
 
   defp merge_entries(existing, new) do
-    new_keys = MapSet.new(new, fn {sid, start, _, _, _} -> {sid, start} end)
-
-    filtered =
-      Enum.reject(existing, fn {sid, start, _, _, _} ->
-        MapSet.member?(new_keys, {sid, start})
-      end)
-
-    filtered ++ new
+    existing ++ new
   end
 
   defp merge_read_results(seg_entries, wal_entries) do

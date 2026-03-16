@@ -301,9 +301,7 @@ defmodule TimelessMetrics.SegmentBuilder do
     new_segments = ingest_into_segments(grouped_points, state)
     new_state = %{state | segments: new_segments}
     flush_segments_to_wal(new_state)
-    # Don't clear — accumulate. WAL merge replaces by {sid, start},
-    # so each write must contain ALL points for the segment.
-    {:noreply, new_state}
+    {:noreply, %{new_state | segments: clear_points(new_state.segments)}}
   end
 
   @impl true
@@ -311,7 +309,7 @@ defmodule TimelessMetrics.SegmentBuilder do
     new_segments = ingest_into_segments(grouped_points, state)
     new_state = %{state | segments: new_segments}
     flush_segments_to_wal(new_state)
-    {:reply, :ok, new_state}
+    {:reply, :ok, %{new_state | segments: clear_points(new_state.segments)}}
   end
 
   def handle_call(:flush, _from, state) do
