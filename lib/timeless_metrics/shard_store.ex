@@ -160,6 +160,18 @@ defmodule TimelessMetrics.ShardStore do
     {:ok, Enum.map(sorted, fn {sid, start, end_t, _count, blob} -> [sid, start, end_t, blob] end)}
   end
 
+  @doc "Read ALL entries from all .seg files and WAL. Used for startup cache load."
+  def read_all_entries(store) do
+    seg_results =
+      list_seg_files(store)
+      |> Enum.flat_map(fn {_ws, path} ->
+        read_seg_matching(store.seg_index_cache, path, fn _ -> true end)
+      end)
+
+    wal_results = read_from_wal_filtered(store, fn _ -> true end)
+    merge_read_results(seg_results, wal_results)
+  end
+
   @doc "Read the latest raw segment for a series."
   def read_latest(store, series_id) do
     # Search newest files first for early exit

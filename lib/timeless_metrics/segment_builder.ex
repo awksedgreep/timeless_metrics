@@ -24,7 +24,9 @@ defmodule TimelessMetrics.SegmentBuilder do
     :name,
     :store,
     :schema,
-    :shard_store
+    :shard_store,
+    :segments_cache,
+    :memory_only
   ]
 
   # 4 hours in seconds
@@ -63,9 +65,43 @@ defmodule TimelessMetrics.SegmentBuilder do
   Returns `{:ok, [[data, start_time, end_time], ...]}` sorted by start_time.
   """
   def read_raw_segments(builder_name, series_id, from, to) do
-    store = :persistent_term.get({__MODULE__, builder_name, :shard_store})
-    TimelessMetrics.ShardStore.read_segments(store, series_id, from, to)
+    cache = :persistent_term.get({__MODULE__, builder_name, :segments_cache})
+    read_from_cache(cache, series_id, from, to)
   end
+
+  defp read_from_cache(cache, series_id, from, to) do
+    # ETS key: {series_id, start_time} — ordered_set gives us range scan
+    # Value: {end_time, count, blob}
+    start_key = {series_id, from}
+    results = collect_cache_range(cache, :ets.next(cache, start_key), series_id, to, [])
+
+    # Also check entries that started before `from` but extend into the range
+    pre_results =
+      case :ets.prev(cache, start_key) do
+        {^series_id, start} = key ->
+          case :ets.lookup(cache, key) do
+            [{_, {end_time, _count, blob}}] when end_time >= from ->
+              [[blob, start, end_time]]
+            _ -> []
+          end
+        _ -> []
+      end
+
+    {:ok, pre_results ++ results}
+  end
+
+  defp collect_cache_range(_cache, :"$end_of_table", _sid, _to, acc), do: Enum.reverse(acc)
+
+  defp collect_cache_range(cache, {sid, start} = key, sid, to, acc) when start <= to do
+    case :ets.lookup(cache, key) do
+      [{_, {end_time, _count, blob}}] ->
+        collect_cache_range(cache, :ets.next(cache, key), sid, to, [[blob, start, end_time] | acc])
+      _ ->
+        collect_cache_range(cache, :ets.next(cache, key), sid, to, acc)
+    end
+  end
+
+  defp collect_cache_range(_cache, _key, _sid, _to, acc), do: Enum.reverse(acc)
 
   @doc """
   Read raw segments for ALL series within a time range (used by rollup). Lock-free.
@@ -242,8 +278,9 @@ defmodule TimelessMetrics.SegmentBuilder do
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
     shard_id = Keyword.fetch!(opts, :shard_id)
-    data_dir = Keyword.fetch!(opts, :data_dir)
+    data_dir = Keyword.get(opts, :data_dir)
     store = Keyword.get(opts, :store)
+    memory_only = Keyword.get(opts, :memory_only, false)
     segment_duration = Keyword.get(opts, :segment_duration, @default_segment_duration)
 
     compression = Keyword.get(opts, :compression, :zstd)
@@ -252,28 +289,50 @@ defmodule TimelessMetrics.SegmentBuilder do
 
     Process.flag(:trap_exit, true)
 
-    File.mkdir_p!(data_dir)
+    # ETS cache for compressed segments — used for ALL reads in both modes
+    cache_table = :"#{name}_segments_cache"
 
-    # Initialize file-based storage (raw segments + tiers + watermarks)
-    shard_store = TimelessMetrics.ShardStore.init(data_dir, shard_id, segment_duration, name)
+    :ets.new(cache_table, [
+      :named_table,
+      :ordered_set,
+      :public,
+      read_concurrency: true
+    ])
 
+    :persistent_term.put({__MODULE__, name, :segments_cache}, cache_table)
+
+    # Disk storage — server mode only
     shard_store =
-      if schema do
-        tier_names = Enum.map(schema.tiers, & &1.name)
-
-        shard_store
-        |> then(fn ss ->
-          Enum.reduce(schema.tiers, ss, fn tier, acc ->
-            TimelessMetrics.ShardStore.init_tier(acc, tier.name)
-          end)
-        end)
-        |> TimelessMetrics.ShardStore.init_watermarks(tier_names)
+      if memory_only do
+        nil
       else
-        shard_store
+        File.mkdir_p!(data_dir)
+        ss = TimelessMetrics.ShardStore.init(data_dir, shard_id, segment_duration, name)
+
+        ss =
+          if schema do
+            tier_names = Enum.map(schema.tiers, & &1.name)
+
+            ss
+            |> then(fn s ->
+              Enum.reduce(schema.tiers, s, fn tier, acc ->
+                TimelessMetrics.ShardStore.init_tier(acc, tier.name)
+              end)
+            end)
+            |> TimelessMetrics.ShardStore.init_watermarks(tier_names)
+          else
+            ss
+          end
+
+        # Load existing segments from disk into ETS cache on startup
+        load_segments_to_cache(ss, cache_table)
+
+        ss
       end
 
-    # Store in persistent_term for lock-free access
-    :persistent_term.put({__MODULE__, name, :shard_store}, shard_store)
+    if shard_store do
+      :persistent_term.put({__MODULE__, name, :shard_store}, shard_store)
+    end
 
     state = %__MODULE__{
       segments: %{},
@@ -285,7 +344,9 @@ defmodule TimelessMetrics.SegmentBuilder do
       name: name,
       store: store,
       schema: schema,
-      shard_store: shard_store
+      shard_store: shard_store,
+      segments_cache: cache_table,
+      memory_only: memory_only
     }
 
     # Periodic seal — flush Buffer, compress, seal completed 4-hour windows.
@@ -380,17 +441,17 @@ defmodule TimelessMetrics.SegmentBuilder do
       write_segments(all_segments, state)
     end
 
-    # Persist tier ETS indexes and watermarks to disk
-    if state.shard_store.tier_state != %{} do
-      TimelessMetrics.ShardStore.persist_tier_indexes(state.shard_store)
-      TimelessMetrics.ShardStore.cleanup_tiers(state.shard_store)
+    # Persist tier ETS indexes and watermarks to disk (server mode only)
+    if state.shard_store do
+      if state.shard_store.tier_state != %{} do
+        TimelessMetrics.ShardStore.persist_tier_indexes(state.shard_store)
+        TimelessMetrics.ShardStore.cleanup_tiers(state.shard_store)
+      end
+
+      TimelessMetrics.ShardStore.persist_watermarks(state.shard_store)
+      TimelessMetrics.ShardStore.cleanup_watermarks(state.shard_store)
+      :persistent_term.erase({__MODULE__, state.name, :shard_store})
     end
-
-    TimelessMetrics.ShardStore.persist_watermarks(state.shard_store)
-    TimelessMetrics.ShardStore.cleanup_watermarks(state.shard_store)
-
-    # Clean up persistent_term
-    :persistent_term.erase({__MODULE__, state.name, :shard_store})
 
     :ok
   end
@@ -487,30 +548,65 @@ defmodule TimelessMetrics.SegmentBuilder do
     end)
   end
 
-  # Async variants for periodic flushes — run in a Task to avoid blocking the GenServer
-  # Write segments to WAL — synchronous
+  # Write segments: compress, store in ETS cache, optionally persist to disk
   defp write_segments(segments, state) do
     compressed = compress_segments(segments, state)
 
     if compressed != [] do
-      TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
+      # Always write to ETS cache (read path)
+      write_to_cache(compressed, state.segments_cache)
+
+      # Persist to disk in server mode
+      if state.shard_store do
+        TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
+      end
     end
   end
 
-  # Write completed segments to WAL, then seal their windows into .seg files
+  # Write completed segments: compress, cache, and seal to .seg files (server mode)
   defp write_and_seal(segments, state) do
     compressed = compress_segments(segments, state)
 
     if compressed != [] do
-      TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
+      # Always write to ETS cache (read path)
+      write_to_cache(compressed, state.segments_cache)
 
-      # Seal each completed window
-      compressed
-      |> Enum.map(fn {_sid, start, _, _, _} -> segment_bucket(start, state.segment_duration) end)
-      |> Enum.uniq()
-      |> Enum.each(fn window ->
-        TimelessMetrics.ShardStore.seal_window(state.shard_store, window)
+      # Persist + seal in server mode
+      if state.shard_store do
+        TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
+
+        compressed
+        |> Enum.map(fn {_sid, start, _, _, _} -> segment_bucket(start, state.segment_duration) end)
+        |> Enum.uniq()
+        |> Enum.each(fn window ->
+          TimelessMetrics.ShardStore.seal_window(state.shard_store, window)
+        end)
+      end
+    end
+  end
+
+  defp write_to_cache(compressed_entries, cache) do
+    rows =
+      Enum.map(compressed_entries, fn {sid, start, end_time, count, blob} ->
+        {{sid, start}, {end_time, count, blob}}
       end)
+
+    :ets.insert(cache, rows)
+  end
+
+  # Load existing .seg + WAL data into ETS cache on startup (server mode)
+  defp load_segments_to_cache(shard_store, cache) do
+    case TimelessMetrics.ShardStore.read_all_entries(shard_store) do
+      entries when is_list(entries) ->
+        rows =
+          Enum.map(entries, fn {sid, start, end_time, count, blob} ->
+            {{sid, start}, {end_time, count, blob}}
+          end)
+
+        :ets.insert(cache, rows)
+
+      _ ->
+        :ok
     end
   end
 end

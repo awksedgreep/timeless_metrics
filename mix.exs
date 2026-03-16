@@ -63,7 +63,7 @@ defmodule TimelessMetrics.MixProject do
 
   defp deps do
     [
-      {:gorilla_stream, "~> 2.2"},
+      {:gorilla_stream, "~> 3.0"},
       {:ex_alp, "~> 0.1"},
       {:ex_openzl, "~> 0.4"},
       {:exqlite, "~> 0.27"},

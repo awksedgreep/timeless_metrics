@@ -12,7 +12,8 @@ defmodule TimelessMetrics.Supervisor do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
-    data_dir = Keyword.fetch!(opts, :data_dir)
+    memory_only = Keyword.get(opts, :mode) == :memory
+    data_dir = if memory_only, do: nil, else: Keyword.fetch!(opts, :data_dir)
     shard_count = Keyword.get(opts, :buffer_shards, max(div(System.schedulers_online(), 2), 2))
     segment_duration = Keyword.get(opts, :segment_duration, 14_400)
     compression = Keyword.get(opts, :compression, :zstd)
@@ -75,6 +76,7 @@ defmodule TimelessMetrics.Supervisor do
                    store: name,
                    shard_id: i,
                    data_dir: data_dir,
+                   memory_only: memory_only,
                    segment_duration: segment_duration,
                    compression: compression,
                    compression_level: compression_level,
@@ -120,25 +122,41 @@ defmodule TimelessMetrics.Supervisor do
         }
       end
 
-    children =
-      [
-        {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
-        {TimelessMetrics.SeriesRegistry, name: registry_name, db: db_name, store: name},
-        {TimelessMetrics.DictTrainer, name: dict_trainer_name, store: name, data_dir: data_dir}
-      ] ++
-        builder_and_buffer_shards ++
-        ingest_workers ++
+    # Core children — always present
+    foundation =
+      if memory_only do
         [
-          {TimelessMetrics.Rollup,
-           name: :"#{name}_rollup",
-           db: db_name,
-           store: name,
-           schema: schema,
-           compression: compression,
-           compression_level: compression_level},
-          {TimelessMetrics.Retention,
-           name: :"#{name}_retention", db: db_name, store: name, schema: schema}
+          {TimelessMetrics.SeriesRegistry, name: registry_name, db: nil, store: name}
         ]
+      else
+        [
+          {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
+          {TimelessMetrics.SeriesRegistry, name: registry_name, db: db_name, store: name},
+          {TimelessMetrics.DictTrainer, name: dict_trainer_name, store: name, data_dir: data_dir}
+        ]
+      end
+
+    # Rollup and retention — both modes (memory mode uses ETS-backed segments)
+    management = [
+      {TimelessMetrics.Rollup,
+       name: :"#{name}_rollup",
+       db: if(!memory_only, do: db_name),
+       store: name,
+       schema: schema,
+       compression: compression,
+       compression_level: compression_level},
+      {TimelessMetrics.Retention,
+       name: :"#{name}_retention",
+       db: if(!memory_only, do: db_name),
+       store: name,
+       schema: schema}
+    ]
+
+    children =
+      foundation ++
+        builder_and_buffer_shards ++
+        (if memory_only, do: [], else: ingest_workers) ++
+        management
 
     # New features — kept from actor era
     alert_interval = Keyword.get(opts, :alert_interval, :timer.seconds(60))
@@ -164,7 +182,7 @@ defmodule TimelessMetrics.Supervisor do
     scraper_name = :"#{name}_scraper"
 
     scraper_children =
-      if Keyword.get(opts, :scraping, true) do
+      if Keyword.get(opts, :scraping, true) and not memory_only do
         [
           {DynamicSupervisor, name: scrape_sup_name, strategy: :one_for_one},
           {TimelessMetrics.Scraper,

@@ -111,7 +111,7 @@ defmodule TimelessMetrics.SeriesRegistry do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
-    db = Keyword.fetch!(opts, :db)
+    db = Keyword.get(opts, :db)
     store = Keyword.get(opts, :store)
     fwd_key = forward_key(name)
     rev_key = reverse_key(name)
@@ -127,18 +127,24 @@ defmodule TimelessMetrics.SeriesRegistry do
       write_concurrency: :auto
     ])
 
-    # Initialize persistent_term with empty maps, then bulk-load from SQLite
+    # Initialize persistent_term with empty maps
     :persistent_term.put(fwd_key, %{})
     :persistent_term.put(rev_key, %{})
-    load_from_db(fwd_key, rev_key, db)
+
+    # Load from SQLite if available (server mode)
+    if db, do: load_from_db(fwd_key, rev_key, db)
 
     # Atomics counter for lock-free ID generation from any process
     id_counter = :atomics.new(1, signed: true)
 
     seed =
-      case TimelessMetrics.DB.read(db, "SELECT COALESCE(MAX(id), 0) FROM series") do
-        {:ok, [[max_id]]} -> max_id
-        _ -> 0
+      if db do
+        case TimelessMetrics.DB.read(db, "SELECT COALESCE(MAX(id), 0) FROM series") do
+          {:ok, [[max_id]]} -> max_id
+          _ -> 0
+        end
+      else
+        0
       end
 
     :atomics.put(id_counter, 1, seed)
@@ -227,6 +233,7 @@ defmodule TimelessMetrics.SeriesRegistry do
   # --- Internals ---
 
   defp flush_pending_inserts(%{pending_inserts: []}), do: :ok
+  defp flush_pending_inserts(%{db: nil}), do: :ok
 
   defp flush_pending_inserts(state) do
     # SQLite has a 32,766 parameter limit. 4 params per row = 8,000 rows per batch.
