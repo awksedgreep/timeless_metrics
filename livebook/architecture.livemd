@@ -88,46 +88,40 @@ parallelizes across schedulers for batches over 1,000 entries.
 
 ## Buffer → SegmentBuilder → Disk
 
-The Buffer GenServer has a periodic flush timer (default: **5 seconds**). When it fires:
+The Buffer has **no periodic flush timer**. Data lives in Buffer ETS (queryable
+immediately) until a 4-hour seal cycle runs or an explicit flush is triggered.
 
-1. Select all points up to a monotonic cutoff
-2. Group by `series_id`
-3. **Only flush series with ≥ 8 points** — series below threshold are re-inserted into ETS
-4. Send ready series to SegmentBuilder via `GenServer.cast` (async, non-blocking)
-5. Atomic delete + re-insert for kept series
+Every **4 hours**, the SegmentBuilder's `check_segments` timer fires. This:
 
-The SegmentBuilder accumulates points in memory, grouped by `{series_id, time_bucket}`.
-When a segment reaches **5,000 points**, it compresses with ALP + zstd and writes to
-the WAL. The segment is then cleared from memory.
+1. Tells the paired Buffer to flush all points to SegmentBuilder (sync call)
+2. SegmentBuilder accumulates points grouped by `{series_id, time_bucket}`
+3. Seals completed 4-hour windows: compress with ALP + zstd → write .seg file
+4. Pending (current window) segments stay in SegmentBuilder memory
 
-Every **10 seconds**, `check_segments` seals completed time windows (segments whose
-4-hour bucket has passed) into immutable `.seg` files.
+The 4-hour timer is offset from process start, avoiding hour-boundary scrape storms.
 
-On shutdown, `terminate` writes ALL remaining segments regardless of threshold.
+On shutdown, `terminate` flushes Buffer and writes ALL remaining segments to disk.
+
+On explicit `TimelessMetrics.flush(store)`, everything is flushed and written immediately
+(used in tests and benchmarks).
 
 ```mermaid
 flowchart TD
-    subgraph "Buffer ETS (queryable immediately)"
-        BUF["Ordered ETS: {sid, ts, seq} → value"]
+    subgraph "Buffer ETS (queryable immediately, no timer)"
+        BUF["Ordered ETS: {sid, ts, seq} → value<br/><i>Data lives here until 4-hour seal cycle</i>"]
     end
 
-    subgraph "Buffer Flush (5s timer)"
-        BUF -->|"series with ≥ 8 pts"| CAST["GenServer.cast → SegmentBuilder"]
-        BUF -->|"series with < 8 pts"| KEEP["Re-insert into ETS"]
+    subgraph "Seal Cycle (every 4 hours)"
+        BUF -->|"flush_sync"| SB["SegmentBuilder accumulates<br/>{sid, bucket} → points"]
+        SB --> SPLIT{"Time window<br/>completed?"}
+        SPLIT -->|yes| COMPRESS["ALP + zstd compress"]
+        COMPRESS --> SEG["Write immutable .seg file"]
+        SPLIT -->|no| KEEP["Keep in SegmentBuilder memory"]
     end
 
-    subgraph "SegmentBuilder (per shard)"
-        CAST --> ACCUM["Accumulate in memory<br/>{sid, bucket} → points"]
-        ACCUM -->|"segment ≥ 5000 pts"| COMPRESS["ALP + zstd compress"]
-        COMPRESS --> WAL["ShardStore.write_wal<br/>(atomic file replace)"]
-        WAL --> CLEAR["Clear segment from memory"]
-        ACCUM -->|"segment < 5000 pts"| WAIT["Keep accumulating"]
-    end
-
-    subgraph "Sealing (10s timer)"
-        WAL --> CHECK{"Time window<br/>completed?"}
-        CHECK -->|yes| SEAL["Move from WAL → .seg file"]
-        CHECK -->|no| STAY["Keep in WAL"]
+    subgraph "Also triggers flush"
+        TERM["terminate (shutdown)"]
+        EXPLICIT["TimelessMetrics.flush(store)"]
     end
 ```
 
@@ -135,11 +129,12 @@ flowchart TD
 
 | Decision | Rationale |
 |----------|-----------|
-| Buffer flush threshold (8 pts/series) | ALP needs ≥ 2 points; 8 gives good sampling |
-| Segment write threshold (5000 pts) | Large blocks = better ALP compression ratio |
+| No Buffer flush timer | Real scrapes are 1-5 min intervals; sub-minute timers waste CPU and produce tiny blocks |
+| 4-hour seal cycle | Matches segment duration; accumulates 240+ points/series at 1-min scrape for good ALP compression |
+| Timer offset from process start | Avoids hour-boundary scrape storms when every Prometheus target fires at :00 |
+| Buffer ETS queryable | Hot data available instantly; no flush-to-query gap |
 | WAL merge: replace by `{sid, start}` | Each write is the complete segment — safe to replace |
-| SegmentBuilder clears after WAL write | Memory stays bounded; segment is fully on disk |
-| Buffer ETS queryable | Hot data available immediately, no flush-to-query gap |
+| No per-segment point threshold | Compress whatever accumulated in the 4-hour window; even 48 points (5-min scrape) compresses well with ALP |
 
 ## Read / Query Path
 
@@ -241,13 +236,13 @@ Atomic write via tmp + rename.
 |-----------|----------------|---------------|---------|
 | IngestWorker | Drain interval | 10ms | Poll ETS queue for new HTTP bodies |
 | IngestWorker | Max batch | 100 entries | Entries per drain cycle |
-| Buffer | Flush interval | 5,000ms | Send accumulated points to SegmentBuilder |
-| Buffer | Min points/series | 8 | Series below this stay in ETS |
 | Buffer | Backpressure | 50,000 msgs | SegmentBuilder mailbox limit |
-| SegmentBuilder | Write threshold | 5,000 pts/segment | Triggers ALP compress + WAL write |
-| SegmentBuilder | Check segments | 10,000ms | Seal completed time windows |
+| SegmentBuilder | Seal cycle | 4 hours | Flush Buffer, compress, seal completed windows |
 | SegmentBuilder | Segment duration | 14,400s (4h) | Time window per .seg file |
 | SeriesRegistry | Publish interval | 5,000ms | Merge ETS overflow → persistent_term |
+
+**No timers in the Buffer.** Data moves from Buffer to disk only on the 4-hour seal
+cycle, explicit flush, or shutdown.
 
 ## HTTP Ingest and Query
 
