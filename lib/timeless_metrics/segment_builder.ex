@@ -299,14 +299,18 @@ defmodule TimelessMetrics.SegmentBuilder do
   @impl true
   def handle_cast({:ingest, grouped_points}, state) do
     new_segments = ingest_into_segments(grouped_points, state)
-    new_state = maybe_flush_wal(%{state | segments: new_segments})
+    new_state = %{state | segments: new_segments}
+    flush_segments_to_wal(new_state)
+    # Don't clear — accumulate. WAL merge replaces by {sid, start},
+    # so each write must contain ALL points for the segment.
     {:noreply, new_state}
   end
 
   @impl true
   def handle_call({:ingest, grouped_points}, _from, state) do
     new_segments = ingest_into_segments(grouped_points, state)
-    new_state = maybe_flush_wal(%{state | segments: new_segments})
+    new_state = %{state | segments: new_segments}
+    flush_segments_to_wal(new_state)
     {:reply, :ok, new_state}
   end
 
@@ -397,16 +401,13 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   # --- Internals ---
 
-  defp maybe_flush_wal(state) do
-    pt_count = Enum.reduce(state.segments, 0, fn {_key, seg}, acc -> acc + length(seg.points) end)
+  defp flush_segments_to_wal(state) do
+    segs = state.segments |> Map.values() |> Enum.reject(&(&1.points == []))
+    if segs != [], do: write_segments(segs, state)
+  end
 
-    if pt_count >= @wal_flush_threshold do
-      write_segments(Map.values(state.segments), state)
-      cleared = Map.new(state.segments, fn {key, seg} -> {key, %{seg | points: []}} end)
-      %{state | segments: cleared}
-    else
-      state
-    end
+  defp clear_points(segments) do
+    Map.new(segments, fn {key, seg} -> {key, %{seg | points: []}} end)
   end
 
   defp ingest_into_segments(grouped_points, state) do

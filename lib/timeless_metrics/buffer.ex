@@ -220,28 +220,29 @@ defmodule TimelessMetrics.Buffer do
     if points != [] do
       grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
 
-      # Split: series with enough points for compression vs too few
-      {ready, keep} =
-        Enum.split_with(grouped, fn {_series_id, pts} ->
-          length(pts) >= @min_points_per_series
-        end)
+      # Only flush series with enough points for ALP compression
+      ready_map =
+        grouped
+        |> Enum.filter(fn {_series_id, pts} -> length(pts) >= @min_points_per_series end)
+        |> Map.new()
 
-      if ready != [] do
-        ready_map = Map.new(ready)
-        ready_count = Enum.reduce(ready, 0, fn {_, pts}, acc -> acc + length(pts) end)
-        ready_series = Map.keys(ready_map) |> MapSet.new()
+      if ready_map != %{} do
+        ready_count = Enum.reduce(ready_map, 0, fn {_, pts}, acc -> acc + length(pts) end)
 
-        # Delete only the flushed points: re-scan for keys belonging to ready series
-        # that are at or before the cutoff, then delete them
-        delete_keys_spec = [
-          {{{:"$1", :"$2", :"$3"}, :_}, [{:"=<", :"$3", cutoff}], [{{:"$1", :"$2", :"$3"}}]}
-        ]
+        # Atomic delete: remove ALL points up to cutoff, then re-insert the ones we're keeping
+        delete_spec = [{{{:_, :_, :"$1"}, :_}, [{:"=<", :"$1", cutoff}], [true]}]
+        :ets.select_delete(state.table, delete_spec)
 
-        :ets.select(state.table, delete_keys_spec)
-        |> Enum.each(fn {sid, ts, seq} ->
-          if MapSet.member?(ready_series, sid) do
-            :ets.delete(state.table, {sid, ts, seq})
-          end
+        # Re-insert points for series below threshold
+        keep_map = Map.drop(grouped, Map.keys(ready_map))
+
+        Enum.each(keep_map, fn {series_id, pts} ->
+          rows =
+            Enum.map(pts, fn {ts, val} ->
+              {{series_id, ts, :erlang.unique_integer([:positive, :monotonic])}, val}
+            end)
+
+          :ets.insert(state.table, rows)
         end)
 
         :atomics.put(state.counter, 1, max(:ets.info(state.table, :size) - @metadata_key_count, 0))
