@@ -13,7 +13,7 @@ Add the dependency, start the supervisor, and optionally enable the HTTP API.
 # mix.exs
 defp deps do
   [
-    {:timeless_metrics, "~> 1.2"}
+    {:timeless_metrics, "~> 5.0"}
   ]
 end
 ```
@@ -40,18 +40,35 @@ All options are passed to the supervisor child spec:
 | Option                     | Default      | Description                               |
 | -------------------------- | ------------ | ----------------------------------------- |
 | `:name`                    | *required*   | Atom identifier for this store instance   |
-| `:data_dir`                | *required*   | Directory for persisted data              |
-| `:compression`             | `:zstd`      | Compression algorithm for segments        |
+| `:data_dir`                | *required**  | Directory for persisted data              |
+| `:mode`                    | `:disk`      | `:disk` (default) or `:memory` (no disk)  |
+| `:compression`             | `:zstd`      | Container compression for segments        |
+| `:compression_level`       | `2`          | zstd compression level                    |
 | `:buffer_shards`           | `cpus / 2`   | Number of ETS write buffer shards         |
-| `:flush_threshold`         | `10_000`     | Points per shard before immediate flush   |
-| `:flush_interval`          | `5_000`      | Buffer flush interval (ms)                |
+| `:segment_duration`        | `14_400`     | Seal window size in seconds (4 hours)     |
 | `:raw_retention_seconds`   | `604_800`    | Raw data retention (default 7 days)       |
 | `:daily_retention_seconds` | `31_536_000` | Daily rollup retention (default 1 year)   |
-| `:rollup_interval`         | `300_000`    | Daily rollup computation interval (ms)    |
-| `:retention_interval`      | `3_600_000`  | Retention cleanup interval (ms)           |
 | `:alert_interval`          | `60_000`     | Alert evaluation interval (ms)            |
 | `:self_monitor`            | `true`       | Emit internal performance metrics         |
 | `:scraping`                | `true`       | Enable Prometheus scrape target subsystem |
+
+*\* `data_dir` is not required when `mode: :memory`*
+
+### Memory-Only Mode
+
+For constrained devices, routers, or testing — no disk, no SQLite:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+children = [
+  {TimelessMetrics, name: :metrics, mode: :memory}
+]
+```
+
+Data lives in ETS only. Compressed with ALP on 4-hour seal cycles, same as disk mode.
+On process termination, data is lost. No IngestWorkers, no Scraper, no AlertEvaluator —
+use the programmatic API (`write/5`, `write_batch/2`, `query/4`) directly.
 
 ### Full Configuration Example
 

@@ -1,12 +1,27 @@
 # TimelessMetrics Architecture
 
-## Supervision Tree
+## Operating Modes
 
-The application starts a top-level `one_for_one` supervisor containing
-`TimelessMetrics.Supervisor` (the data store) and `TimelessMetrics.HTTP` (the API server).
-The data store supervisor uses a `rest_for_one` strategy so that if a foundational child
-(like DB or SeriesRegistry) crashes, all children started after it are restarted in order.
-Buffer and SegmentBuilder pairs are created per shard (default: `schedulers / 2`).
+TimelessMetrics supports three operating modes with a unified pipeline:
+
+| Mode | Config | Storage | Use Case |
+|------|--------|---------|----------|
+| **Server** | `data_dir: "/data"` | ETS + disk (.seg files) | Standalone TSDB, HTTP API, scraping |
+| **Embedded** | `data_dir: "/data"` | ETS + disk (.seg files) | Library inside an Elixir app |
+| **Memory-only** | `mode: :memory` | ETS only, no disk | Routers, constrained devices, testing |
+
+```elixir
+# Server / Embedded (same code, different deployment)
+{TimelessMetrics, name: :metrics, data_dir: "/data/metrics"}
+
+# Memory-only (no disk, no SQLite)
+{TimelessMetrics, name: :metrics, mode: :memory}
+```
+
+All three modes share the same write and query paths. The only difference is whether
+compressed segments are persisted to disk for crash recovery.
+
+## Supervision Tree
 
 ```mermaid
 graph TD
@@ -16,39 +31,39 @@ graph TD
 
     Sup["TimelessMetrics.Supervisor<br/><i>rest_for_one</i>"]
 
-    Sup --> DB["TimelessMetrics.DB<br/><i>SQLite writer + reader pool</i>"]
+    Sup --> DB["TimelessMetrics.DB<br/><i>SQLite (server mode only)</i>"]
     Sup --> SR["TimelessMetrics.SeriesRegistry<br/><i>persistent_term + ETS overflow</i>"]
-    Sup --> DT["TimelessMetrics.DictTrainer<br/><i>zstd dictionary training</i>"]
-    Sup --> SB0["SegmentBuilder 0<br/><i>compression + WAL writer</i>"]
+    Sup --> DT["TimelessMetrics.DictTrainer<br/><i>server mode only</i>"]
+    Sup --> SB0["SegmentBuilder 0<br/><i>compression + ETS cache</i>"]
     Sup --> BUF0["Buffer 0<br/><i>ETS write shard</i>"]
-    Sup --> SBN["SegmentBuilder N<br/><i>compression + WAL writer</i>"]
+    Sup --> SBN["SegmentBuilder N<br/><i>compression + ETS cache</i>"]
     Sup --> BUFN["Buffer N<br/><i>ETS write shard</i>"]
-    Sup --> IW["IngestWorker × N<br/><i>background queue processors</i>"]
-    Sup --> Rollup["TimelessMetrics.Rollup<br/><i>periodic tier aggregation</i>"]
-    Sup --> Ret["TimelessMetrics.Retention<br/><i>1-hr tick</i>"]
-    Sup --> AE["TimelessMetrics.AlertEvaluator<br/><i>60-sec tick</i>"]
-    Sup --> SelfMon["TimelessMetrics.SelfMonitor<br/><i>optional, default: on</i>"]
-    Sup --> ScrapeSup["DynamicSupervisor<br/><i>:scrape_sup, one_for_one</i>"]
-    Sup --> Scraper["TimelessMetrics.Scraper<br/><i>optional, default: on</i>"]
+    Sup --> IW["IngestWorker × N<br/><i>server mode only</i>"]
+    Sup --> Rollup["TimelessMetrics.Rollup"]
+    Sup --> Ret["TimelessMetrics.Retention"]
+    Sup --> AE["TimelessMetrics.AlertEvaluator<br/><i>server mode only</i>"]
+    Sup --> SelfMon["TimelessMetrics.SelfMonitor<br/><i>optional</i>"]
+    Sup --> ScrapeSup["DynamicSupervisor<br/><i>server mode only</i>"]
 
-    ScrapeSup --> W1["Scraper.Worker<br/>target 1"]
-    ScrapeSup --> W2["Scraper.Worker<br/>target 2"]
-
-    style SelfMon stroke-dasharray: 5 5
+    style DB stroke-dasharray: 5 5
+    style DT stroke-dasharray: 5 5
+    style IW stroke-dasharray: 5 5
+    style AE stroke-dasharray: 5 5
     style ScrapeSup stroke-dasharray: 5 5
-    style Scraper stroke-dasharray: 5 5
+    style SelfMon stroke-dasharray: 5 5
 ```
 
-## Write Path — HTTP Ingest
+Dashed components are skipped in memory-only mode (no DB, no IngestWorkers, no
+AlertEvaluator, no Scraper). SeriesRegistry operates without SQLite — ETS +
+persistent_term only, no restart durability.
 
-HTTP import endpoints (`/api/v1/import`, `/api/v1/import/prometheus`) accept the raw
-body, zstd-compress it, and insert it into a shared ETS queue table. The response
-returns **204 immediately** — no parsing, no series resolution, no blocking.
+## Write Path — HTTP Ingest (Server Mode)
 
-Background `IngestWorker` processes (count: `schedulers / 4`, min 2) drain the queue
-every 10ms, decompress, parse (PrometheusNif or JSON), resolve series IDs, and write
-to the appropriate Buffer shard's ETS table. Multiple workers share one queue via
-atomic `:ets.take`.
+HTTP import endpoints accept the raw body, zstd-compress it, and insert it into a
+shared ETS queue table. The response returns **204 immediately**.
+
+Background `IngestWorker` processes drain the queue every 10ms, decompress, parse
+(PrometheusNif or JSON), resolve series IDs, and write to Buffer ETS.
 
 ```mermaid
 flowchart TD
@@ -80,30 +95,29 @@ flowchart TD
 
 **Data is queryable the instant it enters Buffer ETS.** No flush required.
 
-## Write Path — Programmatic API
+## Write Path — Programmatic API (All Modes)
 
 `TimelessMetrics.write/5` resolves the series ID and inserts directly into the
 Buffer shard's ETS table. No GenServer, no message passing. `write_batch/2`
 parallelizes across schedulers for batches over 1,000 entries.
 
-## Buffer → SegmentBuilder → Disk
+This is the only write path for memory-only mode (no HTTP, no IngestWorkers).
+
+## Buffer → SegmentBuilder → ETS Cache (→ Disk)
 
 The Buffer has **no periodic flush timer**. Data lives in Buffer ETS (queryable
 immediately) until a 4-hour seal cycle runs or an explicit flush is triggered.
 
-Every **4 hours**, the SegmentBuilder's `check_segments` timer fires. This:
+Every **4 hours**, the SegmentBuilder's `check_segments` timer fires:
 
 1. Tells the paired Buffer to flush all points to SegmentBuilder (sync call)
 2. SegmentBuilder accumulates points grouped by `{series_id, time_bucket}`
-3. Seals completed 4-hour windows: compress with ALP + zstd → write .seg file
-4. Pending (current window) segments stay in SegmentBuilder memory
+3. Seals completed 4-hour windows: compress with ALP + zstd
+4. Stores compressed blobs in the **ETS segment cache** (queryable immediately)
+5. **Server mode only**: also persists to .seg files on disk for crash recovery
+6. Pending (current window) segments stay in SegmentBuilder memory
 
-The 4-hour timer is offset from process start, avoiding hour-boundary scrape storms.
-
-On shutdown, `terminate` flushes Buffer and writes ALL remaining segments to disk.
-
-On explicit `TimelessMetrics.flush(store)`, everything is flushed and written immediately
-(used in tests and benchmarks).
+On shutdown, `terminate` flushes Buffer and writes ALL remaining segments.
 
 ```mermaid
 flowchart TD
@@ -115,7 +129,8 @@ flowchart TD
         BUF -->|"flush_sync"| SB["SegmentBuilder accumulates<br/>{sid, bucket} → points"]
         SB --> SPLIT{"Time window<br/>completed?"}
         SPLIT -->|yes| COMPRESS["ALP + zstd compress"]
-        COMPRESS --> SEG["Write immutable .seg file"]
+        COMPRESS --> CACHE["ETS Segment Cache<br/><i>compressed blobs, queryable</i>"]
+        CACHE -->|"server mode"| DISK["Write .seg file (durability)"]
         SPLIT -->|no| KEEP["Keep in SegmentBuilder memory"]
     end
 
@@ -133,43 +148,42 @@ flowchart TD
 | 4-hour seal cycle | Matches segment duration; accumulates 240+ points/series at 1-min scrape for good ALP compression |
 | Timer offset from process start | Avoids hour-boundary scrape storms when every Prometheus target fires at :00 |
 | Buffer ETS queryable | Hot data available instantly; no flush-to-query gap |
+| ETS segment cache | ALL reads go through ETS — never touch disk. Disk is write-only for durability |
 | WAL merge: replace by `{sid, start}` | Each write is the complete segment — safe to replace |
-| No per-segment point threshold | Compress whatever accumulated in the 4-hour window; even 48 points (5-min scrape) compresses well with ALP |
+| Same pipeline for all modes | Memory-only skips disk write; everything else identical |
 
 ## Read / Query Path
 
-Queries read from **three locations** and merge the results:
+Queries read from **two ETS sources** and merge the results:
 
 1. **Buffer ETS** — hot, uncompressed points (O(log n) tree walk on ordered_set)
-2. **current.wal** — compressed segments not yet sealed (lock-free file read)
-3. **.seg files** — immutable sealed time windows (binary search on index)
+2. **ETS Segment Cache** — compressed ALP blobs (O(log n) ordered_set lookup, then decompress)
 
-**No GenServer in the read path.** `SegmentBuilder.read_raw_segments` reads the
-`shard_store` from `:persistent_term` and calls `ShardStore.read_segments` directly.
-Buffer reads use `:ets.next` tree traversal.
+**Reads never touch disk.** Disk files (.seg) are only for crash recovery on startup,
+when they are loaded into the ETS segment cache.
 
 ```mermaid
 flowchart TD
     Q["Query.raw(store, series_id, from, to)"]
 
-    Q --> DISK["ShardStore.read_segments (lock-free)"]
+    Q --> CACHE["ETS Segment Cache (lock-free)"]
     Q --> ETS["Buffer.read_points (lock-free)"]
 
-    subgraph "Disk Read (lock-free)"
-        DISK --> SEG[".seg files: binary search index"]
-        DISK --> WALR["current.wal: scan entries"]
-        SEG --> DECOMP["ALP/Gorilla decompress"]
-        WALR --> DECOMP
+    subgraph "Segment Cache Read"
+        CACHE --> LOOKUP["ordered_set: {sid, start} → {end, count, blob}"]
+        LOOKUP --> DECOMP["ALP/Gorilla decompress"]
     end
 
-    subgraph "ETS Read (lock-free)"
+    subgraph "Buffer ETS Read"
         ETS --> WALK[":ets.next walk from {sid, from, 0}"]
     end
 
-    DECOMP --> MERGE["lists.merge(buffer_points, seg_points)"]
+    DECOMP --> MERGE["lists.merge(buffer_points, cache_points)"]
     WALK --> MERGE
     MERGE --> RESULT["{:ok, [{ts, val}, ...]}"]
 ```
+
+**No GenServer in the read path.** Both ETS tables are `:public` with `read_concurrency: true`.
 
 For multi-series queries, `find_matching_series` reads from persistent_term + ETS overflow
 (no SQLite on the hot path), and fans out in parallel via `Task.async_stream`.
@@ -179,6 +193,16 @@ it reads from rollup chunks. If the query spans the watermark boundary, it stitc
 rollup data with raw data.
 
 ## Storage Layout
+
+### In-Memory (both modes)
+
+```
+Per-Shard ETS Tables:
+  Buffer ETS        — raw points: {sid, ts, seq} → value (ordered_set)
+  Segment Cache ETS — compressed: {sid, start} → {end, count, blob} (ordered_set)
+```
+
+### On-Disk (server mode only, for crash recovery)
 
 ```mermaid
 flowchart LR
@@ -205,6 +229,9 @@ flowchart LR
     end
 ```
 
+On server startup, all .seg and WAL data is loaded into the ETS segment cache.
+After startup, disk is write-only — reads never touch it.
+
 ### Compression Pipeline
 
 | Series Type | Encoder | Container | Marker Byte |
@@ -222,27 +249,18 @@ Body:   concatenated compressed blobs
 Index:  40 bytes per entry (sid:i64, start:i64, end:i64, count:u32, offset:u64, len:u32)
 ```
 
-### WAL File Format (current.wal)
-
-```
-Entries concatenated, no global header:
-  sid:i64 | start:i64 | end:i64 | count:u32 | data_len:u32 | data:bytes
-Atomic write via tmp + rename.
-```
-
 ## Timers and Thresholds
 
 | Component | Timer/Threshold | Default Value | Purpose |
 |-----------|----------------|---------------|---------|
 | IngestWorker | Drain interval | 10ms | Poll ETS queue for new HTTP bodies |
 | IngestWorker | Max batch | 100 entries | Entries per drain cycle |
-| Buffer | Backpressure | 50,000 msgs | SegmentBuilder mailbox limit |
 | SegmentBuilder | Seal cycle | 4 hours | Flush Buffer, compress, seal completed windows |
 | SegmentBuilder | Segment duration | 14,400s (4h) | Time window per .seg file |
 | SeriesRegistry | Publish interval | 5,000ms | Merge ETS overflow → persistent_term |
 
-**No timers in the Buffer.** Data moves from Buffer to disk only on the 4-hour seal
-cycle, explicit flush, or shutdown.
+**No timers in the Buffer.** Data moves from Buffer to compressed cache only on the
+4-hour seal cycle, explicit flush, or shutdown.
 
 ## HTTP Ingest and Query
 
@@ -267,7 +285,7 @@ flowchart TD
         QRange["GET /api/v1/query_range<br/>aggregated range"]
         PromQL["GET /prometheus/api/v1/query_range<br/>PromQL (Grafana)"]
 
-        Exp --> QEng["Query.raw → Buffer ETS + ShardStore"]
+        Exp --> QEng["Query.raw → Buffer ETS + Segment Cache ETS"]
         QLatest --> QEng
         QRange --> QEng
         PromQL --> PQL["PromQL.parse → PromQL.execute"]
@@ -287,22 +305,21 @@ flowchart TD
 
 ## Scraper Subsystem
 
-The `Scraper` GenServer manages target CRUD and worker lifecycle. On init it loads
-enabled targets from SQLite and starts a `Scraper.Worker` under `DynamicSupervisor`
-for each. Workers schedule scrapes on fixed intervals with initial jitter to avoid
-thundering herd. Each scrape tick fetches the target URL via HTTP, parses the
-Prometheus exposition text, applies the metric relabel pipeline, and writes the
-resulting entries through `TimelessMetrics.write_batch`. Workers track their own health
-state and flush it to `scrape_health` periodically.
+The `Scraper` GenServer manages target CRUD and worker lifecycle (server mode only).
+On init it loads enabled targets from SQLite and starts a `Scraper.Worker` under
+`DynamicSupervisor` for each. Workers schedule scrapes on fixed intervals with initial
+jitter to avoid thundering herd. Each scrape tick fetches the target URL via HTTP,
+parses the Prometheus exposition text, applies the metric relabel pipeline, and writes
+the resulting entries through `TimelessMetrics.write_batch`.
 
 ## Alert System
 
-The `AlertEvaluator` GenServer ticks every 60 seconds and calls `Alert.evaluate/1`. For
-each enabled rule, it queries recent metric data via `query_aggregate_multi`, then checks
-the last bucket value against the rule's condition (`above`/`below` threshold). A per-series
-state machine tracks transitions through `ok → pending → firing → resolved`. The `pending`
-state implements configurable duration-based delays before firing. State changes to `firing`
-or `resolved` trigger async webhook delivery and are logged to `alert_history`.
+The `AlertEvaluator` GenServer ticks every 60 seconds (server mode only) and calls
+`Alert.evaluate/1`. For each enabled rule, it queries recent metric data via
+`query_aggregate_multi`, then checks the last bucket value against the rule's condition
+(`above`/`below` threshold). A per-series state machine tracks transitions through
+`ok → pending → firing → resolved`. State changes to `firing` or `resolved` trigger
+async webhook delivery and are logged to `alert_history`.
 
 ```mermaid
 stateDiagram-v2
