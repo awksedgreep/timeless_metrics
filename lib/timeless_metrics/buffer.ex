@@ -108,18 +108,23 @@ defmodule TimelessMetrics.Buffer do
     table = table_name(shard_name)
 
     try do
-      # Match: key = {series_id, timestamp, _seq}, guard: ts >= from and ts <= to
-      spec = [
-        {{{:"$1", :"$2", :_}, :"$3"},
-         [{:==, :"$1", series_id}, {:>=, :"$2", from}, {:"=<", :"$2", to}],
-         [{{:"$2", :"$3"}}]}
-      ]
-
-      :ets.select(table, spec)
+      # Use ordered_set tree traversal: start at {series_id, from, 0}
+      # and walk forward until we pass {series_id, to, ...} or leave the series.
+      start_key = {series_id, from, 0}
+      collect_range(table, :ets.next(table, start_key), series_id, to, [])
     rescue
       _ -> []
     end
   end
+
+  defp collect_range(_table, :"$end_of_table", _sid, _to, acc), do: Enum.reverse(acc)
+
+  defp collect_range(table, {sid, ts, _seq} = key, sid, to, acc) when ts <= to do
+    [{^key, value}] = :ets.lookup(table, key)
+    collect_range(table, :ets.next(table, key), sid, to, [{ts, value} | acc])
+  end
+
+  defp collect_range(_table, _key, _sid, _to, acc), do: Enum.reverse(acc)
 
   @doc "Get the current point count in this shard's buffer."
   def buffer_size(shard_name) do
