@@ -442,6 +442,12 @@ defmodule TimelessMetrics.Query do
   @alp_marker 0xA1
   # Raw single-point marker: <<0xA2, ts::int64, val::float64>>
   @raw_point_marker 0xA2
+  # Fast stage 2 marker: <<0xFA, zstd(term_to_binary(points))>>
+  @fast_marker 0xFA
+
+  defp decompress_blob(<<@fast_marker, compressed::binary>>, _store, _compression) do
+    {:ok, :erlang.binary_to_term(:ezstd.decompress(compressed))}
+  end
 
   defp decompress_blob(<<@text_marker, text_blob::binary>>, _store, _compression) do
     TimelessMetrics.TextCodec.decompress(text_blob)

@@ -30,7 +30,8 @@ defmodule TimelessMetrics.SegmentBuilder do
   ]
 
   # 4 hours in seconds
-  @default_segment_duration 14_400
+  # 24 hours — ALP promotes daily for best compression ratio
+  @default_segment_duration 86_400
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -354,9 +355,11 @@ defmodule TimelessMetrics.SegmentBuilder do
       memory_only: memory_only
     }
 
-    # Periodic seal — flush Buffer, compress, seal completed 4-hour windows.
-    # Offset from process start to avoid hour-boundary scrape storms.
-    Process.send_after(self(), :check_segments, :timer.hours(4))
+    # Stage 2: drain ETS buffer every 10s → term_to_binary + zstd level 1
+    Process.send_after(self(), :drain_buffer, :timer.seconds(10))
+
+    # Stage 3: daily, recompress completed windows from fast zstd → ALP
+    Process.send_after(self(), :promote_segments, :timer.hours(24))
 
     {:ok, state}
   end
@@ -422,19 +425,40 @@ defmodule TimelessMetrics.SegmentBuilder do
   end
 
   @impl true
-  def handle_info(:check_segments, state) do
-    # Flush Buffer ETS → SegmentBuilder for this shard
+  def handle_info(:drain_buffer, state) do
+    # Stage 2: drain ETS buffer → fast compress (term_to_binary + zstd 1) → WAL + cache
     shard_name = :"#{state.store}_shard_#{state.shard_id}"
-    GenServer.call(shard_name, :flush_sync, :infinity)
 
-    # Seal completed time windows
+    try do
+      GenServer.call(shard_name, :flush_sync, 5_000)
+    catch
+      :exit, _ -> :ok
+    end
+
+    # Fast-compress any accumulated in-memory segments
+    all_segments = Map.values(state.segments)
+
+    if all_segments != [] do
+      write_segments_fast(all_segments, state)
+    end
+
+    Process.send_after(self(), :drain_buffer, :timer.seconds(10))
+    {:noreply, %{state | segments: %{}}}
+  end
+
+  def handle_info(:promote_segments, state) do
+    # Stage 3: recompress completed time windows from fast zstd → ALP
     {completed, pending} = split_completed(state.segments, state.segment_duration)
 
+    # Promote fast-compressed segments in completed windows to ALP
+    promote_to_alp(state)
+
+    # Seal the completed windows
     if completed != [] do
       write_and_seal(completed, state)
     end
 
-    Process.send_after(self(), :check_segments, :timer.hours(4))
+    Process.send_after(self(), :promote_segments, :timer.hours(24))
     {:noreply, %{state | segments: pending}}
   end
 
@@ -502,6 +526,138 @@ defmodule TimelessMetrics.SegmentBuilder do
     {completed, pending}
   end
 
+  # Stage 2: fast compression — term_to_binary + zstd level 1, tag 0xFA
+  @fast_marker 0xFA
+
+  defp compress_segments_fast(segments) do
+    segments
+    |> Enum.reject(fn seg -> seg.points == [] end)
+    |> Enum.flat_map(fn seg ->
+      sorted_points = Enum.sort_by(seg.points, &elem(&1, 0))
+      raw = :erlang.term_to_binary(sorted_points)
+      compressed = :ezstd.compress(raw, 1)
+      blob = <<@fast_marker, compressed::binary>>
+
+      point_count = length(sorted_points)
+      {last_ts, _} = List.last(sorted_points)
+
+      :telemetry.execute(
+        [:timeless_metrics, :segment, :write],
+        %{point_count: point_count, compressed_bytes: byte_size(blob)},
+        %{series_id: seg.series_id, stage: :fast}
+      )
+
+      [{seg.series_id, seg.start_time, last_ts, point_count, blob}]
+    end)
+  end
+
+  defp write_segments_fast(segments, state) do
+    compressed = compress_segments_fast(segments)
+
+    if compressed != [] do
+      write_to_cache(compressed, state.segments_cache)
+
+      if state.shard_store do
+        TimelessMetrics.ShardStore.write_wal(state.shard_store, compressed)
+      end
+    end
+  end
+
+  # Stage 3: read fast-compressed segments from cache, decompress, recompress with ALP
+  defp promote_to_alp(state) do
+    now = System.os_time(:second)
+    current_bucket = segment_bucket(now, state.segment_duration)
+    cache = state.segments_cache
+
+    # Scan cache for fast-compressed entries (tag 0xFA) in completed windows
+    fast_entries =
+      :ets.foldl(
+        fn {{sid, start} = key, {end_time, count, <<@fast_marker, _::binary>> = blob}}, acc ->
+          bucket = segment_bucket(start, state.segment_duration)
+
+          if bucket < current_bucket do
+            [{key, sid, start, end_time, count, blob} | acc]
+          else
+            acc
+          end
+
+        {{_sid, _start}, _val}, acc ->
+          acc
+        end,
+        [],
+        cache
+      )
+
+    if fast_entries != [] do
+      # Group by series_id, decompress all fast segments, combine points
+      by_series =
+        fast_entries
+        |> Enum.group_by(fn {_key, sid, _start, _end, _count, _blob} -> sid end)
+
+      Enum.each(by_series, fn {series_id, entries} ->
+        # Decompress all fast segments for this series and combine points
+        all_points =
+          entries
+          |> Enum.flat_map(fn {_key, _sid, _start, _end, _count, <<@fast_marker, compressed::binary>>} ->
+            raw = :ezstd.decompress(compressed)
+            :erlang.binary_to_term(raw)
+          end)
+          |> Enum.sort_by(&elem(&1, 0))
+
+        if all_points != [] do
+          {first_ts, _} = hd(all_points)
+          {last_ts, _} = List.last(all_points)
+          is_text = match?([{_, v} | _] when is_binary(v), all_points)
+
+          result =
+            if is_text do
+              case TimelessMetrics.TextCodec.compress(all_points) do
+                {:ok, blob} -> {:ok, <<0xFE, blob::binary>>}
+                error -> error
+              end
+            else
+              case ExAlp.compress(all_points,
+                     compression: :zstd,
+                     compression_level: state.compression_level
+                   ) do
+                {:ok, blob} -> {:ok, <<0xA1, blob::binary>>}
+                error -> error
+              end
+            end
+
+          case result do
+            {:ok, alp_blob} ->
+              point_count = length(all_points)
+
+              :telemetry.execute(
+                [:timeless_metrics, :segment, :promote],
+                %{point_count: point_count, compressed_bytes: byte_size(alp_blob)},
+                %{series_id: series_id, stage: :alp}
+              )
+
+              # Delete old fast entries from cache
+              Enum.each(entries, fn {key, _, _, _, _, _} -> :ets.delete(cache, key) end)
+
+              # Write new ALP entry to cache
+              :ets.insert(cache, {{series_id, first_ts}, {last_ts, point_count, alp_blob}})
+
+              # Update disk storage
+              if state.shard_store do
+                TimelessMetrics.ShardStore.write_wal(state.shard_store, [
+                  {series_id, first_ts, last_ts, point_count, alp_blob}
+                ])
+              end
+
+            {:error, reason} ->
+              require Logger
+              Logger.warning("Failed to promote series #{series_id} to ALP: #{inspect(reason)}")
+          end
+        end
+      end)
+    end
+  end
+
+  # Stage 3 (existing): ALP compression for write_and_seal and explicit flush
   defp compress_segments(segments, state) do
     segments
     |> Enum.reject(fn seg -> seg.points == [] end)
