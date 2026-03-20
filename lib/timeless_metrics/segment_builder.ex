@@ -572,17 +572,18 @@ defmodule TimelessMetrics.SegmentBuilder do
     # Scan cache for fast-compressed entries (tag 0xFA) in completed windows
     fast_entries =
       :ets.foldl(
-        fn {{sid, start} = key, {end_time, count, <<@fast_marker, _::binary>> = blob}}, acc ->
-          bucket = segment_bucket(start, state.segment_duration)
+        fn
+          {{sid, start} = key, {end_time, count, <<@fast_marker, _::binary>> = blob}}, acc ->
+            bucket = segment_bucket(start, state.segment_duration)
 
-          if bucket < current_bucket do
-            [{key, sid, start, end_time, count, blob} | acc]
-          else
+            if bucket < current_bucket do
+              [{key, sid, start, end_time, count, blob} | acc]
+            else
+              acc
+            end
+
+          {{_sid, _start}, _val}, acc ->
             acc
-          end
-
-        {{_sid, _start}, _val}, acc ->
-          acc
         end,
         [],
         cache
@@ -598,7 +599,8 @@ defmodule TimelessMetrics.SegmentBuilder do
         # Decompress all fast segments for this series and combine points
         all_points =
           entries
-          |> Enum.flat_map(fn {_key, _sid, _start, _end, _count, <<@fast_marker, compressed::binary>>} ->
+          |> Enum.flat_map(fn {_key, _sid, _start, _end, _count,
+                               <<@fast_marker, compressed::binary>>} ->
             raw = :ezstd.decompress(compressed)
             :erlang.binary_to_term(raw)
           end)
