@@ -53,6 +53,9 @@ defmodule TimelessMetrics.ShardStore do
   @index_entry_size 40
   # 8+8+8+4+4
   @entry_header_size 32
+  @text_marker 0xFE
+  @alp_marker 0xA1
+  @fast_marker 0xFA
 
   # ========================================================================
   # Raw Segment API
@@ -201,6 +204,16 @@ defmodule TimelessMetrics.ShardStore do
 
         {:ok, [[blob]]}
     end
+  end
+
+  @doc """
+  Merge two raw cache/WAL entries that share the same `{series_id, start_time}` key.
+
+  Returns a single `{series_id, start_time, end_time, count, blob}` tuple with
+  merged points, reusing the same logic as WAL/segment result merging.
+  """
+  def merge_cache_entries(left, right) do
+    merge_entry_group([left, right])
   end
 
   @doc "Delete raw .seg files and WAL entries before cutoff."
@@ -1051,19 +1064,145 @@ defmodule TimelessMetrics.ShardStore do
   end
 
   defp merge_entries(existing, new) do
-    new_keys = MapSet.new(new, fn {sid, start, _, _, _} -> {sid, start} end)
-
-    filtered =
-      Enum.reject(existing, fn {sid, start, _, _, _} ->
-        MapSet.member?(new_keys, {sid, start})
-      end)
-
-    filtered ++ new
+    (existing ++ new)
+    |> Enum.group_by(fn {sid, start, _, _, _} -> {sid, start} end)
+    |> Enum.map(fn {_key, entries} -> merge_entry_group(entries) end)
+    |> Enum.sort_by(fn {sid, start, _end_t, _count, _blob} -> {sid, start} end)
   end
 
   defp merge_read_results(seg_entries, wal_entries) do
     merge_entries(seg_entries, wal_entries)
   end
+
+  defp merge_entry_group([entry]), do: entry
+
+  defp merge_entry_group(entries) do
+    decoded_entries =
+      Enum.map(entries, fn {sid, start, end_t, count, blob} = entry ->
+        case decode_points(blob) do
+          {:ok, points} ->
+            %{
+              entry: entry,
+              sid: sid,
+              start: start,
+              end_t: end_t,
+              count: count,
+              blob: blob,
+              points: points
+            }
+
+          {:error, _reason} ->
+            %{
+              entry: entry,
+              sid: sid,
+              start: start,
+              end_t: end_t,
+              count: count,
+              blob: blob,
+              points: nil
+            }
+        end
+      end)
+
+    case subsuming_entry(decoded_entries) do
+      %{entry: entry} ->
+        entry
+
+      nil ->
+        {sid, start, _end_t, _count, first_blob} = hd(entries)
+
+        points =
+          decoded_entries
+          |> Enum.flat_map(fn
+            %{points: points} when is_list(points) -> points
+            _ -> []
+          end)
+          |> Enum.sort_by(&elem(&1, 0))
+
+        case encode_points(points, first_blob) do
+          {:ok, blob} ->
+            {last_ts, _last_val} = List.last(points)
+            {sid, start, last_ts, length(points), blob}
+
+          {:error, _reason} ->
+            Enum.max_by(entries, fn {_sid, _start, end_t, count, _blob} -> {end_t, count} end)
+        end
+    end
+  end
+
+  defp subsuming_entry(decoded_entries) do
+    decoded_entries
+    |> Enum.filter(&(is_list(&1.points) and &1.points != []))
+    |> Enum.sort_by(
+      fn %{points: points, end_t: end_t, count: count} ->
+        {length(points), end_t, count}
+      end,
+      :desc
+    )
+    |> Enum.find(fn candidate ->
+      Enum.all?(decoded_entries, fn
+        %{points: nil} ->
+          false
+
+        %{points: points} ->
+          multiset_subsumes?(candidate.points, points)
+      end)
+    end)
+  end
+
+  defp multiset_subsumes?(left, right) do
+    left_counts = point_counts(left)
+    right_counts = point_counts(right)
+
+    Enum.all?(right_counts, fn {point, count} ->
+      Map.get(left_counts, point, 0) >= count
+    end)
+  end
+
+  defp point_counts(points) do
+    Enum.reduce(points, %{}, fn point, acc ->
+      Map.update(acc, point, 1, &(&1 + 1))
+    end)
+  end
+
+  defp decode_points(<<@fast_marker, compressed::binary>>) do
+    {:ok, :erlang.binary_to_term(:ezstd.decompress(compressed))}
+  rescue
+    _ -> {:error, :decode_failed}
+  end
+
+  defp decode_points(<<@text_marker, text_blob::binary>>) do
+    TimelessMetrics.TextCodec.decompress(text_blob)
+  end
+
+  defp decode_points(<<@alp_marker, alp_blob::binary>>) do
+    ExAlp.decompress(alp_blob, compression: :zstd)
+  end
+
+  defp decode_points(_blob), do: {:error, :unsupported_blob}
+
+  defp encode_points(points, <<@fast_marker, _::binary>>) do
+    raw = :erlang.term_to_binary(points)
+    {:ok, <<@fast_marker, :ezstd.compress(raw, 1)::binary>>}
+  rescue
+    _ -> {:error, :encode_failed}
+  end
+
+  defp encode_points(points, <<@text_marker, _::binary>>) do
+    case TimelessMetrics.TextCodec.compress(points) do
+      {:ok, blob} -> {:ok, <<@text_marker, blob::binary>>}
+      error -> error
+    end
+  end
+
+  defp encode_points(points, <<@alp_marker, _::binary>>) do
+    case ExAlp.compress(points, compression: :zstd, compression_level: 9) do
+      {:ok, blob} -> {:ok, <<@alp_marker, blob::binary>>}
+      error -> error
+    end
+  end
+
+  defp encode_points(_points, _blob), do: {:error, :unsupported_blob}
 
   defp window_for(timestamp, duration) do
     div(timestamp, duration) * duration

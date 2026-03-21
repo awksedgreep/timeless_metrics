@@ -109,18 +109,79 @@ defmodule TimelessMetrics.Chart do
     |> Enum.with_index()
     |> Enum.map(fn {%{data: data}, idx} ->
       color = Enum.at(@colors, rem(idx, length(@colors)))
+      data = Enum.sort_by(data, &elem(&1, 0))
 
-      points =
-        data
-        |> Enum.sort_by(&elem(&1, 0))
-        |> Enum.map(fn {ts, val} ->
-          "#{Float.round(scale_x.(ts), 1)},#{Float.round(scale_y.(val), 1)}"
-        end)
-        |> Enum.join(" ")
+      data
+      |> split_series_segments()
+      |> Enum.map_join("\n    ", fn segment ->
+        case segment do
+          [{ts, val}] ->
+            x = Float.round(scale_x.(ts), 1)
+            y = Float.round(scale_y.(val), 1)
+            ~s(<circle cx="#{x}" cy="#{y}" r="2.5" fill="#{color}"/>)
 
-      ~s(<polyline points="#{points}" fill="none" stroke="#{color}" stroke-width="1.5" stroke-linejoin="round"/>)
+          points ->
+            points =
+              Enum.map_join(points, " ", fn {ts, val} ->
+                "#{Float.round(scale_x.(ts), 1)},#{Float.round(scale_y.(val), 1)}"
+              end)
+
+            ~s(<polyline points="#{points}" fill="none" stroke="#{color}" stroke-width="1.5" stroke-linejoin="round"/>)
+        end
+      end)
     end)
     |> Enum.join("\n    ")
+  end
+
+  defp split_series_segments(data) do
+    case infer_gap_threshold(data) do
+      nil ->
+        [data]
+
+      gap_threshold ->
+        {segments, current} =
+          Enum.reduce(data, {[], []}, fn {ts, _val} = point, {segments, current} ->
+            case current do
+              [] ->
+                {segments, [point]}
+
+              [{prev_ts, _} | _] = current ->
+                if ts - prev_ts > gap_threshold do
+                  {[Enum.reverse(current) | segments], [point]}
+                else
+                  {segments, [point | current]}
+                end
+            end
+          end)
+
+        segments =
+          if current == [] do
+            segments
+          else
+            [Enum.reverse(current) | segments]
+          end
+
+        Enum.reverse(segments)
+    end
+  end
+
+  defp infer_gap_threshold(data) do
+    diffs =
+      data
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.map(fn [{prev_ts, _}, {next_ts, _}] -> next_ts - prev_ts end)
+      |> Enum.filter(&(&1 > 0))
+      |> Enum.sort()
+
+    case diffs do
+      [] ->
+        nil
+
+      _ ->
+        # Use the typical observed spacing and allow some jitter before breaking the line.
+        typical = Enum.at(diffs, div(length(diffs), 2))
+        max(trunc(typical * 2.5), typical + 1)
+    end
   end
 
   # --- Grid and axes ---
@@ -352,19 +413,20 @@ defmodule TimelessMetrics.Chart do
   end
 
   defp format_timestamp(ts, span) do
-    dt = DateTime.from_unix!(ts)
+    {{year, month, day}, {hour, minute, _second}} =
+      :calendar.system_time_to_local_time(ts, :second)
 
     cond do
       span <= 86400 ->
-        "#{pad(dt.hour)}:#{pad(dt.minute)}"
+        "#{pad(hour)}:#{pad(minute)}"
 
       span <= 604_800 ->
-        day = Date.day_of_week(Date.new!(dt.year, dt.month, dt.day))
-        name = Enum.at(~w(Mon Tue Wed Thu Fri Sat Sun), day - 1)
-        "#{name} #{pad(dt.hour)}:#{pad(dt.minute)}"
+        weekday = Date.day_of_week(Date.new!(year, month, day))
+        name = Enum.at(~w(Mon Tue Wed Thu Fri Sat Sun), weekday - 1)
+        "#{name} #{pad(hour)}:#{pad(minute)}"
 
       true ->
-        "#{dt.month}/#{dt.day}"
+        "#{month}/#{day}"
     end
   end
 

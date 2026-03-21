@@ -78,7 +78,7 @@ defmodule TimelessMetrics.SegmentBuilder do
 
     # Also check entries that started before `from` but extend into the range
     pre_results =
-      case :ets.prev(cache, start_key) do
+      case exact_or_prev_key(cache, start_key) do
         {^series_id, start} = key ->
           case :ets.lookup(cache, key) do
             [{_, {end_time, _count, blob}}] when end_time >= from ->
@@ -93,6 +93,13 @@ defmodule TimelessMetrics.SegmentBuilder do
       end
 
     {:ok, pre_results ++ results}
+  end
+
+  defp exact_or_prev_key(cache, start_key) do
+    case :ets.lookup(cache, start_key) do
+      [{^start_key, _value}] -> start_key
+      [] -> :ets.prev(cache, start_key)
+    end
   end
 
   defp collect_cache_range(_cache, :"$end_of_table", _sid, _to, acc), do: Enum.reverse(acc)
@@ -751,12 +758,24 @@ defmodule TimelessMetrics.SegmentBuilder do
   end
 
   defp write_to_cache(compressed_entries, cache) do
-    rows =
-      Enum.map(compressed_entries, fn {sid, start, end_time, count, blob} ->
-        {{sid, start}, {end_time, count, blob}}
-      end)
+    Enum.each(compressed_entries, fn {sid, start, _end_time, _count, _blob} = entry ->
+      key = {sid, start}
 
-    :ets.insert(cache, rows)
+      merged_entry =
+        case :ets.lookup(cache, key) do
+          [{^key, {existing_end, existing_count, existing_blob}}] ->
+            TimelessMetrics.ShardStore.merge_cache_entries(
+              {sid, start, existing_end, existing_count, existing_blob},
+              entry
+            )
+
+          [] ->
+            entry
+        end
+
+      {_sid, _start, merged_end, merged_count, merged_blob} = merged_entry
+      :ets.insert(cache, {key, {merged_end, merged_count, merged_blob}})
+    end)
   end
 
   # Load existing .seg + WAL data into ETS cache on startup (server mode)

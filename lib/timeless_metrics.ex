@@ -436,6 +436,7 @@ defmodule TimelessMetrics do
 
   @doc "Force flush all buffered data to disk."
   def flush(store) do
+    TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     shard_count = buffer_shard_count(store)
 
     # Flush buffers → SegmentBuilder (sync)
@@ -526,8 +527,13 @@ defmodule TimelessMetrics do
   def info(store) do
     stats = TimelessMetrics.Stats.snapshot(store)
     registry = :"#{store}_registry"
-    series_count = TimelessMetrics.SeriesRegistry.count(registry)
+    series_count = series_count(store, registry)
     data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir}, nil)
+    shard_stats = shard_stats(store)
+    persisted_points = shard_stats.total_points
+    points_ingested = max(stats.points_ingested, persisted_points)
+    buffer_points = max(stats.points_ingested - persisted_points, 0)
+    daily_rollup_rows = daily_rollup_rows(store)
 
     storage_bytes =
       case data_dir && File.ls(data_dir) do
@@ -548,18 +554,17 @@ defmodule TimelessMetrics do
 
     %{
       series_count: series_count,
-      total_points: stats.points_ingested,
-      raw_buffer_points: stats.points_ingested - stats.points_merged,
+      total_points: points_ingested,
+      raw_buffer_points: buffer_points,
       storage_bytes: storage_bytes,
-      points_ingested: stats.points_ingested,
+      points_ingested: points_ingested,
       queries: stats.queries,
-      buffer_points: stats.points_ingested - stats.points_merged,
+      buffer_points: buffer_points,
       db_path: if(data_dir, do: Path.join(data_dir, "metrics.db"), else: nil),
       block_count: 0,
-      bytes_per_point:
-        if(stats.points_ingested > 0, do: storage_bytes / stats.points_ingested, else: 0.0),
+      bytes_per_point: if(points_ingested > 0, do: storage_bytes / points_ingested, else: 0.0),
       compressed_bytes: storage_bytes,
-      daily_rollup_rows: 0
+      daily_rollup_rows: daily_rollup_rows
     }
   end
 
@@ -580,6 +585,69 @@ defmodule TimelessMetrics do
         0
     end
   end
+
+  defp shard_stats(store) do
+    0..(buffer_shard_count(store) - 1)
+    |> Enum.map(fn shard_idx ->
+      TimelessMetrics.SegmentBuilder.raw_stats(:"#{store}_builder_#{shard_idx}")
+    end)
+    |> Enum.reduce(
+      %{segment_count: 0, total_points: 0, raw_bytes: 0, oldest_ts: nil, newest_ts: nil},
+      fn stats, acc ->
+        %{
+          segment_count: acc.segment_count + stats.segment_count,
+          total_points: acc.total_points + stats.total_points,
+          raw_bytes: acc.raw_bytes + stats.raw_bytes,
+          oldest_ts: min_ts(acc.oldest_ts, stats.oldest_ts),
+          newest_ts: max_ts(acc.newest_ts, stats.newest_ts)
+        }
+      end
+    )
+  end
+
+  defp daily_rollup_rows(store) do
+    schema = get_schema(store)
+
+    case Enum.find(schema.tiers, &(&1.name == :daily)) do
+      nil ->
+        0
+
+      _daily_tier ->
+        0..(buffer_shard_count(store) - 1)
+        |> Enum.reduce(0, fn shard_idx, acc ->
+          {_chunks, bucket_count, _compressed_bytes} =
+            TimelessMetrics.SegmentBuilder.read_tier_stats(
+              :"#{store}_builder_#{shard_idx}",
+              :daily
+            )
+
+          acc + bucket_count
+        end)
+    end
+  end
+
+  defp series_count(store, registry) do
+    max(TimelessMetrics.SeriesRegistry.count(registry), persisted_series_count(store))
+  end
+
+  defp persisted_series_count(store) do
+    db = :"#{store}_db"
+
+    case TimelessMetrics.DB.read(db, "SELECT COUNT(*) FROM series") do
+      {:ok, [[count]]} -> count
+      _ -> 0
+    end
+  end
+
+  defp min_ts(nil, nil), do: nil
+  defp min_ts(nil, ts), do: ts
+  defp min_ts(ts, nil), do: ts
+  defp min_ts(left, right), do: min(left, right)
+
+  defp max_ts(nil, nil), do: nil
+  defp max_ts(nil, ts), do: ts
+  defp max_ts(ts, nil), do: ts
+  defp max_ts(left, right), do: max(left, right)
 
   @doc "Force a daily rollup run."
   def rollup(store) do
@@ -603,7 +671,15 @@ defmodule TimelessMetrics do
     db = :"#{store}_db"
 
     {:ok, rows} =
-      TimelessMetrics.DB.read(db, "SELECT DISTINCT metric_name FROM series ORDER BY metric_name")
+      TimelessMetrics.DB.read(
+        db,
+        """
+        SELECT metric_name
+        FROM series
+        GROUP BY metric_name
+        ORDER BY COUNT(*) DESC, metric_name ASC
+        """
+      )
 
     {:ok, Enum.map(rows, fn [name] -> name end)}
   end

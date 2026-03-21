@@ -5,6 +5,7 @@ defmodule TimelessMetricsTest do
 
   setup do
     start_supervised!({TimelessMetrics, name: :test_store, data_dir: @data_dir, engine: :actor})
+
     on_exit(fn -> File.rm_rf!(@data_dir) end)
     :ok
   end
@@ -183,5 +184,66 @@ defmodule TimelessMetricsTest do
       assert exp_ts == act_ts
       assert_in_delta exp_val, act_val, 0.001
     end)
+  end
+
+  test "live cache merges repeated drains within the same open segment" do
+    store = :cache_merge_store
+    data_dir = "/tmp/timeless_cache_merge_#{System.os_time(:microsecond)}"
+    now = System.os_time(:second)
+    segment_duration = 14_400
+    segment_start = div(now, segment_duration) * segment_duration
+    shard = :"#{store}_shard_0"
+    builder = :"#{store}_builder_0"
+
+    start_supervised!(
+      {TimelessMetrics,
+       name: store,
+       data_dir: data_dir,
+       engine: :actor,
+       buffer_shards: 1,
+       segment_duration: segment_duration}
+    )
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    TimelessMetrics.write(store, "cache_merge", %{"host" => "web-1"}, 10.0,
+      timestamp: segment_start + 10
+    )
+
+    TimelessMetrics.write(store, "cache_merge", %{"host" => "web-1"}, 20.0,
+      timestamp: segment_start + 20
+    )
+
+    GenServer.call(shard, :flush_sync, 5_000)
+    send(builder, :drain_buffer)
+    _ = :sys.get_state(builder)
+
+    {:ok, points_after_first_drain} =
+      TimelessMetrics.query(store, "cache_merge", %{"host" => "web-1"},
+        from: segment_start,
+        to: segment_start + 60
+      )
+
+    assert Enum.map(points_after_first_drain, &elem(&1, 1)) == [10.0, 20.0]
+
+    TimelessMetrics.write(store, "cache_merge", %{"host" => "web-1"}, 30.0,
+      timestamp: segment_start + 30
+    )
+
+    TimelessMetrics.write(store, "cache_merge", %{"host" => "web-1"}, 40.0,
+      timestamp: segment_start + 40
+    )
+
+    GenServer.call(shard, :flush_sync, 5_000)
+    send(builder, :drain_buffer)
+    _ = :sys.get_state(builder)
+
+    {:ok, points_after_second_drain} =
+      TimelessMetrics.query(store, "cache_merge", %{"host" => "web-1"},
+        from: segment_start,
+        to: segment_start + 60
+      )
+
+    assert Enum.map(points_after_second_drain, &elem(&1, 1)) == [10.0, 20.0, 30.0, 40.0]
   end
 end

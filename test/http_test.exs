@@ -375,7 +375,7 @@ defmodule TimelessMetrics.HTTPTest do
       TimelessMetrics.TestHTTP.get(@port, "/chart?metric=rel_chart&id=1&from=-1h&to=now")
 
     assert resp.status == 200
-    assert resp.body =~ "<polyline"
+    assert resp.body =~ "<polyline" or resp.body =~ "<circle"
   end
 
   test "GET /chart requires metric param" do

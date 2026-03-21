@@ -179,7 +179,21 @@ defmodule TimelessMetrics.Query do
 
         # Entire query range is covered by rollup data
         to <= watermark ->
-          aggregate_from_rollup_tier(store, tier, series_id, from, to, bucket_seconds, agg_fn)
+          case aggregate_from_rollup_tier(
+                 store,
+                 tier,
+                 series_id,
+                 from,
+                 to,
+                 bucket_seconds,
+                 agg_fn
+               ) do
+            {:ok, []} ->
+              aggregate_from_raw(store, series_id, opts, bucket_seconds, agg_fn)
+
+            result ->
+              result
+          end
 
         # Query spans the boundary — stitch rollup + raw
         true ->
@@ -194,24 +208,28 @@ defmodule TimelessMetrics.Query do
               agg_fn
             )
 
-          {:ok, raw_results} =
-            aggregate_from_raw(
-              store,
-              series_id,
-              [from: watermark, to: to],
-              bucket_seconds,
-              agg_fn
-            )
+          if rollup_results == [] do
+            aggregate_from_raw(store, series_id, opts, bucket_seconds, agg_fn)
+          else
+            {:ok, raw_results} =
+              aggregate_from_raw(
+                store,
+                series_id,
+                [from: watermark, to: to],
+                bucket_seconds,
+                agg_fn
+              )
 
-          # Merge: raw wins for any overlapping buckets (more precise)
-          raw_buckets = MapSet.new(raw_results, &elem(&1, 0))
+            # Merge: raw wins for any overlapping buckets (more precise)
+            raw_buckets = MapSet.new(raw_results, &elem(&1, 0))
 
-          merged =
-            (Enum.reject(rollup_results, fn {b, _} -> MapSet.member?(raw_buckets, b) end) ++
-               raw_results)
-            |> Enum.sort_by(&elem(&1, 0))
+            merged =
+              (Enum.reject(rollup_results, fn {b, _} -> MapSet.member?(raw_buckets, b) end) ++
+                 raw_results)
+              |> Enum.sort_by(&elem(&1, 0))
 
-          {:ok, merged}
+            {:ok, merged}
+          end
       end
     end
   end

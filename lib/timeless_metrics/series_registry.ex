@@ -180,7 +180,8 @@ defmodule TimelessMetrics.SeriesRegistry do
   @impl true
   def handle_call(:flush_pending, _from, state) do
     flush_pending_inserts(state)
-    {:reply, :ok, %{state | pending_inserts: []}}
+    publish_overflow(state)
+    {:reply, :ok, %{state | pending_inserts: [], dirty: false}}
   end
 
   def handle_call({:register, metric_name, labels, key}, _from, state) do
@@ -228,6 +229,13 @@ defmodule TimelessMetrics.SeriesRegistry do
     publish_overflow(state)
     schedule_publish()
     {:noreply, %{state | dirty: false, pending_inserts: []}}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    flush_pending_inserts(state)
+    publish_overflow(state)
+    :ok
   end
 
   # --- Internals ---
