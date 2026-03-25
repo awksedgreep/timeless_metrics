@@ -1,0 +1,13 @@
+[package]
+name = "tms_engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tms_engine"
+crate-type = ["cdylib"]
+
+[dependencies]
+pco = "1"
+rustler = "0.37"
+dashmap = "6"

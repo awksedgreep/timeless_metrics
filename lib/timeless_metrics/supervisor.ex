@@ -12,6 +12,39 @@ defmodule TimelessMetrics.Supervisor do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
+
+    if Keyword.get(opts, :engine) == :rust do
+      init_rust(opts)
+    else
+      init_legacy(opts)
+    end
+  end
+
+  defp init_rust(opts) do
+    name = Keyword.fetch!(opts, :name)
+    data_dir = Keyword.get(opts, :data_dir, "data")
+
+    # Minimal persistent_term setup for HTTP layer compatibility
+    :persistent_term.put({TimelessMetrics, name, :data_dir}, data_dir)
+    :persistent_term.put({TimelessMetrics, name, :engine}, :rust)
+    TimelessMetrics.Stats.init(name)
+
+    # Ingest queue for HTTP layer
+    ingest_queue = :"#{name}_ingest_queue"
+    if :ets.whereis(ingest_queue) == :undefined do
+      :ets.new(ingest_queue, [:named_table, :ordered_set, :public, write_concurrency: :auto])
+    end
+    :persistent_term.put({TimelessMetrics, name, :ingest_queue}, ingest_queue)
+
+    children = [
+      {TimelessMetrics.RustEngine, store: name, data_dir: data_dir}
+    ]
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  defp init_legacy(opts) do
+    name = Keyword.fetch!(opts, :name)
     memory_only = Keyword.get(opts, :mode) == :memory
     data_dir = if memory_only, do: nil, else: Keyword.fetch!(opts, :data_dir)
     shard_count = Keyword.get(opts, :buffer_shards, max(div(System.schedulers_online(), 2), 2))

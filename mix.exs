@@ -71,7 +71,8 @@ defmodule TimelessMetrics.MixProject do
       {:rocket, github: "awksedgreep/rocket"},
       {:req, "~> 0.5"},
       {:elixir_make, "~> 0.9", runtime: false},
-      {:cc_precompiler, "~> 0.1", runtime: false}
+      {:cc_precompiler, "~> 0.1", runtime: false},
+      {:rustler, "~> 0.35"}
     ]
   end
 end
