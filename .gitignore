@@ -31,3 +31,4 @@ timeless-*.tar
 .env
 .env.*
 /native/*/target/
+/priv/native/
