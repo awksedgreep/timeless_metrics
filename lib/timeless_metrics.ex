@@ -25,6 +25,10 @@ defmodule TimelessMetrics do
   # Batch sizes above this threshold use parallel resolution + shard writes
   @parallel_batch_threshold 1_000
 
+  defp rust_engine?(store) do
+    :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust
+  end
+
   @doc "Start a TimelessMetrics instance as part of a supervision tree."
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -50,13 +54,18 @@ defmodule TimelessMetrics do
   """
   def write(store, metric_name, labels, value, opts \\ []) do
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
-    registry = :"#{store}_registry"
-    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    shard_count = buffer_shard_count(store)
-    shard_idx = rem(abs(series_id), shard_count)
     TimelessMetrics.Stats.incr_writes(store)
     TimelessMetrics.Stats.add_points(store, 1)
-    TimelessMetrics.Buffer.write(:"#{store}_shard_#{shard_idx}", series_id, timestamp, value)
+
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.write(store, metric_name, labels, value, timestamp)
+    else
+      registry = :"#{store}_registry"
+      series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+      shard_count = buffer_shard_count(store)
+      shard_idx = rem(abs(series_id), shard_count)
+      TimelessMetrics.Buffer.write(:"#{store}_shard_#{shard_idx}", series_id, timestamp, value)
+    end
   end
 
   @doc """
@@ -66,10 +75,19 @@ defmodule TimelessMetrics do
   `{metric_name, labels, value, timestamp}`.
   """
   def write_batch(store, entries) do
-    registry = :"#{store}_registry"
-    shard_count = buffer_shard_count(store)
     TimelessMetrics.Stats.incr_writes(store)
     TimelessMetrics.Stats.add_points(store, length(entries))
+
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.write_batch(store, entries)
+    else
+      write_batch_legacy(store, entries)
+    end
+  end
+
+  defp write_batch_legacy(store, entries) do
+    registry = :"#{store}_registry"
+    shard_count = buffer_shard_count(store)
 
     if length(entries) >= @parallel_batch_threshold do
       chunk_size = max(div(length(entries), System.schedulers_online()), 1)
@@ -138,10 +156,15 @@ defmodule TimelessMetrics do
   Returns `{:ok, [{timestamp, value}, ...]}`.
   """
   def query(store, metric_name, labels, opts \\ []) do
-    registry = :"#{store}_registry"
-    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
     TimelessMetrics.Stats.incr_queries(store)
-    TimelessMetrics.Query.raw(store, series_id, opts)
+
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.query_raw(store, metric_name, labels, opts)
+    else
+      registry = :"#{store}_registry"
+      series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+      TimelessMetrics.Query.raw(store, series_id, opts)
+    end
   end
 
   @doc """
@@ -151,6 +174,15 @@ defmodule TimelessMetrics do
   """
   def query_multi(store, metric_name, label_filter \\ %{}, opts \\ []) do
     TimelessMetrics.Stats.incr_queries(store)
+
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.query_multi(store, metric_name, label_filter, opts)
+    else
+      query_multi_legacy(store, metric_name, label_filter, opts)
+    end
+  end
+
+  defp query_multi_legacy(store, metric_name, label_filter, opts) do
     matching = find_matching_series(store, metric_name, label_filter)
 
     results =
@@ -196,6 +228,15 @@ defmodule TimelessMetrics do
   """
   def query_aggregate_multi(store, metric_name, label_filter \\ %{}, opts) do
     TimelessMetrics.Stats.incr_queries(store)
+
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.query_aggregate_multi(store, metric_name, label_filter, opts)
+    else
+      query_aggregate_multi_legacy(store, metric_name, label_filter, opts)
+    end
+  end
+
+  defp query_aggregate_multi_legacy(store, metric_name, label_filter, opts) do
     schema = get_schema(store)
     transform = Keyword.get(opts, :transform)
     matching = find_matching_series(store, metric_name, label_filter)
@@ -436,6 +477,14 @@ defmodule TimelessMetrics do
 
   @doc "Force flush all buffered data to disk."
   def flush(store) do
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.flush(store)
+    else
+      flush_legacy(store)
+    end
+  end
+
+  defp flush_legacy(store) do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     shard_count = buffer_shard_count(store)
 
@@ -525,6 +574,14 @@ defmodule TimelessMetrics do
 
   @doc "Get store info and statistics."
   def info(store) do
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.info(store)
+    else
+      info_legacy(store)
+    end
+  end
+
+  defp info_legacy(store) do
     stats = TimelessMetrics.Stats.snapshot(store)
     registry = :"#{store}_registry"
     series_count = series_count(store, registry)
@@ -667,6 +724,14 @@ defmodule TimelessMetrics do
   Returns `{:ok, ["cpu_usage", "mem_usage", ...]}`.
   """
   def list_metrics(store) do
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.list_metrics(store)
+    else
+      list_metrics_legacy(store)
+    end
+  end
+
+  defp list_metrics_legacy(store) do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
 
@@ -690,6 +755,14 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{labels: %{"host" => "web-1"}, ...}, ...]}`.
   """
   def list_series(store, metric_name) do
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.list_series(store, metric_name)
+    else
+      list_series_legacy(store, metric_name)
+    end
+  end
+
+  defp list_series_legacy(store, metric_name) do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
 
@@ -709,6 +782,14 @@ defmodule TimelessMetrics do
   Returns `{:ok, ["web-1", "web-2", ...]}`.
   """
   def label_values(store, metric_name, label_key) do
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.label_values(store, metric_name, label_key)
+    else
+      label_values_legacy(store, metric_name, label_key)
+    end
+  end
+
+  defp label_values_legacy(store, metric_name, label_key) do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
 
