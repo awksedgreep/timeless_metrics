@@ -332,7 +332,9 @@ systemctl --user start timeless
 ```
 Writes ──> SeriesRegistry (persistent_term + ETS) ──> Buffer shards (lock-free ETS)
                                                               │
-                                                    SegmentBuilder (gorilla + zstd)
+                                                    SegmentBuilder (fast zstd now, ALP/RLE on seal)
+                                                              │
+                                              ETS cache + current.wal (queryable immediately)
                                                               │
                                                     ShardStore (.seg files per shard)
                                                               │
@@ -343,7 +345,7 @@ Main DB (SQLite): series registry, metadata, annotations, alerts
 
 - **Sharded ETS buffers** — N lock-free write shards with `write_concurrency: :auto`
 - **Lock-free series creation** — `:atomics` counter + `:ets.insert_new` CAS, no GenServer
-- **SegmentBuilder** — per-shard compression workers (gorilla + zstd), async Task offload
+- **SegmentBuilder** — per-shard compression workers with staged compression: fast zstd for in-progress windows, ALP/RLE for sealed windows
 - **Rollup engine** — periodic tier aggregation with watermark tracking
 - **Retention enforcer** — periodic cleanup of expired segments and tier data
 - **SQLite** — WAL mode, mmap, used only for series registry + metadata (not raw data)

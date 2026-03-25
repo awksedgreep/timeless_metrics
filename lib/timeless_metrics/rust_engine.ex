@@ -54,9 +54,14 @@ defmodule TimelessMetrics.RustEngine do
     {:ok, results} = Nif.engine_query_range(ref(store), metric_name, labels, from, to)
 
     case results do
-      [{_labels, points}] -> {:ok, points}
-      [] -> {:ok, []}
-      multiple -> {:ok, Enum.flat_map(multiple, fn {_, pts} -> pts end) |> Enum.sort_by(&elem(&1, 0))}
+      [{_labels, points}] ->
+        {:ok, points}
+
+      [] ->
+        {:ok, []}
+
+      multiple ->
+        {:ok, Enum.flat_map(multiple, fn {_, pts} -> pts end) |> Enum.sort_by(&elem(&1, 0))}
     end
   end
 
@@ -85,6 +90,7 @@ defmodule TimelessMetrics.RustEngine do
     if bucket_seconds == nil do
       # No bucketing — return scalar aggregate
       {:ok, results} = Nif.engine_query_aggregate(ref(store), metric_name, labels, from, to, agg)
+
       case results do
         [{_labels, val}] -> {:ok, [{from, val}]}
         [] -> {:ok, []}
@@ -95,11 +101,17 @@ defmodule TimelessMetrics.RustEngine do
       # (the Rust engine doesn't have bucketed aggregation built in yet)
       {:ok, results} = Nif.engine_query_range(ref(store), metric_name, labels, from, to)
 
-      points = case results do
-        [{_labels, pts}] -> pts
-        [] -> []
-        multiple -> Enum.flat_map(multiple, fn {_, pts} -> pts end) |> Enum.sort_by(&elem(&1, 0))
-      end
+      points =
+        case results do
+          [{_labels, pts}] ->
+            pts
+
+          [] ->
+            []
+
+          multiple ->
+            Enum.flat_map(multiple, fn {_, pts} -> pts end) |> Enum.sort_by(&elem(&1, 0))
+        end
 
       bucketed = bucket_points(points, from, to, bucket_seconds, agg)
       {:ok, bucketed}
@@ -119,11 +131,13 @@ defmodule TimelessMetrics.RustEngine do
     formatted =
       results
       |> Enum.map(fn {labels, points} ->
-        data = if bucket_seconds do
-          bucket_points(points, from, to, bucket_seconds, agg)
-        else
-          points
-        end
+        data =
+          if bucket_seconds do
+            bucket_points(points, from, to, bucket_seconds, agg)
+          else
+            points
+          end
+
         %{labels: labels, data: data}
       end)
       |> Enum.reject(fn %{data: d} -> d == [] end)
@@ -138,6 +152,7 @@ defmodule TimelessMetrics.RustEngine do
     case results do
       [{_labels, points}] when points != [] ->
         {:ok, List.last(points)}
+
       _ ->
         {:ok, nil}
     end
@@ -198,7 +213,15 @@ defmodule TimelessMetrics.RustEngine do
     engine_dir = Path.join(data_dir, "rust_engine")
     File.mkdir_p!(engine_dir)
 
-    engine = Nif.engine_new(engine_dir, @flush_threshold, @min_flush_size, @compression_level, @memory_budget_mb)
+    engine =
+      Nif.engine_new(
+        engine_dir,
+        @flush_threshold,
+        @min_flush_size,
+        @compression_level,
+        @memory_budget_mb
+      )
+
     :persistent_term.put({__MODULE__, store}, engine)
 
     Process.flag(:trap_exit, true)
@@ -243,13 +266,16 @@ defmodule TimelessMetrics.RustEngine do
   defp bucket_to_seconds(_), do: 60
 
   defp bucket_points([], _from, _to, _step, _agg), do: []
+
   defp bucket_points(points, from, to, step, agg) do
     buckets = Stream.iterate(from, &(&1 + step)) |> Enum.take_while(&(&1 < to))
     point_map = Enum.group_by(points, fn {ts, _} -> from + div(ts - from, step) * step end)
 
     Enum.flat_map(buckets, fn b ->
       case Map.get(point_map, b) do
-        nil -> []
+        nil ->
+          []
+
         pts ->
           vals = Enum.map(pts, &elem(&1, 1))
           [{b, aggregate_values(vals, agg)}]
@@ -267,6 +293,7 @@ defmodule TimelessMetrics.RustEngine do
   defp aggregate_values(vals, _), do: Enum.sum(vals) / length(vals)
 
   defp filter_series(series, filter) when map_size(filter) == 0, do: series
+
   defp filter_series(series, filter) do
     Enum.filter(series, fn labels ->
       Enum.all?(filter, fn {k, v} -> Map.get(labels, k) == v end)

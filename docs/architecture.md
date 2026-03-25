@@ -129,13 +129,11 @@ shard_N/
     index.ets
 ```
 
-Each segment file contains gorilla-compressed data for multiple series within a time window (default: 4 hours). The compression pipeline:
+Each segment window goes through two compression stages.
 
-1. **Gorilla encoding**: timestamps use delta-of-delta; values use XOR encoding (Facebook's Gorilla paper)
-2. **Zstd compression**: the gorilla-encoded binary is further compressed with zstd
-3. **Optional dictionary compression**: trained zstd dictionaries for additional gains on small segments
-
-Text series use an RLE + zstd codec instead of gorilla encoding, identified by a `0xFE` byte prefix.
+1. **Fast in-progress compression**: every ~10 seconds, open segments are serialized with `term_to_binary` and wrapped with zstd (`0xFA` marker). These blobs are written to the live ETS cache and `current.wal`, making fresh data queryable almost immediately.
+2. **Final window compression**: when a window is explicitly flushed or completed, numeric data is recompressed with ALP + zstd (`0xA1`) and text data with RLE + zstd (`0xFE`). Completed windows are then sealed into immutable `.seg` files.
+3. **Legacy compatibility**: older Gorilla-based blobs are still readable and may remain on disk until rewritten.
 
 Measured compression: **0.7 bytes per point** on production-like workloads (739 MB for 1.13 billion points).
 
@@ -143,8 +141,8 @@ Measured compression: **0.7 bytes per point** on production-like workloads (739 
 
 The SegmentBuilder accumulates points in memory. Periodically:
 
-- **flush_pending** (every 60s): compresses only dirty segments (those with new data since last flush) and writes to WAL, making data queryable
-- **check_segments** (every 10s): seals completed time windows into immutable `.seg` files
+- **drain_buffer** (every 10s): flushes the paired Buffer shard, fast-compresses open segments, and writes merged in-progress blobs to the live ETS cache + `current.wal`
+- **promote_segments** (on completed windows / explicit flush): recompresses completed windows into their final codec (ALP for numeric, RLE for text) and seals them into immutable `.seg` files
 
 Compression is offloaded to Tasks to avoid blocking the SegmentBuilder's ingest path.
 

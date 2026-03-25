@@ -31,9 +31,11 @@ defmodule TimelessMetrics.Supervisor do
 
     # Ingest queue for HTTP layer
     ingest_queue = :"#{name}_ingest_queue"
+
     if :ets.whereis(ingest_queue) == :undefined do
       :ets.new(ingest_queue, [:named_table, :ordered_set, :public, write_concurrency: :auto])
     end
+
     :persistent_term.put({TimelessMetrics, name, :ingest_queue}, ingest_queue)
 
     children = [
