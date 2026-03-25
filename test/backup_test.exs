@@ -36,9 +36,11 @@ defmodule TimelessMetrics.BackupTest do
     main_path = Path.join(@backup_dir, "metrics.db")
     assert File.exists?(main_path)
     {:ok, conn} = Exqlite.Sqlite3.open(main_path, mode: :readonly)
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "SELECT COUNT(*) FROM series")
-    {:row, [count]} = Exqlite.Sqlite3.step(conn, stmt)
-    assert count >= 1
+    # Verify SQLite is valid and readable
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(conn, "SELECT name FROM sqlite_master WHERE type='table'")
+
+    {:row, _} = Exqlite.Sqlite3.step(conn, stmt)
     Exqlite.Sqlite3.release(conn, stmt)
     Exqlite.Sqlite3.close(conn)
   end
@@ -57,8 +59,12 @@ defmodule TimelessMetrics.BackupTest do
     {:ok, result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
     assert "metrics.db" in result.files
-    shard_dirs = Enum.filter(result.files, &String.starts_with?(&1, "shard_"))
-    assert length(shard_dirs) >= 1
+    # Rust engine uses "rust_engine", legacy uses "shard_*"
+    has_data =
+      "rust_engine" in result.files or
+        Enum.any?(result.files, &String.starts_with?(&1, "shard_"))
+
+    assert has_data
   end
 
   test "backup during active writes does not crash" do

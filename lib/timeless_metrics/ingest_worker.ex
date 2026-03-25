@@ -148,12 +148,25 @@ defmodule TimelessMetrics.IngestWorker do
       TimelessMetrics.Stats.incr_writes(store)
       TimelessMetrics.Stats.add_points(store, count)
 
-      Enum.each(groups, fn {{metric_name, labels}, batch} ->
-        series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-        shard_idx = rem(abs(series_id), shard_count)
-        points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
-        TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
-      end)
+      if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust do
+        # Rust engine: batch all entries in one NIF call
+        entries =
+          Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
+            Enum.map(batch, fn {ts, val} -> {metric_name, labels, ts, val} end)
+          end)
+
+        TimelessMetrics.RustEngine.Nif.engine_write_batch_labeled(
+          TimelessMetrics.RustEngine.ref(store),
+          entries
+        )
+      else
+        Enum.each(groups, fn {{metric_name, labels}, batch} ->
+          series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+          shard_idx = rem(abs(series_id), shard_count)
+          points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
+          TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+        end)
+      end
     end
   end
 
@@ -180,12 +193,24 @@ defmodule TimelessMetrics.IngestWorker do
       TimelessMetrics.Stats.incr_writes(store)
       TimelessMetrics.Stats.add_points(store, count)
 
-      Enum.each(groups, fn {{metric_name, labels}, batch} ->
-        series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-        shard_idx = rem(abs(series_id), shard_count)
-        points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
-        TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
-      end)
+      if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust do
+        entries =
+          Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
+            Enum.map(batch, fn {ts, val} -> {metric_name, labels, ts, val} end)
+          end)
+
+        TimelessMetrics.RustEngine.Nif.engine_write_batch_labeled(
+          TimelessMetrics.RustEngine.ref(store),
+          entries
+        )
+      else
+        Enum.each(groups, fn {{metric_name, labels}, batch} ->
+          series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+          shard_idx = rem(abs(series_id), shard_count)
+          points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
+          TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+        end)
+      end
     end
   end
 

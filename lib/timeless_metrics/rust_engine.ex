@@ -172,8 +172,6 @@ defmodule TimelessMetrics.RustEngine do
   end
 
   def find_series(store, metric_name, label_filter) do
-    {:ok, results} = Nif.engine_query_range(ref(store), metric_name, label_filter, 0, 0)
-    # Just need the labels, not the points
     {:ok, series} = Nif.engine_list_series(ref(store), metric_name)
     filter_series(series, label_filter)
   end

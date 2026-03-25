@@ -11,22 +11,43 @@ defmodule TimelessMetrics.Supervisor do
 
   @impl true
   def init(opts) do
-    name = Keyword.fetch!(opts, :name)
+    engine = Keyword.get(opts, :engine, :rust)
 
-    if Keyword.get(opts, :engine) == :rust do
-      init_rust(opts)
-    else
+    if engine in [:legacy, :actor, :sharded] do
       init_legacy(opts)
+    else
+      init_rust(opts)
     end
   end
 
   defp init_rust(opts) do
     name = Keyword.fetch!(opts, :name)
     data_dir = Keyword.get(opts, :data_dir, "data")
+    memory_only = Keyword.get(opts, :mode) == :memory
 
-    # Minimal persistent_term setup for HTTP layer compatibility
+    schema =
+      case Keyword.get(opts, :schema) do
+        nil -> TimelessMetrics.Schema.default()
+        mod when is_atom(mod) -> mod.__schema__()
+        %TimelessMetrics.Schema{} = s -> s
+      end
+
+    # Same persistent_term setup as legacy — HTTP, stats, retention all need these
+    :persistent_term.put({TimelessMetrics, name, :schema}, schema)
     :persistent_term.put({TimelessMetrics, name, :data_dir}, data_dir)
     :persistent_term.put({TimelessMetrics, name, :engine}, :rust)
+    :persistent_term.put({TimelessMetrics, name, :shard_count}, 1)
+
+    :persistent_term.put(
+      {TimelessMetrics, name, :raw_retention_seconds},
+      Keyword.get(opts, :raw_retention_seconds, 604_800)
+    )
+
+    :persistent_term.put(
+      {TimelessMetrics, name, :daily_retention_seconds},
+      Keyword.get(opts, :daily_retention_seconds, 31_536_000)
+    )
+
     TimelessMetrics.Stats.init(name)
 
     # Ingest queue for HTTP layer
@@ -38,9 +59,81 @@ defmodule TimelessMetrics.Supervisor do
 
     :persistent_term.put({TimelessMetrics, name, :ingest_queue}, ingest_queue)
 
-    children = [
-      {TimelessMetrics.RustEngine, store: name, data_dir: data_dir}
-    ]
+    db_name = :"#{name}_db"
+
+    # Ingest workers for HTTP import queueing
+    ingest_worker_count =
+      Keyword.get(opts, :ingest_workers, max(div(System.schedulers_online(), 4), 2))
+
+    ingest_workers =
+      for i <- 0..(ingest_worker_count - 1) do
+        %{
+          id: :"#{name}_ingest_worker_#{i}",
+          start:
+            {TimelessMetrics.IngestWorker, :start_link,
+             [
+               [
+                 name: :"#{name}_ingest_worker_#{i}",
+                 store: name,
+                 queue: ingest_queue,
+                 worker_id: i
+               ]
+             ]}
+        }
+      end
+
+    # Alert evaluator
+    alert_interval = Keyword.get(opts, :alert_interval, :timer.seconds(60))
+
+    alert_children =
+      if memory_only do
+        []
+      else
+        [
+          {TimelessMetrics.AlertEvaluator,
+           name: :"#{name}_alert_evaluator", store: name, interval: alert_interval}
+        ]
+      end
+
+    # Self monitor
+    self_monitor_children =
+      if Keyword.get(opts, :self_monitor, true) do
+        labels = Keyword.get(opts, :self_monitor_labels, %{})
+
+        [
+          {TimelessMetrics.SelfMonitor,
+           name: :"#{name}_self_monitor", store: name, labels: labels}
+        ]
+      else
+        []
+      end
+
+    # Scraper
+    scrape_sup_name = :"#{name}_scrape_sup"
+    scraper_name = :"#{name}_scraper"
+
+    scraper_children =
+      if Keyword.get(opts, :scraping, true) and not memory_only do
+        [
+          {DynamicSupervisor, name: scrape_sup_name, strategy: :one_for_one},
+          {TimelessMetrics.Scraper,
+           name: scraper_name, store: name, db: db_name, scrape_sup: scrape_sup_name}
+        ]
+      else
+        []
+      end
+
+    children =
+      [
+        # SQLite for admin (alerts, annotations, metadata, scrape targets, rollups)
+        {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
+        # Rust engine for hot data path
+        {TimelessMetrics.RustEngine, store: name, data_dir: data_dir}
+      ] ++
+        if(memory_only, do: [], else: ingest_workers) ++
+        alert_children ++
+        self_monitor_children ++
+        scraper_children
 
     Supervisor.init(children, strategy: :one_for_one)
   end

@@ -503,6 +503,44 @@ defmodule TimelessMetrics do
 
   @doc "Create a consistent online backup."
   def backup(store, target_dir) do
+    if rust_engine?(store) do
+      backup_rust(store, target_dir)
+    else
+      backup_legacy(store, target_dir)
+    end
+  end
+
+  defp backup_rust(store, target_dir) do
+    flush(store)
+    data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir})
+    db = :"#{store}_db"
+
+    File.mkdir_p!(target_dir)
+
+    # SQLite backup (admin data: alerts, annotations, scrape targets)
+    db_target = Path.join(target_dir, "metrics.db")
+    TimelessMetrics.DB.write(db, "VACUUM INTO ?1", [db_target])
+
+    # Copy Rust engine data
+    engine_src = Path.join(data_dir, "rust_engine")
+    engine_dst = Path.join(target_dir, "rust_engine")
+    engine_bytes = copy_dir(engine_src, engine_dst)
+
+    db_size =
+      case File.stat(db_target) do
+        {:ok, %{size: s}} -> s
+        _ -> 0
+      end
+
+    {:ok,
+     %{
+       path: target_dir,
+       files: ["metrics.db", "rust_engine"],
+       total_bytes: db_size + engine_bytes
+     }}
+  end
+
+  defp backup_legacy(store, target_dir) do
     # Flush pending series registrations to SQLite
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     # Flush all buffers and segment builders to disk
