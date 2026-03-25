@@ -30,3 +30,4 @@ timeless-*.tar
 # Environment files
 .env
 .env.*
+/native/*/target/
