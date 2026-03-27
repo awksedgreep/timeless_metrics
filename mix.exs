@@ -1,7 +1,7 @@
 defmodule TimelessMetrics.MixProject do
   use Mix.Project
 
-  @version "6.0.2"
+  @version "6.0.3"
 
   def project do
     [
