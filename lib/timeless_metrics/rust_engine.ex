@@ -216,17 +216,37 @@ defmodule TimelessMetrics.RustEngine do
       Nif.engine_info(ref(store))
       |> unwrap_nif_ok()
 
+    data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir}, nil)
+    total_points = trunc(raw["total_points"])
+    storage_bytes = trunc(raw["total_bytes"])
+    disk_points = trunc(raw["disk_points"])
+
     %{
       series_count: trunc(raw["series_count"]),
-      total_points: trunc(raw["total_points"]),
-      storage_bytes: trunc(raw["total_bytes"]),
+      disk_points: disk_points,
+      total_points: total_points,
+      points_ingested: total_points,
+      storage_bytes: storage_bytes,
+      compressed_bytes: storage_bytes,
       bytes_per_point: raw["bytes_per_point"],
       raw_buffer_points: trunc(raw["buffered_points"]),
+      buffer_points: trunc(raw["buffered_points"]),
       block_count: trunc(raw["chunk_count"]),
       process_count: 1,
       index_ets_bytes: 0,
+      buffer_memory_bytes: trunc(raw["buffer_memory_bytes"] || 0),
       daily_rollup_rows: 0,
-      db_path: nil
+      db_path: if(data_dir, do: Path.join(data_dir, "metrics.db"), else: nil),
+      oldest_timestamp:
+        case raw["oldest_timestamp"] do
+          nil -> nil
+          ts -> trunc(ts)
+        end,
+      newest_timestamp:
+        case raw["newest_timestamp"] do
+          nil -> nil
+          ts -> trunc(ts)
+        end
     }
   end
 

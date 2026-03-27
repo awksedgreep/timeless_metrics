@@ -39,7 +39,18 @@ defmodule TimelessMetrics.MixProject do
   defp package do
     [
       maintainers: ["Mark Cotner"],
-      files: ~w(lib c_src Makefile mix.exs README.md LICENSE),
+      files: ~w(
+        lib
+        native/tms_engine/Cargo.toml
+        native/tms_engine/Cargo.lock
+        native/tms_engine/src
+        c_src
+        Makefile
+        mix.exs
+        checksum.exs
+        README.md
+        LICENSE
+      ),
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/awksedgreep/timeless_metrics"}
     ]
@@ -68,7 +79,7 @@ defmodule TimelessMetrics.MixProject do
       {:ex_openzl, "~> 0.4"},
       {:exqlite, "~> 0.27"},
       {:ezstd, "~> 1.2"},
-      {:rocket, github: "awksedgreep/rocket"},
+      {:rocket, "~> 0.2"},
       {:req, "~> 0.5"},
       {:elixir_make, "~> 0.9", runtime: false},
       {:cc_precompiler, "~> 0.1", runtime: false},

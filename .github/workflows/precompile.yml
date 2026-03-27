@@ -5,71 +5,120 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
 
-      - name: Install cross-compile toolchain
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Erlang & Elixir (Linux)
+        if: runner.os == 'Linux'
+        uses: erlef/setup-beam@v2
+        with:
+          otp-version: "27"
+          elixir-version: "1.19"
+
+      - name: Install Erlang & Elixir (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install erlang elixir
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Install cross-compile toolchain (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Set up Elixir
-        uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.18"
-          otp-version: "27"
-
-      - name: Cache deps
-        uses: actions/cache@v4
-        with:
-          path: deps
-          key: ${{ runner.os }}-precompile-mix-${{ hashFiles('**/mix.lock') }}
-
-      - name: Install dependencies
+      - name: Fetch dependencies
         run: mix deps.get
 
-      - name: Precompile NIFs
-        run: |
-          mkdir -p cache
-          MIX_ENV=prod ELIXIR_MAKE_CACHE_DIR=cache mix elixir_make.precompile
+      - name: Precompile
+        run: mix elixir_make.precompile
+        env:
+          CC_PRECOMPILER_CURRENT_TARGET: ${{ matrix.target }}
+          ELIXIR_MAKE_CACHE_DIR: ${{ github.workspace }}/cache
 
-      - name: Upload precompiled artifacts
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
         with:
-          files: cache/*.tar.gz
+          name: nif-${{ matrix.target }}
+          path: cache/*.tar.gz
+          if-no-files-found: error
 
-  macos:
-    runs-on: macos-latest
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - name: Set up Elixir
-        uses: erlef/setup-beam@v1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Erlang & Elixir
+        uses: erlef/setup-beam@v2
         with:
-          elixir-version: "1.18"
           otp-version: "27"
+          elixir-version: "1.19"
 
-      - name: Cache deps
-        uses: actions/cache@v4
-        with:
-          path: deps
-          key: ${{ runner.os }}-precompile-mix-${{ hashFiles('**/mix.lock') }}
-
-      - name: Install dependencies
+      - name: Fetch dependencies
         run: mix deps.get
 
-      - name: Precompile NIFs
-        run: |
-          mkdir -p cache
-          MIX_ENV=prod ELIXIR_MAKE_CACHE_DIR=cache mix elixir_make.precompile
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          pattern: nif-*
+          merge-multiple: true
 
-      - name: Upload precompiled artifacts
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: cache/*.tar.gz
+          files: artifacts/*.tar.gz
+
+      - name: Generate checksums
+        run: mix elixir_make.checksum --all --ignore-unavailable
+        env:
+          ELIXIR_MAKE_CACHE_DIR: ${{ github.workspace }}/artifacts
+
+      - name: Commit checksum.exs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cp checksum.exs /tmp/checksum.exs
+          git fetch origin main
+          git checkout main
+          cp /tmp/checksum.exs checksum.exs
+          git add checksum.exs
+          git diff --cached --quiet || git commit -m "Update checksum.exs for ${GITHUB_REF_NAME}"
+          git push
+
+      - name: Publish to Hex
+        run: mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

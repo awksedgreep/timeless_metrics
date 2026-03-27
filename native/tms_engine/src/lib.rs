@@ -1432,9 +1432,35 @@ impl Engine {
 
         let mut unique_files: HashSet<&PathBuf> = HashSet::new();
         let mut total_disk_points: u64 = 0;
+        let mut oldest_ts: Option<i64> = None;
+        let mut newest_ts: Option<i64> = None;
         for meta in index.values() {
             total_disk_points += meta.point_count as u64;
             unique_files.insert(&meta.path);
+            oldest_ts = match oldest_ts {
+                Some(existing) => Some(existing.min(meta.min_ts)),
+                None => Some(meta.min_ts),
+            };
+            newest_ts = match newest_ts {
+                Some(existing) => Some(existing.max(meta.max_ts)),
+                None => Some(meta.max_ts),
+            };
+        }
+
+        for entry in self.partitions.iter() {
+            let buf = entry.value();
+            if let Some(min_ts) = buf.timestamps.iter().min() {
+                oldest_ts = match oldest_ts {
+                    Some(existing) => Some(existing.min(*min_ts)),
+                    None => Some(*min_ts),
+                };
+            }
+            if let Some(max_ts) = buf.timestamps.iter().max() {
+                newest_ts = match newest_ts {
+                    Some(existing) => Some(existing.max(*max_ts)),
+                    None => Some(*max_ts),
+                };
+            }
         }
 
         let total_bytes: u64 = unique_files
@@ -1453,12 +1479,15 @@ impl Engine {
             chunk_count,
             partition_count,
             series_count,
+            disk_points: total_disk_points,
             buffered_points,
             total_points,
             total_bytes,
             bytes_per_point,
             buffer_memory,
             file_count: unique_files.len(),
+            oldest_ts,
+            newest_ts,
         }
     }
 }
@@ -1467,12 +1496,15 @@ struct EngineInfo {
     chunk_count: usize,
     partition_count: usize,
     series_count: usize,
+    disk_points: u64,
     buffered_points: usize,
     total_points: u64,
     total_bytes: u64,
     bytes_per_point: f64,
     buffer_memory: usize,
     file_count: usize,
+    oldest_ts: Option<i64>,
+    newest_ts: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1712,15 +1744,23 @@ fn engine_info(resource: ResourceArc<EngineResource>) -> Result<HashMap<String, 
     m.insert("chunk_count".into(), info.chunk_count as f64);
     m.insert("partition_count".into(), info.partition_count as f64);
     m.insert("series_count".into(), info.series_count as f64);
+    m.insert("disk_points".into(), info.disk_points as f64);
     m.insert("buffered_points".into(), info.buffered_points as f64);
     m.insert("total_points".into(), info.total_points as f64);
     m.insert("total_bytes".into(), info.total_bytes as f64);
     m.insert("bytes_per_point".into(), info.bytes_per_point);
+    m.insert("buffer_memory_bytes".into(), info.buffer_memory as f64);
     m.insert(
         "buffer_memory_mb".into(),
         info.buffer_memory as f64 / 1024.0 / 1024.0,
     );
     m.insert("file_count".into(), info.file_count as f64);
+    if let Some(oldest_ts) = info.oldest_ts {
+        m.insert("oldest_timestamp".into(), oldest_ts as f64);
+    }
+    if let Some(newest_ts) = info.newest_ts {
+        m.insert("newest_timestamp".into(), newest_ts as f64);
+    }
     Ok(m)
 }
 
