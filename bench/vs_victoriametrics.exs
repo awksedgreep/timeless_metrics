@@ -9,6 +9,7 @@ defmodule VsBench do
   @vm_url "http://127.0.0.1:9428"
   @tm_http_port 19_428
   @tm_http_url "http://127.0.0.1:#{@tm_http_port}"
+  @tmp_dir System.tmp_dir!()
   @metrics ~w(cpu_usage mem_usage disk_usage load_avg if_in_octets if_out_octets
               temperature signal_power ping_latency bandwidth_util)
   @interval 300
@@ -37,8 +38,12 @@ defmodule VsBench do
 
     # Verify VM is reachable
     case Req.get("#{@vm_url}/health") do
-      {:ok, %{status: 200}} -> :ok
-      _ -> IO.puts("  ERROR: VictoriaMetrics not reachable at #{@vm_url}"); System.halt(1)
+      {:ok, %{status: 200}} ->
+        :ok
+
+      _ ->
+        IO.puts("  ERROR: VictoriaMetrics not reachable at #{@vm_url}")
+        System.halt(1)
     end
 
     now = System.os_time(:second)
@@ -47,19 +52,23 @@ defmodule VsBench do
     labels_for = 0..(devices - 1) |> Enum.map(&%{"host" => "dev_#{&1}"}) |> List.to_tuple()
 
     # --- Phase 1: Native API Ingest (for query data + reference speed) ---
-    data_dir = "/home/mcotner/timeless_vs_bench_#{System.os_time(:millisecond)}"
+    data_dir = Path.join(@tmp_dir, "timeless_vs_bench_#{System.os_time(:millisecond)}")
     File.mkdir_p!(data_dir)
 
     {:ok, _} =
-      TimelessMetrics.Supervisor.start_link(
-        name: :vs_bench,
-        data_dir: data_dir,
-        raw_retention_seconds: (days + 7) * 86_400,
-        rollup_interval: :timer.hours(999),
-        retention_interval: :timer.hours(999),
-        flush_interval: 60_000,
-        self_monitor: false,
-        scraping: false
+      Supervisor.start_link(
+        [
+          {TimelessMetrics,
+           name: :vs_bench,
+           data_dir: data_dir,
+           raw_retention_seconds: (days + 7) * 86_400,
+           rollup_interval: :timer.hours(999),
+           retention_interval: :timer.hours(999),
+           flush_interval: 60_000,
+           self_monitor: false,
+           scraping: false}
+        ],
+        strategy: :one_for_one
       )
 
     IO.puts("\n  Phase 1: Native API Ingest (concurrent writers, with index lookup)")
@@ -114,7 +123,10 @@ defmodule VsBench do
     write_rate = trunc(total_points / (write_us / 1_000_000))
     wall_rate = trunc(total_points / (wall_us / 1_000_000))
 
-    IO.puts("\r    Write only:   #{fmt_dur(write_us)}  [#{fmt_int(write_rate)} pts/sec] (#{writers} writers)      ")
+    IO.puts(
+      "\r    Write only:   #{fmt_dur(write_us)}  [#{fmt_int(write_rate)} pts/sec] (#{writers} writers)      "
+    )
+
     IO.puts("    Flush+compress: #{fmt_dur(flush_us)}")
     IO.puts("    Wall total:   #{fmt_dur(wall_us)}  [#{fmt_int(wall_rate)} pts/sec effective]")
 
@@ -125,37 +137,45 @@ defmodule VsBench do
     IO.puts("")
 
     # Start TM HTTP server on separate port
-    http_data_dir = "/home/mcotner/timeless_vs_bench_http_#{System.os_time(:millisecond)}"
+    http_data_dir = Path.join(@tmp_dir, "timeless_vs_bench_http_#{System.os_time(:millisecond)}")
     File.mkdir_p!(http_data_dir)
 
     {:ok, _} =
-      TimelessMetrics.Supervisor.start_link(
-        name: :vs_http_bench,
-        data_dir: http_data_dir,
-        raw_retention_seconds: (days + 7) * 86_400,
-        rollup_interval: :timer.hours(999),
-        retention_interval: :timer.hours(999),
-        flush_interval: 60_000,
-        self_monitor: false,
-        scraping: false
+      Supervisor.start_link(
+        [
+          {TimelessMetrics,
+           name: :vs_http_bench,
+           data_dir: http_data_dir,
+           raw_retention_seconds: (days + 7) * 86_400,
+           rollup_interval: :timer.hours(999),
+           retention_interval: :timer.hours(999),
+           flush_interval: 60_000,
+           self_monitor: false,
+           scraping: false},
+          {TimelessMetrics.HTTP, store: :vs_http_bench, port: @tm_http_port}
+        ],
+        strategy: :one_for_one
       )
-
-    {:ok, _http_pid} = Bandit.start_link(
-      plug: {TimelessMetrics.HTTP, [store: :vs_http_bench]},
-      port: @tm_http_port
-    )
 
     # Verify TM HTTP is reachable
     case Req.get("#{@tm_http_url}/health") do
-      {:ok, %{status: 200}} -> :ok
-      other -> IO.puts("  ERROR: TM HTTP not reachable at #{@tm_http_url}: #{inspect(other)}"); System.halt(1)
+      {:ok, %{status: 200}} ->
+        :ok
+
+      other ->
+        IO.puts("  ERROR: TM HTTP not reachable at #{@tm_http_url}: #{inspect(other)}")
+        System.halt(1)
     end
 
-    tm_req = Req.new(base_url: @tm_http_url, connect_options: [timeout: 30_000], receive_timeout: 60_000)
-    vm_req = Req.new(base_url: @vm_url, connect_options: [timeout: 30_000], receive_timeout: 60_000)
+    tm_req =
+      Req.new(base_url: @tm_http_url, connect_options: [timeout: 30_000], receive_timeout: 60_000)
+
+    vm_req =
+      Req.new(base_url: @vm_url, connect_options: [timeout: 30_000], receive_timeout: 60_000)
 
     # Pre-build all day payloads (exclude from timing — measures server, not client serialization)
     IO.write("    Building payloads...")
+
     day_bodies =
       for day <- 0..(days - 1) do
         day_start = start_ts + day * 86_400
@@ -168,7 +188,17 @@ defmodule VsBench do
             for dev <- 0..(devices - 1), metric <- @metrics do
               val = gen(metric, ts, dev)
               host = "dev_#{dev}"
-              [metric, ~c'{host="', host, ~c'"} ', Float.to_string(val), ?\s, Integer.to_string(ts_ms), ?\n]
+
+              [
+                metric,
+                ~c'{host="',
+                host,
+                ~c'"} ',
+                Float.to_string(val),
+                ?\s,
+                Integer.to_string(ts_ms),
+                ?\n
+              ]
             end
           end
 
@@ -183,8 +213,11 @@ defmodule VsBench do
     {tm_http_us, _} =
       :timer.tc(fn ->
         for {body, day} <- Enum.with_index(day_bodies, 1) do
-          Req.post!(tm_req, url: "/api/v1/import/prometheus", body: body,
-            headers: [{"content-type", "text/plain"}])
+          Req.post!(tm_req,
+            url: "/api/v1/import/prometheus",
+            body: body,
+            headers: [{"content-type", "text/plain"}]
+          )
 
           if rem(day, 10) == 0 do
             IO.write("\r    TimelessMetrics HTTP: day #{day}/#{days}    ")
@@ -197,14 +230,20 @@ defmodule VsBench do
     tm_verified_points = tm_health["points"] + tm_health["buffer_points"]
 
     tm_http_rate = trunc(total_points / (tm_http_us / 1_000_000))
-    IO.puts("\r    TimelessMetrics HTTP: #{fmt_dur(tm_http_us)}  [#{fmt_int(tm_http_rate)} pts/sec]  (#{fmt_int(tm_verified_points)} pts verified)    ")
+
+    IO.puts(
+      "\r    TimelessMetrics HTTP: #{fmt_dur(tm_http_us)}  [#{fmt_int(tm_http_rate)} pts/sec]  (#{fmt_int(tm_verified_points)} pts verified)    "
+    )
 
     # --- 2b: VictoriaMetrics HTTP (may buffer — need to wait for data to land) ---
     vm_send_start = System.monotonic_time(:microsecond)
 
     for {body, day} <- Enum.with_index(day_bodies, 1) do
-      Req.post!(vm_req, url: "/api/v1/import/prometheus", body: body,
-        headers: [{"content-type", "text/plain"}])
+      Req.post!(vm_req,
+        url: "/api/v1/import/prometheus",
+        body: body,
+        headers: [{"content-type", "text/plain"}]
+      )
 
       if rem(day, 10) == 0 do
         IO.write("\r    VictoriaMetrics HTTP:   day #{day}/#{days} (sending)    ")
@@ -214,7 +253,10 @@ defmodule VsBench do
     vm_send_done = System.monotonic_time(:microsecond)
     vm_send_us = vm_send_done - vm_send_start
     vm_send_rate = trunc(total_points / (vm_send_us / 1_000_000))
-    IO.puts("\r    VictoriaMetrics send:   #{fmt_dur(vm_send_us)}  [#{fmt_int(vm_send_rate)} pts/sec] (HTTP accept only)    ")
+
+    IO.puts(
+      "\r    VictoriaMetrics send:   #{fmt_dur(vm_send_us)}  [#{fmt_int(vm_send_rate)} pts/sec] (HTTP accept only)    "
+    )
 
     # Now wait for VM to actually process the data — poll until series count stabilizes
     IO.write("    Waiting for VM to process...")
@@ -227,7 +269,11 @@ defmodule VsBench do
     vm_real_rate = trunc(total_points / (vm_total_us / 1_000_000))
 
     IO.puts(" done")
-    IO.puts("    VictoriaMetrics real:   #{fmt_dur(vm_total_us)}  [#{fmt_int(vm_real_rate)} pts/sec] (send + process + verify)")
+
+    IO.puts(
+      "    VictoriaMetrics real:   #{fmt_dur(vm_total_us)}  [#{fmt_int(vm_real_rate)} pts/sec] (send + process + verify)"
+    )
+
     IO.puts("      VM series confirmed:  #{vm_verified_points}")
 
     IO.puts("")
@@ -260,16 +306,24 @@ defmodule VsBench do
 
     # VM storage via series API (more reliable for historical data)
     now_q = System.os_time(:second)
-    %{status: 200, body: vm_series_resp} = Req.get!(vm_req, url: "/api/v1/series",
-      params: ["match[]": ~s({__name__=~".+"}), start: now_q - 40 * 86_400, end: now_q])
+
+    %{status: 200, body: vm_series_resp} =
+      Req.get!(vm_req,
+        url: "/api/v1/series",
+        params: ["match[]": ~s({__name__=~".+"}), start: now_q - 40 * 86_400, end: now_q]
+      )
+
     vm_series = length(vm_series_resp["data"])
     IO.puts("    VictoriaMetrics:")
     IO.puts("      Series:     #{fmt_int(vm_series)}")
 
-    case System.cmd("podman", ["exec", "victoriametrics", "du", "-sh", "/victoria-metrics-data"], stderr_to_stdout: true) do
+    case System.cmd("podman", ["exec", "victoriametrics", "du", "-sh", "/victoria-metrics-data"],
+           stderr_to_stdout: true
+         ) do
       {output, 0} ->
         [size | _] = String.split(output)
         IO.puts("      Disk usage: #{size}")
+
       _ ->
         IO.puts("      (disk usage: check container filesystem)")
     end
@@ -291,44 +345,77 @@ defmodule VsBench do
     q_agg_multi = "avg_over_time(cpu_usage[60s])"
 
     queries = [
-      {"raw 1h (single)", fn ->
-        TimelessMetrics.query(:vs_bench, "cpu_usage", test_labels, from: query_from, to: query_to)
-      end, fn ->
-        Req.get!(vm_req, url: "/api/v1/query_range",
-          params: [query: q_single, start: query_from, end: query_to, step: 300])
-      end},
-      {"raw 24h (single)", fn ->
-        TimelessMetrics.query(:vs_bench, "cpu_usage", test_labels, from: now - 86_400, to: now)
-      end, fn ->
-        Req.get!(vm_req, url: "/api/v1/query_range",
-          params: [query: q_single, start: now - 86_400, end: now, step: 300])
-      end},
-      {"agg 1h avg (single)", fn ->
-        TimelessMetrics.query_aggregate(:vs_bench, "cpu_usage", test_labels,
-          from: query_from, to: query_to, bucket: {60, :seconds}, aggregate: :avg)
-      end, fn ->
-        Req.get!(vm_req, url: "/api/v1/query_range",
-          params: [query: q_agg_single, start: query_from, end: query_to, step: 60])
-      end},
-      {"multi #{devices} hosts 1h", fn ->
-        TimelessMetrics.query_aggregate_multi(:vs_bench, "cpu_usage", %{},
-          from: query_from, to: query_to, bucket: {60, :seconds}, aggregate: :avg)
-      end, fn ->
-        Req.get!(vm_req, url: "/api/v1/query_range",
-          params: [query: q_agg_multi, start: query_from, end: query_to, step: 60])
-      end},
-      {"latest value", fn ->
-        TimelessMetrics.latest(:vs_bench, "cpu_usage", test_labels)
-      end, fn ->
-        Req.get!(vm_req, url: "/api/v1/query",
-          params: [query: q_single])
-      end}
+      {"raw 1h (single)",
+       fn ->
+         TimelessMetrics.query(:vs_bench, "cpu_usage", test_labels,
+           from: query_from,
+           to: query_to
+         )
+       end,
+       fn ->
+         Req.get!(vm_req,
+           url: "/api/v1/query_range",
+           params: [query: q_single, start: query_from, end: query_to, step: 300]
+         )
+       end},
+      {"raw 24h (single)",
+       fn ->
+         TimelessMetrics.query(:vs_bench, "cpu_usage", test_labels, from: now - 86_400, to: now)
+       end,
+       fn ->
+         Req.get!(vm_req,
+           url: "/api/v1/query_range",
+           params: [query: q_single, start: now - 86_400, end: now, step: 300]
+         )
+       end},
+      {"agg 1h avg (single)",
+       fn ->
+         TimelessMetrics.query_aggregate(:vs_bench, "cpu_usage", test_labels,
+           from: query_from,
+           to: query_to,
+           bucket: {60, :seconds},
+           aggregate: :avg
+         )
+       end,
+       fn ->
+         Req.get!(vm_req,
+           url: "/api/v1/query_range",
+           params: [query: q_agg_single, start: query_from, end: query_to, step: 60]
+         )
+       end},
+      {"multi #{devices} hosts 1h",
+       fn ->
+         TimelessMetrics.query_aggregate_multi(:vs_bench, "cpu_usage", %{},
+           from: query_from,
+           to: query_to,
+           bucket: {60, :seconds},
+           aggregate: :avg
+         )
+       end,
+       fn ->
+         Req.get!(vm_req,
+           url: "/api/v1/query_range",
+           params: [query: q_agg_multi, start: query_from, end: query_to, step: 60]
+         )
+       end},
+      {"latest value",
+       fn ->
+         TimelessMetrics.latest(:vs_bench, "cpu_usage", test_labels)
+       end,
+       fn ->
+         Req.get!(vm_req,
+           url: "/api/v1/query",
+           params: [query: q_single]
+         )
+       end}
     ]
 
     IO.puts("  #{iterations} iterations each\n")
+
     IO.puts(
       "  #{String.pad_trailing("Query", 28)} #{String.pad_leading("TimelessMetrics", 12)} #{String.pad_leading("VM", 12)} #{String.pad_leading("Ratio", 8)}"
     )
+
     IO.puts("  " <> String.duplicate("-", 64))
 
     Enum.each(queries, fn {name, timeless_fn, vm_fn} ->
@@ -336,15 +423,17 @@ defmodule VsBench do
       timeless_fn.()
       vm_fn.()
 
-      t_times = for _ <- 1..iterations do
-        {us, _} = :timer.tc(timeless_fn)
-        us
-      end
+      t_times =
+        for _ <- 1..iterations do
+          {us, _} = :timer.tc(timeless_fn)
+          us
+        end
 
-      v_times = for _ <- 1..iterations do
-        {us, _} = :timer.tc(vm_fn)
-        us
-      end
+      v_times =
+        for _ <- 1..iterations do
+          {us, _} = :timer.tc(vm_fn)
+          us
+        end
 
       t_avg = Enum.sum(t_times) / iterations
       v_avg = Enum.sum(v_times) / iterations
@@ -363,18 +452,38 @@ defmodule VsBench do
     IO.puts("  " <> String.duplicate("-", 64))
     IO.puts("  #{String.pad_trailing("Method", 40)} #{String.pad_leading("pts/sec", 12)}")
     IO.puts("  " <> String.duplicate("-", 64))
-    IO.puts("  #{String.pad_trailing("TM native write_batch (#{writers} writers)", 40)} #{String.pad_leading(fmt_int(write_rate), 12)}")
-    IO.puts("  #{String.pad_trailing("TM native wall (write+flush+compress)", 40)} #{String.pad_leading(fmt_int(wall_rate), 12)}")
-    IO.puts("  #{String.pad_trailing("TM HTTP (Prometheus, synchronous)", 40)} #{String.pad_leading(fmt_int(tm_http_rate), 12)}")
-    IO.puts("  #{String.pad_trailing("VM HTTP (Prometheus, accept only)", 40)} #{String.pad_leading(fmt_int(vm_send_rate), 12)}")
-    IO.puts("  #{String.pad_trailing("VM HTTP (Prometheus, sustained/verified)", 40)} #{String.pad_leading(fmt_int(vm_real_rate), 12)}")
+
+    IO.puts(
+      "  #{String.pad_trailing("TM native write_batch (#{writers} writers)", 40)} #{String.pad_leading(fmt_int(write_rate), 12)}"
+    )
+
+    IO.puts(
+      "  #{String.pad_trailing("TM native wall (write+flush+compress)", 40)} #{String.pad_leading(fmt_int(wall_rate), 12)}"
+    )
+
+    IO.puts(
+      "  #{String.pad_trailing("TM HTTP (Prometheus, synchronous)", 40)} #{String.pad_leading(fmt_int(tm_http_rate), 12)}"
+    )
+
+    IO.puts(
+      "  #{String.pad_trailing("VM HTTP (Prometheus, accept only)", 40)} #{String.pad_leading(fmt_int(vm_send_rate), 12)}"
+    )
+
+    IO.puts(
+      "  #{String.pad_trailing("VM HTTP (Prometheus, sustained/verified)", 40)} #{String.pad_leading(fmt_int(vm_real_rate), 12)}"
+    )
+
     IO.puts("  " <> String.duplicate("-", 64))
     tm_vs_vm = if vm_real_rate > 0, do: Float.round(write_rate / vm_real_rate, 2), else: 0.0
     IO.puts("  TM native vs VM HTTP sustained: #{tm_vs_vm}x")
     IO.puts("  " <> String.duplicate("=", 64))
     IO.puts("  Cleanup:")
     IO.puts("    rm -rf #{data_dir} #{http_data_dir}")
-    IO.puts("    curl -s 'http://localhost:8428/api/v1/admin/tsdb/delete_series?match[]={__name__=~\".*\"}' > /dev/null")
+
+    IO.puts(
+      "    curl -s 'http://localhost:8428/api/v1/admin/tsdb/delete_series?match[]={__name__=~\".*\"}' > /dev/null"
+    )
+
     IO.puts("  " <> String.duplicate("=", 64))
   end
 
@@ -401,21 +510,33 @@ defmodule VsBench do
   end
 
   # --- Formatting ---
-  defp fmt_int(n) when n >= 1_000_000, do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+  defp fmt_int(n) when n >= 1_000_000,
+    do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
   defp fmt_int(n) when n >= 1_000, do: "#{:erlang.float_to_binary(n / 1_000, decimals: 1)}K"
   defp fmt_int(n), do: Integer.to_string(n)
 
-  defp fmt_bytes(n) when n >= 1_073_741_824, do: "#{:erlang.float_to_binary(n / 1_073_741_824, decimals: 1)} GB"
-  defp fmt_bytes(n) when n >= 1_048_576, do: "#{:erlang.float_to_binary(n / 1_048_576, decimals: 1)} MB"
+  defp fmt_bytes(n) when n >= 1_073_741_824,
+    do: "#{:erlang.float_to_binary(n / 1_073_741_824, decimals: 1)} GB"
+
+  defp fmt_bytes(n) when n >= 1_048_576,
+    do: "#{:erlang.float_to_binary(n / 1_048_576, decimals: 1)} MB"
+
   defp fmt_bytes(n) when n >= 1_024, do: "#{:erlang.float_to_binary(n / 1_024, decimals: 1)} KB"
   defp fmt_bytes(n), do: "#{n} B"
 
-  defp fmt_dur(us) when us >= 60_000_000, do: "#{:erlang.float_to_binary(us / 60_000_000, decimals: 1)}m"
-  defp fmt_dur(us) when us >= 1_000_000, do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 1)}s"
+  defp fmt_dur(us) when us >= 60_000_000,
+    do: "#{:erlang.float_to_binary(us / 60_000_000, decimals: 1)}m"
+
+  defp fmt_dur(us) when us >= 1_000_000,
+    do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 1)}s"
+
   defp fmt_dur(us) when us >= 1_000, do: "#{:erlang.float_to_binary(us / 1_000, decimals: 1)}ms"
   defp fmt_dur(us), do: "#{us}us"
 
-  defp fmt_us(us) when us >= 1_000_000, do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 2)}s"
+  defp fmt_us(us) when us >= 1_000_000,
+    do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 2)}s"
+
   defp fmt_us(us) when us >= 1_000, do: "#{:erlang.float_to_binary(us / 1_000, decimals: 2)}ms"
   defp fmt_us(us), do: "#{:erlang.float_to_binary(us / 1, decimals: 0)}us"
 
@@ -437,8 +558,10 @@ defmodule VsBench do
     now = System.os_time(:second)
     start = now - 40 * 86_400
 
-    case Req.get(vm_req, url: "/api/v1/series",
-           params: ["match[]": ~s({__name__=~".+"}), start: start, end: now]) do
+    case Req.get(vm_req,
+           url: "/api/v1/series",
+           params: ["match[]": ~s({__name__=~".+"}), start: start, end: now]
+         ) do
       {:ok, %{status: 200, body: %{"data" => data}}} ->
         count = length(data)
 

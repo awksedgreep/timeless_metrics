@@ -2,14 +2,16 @@ defmodule WriteBench do
   @moduledoc """
   Embedded write/query benchmark using the programmatic API.
 
-  Tests both disk and memory-only modes with realistic DataGenerator data.
-  Measures: write throughput (single + concurrent), flush + compression,
-  query latency, and compression ratio.
+  Splits cold population from steady-state ingest so series creation cost
+  does not dominate the throughput numbers.
 
   Usage:
-    mix run bench/write_bench.exs              # disk mode
-    mix run bench/write_bench.exs --memory     # memory-only mode
+    mix run bench/write_bench.exs
+    mix run bench/write_bench.exs --memory
   """
+
+  @steady_state_seconds 10
+  @batch_window 100
 
   def run(args) do
     memory_only = "--memory" in args
@@ -19,14 +21,15 @@ defmodule WriteBench do
     IO.puts("\n=============================================")
     IO.puts("  TimelessMetrics Embedded Benchmark (#{mode_label})")
     IO.puts("  Schedulers: #{System.schedulers_online()}")
+    IO.puts("  Steady-state window: #{@steady_state_seconds}s")
     IO.puts("=============================================\n")
 
-    for {label, series, pts_per_series} <- [
-          {"Small (1K series × 100 pts)", 1_000, 100},
-          {"Medium (10K series × 100 pts)", 10_000, 100},
-          {"Large (10K series × 1K pts)", 10_000, 1_000}
+    for {label, series_count, pts_per_series} <- [
+          {"Small (1K series x 100 pts)", 1_000, 100},
+          {"Medium (10K series x 100 pts)", 10_000, 100},
+          {"Large (10K series x 1K pts)", 10_000, 1_000}
         ] do
-      run_scale(label, series, pts_per_series, memory_only)
+      run_scale(label, series_count, pts_per_series, memory_only)
     end
 
     IO.puts("--- Compression by Data Pattern ---\n")
@@ -36,12 +39,13 @@ defmodule WriteBench do
   defp run_scale(label, series_count, pts_per_series, memory_only) do
     total = series_count * pts_per_series
     data_dir = "/tmp/timeless_bench_#{System.os_time(:millisecond)}"
+    store = :"bench_#{System.unique_integer([:positive])}"
 
     store_opts =
       if memory_only do
-        [name: :bench, mode: :memory, self_monitor: false]
+        [name: store, mode: :memory, self_monitor: false]
       else
-        [name: :bench, data_dir: data_dir, self_monitor: false]
+        [name: store, data_dir: data_dir, self_monitor: false]
       end
 
     {:ok, sup} =
@@ -50,169 +54,201 @@ defmodule WriteBench do
         strategy: :one_for_one
       )
 
-    now = System.os_time(:second)
-    metrics = TimelessMetrics.DataGenerator.metrics() |> Enum.take(20)
+    try do
+      now = System.os_time(:second)
+      metrics = TimelessMetrics.DataGenerator.metrics() |> Enum.take(20)
+      series = build_series(series_count, metrics)
+      population_start = now - pts_per_series
 
-    IO.puts("--- #{label} = #{format_number(total)} points ---\n")
+      IO.puts("--- #{label} = #{format_number(total)} points ---\n")
 
-    # --- Single-threaded writes ---
-    {single_us, _} =
-      :timer.tc(fn ->
-        for s <- 1..series_count do
-          metric = Enum.at(metrics, rem(s, 20))
-          labels = %{"host" => "device_#{s}"}
-
-          for i <- 0..(pts_per_series - 1) do
-            ts = now - pts_per_series + i
-            val = TimelessMetrics.DataGenerator.value(metric, ts * 1000, s)
-            TimelessMetrics.write(:bench, metric, labels, val, timestamp: ts)
-          end
-        end
-      end)
-
-    single_rate = trunc(total / (single_us / 1_000_000))
-    IO.puts("  Write (single):     #{format_number(single_rate)}/sec  (#{div(single_us, 1000)}ms)")
-
-    # --- Query before flush (from Buffer ETS) ---
-    sample_metric = Enum.at(metrics, rem(1, 20))
-
-    {q_ets_us, {:ok, ets_pts}} =
-      :timer.tc(fn ->
-        TimelessMetrics.query(:bench, sample_metric, %{"host" => "device_1"},
-          from: now - pts_per_series - 1,
-          to: now + 1
-        )
-      end)
-
-    IO.puts("  Query (ETS hot):    #{length(ets_pts)} pts in #{div(q_ets_us, 1000)}ms")
-
-    # --- Flush + compress ---
-    {flush_us, _} = :timer.tc(fn -> TimelessMetrics.flush(:bench) end)
-    IO.puts("  Flush + compress:   #{div(flush_us, 1000)}ms")
-
-    # --- Query after flush (from compressed ETS cache) ---
-    {q_cache_us, {:ok, cache_pts}} =
-      :timer.tc(fn ->
-        TimelessMetrics.query(:bench, sample_metric, %{"host" => "device_1"},
-          from: now - pts_per_series - 1,
-          to: now + 1
-        )
-      end)
-
-    IO.puts("  Query (compressed): #{length(cache_pts)} pts in #{div(q_cache_us, 1000)}ms")
-
-    # --- Storage stats ---
-    info = TimelessMetrics.info(:bench)
-    IO.puts("  Series:             #{info.series_count}")
-    IO.puts("  Points ingested:    #{format_number(info.points_ingested)}")
-    IO.puts("  Storage:            #{format_bytes(info.storage_bytes)}")
-    IO.puts("  Bytes/point:        #{Float.round(info.bytes_per_point, 3)}")
-
-    # --- Concurrent write throughput ---
-    # Reset store
-    Supervisor.stop(sup)
-    cleanup_persistent_terms(:bench)
-    if not memory_only, do: File.rm_rf!(data_dir)
-    data_dir2 = "/tmp/timeless_bench_conc_#{System.os_time(:millisecond)}"
-
-    store_opts2 =
-      if memory_only do
-        [name: :bench, mode: :memory, self_monitor: false]
-      else
-        [name: :bench, data_dir: data_dir2, self_monitor: false]
-      end
-
-    {:ok, sup2} =
-      Supervisor.start_link(
-        [{TimelessMetrics, store_opts2}],
-        strategy: :one_for_one
-      )
-
-    writers = System.schedulers_online()
-    chunk_size = div(series_count, writers)
-
-    {conc_us, _} =
-      :timer.tc(fn ->
-        1..writers
-        |> Enum.map(fn w ->
-          Task.async(fn ->
-            start_s = (w - 1) * chunk_size + 1
-            end_s = min(w * chunk_size, series_count)
-
-            for s <- start_s..end_s do
-              metric = Enum.at(metrics, rem(s, 20))
-              labels = %{"host" => "device_#{s}"}
-
-              for i <- 0..(pts_per_series - 1) do
-                ts = now - pts_per_series + i
-                val = TimelessMetrics.DataGenerator.value(metric, ts * 1000, s)
-                TimelessMetrics.write(:bench, metric, labels, val, timestamp: ts)
-              end
-            end
-          end)
+      {populate_us, _} =
+        :timer.tc(fn ->
+          populate_store(store, series, pts_per_series, population_start)
         end)
-        |> Enum.each(&Task.await(&1, 60_000))
-      end)
 
-    conc_rate = trunc(total / (conc_us / 1_000_000))
-    IO.puts("  Write (#{writers} workers): #{format_number(conc_rate)}/sec  (#{div(conc_us, 1000)}ms)")
+      populate_rate = trunc(total / (populate_us / 1_000_000))
 
-    # --- Batch writes using write_batch ---
-    Supervisor.stop(sup2)
-    cleanup_persistent_terms(:bench)
-    if not memory_only, do: File.rm_rf!(data_dir2)
-    data_dir3 = "/tmp/timeless_bench_batch_#{System.os_time(:millisecond)}"
-
-    store_opts3 =
-      if memory_only do
-        [name: :bench, mode: :memory, self_monitor: false]
-      else
-        [name: :bench, data_dir: data_dir3, self_monitor: false]
-      end
-
-    {:ok, sup3} =
-      Supervisor.start_link(
-        [{TimelessMetrics, store_opts3}],
-        strategy: :one_for_one
+      IO.puts(
+        "  Populate (cold):    #{format_number(populate_rate)}/sec  (#{div(populate_us, 1000)}ms)"
       )
 
-    {batch_us, _} =
-      :timer.tc(fn ->
-        for ts_offset <- 0..(pts_per_series - 1) do
-          ts = now - pts_per_series + ts_offset
+      {sample_metric, sample_labels, _sample_idx} = hd(series)
 
-          entries =
-            for s <- 1..series_count do
-              metric = Enum.at(metrics, rem(s, 20))
-              val = TimelessMetrics.DataGenerator.value(metric, ts * 1000, s)
-              {metric, %{"host" => "device_#{s}"}, val, ts}
-            end
+      {q_hot_us, {:ok, hot_points}} =
+        :timer.tc(fn ->
+          TimelessMetrics.query(store, sample_metric, sample_labels,
+            from: population_start - 1,
+            to: now + 1
+          )
+        end)
 
-          TimelessMetrics.write_batch(:bench, entries)
+      IO.puts("  Query (hot):        #{length(hot_points)} pts in #{div(q_hot_us, 1000)}ms")
+
+      steady_start = now + 1
+
+      {single_count, single_us} = run_single_phase(store, series, steady_start)
+
+      IO.puts(
+        "  Write (single):     #{format_number(rate(single_count, single_us))}/sec  (#{@steady_state_seconds}s steady-state)"
+      )
+
+      {conc_count, conc_us} = run_concurrent_phase(store, series, steady_start)
+
+      IO.puts(
+        "  Write (#{System.schedulers_online()} workers): #{format_number(rate(conc_count, conc_us))}/sec  (#{@steady_state_seconds}s steady-state)"
+      )
+
+      {batch_count, batch_us} = run_batch_phase(store, series, steady_start)
+
+      IO.puts(
+        "  Write (batch):      #{format_number(rate(batch_count, batch_us))}/sec  (#{@steady_state_seconds}s steady-state)"
+      )
+
+      {flush_us, _} = :timer.tc(fn -> TimelessMetrics.flush(store) end)
+      IO.puts("  Flush + compress:   #{div(flush_us, 1000)}ms")
+
+      {q_compressed_us, {:ok, compressed_points}} =
+        :timer.tc(fn ->
+          TimelessMetrics.query(store, sample_metric, sample_labels,
+            from: population_start - 1,
+            to: steady_start + @steady_state_seconds + 1
+          )
+        end)
+
+      IO.puts(
+        "  Query (compressed): #{length(compressed_points)} pts in #{div(q_compressed_us, 1000)}ms"
+      )
+
+      info = TimelessMetrics.info(store)
+      points_ingested = Map.get(info, :points_ingested, info.total_points)
+      IO.puts("  Series:             #{info.series_count}")
+      IO.puts("  Points ingested:    #{format_number(points_ingested)}")
+      IO.puts("  Storage:            #{format_bytes(info.storage_bytes)}")
+      IO.puts("  Bytes/point:        #{Float.round(info.bytes_per_point, 3)}")
+      IO.puts("")
+    after
+      Supervisor.stop(sup)
+      if not memory_only, do: File.rm_rf!(data_dir)
+    end
+  end
+
+  defp build_series(series_count, metrics) do
+    for series_idx <- 1..series_count do
+      metric = Enum.at(metrics, rem(series_idx, length(metrics)))
+      labels = %{"host" => "device_#{series_idx}"}
+      {metric, labels, series_idx}
+    end
+  end
+
+  defp populate_store(store, series, pts_per_series, population_start) do
+    for ts_offset <- 0..(pts_per_series - 1) do
+      ts = population_start + ts_offset
+
+      entries =
+        Enum.map(series, fn {metric, labels, series_idx} ->
+          value = TimelessMetrics.DataGenerator.value(metric, ts * 1000, series_idx)
+          {metric, labels, value, ts}
+        end)
+
+      :ok = TimelessMetrics.write_batch(store, entries)
+    end
+  end
+
+  defp run_single_phase(store, series, steady_start) do
+    deadline = System.monotonic_time(:millisecond) + @steady_state_seconds * 1000
+
+    {count, _ts} =
+      Stream.cycle(series)
+      |> Enum.reduce_while({0, steady_start}, fn {metric, labels, series_idx}, {count, ts} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:halt, {count, ts}}
+        else
+          value = TimelessMetrics.DataGenerator.value(metric, ts * 1000, series_idx)
+          :ok = TimelessMetrics.write(store, metric, labels, value, timestamp: ts)
+          {:cont, {count + 1, ts + 1}}
         end
       end)
 
-    batch_rate = trunc(total / (batch_us / 1_000_000))
-    IO.puts("  Write (batch):      #{format_number(batch_rate)}/sec  (#{div(batch_us, 1000)}ms)")
-    IO.puts("")
+    {count, @steady_state_seconds * 1_000_000}
+  end
 
-    Supervisor.stop(sup3)
-    cleanup_persistent_terms(:bench)
-    if not memory_only, do: File.rm_rf!(data_dir3)
+  defp run_concurrent_phase(store, series, steady_start) do
+    deadline = System.monotonic_time(:millisecond) + @steady_state_seconds * 1000
+    worker_count = System.schedulers_online()
+    counter = :atomics.new(1, [])
+    chunk_size = max(div(length(series), worker_count), 1)
+
+    series
+    |> Enum.chunk_every(chunk_size)
+    |> Enum.with_index()
+    |> Enum.map(fn {chunk, worker_idx} ->
+      Task.async(fn ->
+        Stream.cycle(chunk)
+        |> Enum.reduce_while(steady_start + worker_idx, fn {metric, labels, series_idx}, ts ->
+          if System.monotonic_time(:millisecond) >= deadline do
+            {:halt, :ok}
+          else
+            value = TimelessMetrics.DataGenerator.value(metric, ts * 1000, series_idx)
+            :ok = TimelessMetrics.write(store, metric, labels, value, timestamp: ts)
+            :atomics.add_get(counter, 1, 1)
+            {:cont, ts + worker_count}
+          end
+        end)
+      end)
+    end)
+    |> Task.await_many(:infinity)
+
+    {:atomics.get(counter, 1), @steady_state_seconds * 1_000_000}
+  end
+
+  defp run_batch_phase(store, series, steady_start) do
+    deadline = System.monotonic_time(:millisecond) + @steady_state_seconds * 1000
+    windows = Enum.chunk_every(series, @batch_window)
+
+    {count, _ts} =
+      Stream.cycle(windows)
+      |> Enum.reduce_while({0, steady_start}, fn window, {count, ts} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:halt, {count, ts}}
+        else
+          entries =
+            Enum.map(window, fn {metric, labels, series_idx} ->
+              value = TimelessMetrics.DataGenerator.value(metric, ts * 1000, series_idx)
+              {metric, labels, value, ts}
+            end)
+
+          :ok = TimelessMetrics.write_batch(store, entries)
+          {:cont, {count + length(entries), ts + 1}}
+        end
+      end)
+
+    {count, @steady_state_seconds * 1_000_000}
   end
 
   defp run_compression_analysis(memory_only) do
     now = System.os_time(:second)
     n = 10_000
-    metrics = TimelessMetrics.DataGenerator.metrics()
 
-    # Use DataGenerator for realistic patterns
     patterns = [
-      {"node_load1 (gauge)", fn i -> TimelessMetrics.DataGenerator.value("node_load1", (now + i) * 1000, 1) end},
-      {"node_cpu_seconds (ctr)", fn i -> TimelessMetrics.DataGenerator.value("node_cpu_seconds_total", (now + i) * 1000, 1) end},
-      {"node_mem_total (const)", fn i -> TimelessMetrics.DataGenerator.value("node_memory_MemTotal_bytes", (now + i) * 1000, 1) end},
-      {"node_disk_read (ctr)", fn i -> TimelessMetrics.DataGenerator.value("node_disk_read_bytes_total", (now + i) * 1000, 1) end},
-      {"node_entropy (gauge)", fn i -> TimelessMetrics.DataGenerator.value("node_entropy_avail_bits", (now + i) * 1000, 1) end},
+      {"node_load1 (gauge)",
+       fn i -> TimelessMetrics.DataGenerator.value("node_load1", (now + i) * 1000, 1) end},
+      {"node_cpu_seconds (ctr)",
+       fn i ->
+         TimelessMetrics.DataGenerator.value("node_cpu_seconds_total", (now + i) * 1000, 1)
+       end},
+      {"node_mem_total (const)",
+       fn i ->
+         TimelessMetrics.DataGenerator.value("node_memory_MemTotal_bytes", (now + i) * 1000, 1)
+       end},
+      {"node_disk_read (ctr)",
+       fn i ->
+         TimelessMetrics.DataGenerator.value("node_disk_read_bytes_total", (now + i) * 1000, 1)
+       end},
+      {"node_entropy (gauge)",
+       fn i ->
+         TimelessMetrics.DataGenerator.value("node_entropy_avail_bits", (now + i) * 1000, 1)
+       end},
       {"Random float", fn _i -> :rand.uniform() * 1000.0 end}
     ]
 
@@ -223,12 +259,13 @@ defmodule WriteBench do
 
     Enum.each(patterns, fn {label, gen_fn} ->
       data_dir = "/tmp/timeless_cmp_#{System.os_time(:millisecond)}"
+      store = :"cmp_#{System.unique_integer([:positive])}"
 
       store_opts =
         if memory_only do
-          [name: :cmp, mode: :memory, buffer_shards: 1, self_monitor: false]
+          [name: store, mode: :memory, self_monitor: false]
         else
-          [name: :cmp, data_dir: data_dir, buffer_shards: 1, self_monitor: false]
+          [name: store, data_dir: data_dir, self_monitor: false]
         end
 
       {:ok, sup} =
@@ -237,39 +274,39 @@ defmodule WriteBench do
           strategy: :one_for_one
         )
 
-      for i <- 0..(n - 1) do
-        TimelessMetrics.write(:cmp, "bench", %{"t" => "1"}, gen_fn.(i), timestamp: now + i)
+      try do
+        for i <- 0..(n - 1) do
+          TimelessMetrics.write(store, "bench", %{"t" => "1"}, gen_fn.(i), timestamp: now + i)
+        end
+
+        TimelessMetrics.flush(store)
+
+        info = TimelessMetrics.info(store)
+        points_ingested = Map.get(info, :points_ingested, info.total_points)
+
+        bpp =
+          if points_ingested > 0 do
+            Float.round(info.storage_bytes / points_ingested, 2)
+          else
+            0.0
+          end
+
+        label_fmt = String.pad_trailing(label, 26)
+        bytes_fmt = String.pad_leading(format_bytes(info.storage_bytes), 10)
+        bpp_fmt = String.pad_leading("#{bpp}", 12)
+
+        IO.puts("  │ #{label_fmt} │ #{bytes_fmt} │ #{bpp_fmt} │")
+      after
+        Supervisor.stop(sup)
+        if not memory_only, do: File.rm_rf!(data_dir)
       end
-
-      TimelessMetrics.flush(:cmp)
-
-      info = TimelessMetrics.info(:cmp)
-      bpp = if info.points_ingested > 0, do: Float.round(info.storage_bytes / info.points_ingested, 2), else: 0.0
-
-      label_fmt = String.pad_trailing(label, 26)
-      bytes_fmt = String.pad_leading(format_bytes(info.storage_bytes), 10)
-      bpp_fmt = String.pad_leading("#{bpp}", 12)
-
-      IO.puts("  │ #{label_fmt} │ #{bytes_fmt} │ #{bpp_fmt} │")
-
-      Supervisor.stop(sup)
-      cleanup_persistent_terms(:cmp)
-      if not memory_only, do: File.rm_rf!(data_dir)
     end)
 
     IO.puts("  └────────────────────────────┴────────────┴──────────────┘")
     IO.puts("")
   end
 
-  defp cleanup_persistent_terms(store) do
-    for key <- [:schema, :shard_count, :data_dir, :raw_retention_seconds, :daily_retention_seconds, :ingest_queue] do
-      try do
-        :persistent_term.erase({TimelessMetrics, store, key})
-      rescue
-        _ -> :ok
-      end
-    end
-  end
+  defp rate(count, microseconds), do: trunc(count / (microseconds / 1_000_000))
 
   defp format_number(n) when n >= 1_000_000, do: "#{Float.round(n / 1_000_000, 2)}M"
   defp format_number(n) when n >= 1_000, do: "#{Float.round(n / 1_000, 1)}K"

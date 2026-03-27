@@ -1,15 +1,29 @@
 defmodule TimelessMetrics.HTTPTest do
   use ExUnit.Case, async: false
 
+  alias TimelessMetrics.TestHelper
+
   @data_dir "/tmp/timeless_http_test_#{System.os_time(:millisecond)}"
   @port 18_410
 
-  setup do
-    start_supervised!({TimelessMetrics, name: :http_test, data_dir: @data_dir, engine: :actor})
+  setup_all do
     start_supervised!({TimelessMetrics.HTTP, store: :http_test, port: @port})
     Process.sleep(50)
 
     on_exit(fn ->
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
+    end)
+
+    :ok
+  end
+
+  setup do
+    TestHelper.await_down(:http_test_sup)
+    :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
+    start_supervised!({TimelessMetrics, name: :http_test, data_dir: @data_dir, engine: :actor})
+
+    on_exit(fn ->
+      TestHelper.await_down(:http_test_sup)
       :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
       File.rm_rf!(@data_dir)
     end)

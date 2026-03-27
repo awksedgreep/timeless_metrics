@@ -27,7 +27,10 @@ defmodule TimelessMetrics.RustEngine do
   end
 
   def write(store, metric_name, labels, value, timestamp) do
-    Nif.engine_write_batch_labeled(ref(store), [{metric_name, labels, timestamp, value}])
+    case Nif.engine_write_batch_labeled(ref(store), [{metric_name, labels, timestamp, value}]) do
+      {:ok, :ok} -> :ok
+      {:error, _} = error -> error
+    end
   end
 
   def write_batch(store, entries) do
@@ -40,18 +43,26 @@ defmodule TimelessMetrics.RustEngine do
         {metric, labels, value, ts} -> {metric, labels, ts, value}
       end)
 
-    Nif.engine_write_batch_labeled(ref(store), labeled)
+    case Nif.engine_write_batch_labeled(ref(store), labeled) do
+      {:ok, :ok} -> :ok
+      {:error, _} = error -> error
+    end
   end
 
   def flush(store) do
-    Nif.engine_flush(ref(store))
+    case Nif.engine_flush(ref(store)) do
+      {:ok, :ok} -> :ok
+      {:error, _} = error -> error
+    end
   end
 
   def query_raw(store, metric_name, labels, opts) do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
 
-    {:ok, results} = Nif.engine_query_range(ref(store), metric_name, labels, from, to)
+    {:ok, results} =
+      Nif.engine_query_range(ref(store), metric_name, labels, from, to)
+      |> unwrap_nif_ok()
 
     case results do
       [{_labels, points}] ->
@@ -69,7 +80,9 @@ defmodule TimelessMetrics.RustEngine do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
 
-    {:ok, results} = Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
+    {:ok, results} =
+      Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
+      |> unwrap_nif_ok()
 
     formatted =
       results
@@ -89,7 +102,9 @@ defmodule TimelessMetrics.RustEngine do
 
     if bucket_seconds == nil do
       # No bucketing — return scalar aggregate
-      {:ok, results} = Nif.engine_query_aggregate(ref(store), metric_name, labels, from, to, agg)
+      {:ok, results} =
+        Nif.engine_query_aggregate(ref(store), metric_name, labels, from, to, agg)
+        |> unwrap_nif_ok()
 
       case results do
         [{_labels, val}] -> {:ok, [{from, val}]}
@@ -99,7 +114,9 @@ defmodule TimelessMetrics.RustEngine do
     else
       # Bucketed — need to fetch raw points and bucket in Elixir
       # (the Rust engine doesn't have bucketed aggregation built in yet)
-      {:ok, results} = Nif.engine_query_range(ref(store), metric_name, labels, from, to)
+      {:ok, results} =
+        Nif.engine_query_range(ref(store), metric_name, labels, from, to)
+        |> unwrap_nif_ok()
 
       points =
         case results do
@@ -126,7 +143,9 @@ defmodule TimelessMetrics.RustEngine do
 
     bucket_seconds = bucket_to_seconds(bucket)
 
-    {:ok, results} = Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
+    {:ok, results} =
+      Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
+      |> unwrap_nif_ok()
 
     formatted =
       results
@@ -147,7 +166,10 @@ defmodule TimelessMetrics.RustEngine do
 
   def latest(store, metric_name, labels) do
     now = System.os_time(:second)
-    {:ok, results} = Nif.engine_query_range(ref(store), metric_name, labels, now - 300, now)
+
+    {:ok, results} =
+      Nif.engine_query_range(ref(store), metric_name, labels, now - 300, now)
+      |> unwrap_nif_ok()
 
     case results do
       [{_labels, points}] when points != [] ->
@@ -160,19 +182,27 @@ defmodule TimelessMetrics.RustEngine do
 
   def list_metrics(store) do
     Nif.engine_list_metrics(ref(store))
+    |> unwrap_nif_ok()
   end
 
   def list_series(store, metric_name) do
-    {:ok, series} = Nif.engine_list_series(ref(store), metric_name)
+    {:ok, series} =
+      Nif.engine_list_series(ref(store), metric_name)
+      |> unwrap_nif_ok()
+
     {:ok, Enum.map(series, fn labels -> %{labels: labels} end)}
   end
 
   def label_values(store, metric_name, label_key) do
     Nif.engine_label_values(ref(store), metric_name, label_key)
+    |> unwrap_nif_ok()
   end
 
   def find_series(store, metric_name, label_filter) do
-    {:ok, series} = Nif.engine_list_series(ref(store), metric_name)
+    {:ok, series} =
+      Nif.engine_list_series(ref(store), metric_name)
+      |> unwrap_nif_ok()
+
     filter_series(series, label_filter)
   end
 
@@ -181,7 +211,9 @@ defmodule TimelessMetrics.RustEngine do
   end
 
   def info(store) do
-    raw = Nif.engine_info(ref(store))
+    {:ok, raw} =
+      Nif.engine_info(ref(store))
+      |> unwrap_nif_ok()
 
     %{
       series_count: trunc(raw["series_count"]),
@@ -231,21 +263,21 @@ defmodule TimelessMetrics.RustEngine do
 
   @impl true
   def handle_info(:periodic_flush, state) do
-    Nif.engine_flush_pending(state.engine)
+    _ = Nif.engine_flush_pending(state.engine)
     schedule_flush()
     {:noreply, state}
   end
 
   @impl true
   def handle_info(:cold_flush, state) do
-    Nif.engine_flush_cold(state.engine, 300)
+    _ = Nif.engine_flush_cold(state.engine, 300)
     schedule_cold_flush()
     {:noreply, state}
   end
 
   @impl true
   def terminate(_reason, state) do
-    Nif.engine_shutdown(state.engine)
+    _ = Nif.engine_shutdown(state.engine)
     :ok
   end
 
@@ -253,6 +285,10 @@ defmodule TimelessMetrics.RustEngine do
   defp schedule_cold_flush, do: Process.send_after(self(), :cold_flush, @cold_flush_interval)
 
   # ── Helpers ─────────────────────────────────────────────────────────
+
+  defp unwrap_nif_ok({:ok, {:ok, value}}), do: {:ok, value}
+  defp unwrap_nif_ok({:ok, value}), do: {:ok, value}
+  defp unwrap_nif_ok({:error, _} = error), do: error
 
   defp bucket_to_seconds(nil), do: nil
   defp bucket_to_seconds(:minute), do: 60

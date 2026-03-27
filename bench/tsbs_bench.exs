@@ -14,14 +14,10 @@ defmodule TSBSBench do
     IO.puts("Data dir: #{@data_dir}")
     IO.puts("HTTP port: #{@port}\n")
 
-    # Start TimelessMetrics with tuned settings
-    shards = System.schedulers_online()
-
     {:ok, _sup} =
       Supervisor.start_link(
         [
-          {TimelessMetrics,
-           name: :tsbs_bench, data_dir: @data_dir, buffer_shards: shards},
+          {TimelessMetrics, name: :tsbs_bench, data_dir: @data_dir, self_monitor: false},
           {TimelessMetrics.HTTP, store: :tsbs_bench, port: @port}
         ],
         strategy: :one_for_one

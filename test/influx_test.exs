@@ -1,6 +1,8 @@
 defmodule TimelessMetrics.InfluxTest do
   use ExUnit.Case, async: false
 
+  alias TimelessMetrics.TestHelper
+
   @moduledoc """
   Tests for InfluxDB line protocol ingestion and TSBS query routing.
   """
@@ -8,12 +10,27 @@ defmodule TimelessMetrics.InfluxTest do
   @data_dir "/tmp/timeless_influx_test_#{System.os_time(:millisecond)}"
   @port 18_407
 
-  setup do
-    start_supervised!({TimelessMetrics, name: :influx_test, data_dir: @data_dir, engine: :actor})
+  setup_all do
     start_supervised!({TimelessMetrics.HTTP, store: :influx_test, port: @port})
     Process.sleep(50)
 
-    on_exit(fn -> File.rm_rf!(@data_dir) end)
+    on_exit(fn ->
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:influx_test, nil})
+    end)
+
+    :ok
+  end
+
+  setup do
+    TestHelper.await_down(:influx_test_sup)
+    :persistent_term.put({TimelessMetrics.HTTP, :config}, {:influx_test, nil})
+    start_supervised!({TimelessMetrics, name: :influx_test, data_dir: @data_dir, engine: :actor})
+
+    on_exit(fn ->
+      TestHelper.await_down(:influx_test_sup)
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:influx_test, nil})
+      File.rm_rf!(@data_dir)
+    end)
 
     :ok
   end

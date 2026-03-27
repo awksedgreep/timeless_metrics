@@ -1,15 +1,32 @@
 defmodule TimelessMetrics.ScraperTest do
   use ExUnit.Case, async: false
 
+  alias TimelessMetrics.TestHelper
+
   @data_dir "/tmp/timeless_scraper_test_#{System.os_time(:millisecond)}"
   @port 18_408
 
-  setup do
-    start_supervised!({TimelessMetrics, name: :scraper_test, data_dir: @data_dir, scraping: true})
+  setup_all do
     start_supervised!({TimelessMetrics.HTTP, store: :scraper_test, port: @port})
     Process.sleep(50)
 
-    on_exit(fn -> File.rm_rf!(@data_dir) end)
+    on_exit(fn ->
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:scraper_test, nil})
+    end)
+
+    :ok
+  end
+
+  setup do
+    TestHelper.await_down(:scraper_test_sup)
+    :persistent_term.put({TimelessMetrics.HTTP, :config}, {:scraper_test, nil})
+    start_supervised!({TimelessMetrics, name: :scraper_test, data_dir: @data_dir, scraping: true})
+
+    on_exit(fn ->
+      TestHelper.await_down(:scraper_test_sup)
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:scraper_test, nil})
+      File.rm_rf!(@data_dir)
+    end)
 
     :ok
   end
