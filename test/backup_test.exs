@@ -1,14 +1,31 @@
 defmodule TimelessMetrics.BackupTest do
   use ExUnit.Case, async: false
 
+  alias TimelessMetrics.TestHelper
+
   @data_dir "/tmp/timeless_backup_test_#{System.os_time(:millisecond)}"
   @backup_dir "/tmp/timeless_backup_target_#{System.os_time(:millisecond)}"
   @port 18_402
 
+  setup_all do
+    start_supervised!({TimelessMetrics.HTTP, store: :backup_test, port: @port})
+    Process.sleep(50)
+
+    on_exit(fn ->
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:backup_test, nil})
+    end)
+
+    :ok
+  end
+
   setup do
+    TestHelper.await_down(:backup_test_sup)
+    :persistent_term.put({TimelessMetrics.HTTP, :config}, {:backup_test, nil})
     start_supervised!({TimelessMetrics, name: :backup_test, data_dir: @data_dir})
 
     on_exit(fn ->
+      TestHelper.await_down(:backup_test_sup)
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:backup_test, nil})
       File.rm_rf!(@data_dir)
       File.rm_rf!(@backup_dir)
     end)
@@ -88,9 +105,6 @@ defmodule TimelessMetrics.BackupTest do
   end
 
   test "HTTP POST /api/v1/backup triggers backup with custom path" do
-    start_supervised!({TimelessMetrics.HTTP, store: :backup_test, port: @port})
-    Process.sleep(50)
-
     now = System.os_time(:second)
 
     TimelessMetrics.write(:backup_test, "http_metric", %{"x" => "y"}, 42.0, timestamp: now - 60)
@@ -117,15 +131,12 @@ defmodule TimelessMetrics.BackupTest do
   end
 
   test "HTTP POST /api/v1/backup uses default path when no body" do
-    start_supervised!({TimelessMetrics.HTTP, store: :backup_test, port: @port + 1})
-    Process.sleep(50)
-
     now = System.os_time(:second)
 
     TimelessMetrics.write(:backup_test, "default_path", %{"a" => "b"}, 1.0, timestamp: now - 60)
     TimelessMetrics.flush(:backup_test)
 
-    resp = TimelessMetrics.TestHTTP.post(@port + 1, "/api/v1/backup", "")
+    resp = TimelessMetrics.TestHTTP.post(@port, "/api/v1/backup", "")
 
     assert resp.status == 200
     result = :json.decode(resp.body)

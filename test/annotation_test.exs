@@ -1,15 +1,32 @@
 defmodule TimelessMetrics.AnnotationTest do
   use ExUnit.Case, async: false
 
+  alias TimelessMetrics.TestHelper
+
   @data_dir "/tmp/timeless_annot_test_#{System.os_time(:millisecond)}"
   @port 18_404
 
-  setup do
-    start_supervised!({TimelessMetrics, name: :annot_test, data_dir: @data_dir, engine: :actor})
+  setup_all do
     start_supervised!({TimelessMetrics.HTTP, store: :annot_test, port: @port})
     Process.sleep(50)
 
-    on_exit(fn -> File.rm_rf!(@data_dir) end)
+    on_exit(fn ->
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:annot_test, nil})
+    end)
+
+    :ok
+  end
+
+  setup do
+    TestHelper.await_down(:annot_test_sup)
+    :persistent_term.put({TimelessMetrics.HTTP, :config}, {:annot_test, nil})
+    start_supervised!({TimelessMetrics, name: :annot_test, data_dir: @data_dir, engine: :actor})
+
+    on_exit(fn ->
+      TestHelper.await_down(:annot_test_sup)
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:annot_test, nil})
+      File.rm_rf!(@data_dir)
+    end)
 
     :ok
   end

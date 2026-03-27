@@ -1,20 +1,34 @@
 defmodule TimelessMetrics.MetadataRateTest do
   use ExUnit.Case, async: false
 
+  alias TimelessMetrics.TestHelper
+
+  @data_dir "/tmp/timeless_meta_test_#{System.os_time(:millisecond)}"
   @port 18_406
 
-  setup do
-    id = System.unique_integer([:positive])
-    store = :"meta_test_#{id}"
-    data_dir = "/tmp/timeless_meta_test_#{id}"
-
-    start_supervised!({TimelessMetrics, name: store, data_dir: data_dir, engine: :actor})
-    start_supervised!({TimelessMetrics.HTTP, store: store, port: @port})
+  setup_all do
+    start_supervised!({TimelessMetrics.HTTP, store: :meta_test, port: @port})
     Process.sleep(50)
 
-    on_exit(fn -> File.rm_rf!(data_dir) end)
+    on_exit(fn ->
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:meta_test, nil})
+    end)
 
-    {:ok, store: store}
+    :ok
+  end
+
+  setup do
+    TestHelper.await_down(:meta_test_sup)
+    :persistent_term.put({TimelessMetrics.HTTP, :config}, {:meta_test, nil})
+    start_supervised!({TimelessMetrics, name: :meta_test, data_dir: @data_dir, engine: :actor})
+
+    on_exit(fn ->
+      TestHelper.await_down(:meta_test_sup)
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:meta_test, nil})
+      File.rm_rf!(@data_dir)
+    end)
+
+    {:ok, store: :meta_test}
   end
 
   # --- Metadata ---

@@ -3,6 +3,8 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
   @moduletag :integration
   @moduletag timeout: 300_000
 
+  alias TimelessMetrics.TestHelper
+
   @moduledoc """
   End-to-end simulation of TSBS DevOps query types.
 
@@ -21,10 +23,21 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
   @points_per_series 100
   @base_ts 1_700_000_000
 
-  setup do
-    start_supervised!({TimelessMetrics, name: :tsbs_test, data_dir: @data_dir, engine: :actor})
+  setup_all do
     start_supervised!({TimelessMetrics.HTTP, store: :tsbs_test, port: @port})
     Process.sleep(50)
+
+    on_exit(fn ->
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:tsbs_test, nil})
+    end)
+
+    :ok
+  end
+
+  setup do
+    TestHelper.await_down(:tsbs_test_sup)
+    :persistent_term.put({TimelessMetrics.HTTP, :config}, {:tsbs_test, nil})
+    start_supervised!({TimelessMetrics, name: :tsbs_test, data_dir: @data_dir, engine: :actor})
 
     # Write TSBS-style data: 10 hosts x 10 CPU metrics x 100 points
     entries =
@@ -43,6 +56,8 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
     TimelessMetrics.flush(:tsbs_test)
 
     on_exit(fn ->
+      TestHelper.await_down(:tsbs_test_sup)
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:tsbs_test, nil})
       File.rm_rf!(@data_dir)
     end)
 

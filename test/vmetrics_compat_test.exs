@@ -14,15 +14,33 @@ defmodule TimelessMetrics.VMetricsCompatTest do
   """
   use ExUnit.Case, async: false
 
+  alias TimelessMetrics.TestHelper
+
   @data_dir "/tmp/timeless_vmetrics_compat_#{System.os_time(:millisecond)}"
   @port 18_412
 
-  setup do
-    TimelessMetrics.TestHelper.await_down(:vmc_sup)
-    start_supervised!({TimelessMetrics, name: :vmc, data_dir: @data_dir, engine: :actor})
+  setup_all do
     start_supervised!({TimelessMetrics.HTTP, store: :vmc, port: @port})
     Process.sleep(50)
-    on_exit(fn -> File.rm_rf!(@data_dir) end)
+
+    on_exit(fn ->
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:vmc, nil})
+    end)
+
+    :ok
+  end
+
+  setup do
+    TestHelper.await_down(:vmc_sup)
+    :persistent_term.put({TimelessMetrics.HTTP, :config}, {:vmc, nil})
+    start_supervised!({TimelessMetrics, name: :vmc, data_dir: @data_dir, engine: :actor})
+
+    on_exit(fn ->
+      TestHelper.await_down(:vmc_sup)
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:vmc, nil})
+      File.rm_rf!(@data_dir)
+    end)
+
     :ok
   end
 
