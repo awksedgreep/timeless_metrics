@@ -1,7 +1,7 @@
 defmodule TimelessMetrics.MixProject do
   use Mix.Project
 
-  @version "6.0.0"
+  @version "6.0.1"
 
   def project do
     [
@@ -27,7 +27,7 @@ defmodule TimelessMetrics.MixProject do
       make_precompiler_filename: "prometheus_nif",
       make_precompiler_priv_paths: ["prometheus_nif.*"],
       make_precompiler_nif_versions: [versions: ["2.16", "2.17"]],
-      description: "Embedded time series database for Elixir with Gorilla + zstd compression.",
+      description: "Embedded time series database for Elixir with a Rust-native hot path.",
       source_url: "https://github.com/awksedgreep/timeless_metrics",
       homepage_url: "https://github.com/awksedgreep/timeless_metrics",
       package: package(),

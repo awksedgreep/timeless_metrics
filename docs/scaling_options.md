@@ -1,111 +1,105 @@
-# TimelessMetrics Scaling Options
+# TimelessMetrics Scaling Notes
 
-Performance on AWS i8g.24xlarge (96 vCPU ARM, 768 GiB RAM), 200K series:
+This guide focuses on the current rust-default engine. Older ETS shard and SegmentBuilder tuning advice is intentionally omitted here because it no longer describes the default deployment path.
 
-| Metric | Value |
-|--------|-------|
-| Sustained writes (256 writers) | 4.39M pts/sec |
-| Query rate (24 workers + writes) | 7,853 q/sec |
-| Query latency | 3.06ms |
-| Storage efficiency | 0.7 bytes/pt |
+## Architecture overview
 
----
+The rust engine keeps the hot path inside a single native resource:
 
-## Architecture Overview
-
-TimelessMetrics uses a **sharded ETS write buffer** architecture: incoming points land in one of N lock-free ETS tables, paired with N SegmentBuilder workers that compress and write segments to disk. No per-series processes exist.
-
-```
+```text
 write(store, metric, labels, value)
-  → SeriesRegistry.get_or_create (persistent_term + ETS lookup)
-  → Buffer.write (ETS insert, lock-free)
-  → SegmentBuilder accumulates, compresses, writes to disk
+  -> resolve series id in rust
+  -> append point to an in-memory partition buffer
+  -> flush compressed chunks to disk
 ```
 
----
+Supporting features such as alerts, annotations, scrape targets, and rollup metadata still use the Elixir-side SQLite admin database, but raw point ingestion and querying go through the rust engine.
 
-## Write Path Scaling
+## What scales well
 
-### How it scales
+### Batch writes
 
-1. **Sharded ETS buffers**: N independent ETS tables with `write_concurrency: :auto`. Each table has its own lock striping, so more shards = less contention. Default is `schedulers / 2`.
+If you control the caller, `write_batch/2` is the first scaling lever to use.
 
-2. **Lock-free series creation**: New series get IDs from `:atomics` and register via `:ets.insert_new` (CAS). No GenServer in the creation hot path.
+- It amortizes Elixir-to-NIF overhead.
+- It reduces repeated label resolution work.
+- It produces the most representative ingest numbers for sustained workloads.
 
-3. **Parallel compression**: Each shard has its own SegmentBuilder that compresses independently. Compression is offloaded to Tasks to avoid blocking ingestion.
+In the current benchmark set, batch ingest is materially stronger than point-at-a-time writes.
 
-4. **Disk writes**: each shard writes to its own directory. No cross-shard contention on disk I/O.
+### Warm steady-state ingest
 
-### Scaling strategies
+TimelessMetrics performs best once the active series set already exists and writes are flowing into established series.
 
-| Strategy | When needed | Expected gain |
-|----------|-------------|---------------|
-| Increase `buffer_shards` | Write contention on high-core machines | More parallel write paths |
-| Increase `flush_threshold` | Reduce flush overhead | Larger batches to SegmentBuilder |
-| Pre-resolved writes (`write_resolved`) | Hot path with known series IDs | Skip registry lookup |
-| Concurrent `write_batch` callers | Multiple data sources | Linear scaling with caller count |
+- Cold population includes series creation and metadata persistence.
+- Warm ingest reflects ongoing workload throughput.
 
-### Pre-resolved writes
+When benchmarking or capacity planning, separate those two phases. Mixing them leads to misleading conclusions.
 
-For hot paths where you write to the same series repeatedly, resolve the series ID once and bypass the registry on subsequent writes:
+### Query fan-out by label filter
 
-```elixir
-series_id = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
-TimelessMetrics.write_resolved(:metrics, series_id, 73.2, timestamp: ts)
-```
+Multi-series queries scale best when label filters narrow the working set early.
 
----
+- Exact-label queries are cheapest.
+- Partial-label queries are fine when cardinality is bounded.
+- Wide-open queries across large metrics are the most expensive path.
 
-## Query Path Scaling
+### Multiple store instances
 
-### Current approach
+If one node must serve very different workloads, separate them into different stores instead of over-tuning one global instance.
 
-Queries read from compressed segments on disk via lock-free file operations. Multi-series queries group by shard and fan out via `Task.async_stream` — each shard's series are queried together to avoid cross-shard file contention.
+Examples:
+- high-churn application metrics in one store
+- long-retention infrastructure metrics in another
+- isolated benchmark or test stores in memory mode
 
-### Strategies
+## What to tune
 
-- **Label filters**: Always filter by labels to reduce fan-out scope
-- **Aggregated queries**: Use `query_aggregate_multi` instead of raw queries for dashboards
-- **Daily rollups**: Use `query_daily` for long time ranges (reads pre-computed tier data instead of decompressing raw segments)
+### `ingest_workers`
 
----
+`ingest_workers` affects only HTTP imports. It controls how many background workers drain the HTTP ingest queue.
 
-## Memory Scaling
+- Increase it when HTTP import is saturated and CPU is available.
+- Leave it near the default for most deployments.
+- Lower it for small embedded or mostly-query workloads.
 
-Memory usage is primarily in the ETS buffer shards and SegmentBuilder in-memory segments:
+### `schema`
 
-- **ETS buffers**: each shard holds points between flushes. Bounded by `flush_threshold × shard_count`.
-- **SegmentBuilder**: accumulates points in memory until the segment window completes. Bounded by `segment_duration` × write rate per shard.
-- **Series registry**: persistent_term map + ETS overflow. ~100 bytes per series.
+The schema controls rollup tiers and retention. This is one of the most important operational choices because it affects both disk usage and long-range query cost.
 
-### Estimates
+- Short raw retention reduces storage cost for high-volume workloads.
+- Longer rollup retention keeps dashboards cheap over long windows.
+- Custom tiers are preferable to forcing every query through raw history.
 
-| Series count | Registry memory | Buffer memory (default settings) |
-|-------------|----------------|----------------------------------|
-| 10K | ~1 MB | ~50 MB |
-| 100K | ~10 MB | ~50 MB |
-| 500K | ~50 MB | ~50 MB |
-| 1M+ | ~100 MB | ~50 MB |
+### `raw_retention_seconds` and `daily_retention_seconds`
 
-Buffer memory is independent of series count — it depends on write rate and flush settings.
+These are the coarse controls for storage growth.
 
----
+- Increase them only when you need that data online.
+- For dense operational metrics, extra raw retention adds up quickly.
+- Long-term planning should usually lean on rollups, not unlimited raw data.
 
-## Scale Thresholds
+### `mode`
 
-| Series Count | Expected Bottleneck | Mitigation |
-|-------------|-------------------|------------|
-| 10K | None | Current architecture works well |
-| 100K | Series creation time | Already lock-free, scales with cores |
-| 500K | Registry persistent_term size | Monitor publish cycle times |
-| 1M+ | Single-node limits | Multiple store instances or partitioning |
+- `:disk` is the normal production path.
+- `:memory` is for tests, ephemeral services, and isolated benchmarks.
 
----
+## Benchmarking guidance
 
-## What NOT to Do
+Use the maintained benchmark set in [`bench/README.md`](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/README.md).
 
-- **Don't add a connection pool for SQLite writes.** SQLite is only used for metadata. Raw data goes to segment files via SegmentBuilder.
+For ingest performance, treat these as separate questions:
 
-- **Don't switch to PostgreSQL/TimescaleDB.** The whole point is embedded, zero-dependency. Network round-trips to an external DB would negate the query latency advantage.
+1. How expensive is cold population?
+2. What is warm steady-state throughput?
+3. How much time does flush/compression add?
+4. How do real HTTP workloads compare to direct library writes?
 
-- **Don't pre-optimize for 1M+ series.** The current architecture handles 200K series at 4.39M pts/sec. Optimize when you hit actual bottlenecks, not hypothetical ones.
+The updated `bench/write_bench.exs` follows that split and is the best starting point for write-path analysis.
+
+## What not to optimize first
+
+- Do not assume compression is the bottleneck. Current compression efficiency is already strong.
+- Do not compare cold-start benchmarks to warm-ingest benchmarks as if they measured the same thing.
+- Do not tune legacy-only options unless you are intentionally running `engine: :legacy`.
+- Do not widen queries unnecessarily when dashboards only need aggregated or filtered results.

@@ -1,199 +1,236 @@
 # Architecture
 
-This document describes the internal architecture of TimelessMetrics. For the public API, see [API Reference](API.md).
+This document describes the current default architecture of TimelessMetrics.
 
-## Supervision tree
+The important versioned truth is:
+- the default engine is the Rust engine
+- the legacy Elixir engine still exists, but it is no longer the primary design target
 
-```
-TimelessMetrics.Supervisor (:metrics_sup)
-├── TimelessMetrics.DB (:metrics_db)
-│     SQLite database (WAL mode) for series registry, metadata, annotations, alerts
-├── TimelessMetrics.SeriesRegistry (:metrics_registry)
-│     Series ID lookup (persistent_term + ETS overflow + SQLite backing)
-├── TimelessMetrics.DictTrainer (:metrics_dict_trainer)
-│     Trains zstd dictionaries for improved compression
-├── TimelessMetrics.SegmentBuilder (:metrics_builder_0..N)
-│     Per-shard compression worker (accumulates → gorilla + zstd → disk)
-├── TimelessMetrics.Buffer (:metrics_shard_0..N)
-│     Per-shard ETS write buffer (lock-free inserts)
-├── TimelessMetrics.Rollup (:metrics_rollup)
-│     Periodic rollup aggregation (hourly, daily tiers)
-├── TimelessMetrics.Retention (:metrics_retention)
-│     Periodic cleanup of expired raw and rollup data
-├── TimelessMetrics.AlertEvaluator (:metrics_alert_evaluator)
-│     Periodic alert rule evaluation
-├── TimelessMetrics.SelfMonitor (:metrics_self_monitor)
-│     Writes internal store metrics (series count, points, storage bytes)
-├── DynamicSupervisor (:metrics_scrape_sup)
-│     Supervises per-target scrape worker processes
-└── TimelessMetrics.Scraper (:metrics_scraper)
-      Manages scrape targets, starts/stops workers
-```
+If you are reading older notes that describe ETS shard buffers, SegmentBuilder, Gorilla, ALP, or SQLite-backed raw storage as the hot path, those describe the legacy engine, not the default runtime on `main`.
 
-The supervisor uses `:rest_for_one` strategy, so a crash in the DB or registry restarts everything downstream.
+## High-Level Design
 
-Buffer and SegmentBuilder are paired — each shard has one of each. The default shard count is `max(schedulers_online / 2, 2)`, so a 96-core machine gets 48 shards.
+TimelessMetrics is split into two layers:
 
-## Sharded write architecture
+1. Rust hot path
+   - series resolution
+   - labeled writes and batch writes
+   - raw and aggregate reads
+   - chunk persistence and restart recovery
+   - label and metric listing
 
-Every write is routed to one of N ETS buffer shards by series ID. This distributes write contention across independent tables, each with its own lock striping via `write_concurrency: :auto`.
+2. Elixir product layer
+   - supervision and configuration
+   - HTTP API
+   - background ingest workers
+   - alerts, annotations, metadata, scrape targets
+   - PromQL execution and response shaping
+   - charts, dashboard, forecasting, anomaly detection
+   - retention, rollups, backup orchestration
 
-There are no per-series processes. The hot write path is entirely lock-free ETS operations.
+The Rust layer is responsible for the time-series engine. Elixir is responsible for the surrounding application behavior.
 
-## Write path
+## Supervision Tree
 
-```
-write(store, metric_name, labels, value)
-  │
-  ▼
-SeriesRegistry.get_or_create/3
-  ├── persistent_term Map lookup (fast path: series exists)
-  ├── ETS overflow lookup (warm path: recently created)
-  └── atomics counter + :ets.insert_new (cold path: new series, lock-free)
-  │
-  ▼
-series_id → shard routing: rem(abs(series_id), shard_count)
-  │
-  ▼
-Buffer.write/4 → :ets.insert(shard_table, {{series_id, ts, seq}, value})
-  │  (when buffer reaches flush_threshold or flush_interval fires)
-  ▼
-SegmentBuilder.ingest/2 (GenServer cast — non-blocking)
-  │  (accumulates in memory, grouped by {series_id, time_window})
-  │  (periodic flush_pending compresses dirty segments → WAL)
-  │  (periodic check_segments seals completed windows → .seg files)
-  ▼
-ShardStore: gorilla + zstd compressed segments on disk
+For a normal persisted store:
+
+```elixir
+children = [
+  {TimelessMetrics, name: :metrics, data_dir: "/var/lib/metrics"},
+  {TimelessMetrics.HTTP, store: :metrics, port: 8428}
+]
 ```
 
-**Batch writes** (`write_batch/2`) resolve all series IDs, group by shard, and call `Buffer.write_bulk/2` per shard — one ETS insert per shard regardless of batch size.
+Internally, the store supervisor starts different children depending on mode, but the current rust-default path is roughly:
 
-**Series creation** is lock-free: new series get IDs from an `:atomics` counter and register via `:ets.insert_new` (atomic CAS). SQLite metadata writes are batched asynchronously on a periodic timer.
-
-## Read path
-
-```
-query(store, metric_name, labels, opts)
-  │
-  ▼
-SeriesRegistry resolves series_id
-  │
-  ▼
-Query.raw/3 → routes to the series' shard's SegmentBuilder
-  │
-  ├── ShardStore.read_segments(series_id, from, to)
-  │     Reads compressed .seg files + WAL
-  │     Lock-free file I/O, no GenServer involved
-  │
-  ▼
-Decompress segments (gorilla + zstd)
-  │
-  ▼
-Filter by time range, merge, return [{timestamp, value}, ...]
+```text
+TimelessMetrics.Supervisor
+├── TimelessMetrics.DB
+├── TimelessMetrics.RustEngine
+├── TimelessMetrics.IngestWorker x N   (non-memory mode)
+├── TimelessMetrics.AlertEvaluator     (non-memory mode)
+├── TimelessMetrics.SelfMonitor        (optional)
+├── DynamicSupervisor                  (scraping enabled, non-memory mode)
+└── TimelessMetrics.Scraper            (scraping enabled, non-memory mode)
 ```
 
-**Single-series queries** read from the SegmentBuilder's shard storage via lock-free file operations. No process mailbox is involved, so queries don't compete with writes.
+`TimelessMetrics.HTTP` is a separate child you add alongside the store when you want HTTP ingest/query endpoints.
 
-**Multi-series queries** (`query_multi`, `query_aggregate_multi`, etc.) group matching series by shard and fan out via `Task.async_stream`. Each shard's series are queried together, eliminating cross-shard file contention.
+## Engine Selection
 
-## Series Registry
+`TimelessMetrics.Supervisor` defaults to:
 
-The SeriesRegistry uses a three-tier lookup for maximum throughput:
-
-| Tier | Mechanism | Latency | When |
-|------|-----------|---------|------|
-| Published | `persistent_term` Map | Zero-copy, sub-microsecond | Steady state (after publish timer) |
-| Overflow | ETS `:set` with `write_concurrency: :auto` | Lock-free read | Recently created series |
-| Creation | `:atomics.add_get` + `:ets.insert_new` | Lock-free CAS | First write to a new series |
-
-Every 5 seconds, the overflow table is merged into the persistent_term map and cleared. In steady state, 100% of lookups hit the persistent_term fast path.
-
-SQLite writes are batched asynchronously — they never block the write path.
-
-## Storage format
-
-### Segments
-
-Data is stored in time-windowed segments per shard:
-
-```
-shard_N/
-  raw/
-    1706000000.seg    # immutable segment file per window
-    current.wal       # pending data not yet sealed
-  tier_hourly/
-    chunks.dat        # append-only tier data
-    index.ets
-  tier_daily/
-    chunks.dat
-    index.ets
+```elixir
+engine: :rust
 ```
 
-Each segment window goes through two compression stages.
+The legacy engine is still available through explicit configuration:
 
-1. **Fast in-progress compression**: every ~10 seconds, open segments are serialized with `term_to_binary` and wrapped with zstd (`0xFA` marker). These blobs are written to the live ETS cache and `current.wal`, making fresh data queryable almost immediately.
-2. **Final window compression**: when a window is explicitly flushed or completed, numeric data is recompressed with ALP + zstd (`0xA1`) and text data with RLE + zstd (`0xFE`). Completed windows are then sealed into immutable `.seg` files.
-3. **Legacy compatibility**: older Gorilla-based blobs are still readable and may remain on disk until rewritten.
-
-Measured compression: **0.7 bytes per point** on production-like workloads (739 MB for 1.13 billion points).
-
-### WAL and sealing
-
-The SegmentBuilder accumulates points in memory. Periodically:
-
-- **drain_buffer** (every 10s): flushes the paired Buffer shard, fast-compresses open segments, and writes merged in-progress blobs to the live ETS cache + `current.wal`
-- **promote_segments** (on completed windows / explicit flush): recompresses completed windows into their final codec (ALP for numeric, RLE for text) and seals them into immutable `.seg` files
-
-Compression is offloaded to Tasks to avoid blocking the SegmentBuilder's ingest path.
-
-### SQLite
-
-SQLite (WAL mode with mmap) stores metadata only:
-
-- **Series registry**: maps `{metric_name, labels}` to series IDs
-- **Metric metadata**: type, unit, description
-- **Annotations**: event markers with timestamps and tags
-- **Alert rules and history**: threshold conditions, evaluation state
-- **Scrape targets and health**: Prometheus target configuration
-
-SQLite is not used for raw time series data — that goes directly to compressed segment files for maximum throughput.
-
-## Rollup pipeline
-
-The `Rollup` process runs periodically (default: every 5 minutes) and computes tiered aggregates per shard:
-
-```
-Raw segments per shard
-  │
-  ▼
-Read segments since last watermark
-  │
-  ▼
-Group by day (UTC midnight boundaries)
-  │
-  ▼
-Compute aggregates: avg, min, max, sum, count, last
-  │
-  ▼
-Write tier chunks to ShardStore (binary files, not SQLite)
+```elixir
+{TimelessMetrics, name: :metrics, data_dir: "/tmp/metrics", engine: :legacy}
 ```
 
-Rollup data is stored in the same shard directory as raw segments, enabling parallel per-shard reads for long-range queries.
+Current docs in this file describe the rust path unless stated otherwise.
 
-## Retention
+## Write Path
 
-The `Retention` process runs periodically (default: every hour) and enforces retention policies per shard:
+### Programmatic API
 
-| Tier | Default retention | What's deleted |
-|------|-------------------|----------------|
-| Raw | 7 days | Segment files older than the cutoff |
-| Daily | 365 days | Tier chunk data older than the cutoff |
+Elixir writes call into `TimelessMetrics.RustEngine`, which forwards to the Rust NIF.
 
-Configure via `raw_retention_seconds` and `daily_retention_seconds` supervisor options.
+Flow:
 
-## Further reading
+```text
+TimelessMetrics.write / write_batch
+  -> TimelessMetrics.RustEngine
+  -> Rust NIF
+  -> resolve series
+  -> append to in-memory partition buffers
+  -> flush to chunk files when thresholds or maintenance triggers fire
+```
 
-- [Configuration Reference](configuration.md) — all supervisor options and tuning guidance
-- [API Reference](API.md) — complete Elixir and HTTP API
-- [Operations](operations.md) — monitoring, backup, troubleshooting
-- [Benchmark Comparison](../notes/blog_benchmark_comparison.md) — Timeless vs VictoriaMetrics on 96-core ARM
+Key properties:
+- batch writes are the primary high-throughput path
+- the engine maintains its own series registry
+- chunk metadata is stored and rebuilt from files on restart
+- writes remain queryable before and after flush
+
+### HTTP Ingest
+
+HTTP ingest is intentionally decoupled from parsing and storage:
+
+```text
+HTTP request
+  -> handler enqueues raw body in ETS
+  -> returns quickly
+  -> IngestWorker drains queue
+  -> parse body
+  -> RustEngine/NIF write path
+```
+
+This is true for:
+- VictoriaMetrics JSON-line ingest
+- Prometheus text ingest
+- Influx line protocol ingest
+
+The queue is an Elixir concern. The actual time-series write path is still the Rust engine.
+
+## Read Path
+
+Raw and aggregate reads for the default engine go through the Rust layer.
+
+Examples:
+- `TimelessMetrics.query/4`
+- `TimelessMetrics.query_multi/4`
+- `TimelessMetrics.query_aggregate/4`
+- `TimelessMetrics.query_aggregate_multi/4`
+
+PromQL and HTTP compatibility endpoints are layered above that:
+
+```text
+HTTP / PromQL request
+  -> parse HTTP params or PromQL
+  -> call TimelessMetrics query functions
+  -> RustEngine / NIF returns data
+  -> Elixir formats HTTP / Prometheus response
+```
+
+So the Rust engine owns the data retrieval, but Elixir still owns:
+- PromQL planning
+- Prometheus response envelopes
+- dashboard/chart formatting
+- filtering and endpoint-specific shaping
+
+## Storage Model
+
+The rust engine persists data under a Rust-engine-specific directory inside the store `data_dir`.
+
+Conceptually it keeps:
+- a persisted series registry
+- individual chunk files
+- batched chunk files
+- an in-memory index rebuilt on startup
+
+Important behavior:
+- chunk metadata is used to prune reads efficiently
+- restart recovery rebuilds the in-memory index from disk
+- chunk naming is designed to avoid restart-time overwrite collisions
+- out-of-order points are normalized before chunk metadata is written
+
+## Memory-Only Mode
+
+Memory-only mode disables durable raw-data persistence:
+
+```elixir
+{TimelessMetrics, name: :metrics, mode: :memory}
+```
+
+In memory-only mode:
+- the rust engine still serves as the hot path
+- scraping and alert evaluator are skipped
+- raw series data is not persisted for recovery
+
+This mode is useful for:
+- tests
+- local experiments
+- ephemeral services
+- constrained deployments
+
+## Metadata and Admin Data
+
+The Rust engine handles time-series storage, but the DB process still matters.
+
+Elixir-side admin data is still managed in SQLite-backed tables through `TimelessMetrics.DB`, including:
+- metric metadata
+- annotations
+- alert rules and state
+- scrape targets and scrape health
+- rollup/admin metadata used by the higher-level product surface
+
+That means the system is not “Rust only.” It is a Rust-default time-series engine with an Elixir application layer around it.
+
+## HTTP Surface
+
+`TimelessMetrics.HTTP` exposes three groups of endpoints:
+
+1. Native ingest/query
+   - `/api/v1/import`
+   - `/api/v1/import/prometheus`
+   - `/write`
+   - `/api/v1/query`
+   - `/api/v1/query_range`
+   - `/api/v1/export`
+
+2. Prometheus-compatible endpoints
+   - `/prometheus/api/v1/query`
+   - `/prometheus/api/v1/query_range`
+   - `/prometheus/api/v1/labels`
+   - `/prometheus/api/v1/label/:name/values`
+   - `/prometheus/api/v1/series`
+
+3. Product/ops endpoints
+   - `/health`
+   - `/health/detailed`
+   - `/chart`
+   - annotations, alerts, metadata, backup, dashboard, forecasting, anomalies
+
+## Benchmarks
+
+The benchmark set was cleaned up to reflect the current architecture. See:
+- [../bench/README.md](../bench/README.md)
+
+The maintained benchmarks are:
+- embedded API throughput
+- HTTP concurrency
+- realistic HTTP workload ramp
+- TSBS harness
+- VictoriaMetrics comparison
+
+## Legacy Notes
+
+If you need the legacy engine, keep these distinctions in mind:
+- old docs describing ETS shard buffers and SegmentBuilder are about the legacy path
+- old compression references to Gorilla or ALP as the primary active engine are legacy descriptions
+- old benchmark scripts that depended on actor-era internals were intentionally removed
+
+The codebase still contains compatibility paths, but the primary architecture is now the rust-default engine described above.

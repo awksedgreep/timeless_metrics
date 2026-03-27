@@ -2,8 +2,9 @@ defmodule TimelessMetrics do
   @moduledoc """
   Embedded time series storage for Elixir.
 
-  Uses per-series actor processes with Gorilla compression and SQLite
-  for fast, compact metric storage with daily rollups and configurable retention.
+  TimelessMetrics runs as an embedded store inside your application and defaults to
+  a Rust-backed engine for raw point ingestion and queries. Administrative data such
+  as annotations, alerts, scrape targets, and rollup metadata stays on the Elixir side.
 
   ## Quick Start
 

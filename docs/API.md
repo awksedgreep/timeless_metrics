@@ -13,7 +13,7 @@ covers the Elixir API, the HTTP interface, and the SVG charting endpoint.
   - [Writing Data](#writing-data)
   - [Writing Text Data](#writing-text-data)
   - [Querying Text Data](#querying-text-data)
-  - [Pre-Resolved Writes (High-Throughput)](#pre-resolved-writes-high-throughput)
+  - [Pre-Resolved Writes (Legacy Engine)](#pre-resolved-writes-legacy-engine)
   - [Querying Data](#querying-data)
   - [Aggregation Queries](#aggregation-queries)
   - [Tier Queries](#tier-queries)
@@ -64,12 +64,21 @@ All subsequent API calls reference the store by its name (`:metrics` above).
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `:name` | atom | **required** | Store name used in all API calls |
-| `:data_dir` | string | **required** | Directory for block data files and metadata database |
-| `:buffer_shards` | integer | `cpus / 2` | Number of ETS write buffer shards |
-| `:flush_threshold` | integer | `10_000` | Points per shard before immediate flush |
-| `:flush_interval` | integer | `5_000` | Buffer flush interval in ms |
-| `:compression` | atom | `:zstd` | Compression algorithm |
+| `:data_dir` | string | `"data"` | Directory for Rust engine chunk data and SQLite admin data |
+| `:mode` | atom | `:disk` | `:disk` persists data; `:memory` keeps the store ephemeral |
 | `:schema` | module/struct | `TimelessMetrics.Schema.default()` | Rollup tier configuration |
+| `:raw_retention_seconds` | integer | `604_800` | Raw point retention in seconds |
+| `:daily_retention_seconds` | integer | `31_536_000` | Daily rollup retention in seconds |
+| `:ingest_workers` | integer | `max(div(cpus, 4), 2)` | HTTP ingest queue workers |
+| `:alert_interval` | integer | `60_000` | Alert evaluation interval in ms |
+| `:self_monitor` | boolean | `true` | Enable internal self-monitoring metrics |
+| `:self_monitor_labels` | map | `%{}` | Labels applied to self-monitoring metrics |
+| `:scraping` | boolean | `true` | Enable Prometheus scraping support |
+| `:engine` | atom | `:rust` | Engine selection; `:rust` is the default and maintained path |
+
+Legacy-only knobs such as `:buffer_shards`, `:flush_threshold`, `:flush_interval`,
+`:segment_duration`, and `:compression_level` only apply when you intentionally run
+`engine: :legacy`.
 
 ### Writing Data
 
@@ -156,23 +165,22 @@ TimelessMetrics.write_text_batch(:metrics, [
 {:ok, nil} = TimelessMetrics.latest_text(:metrics, "nonexistent", %{})
 ```
 
-### Pre-Resolved Writes (High-Throughput)
+### Pre-Resolved Writes (Legacy Engine)
 
-For hot paths (hundreds of thousands of writes per second), resolve series IDs
-once at startup and bypass the registry on every write:
+Pre-resolved writes are a legacy-engine optimization. They are still available for
+compatibility, but they are not the primary hot path on the rust-default engine.
+
+If you are running the default rust engine, prefer `write_batch/2` for sustained
+throughput. If you are intentionally running `engine: :legacy`, you can still use
+pre-resolved writes:
 
 ```elixir
-# Resolve once (e.g., at poller init)
 sid = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
-
-# Write on the hot path — zero registry overhead
 TimelessMetrics.write_resolved(:metrics, sid, 73.2)
 TimelessMetrics.write_resolved(:metrics, sid, 74.1, timestamp: 1_700_000_060)
 ```
 
-#### Pre-resolved batch
-
-Each entry is `{series_id, value}` or `{series_id, value, timestamp}`:
+Each batch entry is `{series_id, value}` or `{series_id, value, timestamp}`:
 
 ```elixir
 TimelessMetrics.write_batch_resolved(:metrics, [
@@ -942,11 +950,12 @@ When starting TimelessMetrics as a library:
 {TimelessMetrics,
   name: :metrics,
   data_dir: "/var/lib/metrics",
-  buffer_shards: 16,
-  flush_threshold: 10_000,
-  flush_interval: 5_000,
-  compression: :zstd,
-  schema: MyApp.MetricsSchema}
+  schema: MyApp.MetricsSchema,
+  raw_retention_seconds: 14 * 86_400,
+  daily_retention_seconds: 365 * 86_400,
+  ingest_workers: 8,
+  alert_interval: :timer.seconds(30),
+  self_monitor: true}
 ```
 
 ### Schema and Rollup Tiers

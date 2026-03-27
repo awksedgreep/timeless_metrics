@@ -2,8 +2,9 @@ defmodule TimelessMetrics.RustEngine do
   @moduledoc """
   Rust-native storage engine backend for TimelessMetrics.
 
-  Replaces ETS shards + SeriesRegistry + Buffer + SegmentBuilder + SQLite
-  with a single Rust NIF resource (DashMap + Pco + BTreeMap).
+  Handles the hot path for raw point writes and queries through a single Rust NIF
+  resource. The Elixir application still owns supervision, HTTP routing, alerts,
+  annotations, scrape targets, and rollup metadata.
 
   Started as a child of the store's supervisor. The engine reference is
   stored in persistent_term for zero-cost access on the hot path.

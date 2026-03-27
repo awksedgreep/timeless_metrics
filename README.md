@@ -18,9 +18,30 @@
 
 > "I found it ironic that the first thing you do to time series data is squash the timestamp. That's how the name Timeless was born." --Mark Cotner
 
-Embedded time series database for Elixir. Combines [Gorilla compression](https://github.com/awksedgreep/gorilla_stream) with zstd for fast, compact metric storage with automatic rollups and configurable retention.
+TimelessMetrics is an embedded time-series database for Elixir with a Rust-native hot path, built-in HTTP ingest/query APIs, retention, rollups, alerting, scraping, charts, and Prometheus/VictoriaMetrics compatibility.
 
-Run it as a library inside your Elixir app or as a standalone container.
+It runs:
+- as a library inside your Elixir application
+- as a local service with the included HTTP API
+- in memory-only mode for tests and constrained environments
+
+## Current Architecture
+
+The default engine is the Rust engine.
+
+Hot-path responsibilities live in the Rust NIF:
+- labeled writes and batched writes
+- raw and aggregate range queries
+- series index and label filtering
+- chunk persistence and recovery
+
+Elixir still owns the surrounding product surface:
+- HTTP API
+- background ingest workers
+- alerts, annotations, metadata, and scrape target management
+- rollups, retention orchestration, charts, dashboard, and PromQL handling
+
+If you need the detailed design, start with [docs/architecture.md](docs/architecture.md).
 
 ## Documentation
 
@@ -37,49 +58,25 @@ Run it as a library inside your Elixir app or as a standalone container.
 - [Operations](docs/operations.md)
 - [Capacity Planning](docs/capacity_planning.md)
 - [Scaling](docs/scaling_options.md)
+- [Benchmarks](bench/README.md)
 
-## Performance
+## Highlights
 
-Benchmarked on AWS i8g.24xlarge (96 vCPU ARM, 768 GiB RAM) against VictoriaMetrics v1.108.1, 200K series, 256 concurrent writers + 24 query workers:
-
-| Metric | Timeless | VictoriaMetrics |
-|---|---|---|
-| **Write rate** | 4.39M pts/s | 4.47M pts/s |
-| **Write latency** | 2.94ms | 2.85ms |
-| **Query rate** | **7,853 q/s** | 3,045 q/s |
-| **Query latency** | **3.06ms** | 7.88ms |
-| **Storage** | **0.7 bytes/pt** | — |
-
-2.6x faster queries at half the latency. Matches VictoriaMetrics on writes within 2%.
-
-See [full benchmark writeup](notes/blog_benchmark_comparison.md) for methodology and analysis.
-
-## Features
-
-- **High throughput** — 4.39M points/sec writes, 7,853 queries/sec on 96 cores
-- **Compact storage** — Gorilla + zstd compression, 0.7 bytes per point
-- **Sharded architecture** — lock-free ETS write buffers with parallel compression workers
-- **Automatic rollups** — configurable tiers (hourly, daily, monthly) with retention policies
-- **VictoriaMetrics compatible** — JSON line import, works with Vector, Grafana, and existing VM tooling
-- **Prometheus compatible** — text exposition import and PromQL-compatible query endpoint for Grafana
-- **SVG charts** — pure Elixir chart rendering, embeddable via `<img>` tags with light/dark/auto themes
-- **Built-in dashboard** — zero-dependency HTML overview with auto-refresh
-- **Annotations** — event markers (deploys, incidents) that overlay on charts
-- **Forecasting** — polynomial trend + Fourier seasonal regression, auto-detects daily/weekly/yearly periods
-- **Anomaly detection** — z-score analysis on model residuals with configurable sensitivity
-- **Capacity planning** — forecast from daily/weekly data to predict growth months or years ahead
-- **Alerts** — threshold-based rules with webhook notifications (ntfy.sh, Slack, etc.)
-- **Metric metadata** — type, unit, and description registration
-- **Zero external dependencies** — SQLite (metadata only) + pure Elixir, no Nx/Scholar/ML libraries required
+- Rust-native storage engine enabled by default
+- Embedded Elixir API plus optional HTTP API
+- Prometheus text ingest, VictoriaMetrics JSON-line ingest, and Influx line protocol ingest
+- Prometheus-compatible query endpoints for Grafana
+- Fast batched writes and compact on-disk chunks
+- Built-in dashboard, SVG charts, annotations, forecasting, anomaly detection, and alerts
+- Scraping subsystem for pulling Prometheus targets into the local store
+- Memory-only mode for ephemeral deployments and tests
 
 ## Quick Start
 
-### As a library
-
-Add to your `mix.exs`:
+Add to `mix.exs`:
 
 ```elixir
-{:timeless_metrics, "~> 2.0"}
+{:timeless_metrics, "~> 6.0"}
 ```
 
 Add to your supervision tree:
@@ -96,289 +93,120 @@ Write and query:
 ```elixir
 TimelessMetrics.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2)
 
-{:ok, points} = TimelessMetrics.query(:metrics, "cpu_usage", %{"host" => "web-1"},
-  from: System.os_time(:second) - 3600)
+{:ok, points} =
+  TimelessMetrics.query(:metrics, "cpu_usage", %{"host" => "web-1"},
+    from: System.os_time(:second) - 3600,
+    to: System.os_time(:second)
+  )
 ```
 
-### As a container
+Memory-only mode:
 
-```bash
-podman build -f Containerfile -t timeless_metrics:latest .
-podman run -d -p 8428:8428 -v timeless_data:/data:Z localhost/timeless_metrics:latest
+```elixir
+children = [
+  {TimelessMetrics, name: :metrics, mode: :memory},
+  {TimelessMetrics.HTTP, store: :metrics, port: 8428}
+]
 ```
-
-Ingest data:
-
-```bash
-curl -X POST http://localhost:8428/api/v1/import -d '
-{"metric":{"__name__":"cpu_usage","host":"web-1"},"values":[73.2],"timestamps":[1700000000]}'
-```
-
-Query:
-
-```bash
-curl 'http://localhost:8428/api/v1/query_range?metric=cpu_usage&from=-1h&step=60'
-```
-
-Embed a chart with forecast and anomaly overlays:
-
-```html
-<img src="http://localhost:8428/chart?metric=cpu_usage&from=-6h&forecast=1h&anomalies=medium&theme=auto" />
-```
-
-Forecast future values:
-
-```bash
-curl 'http://localhost:8428/api/v1/forecast?metric=cpu_usage&from=-24h&step=300&horizon=6h'
-```
-
-Detect anomalies:
-
-```bash
-curl 'http://localhost:8428/api/v1/anomalies?metric=cpu_usage&from=-24h&step=300&sensitivity=medium'
-```
-
-View the dashboard at `http://localhost:8428/`.
 
 ## Elixir API
 
-### Writing
+Writes:
 
 ```elixir
-# Single write
 TimelessMetrics.write(:metrics, "cpu_usage", %{"host" => "web-1"}, 73.2)
 
-# Pre-resolved writes (bypass series lookup — faster for hot paths)
-series_id = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
-TimelessMetrics.write_resolved(:metrics, series_id, 73.2)
-
-# Batch writes
 TimelessMetrics.write_batch(:metrics, [
   {"cpu_usage", %{"host" => "web-1"}, 73.2},
   {"mem_usage", %{"host" => "web-1"}, 4096.0}
 ])
 ```
 
-### Querying
+Queries:
 
 ```elixir
-# Raw points for a specific series
-{:ok, points} = TimelessMetrics.query(:metrics, "cpu_usage", %{"host" => "web-1"},
-  from: System.os_time(:second) - 3600)
+{:ok, points} =
+  TimelessMetrics.query(:metrics, "cpu_usage", %{"host" => "web-1"},
+    from: System.os_time(:second) - 3600
+  )
 
-# Aggregated query (bucketed)
-{:ok, points} = TimelessMetrics.query_aggregate(:metrics, "cpu_usage", %{"host" => "web-1"},
-  from: System.os_time(:second) - 3600, bucket: {60, :seconds}, aggregate: :avg)
+{:ok, series} =
+  TimelessMetrics.query_multi(:metrics, "cpu_usage", %{"host" => "web-1"},
+    from: System.os_time(:second) - 3600
+  )
 
-# Multi-series query (all series matching a label filter)
-{:ok, results} = TimelessMetrics.query_multi(:metrics, "cpu_usage", %{"host" => "web-1"},
-  from: System.os_time(:second) - 3600)
-
-# Query from rollup tiers
-{:ok, points} = TimelessMetrics.query_tier(:metrics, :daily, "cpu_usage", %{"host" => "web-1"},
-  from: System.os_time(:second) - 86_400 * 30)
+{:ok, buckets} =
+  TimelessMetrics.query_aggregate(:metrics, "cpu_usage", %{"host" => "web-1"},
+    from: System.os_time(:second) - 3600,
+    bucket: {60, :seconds},
+    aggregate: :avg
+  )
 ```
 
-### Stats
-
-```elixir
-info = TimelessMetrics.info(:metrics)
-
-# %{
-#   series_count: 150,
-#   segment_count: 42,
-#   total_points: 1_250_000,
-#   raw_compressed_bytes: 837_500,
-#   bytes_per_point: 0.67,
-#   storage_bytes: 24_000_000,
-#   buffer_points: 320,
-#   oldest_timestamp: 1700000000,
-#   newest_timestamp: 1700086400,
-#   tiers: [%{name: :hourly, chunks: 24, buckets: 3600, ...}, ...],
-#   ...
-# }
-```
-
-### Discovery
+Discovery and operations:
 
 ```elixir
 TimelessMetrics.list_metrics(:metrics)
-#=> ["cpu_usage", "mem_usage", "disk_io"]
-
 TimelessMetrics.list_series(:metrics, "cpu_usage")
-#=> [%{series_id: 1, labels: %{"host" => "web-1"}}, ...]
-
 TimelessMetrics.label_values(:metrics, "cpu_usage", "host")
-#=> ["web-1", "web-2", "db-1"]
+TimelessMetrics.info(:metrics)
+TimelessMetrics.flush(:metrics)
+TimelessMetrics.backup(:metrics, "/tmp/metrics-backup")
 ```
 
-### Operations
+## HTTP API
 
-```elixir
-TimelessMetrics.flush(:metrics)              # Force flush all series to disk
-TimelessMetrics.rollup(:metrics)             # Run rollup aggregation
-TimelessMetrics.compact(:metrics)            # Compact raw segments
-TimelessMetrics.enforce_retention(:metrics)  # Clean up expired data
-TimelessMetrics.backup(:metrics, "/tmp/bak") # Online backup
-```
-
-## HTTP Endpoints
+Core endpoints:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/v1/import` | VictoriaMetrics JSON line ingest |
-| `POST` | `/api/v1/import/prometheus` | Prometheus text format ingest |
-| `GET` | `/api/v1/export` | Export raw points (VM JSON line format) |
-| `GET` | `/api/v1/query` | Latest value for matching series |
-| `GET` | `/api/v1/query_range` | Range query with bucketed aggregation |
-| `GET` | `/prometheus/api/v1/query_range` | Grafana-compatible Prometheus endpoint |
-| `GET` | `/api/v1/label/__name__/values` | List all metric names |
-| `GET` | `/api/v1/label/:name/values` | List values for a label key |
-| `GET` | `/api/v1/series` | List series for a metric |
-| `POST` | `/api/v1/metadata` | Register metric metadata |
-| `GET` | `/api/v1/metadata` | Get metric metadata |
-| `POST` | `/api/v1/annotations` | Create an annotation |
-| `GET` | `/api/v1/annotations` | Query annotations |
-| `DELETE` | `/api/v1/annotations/:id` | Delete an annotation |
-| `POST` | `/api/v1/alerts` | Create an alert rule |
-| `GET` | `/api/v1/alerts` | List alert rules |
-| `DELETE` | `/api/v1/alerts/:id` | Delete an alert rule |
-| `GET` | `/api/v1/forecast` | Forecast future values |
-| `GET` | `/api/v1/anomalies` | Detect anomalies |
-| `GET` | `/chart` | SVG chart (supports `&forecast=` and `&anomalies=` overlays) |
-| `GET` | `/health` | Health check with stats |
-| `GET` | `/` | HTML dashboard |
+| `POST` | `/api/v1/import` | VictoriaMetrics JSON-line ingest |
+| `POST` | `/api/v1/import/prometheus` | Prometheus text ingest |
+| `POST` | `/write` | Influx line protocol ingest |
+| `GET` | `/api/v1/query` | Latest-value query |
+| `GET` | `/api/v1/query_range` | Native range query |
+| `GET` | `/api/v1/export` | Multi-series export |
+| `GET` | `/prometheus/api/v1/query` | Prometheus instant query |
+| `GET` | `/prometheus/api/v1/query_range` | Prometheus range query |
+| `GET` | `/prometheus/api/v1/labels` | Prometheus label names |
+| `GET` | `/prometheus/api/v1/series` | Prometheus series listing |
+| `GET` | `/chart` | SVG chart |
+| `GET` | `/health` | Lightweight health/status |
+| `GET` | `/health/detailed` | More expensive store diagnostics |
 
-See [docs/API.md](docs/API.md) for full request/response documentation with examples.
-
-## Forecasting & Anomaly Detection
-
-TimelessMetrics includes a built-in forecast engine and anomaly detector — no external ML libraries needed. The pure Elixir normal equation solver runs in ~3ms for a year of daily data.
-
-Seasonal periods are auto-detected from the data's sampling interval:
-
-| Sampling | Periods | Use Case |
-|---|---|---|
-| Sub-hourly | Daily + half-daily | Operational monitoring |
-| Hourly | Daily + weekly | Trend analysis |
-| Daily+ | Weekly + yearly | Capacity planning |
-
-### Elixir API
-
-```elixir
-# Forecast 6 hours ahead from 24h of 5-minute data
-{:ok, results} = TimelessMetrics.forecast(:metrics, "cpu_usage", %{"host" => "web-1"},
-  from: now - 86_400, horizon: 21_600, bucket: {300, :seconds})
-
-# Detect anomalies
-{:ok, results} = TimelessMetrics.detect_anomalies(:metrics, "cpu_usage", %{"host" => "web-1"},
-  from: now - 86_400, bucket: {300, :seconds}, sensitivity: :medium)
-
-# Capacity planning: 1 year of daily data → 1 year forecast
-{:ok, results} = TimelessMetrics.forecast(:metrics, "bandwidth_peak", %{},
-  from: now - 365 * 86_400, horizon: 365 * 86_400, bucket: {1, :days}, aggregate: :max)
-```
-
-### Chart overlays
-
-```html
-<!-- Purple dashed forecast line + red anomaly dots -->
-<img src="http://localhost:8428/chart?metric=cpu_usage&from=-24h&forecast=6h&anomalies=medium" />
-```
-
-![Forecast + anomaly chart](docs/examples/chart_full_analysis.svg)
-
-See [docs/capacity_planning.md](docs/capacity_planning.md) for detailed capacity planning guide with ISP examples.
-
-See [docs/alerting.md](docs/alerting.md) for alert rules, webhook payloads, and integration with ntfy.sh/Slack.
-
-## Container Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TIMELESS_DATA_DIR` | `/data` | Storage directory |
-| `TIMELESS_PORT` | `8428` | HTTP listen port |
-| `TIMELESS_BEARER_TOKEN` | *(none)* | Bearer token for API auth (unset = no auth) |
-
-## Authentication
-
-Set `TIMELESS_BEARER_TOKEN` to require authentication on all endpoints (except `/health`):
+Example ingest:
 
 ```bash
-# Via env var
-TIMELESS_BEARER_TOKEN=my-secret-token podman run -d -p 8428:8428 ...
-
-# API access
-curl -H "Authorization: Bearer my-secret-token" http://localhost:8428/api/v1/query_range?...
-
-# Browser access (dashboard, charts) via query param
-http://localhost:8428/chart?metric=cpu_usage&from=-6h&token=my-secret-token
+curl -X POST http://localhost:8428/api/v1/import/prometheus \
+  -H "Content-Type: text/plain" \
+  --data-binary '
+cpu_usage{host="web-1"} 73.2
+cpu_usage{host="web-2"} 61.8
+'
 ```
 
-When unset, all endpoints are open (backwards compatible, for trusted networks).
-
-## Podman Quadlet
-
-Copy `timeless.container` to `~/.config/containers/systemd/`:
+Example range query:
 
 ```bash
-cp timeless.container ~/.config/containers/systemd/
-systemctl --user daemon-reload
-systemctl --user start timeless
+curl 'http://localhost:8428/api/v1/query_range?metric=cpu_usage&host=web-1&from=1700000000&to=1700003600&step=60'
 ```
 
-## Architecture
+Example Prometheus-compatible query:
 
-```
-Writes ──> SeriesRegistry (persistent_term + ETS) ──> Buffer shards (lock-free ETS)
-                                                              │
-                                                    SegmentBuilder (fast zstd now, ALP/RLE on seal)
-                                                              │
-                                              ETS cache + current.wal (queryable immediately)
-                                                              │
-                                                    ShardStore (.seg files per shard)
-                                                              │
-                                              Rollup Engine ──┤── tier chunks
-                                                              │
-Main DB (SQLite): series registry, metadata, annotations, alerts
+```bash
+curl 'http://localhost:8428/prometheus/api/v1/query_range?query=cpu_usage{host="web-1"}&start=1700000000&end=1700003600&step=60'
 ```
 
-- **Sharded ETS buffers** — N lock-free write shards with `write_concurrency: :auto`
-- **Lock-free series creation** — `:atomics` counter + `:ets.insert_new` CAS, no GenServer
-- **SegmentBuilder** — per-shard compression workers with staged compression: fast zstd for in-progress windows, ALP/RLE for sealed windows
-- **Rollup engine** — periodic tier aggregation with watermark tracking
-- **Retention enforcer** — periodic cleanup of expired segments and tier data
-- **SQLite** — WAL mode, mmap, used only for series registry + metadata (not raw data)
+## Benchmarks
 
-## Custom Rollup Schema
+The maintained benchmark set lives under [bench/](bench/README.md):
+- embedded API throughput: [bench/write_bench.exs](bench/write_bench.exs)
+- HTTP concurrency: [bench/http_concurrency.exs](bench/http_concurrency.exs)
+- realistic workload ramp: [bench/realistic_workload.exs](bench/realistic_workload.exs)
+- TSBS harness: [bench/tsbs_bench.exs](bench/tsbs_bench.exs)
+- VictoriaMetrics comparison: [bench/vs_victoriametrics.exs](bench/vs_victoriametrics.exs)
 
-```elixir
-defmodule MyApp.MetricsSchema do
-  use TimelessMetrics.Schema
+## Notes
 
-  raw_retention {7, :days}
-
-  tier :hourly,
-    resolution: :hour,
-    aggregates: [:avg, :min, :max, :count, :sum, :last],
-    retention: {30, :days}
-
-  tier :daily,
-    resolution: :day,
-    aggregates: [:avg, :min, :max, :count, :sum, :last],
-    retention: {365, :days}
-
-  tier :monthly,
-    resolution: {30, :days},
-    aggregates: [:avg, :min, :max, :count, :sum, :last],
-    retention: :forever
-end
-```
-
-```elixir
-{TimelessMetrics, name: :metrics, data_dir: "/data", schema: MyApp.MetricsSchema}
-```
-
-## License
-
-MIT
+- The legacy Elixir engine still exists behind explicit `engine:` selection for compatibility and migration work, but the default path is Rust.
+- The rust build may emit the upstream `rustler::resource!` `non_local_definitions` warning. That warning is currently expected.
