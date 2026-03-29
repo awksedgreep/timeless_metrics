@@ -57,6 +57,7 @@ jobs:
         run: mix elixir_make.precompile
         env:
           CC_PRECOMPILER_CURRENT_TARGET: ${{ matrix.target }}
+          RUST_TARGET: ${{ matrix.rust_target }}
           ELIXIR_MAKE_CACHE_DIR: ${{ github.workspace }}/cache
 
       - name: Upload artifacts

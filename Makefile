@@ -22,9 +22,21 @@ endif
 NIF_SRC = c_src/prometheus_nif.cpp
 NIF_OBJ = $(PRIV_DIR)/prometheus_nif.o
 
+# Rust NIF settings
+RUST_TARGET ?= $(shell rustc -Vv 2>/dev/null | grep host | cut -d' ' -f2)
+RUST_NIF_DIR = $(PRIV_DIR)/native
+RUST_NIF_SO = $(RUST_NIF_DIR)/tms_engine.so
+CARGO_FLAGS = --release
+ifneq ($(RUST_TARGET),)
+	CARGO_FLAGS += --target $(RUST_TARGET)
+	RUST_OUT_DIR = native/tms_engine/target/$(RUST_TARGET)/release
+else
+	RUST_OUT_DIR = native/tms_engine/target/release
+endif
+
 .PHONY: all clean
 
-all: $(PRIV_DIR) $(NIF_SO)
+all: $(PRIV_DIR) $(NIF_SO) $(RUST_NIF_SO)
 
 $(PRIV_DIR):
 	mkdir -p $(PRIV_DIR)
@@ -36,7 +48,16 @@ $(NIF_OBJ): .FORCE $(NIF_SRC)
 $(NIF_SO): $(NIF_OBJ) | $(PRIV_DIR)
 	$(CXX) $(LDFLAGS) -o $@ $(NIF_OBJ)
 
+$(RUST_NIF_SO): .FORCE | $(PRIV_DIR)
+	mkdir -p $(RUST_NIF_DIR)
+	cd native/tms_engine && cargo build $(CARGO_FLAGS)
+	cp $(RUST_OUT_DIR)/libtms_engine.so $(RUST_NIF_SO) 2>/dev/null || \
+	cp $(RUST_OUT_DIR)/libtms_engine.dylib $(RUST_NIF_SO) 2>/dev/null || \
+	(echo "ERROR: Rust NIF build failed — cargo not found or build error" && exit 1)
+
 .FORCE:
 
 clean:
 	rm -f $(NIF_SO) $(NIF_OBJ)
+	rm -f $(RUST_NIF_SO)
+	cd native/tms_engine && cargo clean 2>/dev/null || true

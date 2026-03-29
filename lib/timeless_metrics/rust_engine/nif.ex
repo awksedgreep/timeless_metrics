@@ -1,6 +1,6 @@
 defmodule TimelessMetrics.RustEngine.Nif do
   @moduledoc false
-  use Rustler, otp_app: :timeless_metrics, crate: "tms_engine"
+  use Rustler, otp_app: :timeless_metrics, crate: "tms_engine", skip_compilation?: true
 
   def engine_new(
         _data_dir,
