@@ -174,25 +174,33 @@ defmodule TimelessMetrics.RustEngine do
 
     bucket_seconds = bucket_to_seconds(bucket)
 
-    {:ok, results} =
-      Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
-      |> unwrap_nif_ok()
+    if bucket_seconds do
+      {:ok, results} =
+        Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
+        |> unwrap_nif_ok()
 
-    formatted =
-      results
-      |> Enum.map(fn {labels, points} ->
-        data =
-          if bucket_seconds do
-            bucket_points(points, from, to, bucket_seconds, agg)
-          else
-            points
-          end
+      formatted =
+        results
+        |> Enum.map(fn {labels, points} ->
+          %{labels: labels, data: bucket_points(points, from, to, bucket_seconds, agg)}
+        end)
+        |> Enum.reject(fn %{data: d} -> d == [] end)
 
-        %{labels: labels, data: data}
-      end)
-      |> Enum.reject(fn %{data: d} -> d == [] end)
+      {:ok, formatted}
+    else
+      {:ok, results} =
+        Nif.engine_query_aggregate(ref(store), metric_name, label_filter, from, to, agg)
+        |> unwrap_nif_ok()
 
-    {:ok, formatted}
+      formatted =
+        results
+        |> Enum.map(fn {labels, value} ->
+          %{labels: labels, data: [{from, value}]}
+        end)
+        |> Enum.reject(fn %{data: d} -> d == [] end)
+
+      {:ok, formatted}
+    end
   end
 
   def latest(store, metric_name, labels) do

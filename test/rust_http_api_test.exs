@@ -145,6 +145,46 @@ defmodule TimelessMetrics.RustHTTPAPITest do
     assert points == [{now, 12.5}, {now + 1, 15.0}]
   end
 
+  test "query_aggregate_multi returns scalar aggregates without fetching raw points" do
+    now = System.os_time(:second)
+
+    TimelessMetrics.write(:rust_http_test, "agg_multi", %{"host" => "web-1"}, 10.0,
+      timestamp: now
+    )
+
+    TimelessMetrics.write(:rust_http_test, "agg_multi", %{"host" => "web-1"}, 20.0,
+      timestamp: now + 1
+    )
+
+    TimelessMetrics.write(:rust_http_test, "agg_multi", %{"host" => "web-2"}, 30.0,
+      timestamp: now
+    )
+
+    TimelessMetrics.write(:rust_http_test, "agg_multi", %{"host" => "web-2"}, 50.0,
+      timestamp: now + 1
+    )
+
+    TimelessMetrics.flush(:rust_http_test)
+
+    {:ok, results} =
+      TimelessMetrics.query_aggregate_multi(:rust_http_test, "agg_multi", %{},
+        from: now - 1,
+        to: now + 5,
+        aggregate: :avg
+      )
+
+    assert length(results) == 2
+
+    sorted =
+      results
+      |> Enum.sort_by(& &1.labels["host"])
+
+    assert sorted == [
+             %{labels: %{"host" => "web-1"}, data: [{now - 1, 15.0}]},
+             %{labels: %{"host" => "web-2"}, data: [{now - 1, 40.0}]}
+           ]
+  end
+
   test "GET /prometheus/api/v1/labels returns label names with rust engine" do
     now = System.os_time(:second)
 
