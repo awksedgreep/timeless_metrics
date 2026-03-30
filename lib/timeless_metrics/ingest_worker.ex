@@ -149,16 +149,14 @@ defmodule TimelessMetrics.IngestWorker do
       TimelessMetrics.Stats.add_points(store, count)
 
       if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust do
-        # Rust engine: batch all entries in one NIF call
+        # Rust engine: route through the optimized write path so steady-state
+        # ingest uses the Elixir-side series-id cache and raw batch NIF.
         entries =
           Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
             Enum.map(batch, fn {ts, val} -> {metric_name, labels, ts, val} end)
           end)
 
-        TimelessMetrics.RustEngine.Nif.engine_write_batch_labeled(
-          TimelessMetrics.RustEngine.ref(store),
-          entries
-        )
+        TimelessMetrics.RustEngine.write_batch(store, entries)
       else
         Enum.each(groups, fn {{metric_name, labels}, batch} ->
           series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
@@ -199,10 +197,7 @@ defmodule TimelessMetrics.IngestWorker do
             Enum.map(batch, fn {ts, val} -> {metric_name, labels, ts, val} end)
           end)
 
-        TimelessMetrics.RustEngine.Nif.engine_write_batch_labeled(
-          TimelessMetrics.RustEngine.ref(store),
-          entries
-        )
+        TimelessMetrics.RustEngine.write_batch(store, entries)
       else
         Enum.each(groups, fn {{metric_name, labels}, batch} ->
           series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)

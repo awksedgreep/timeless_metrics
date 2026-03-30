@@ -27,26 +27,56 @@ defmodule TimelessMetrics.RustEngine do
     :persistent_term.get({__MODULE__, store})
   end
 
-  def write(store, metric_name, labels, value, timestamp) do
-    case Nif.engine_write_batch_labeled(ref(store), [{metric_name, labels, timestamp, value}]) do
+  def write_resolved(store, series_id, value, timestamp) do
+    case Nif.engine_write_batch_raw(ref(store), encode_raw_batch([{series_id, timestamp, value}])) do
       {:ok, :ok} -> :ok
       {:error, _} = error -> error
     end
   end
 
+  def resolve_series(store, metric_name, labels) do
+    cache = cache_ref(store)
+    key = {metric_name, labels}
+
+    case :ets.lookup(cache, key) do
+      [{^key, series_id}] ->
+        {:ok, series_id}
+
+      [] ->
+        with {:ok, series_id} <-
+               Nif.engine_resolve_series(ref(store), metric_name, labels)
+               |> unwrap_nif_ok() do
+          cache_series_id(cache, key, series_id)
+          {:ok, series_id}
+        end
+    end
+  end
+
+  def write(store, metric_name, labels, value, timestamp) do
+    with {:ok, series_id} <- resolve_series(store, metric_name, labels) do
+      write_resolved(store, series_id, value, timestamp)
+    end
+  end
+
   def write_batch(store, entries) do
-    # Convert from timeless_metrics format {metric, labels, value} or {metric, labels, value, ts}
-    now = System.os_time(:second)
+    if entries == [] do
+      :ok
+    else
+      # Convert from timeless_metrics format {metric, labels, value} or {metric, labels, value, ts}
+      now = System.os_time(:second)
+      normalized = normalize_entries(entries, now)
 
-    labeled =
-      Enum.map(entries, fn
-        {metric, labels, value} -> {metric, labels, now, value}
-        {metric, labels, value, ts} -> {metric, labels, ts, value}
-      end)
+      with {:ok, series_ids} <- resolve_series_ids(store, normalized) do
+        raw_entries =
+          Enum.map(normalized, fn {metric, labels, ts, value} ->
+            {Map.fetch!(series_ids, {metric, labels}), ts, value}
+          end)
 
-    case Nif.engine_write_batch_labeled(ref(store), labeled) do
-      {:ok, :ok} -> :ok
-      {:error, _} = error -> error
+        case Nif.engine_write_batch_raw(ref(store), encode_raw_batch(raw_entries)) do
+          {:ok, :ok} -> :ok
+          {:error, _} = error -> error
+        end
+      end
     end
   end
 
@@ -273,13 +303,23 @@ defmodule TimelessMetrics.RustEngine do
         @memory_budget_mb
       )
 
+    cache =
+      :ets.new(__MODULE__, [
+        :set,
+        :public,
+        {:read_concurrency, true},
+        {:write_concurrency, :auto},
+        {:decentralized_counters, true}
+      ])
+
     :persistent_term.put({__MODULE__, store}, engine)
+    :persistent_term.put({__MODULE__, store, :series_cache}, cache)
 
     Process.flag(:trap_exit, true)
     schedule_flush()
     schedule_cold_flush()
 
-    {:ok, %{store: store, engine: engine}}
+    {:ok, %{store: store, engine: engine, cache: cache}}
   end
 
   @impl true
@@ -299,6 +339,9 @@ defmodule TimelessMetrics.RustEngine do
   @impl true
   def terminate(_reason, state) do
     _ = Nif.engine_shutdown(state.engine)
+    :persistent_term.erase({__MODULE__, state.store})
+    :persistent_term.erase({__MODULE__, state.store, :series_cache})
+    _ = :ets.delete(state.cache)
     :ok
   end
 
@@ -310,6 +353,62 @@ defmodule TimelessMetrics.RustEngine do
   defp unwrap_nif_ok({:ok, {:ok, value}}), do: {:ok, value}
   defp unwrap_nif_ok({:ok, value}), do: {:ok, value}
   defp unwrap_nif_ok({:error, _} = error), do: error
+
+  defp cache_ref(store) do
+    :persistent_term.get({__MODULE__, store, :series_cache})
+  end
+
+  defp cache_series_id(cache, key, series_id) do
+    true = :ets.insert(cache, {key, series_id})
+    series_id
+  end
+
+  defp normalize_entries(entries, now) do
+    Enum.map(entries, fn
+      {metric, labels, value} -> {metric, labels, now, value}
+      {metric, labels, value, ts} -> {metric, labels, ts, value}
+    end)
+  end
+
+  defp resolve_series_ids(store, entries) do
+    cache = cache_ref(store)
+
+    {resolved, missing} =
+      Enum.reduce(entries, {%{}, %{}}, fn {metric, labels, _ts, _value}, {resolved, missing} ->
+        key = {metric, labels}
+
+        cond do
+          Map.has_key?(resolved, key) ->
+            {resolved, missing}
+
+          true ->
+            case :ets.lookup(cache, key) do
+              [{^key, series_id}] ->
+                {Map.put(resolved, key, series_id), missing}
+
+              [] ->
+                {resolved, Map.put(missing, key, {metric, labels})}
+            end
+        end
+      end)
+
+    Enum.reduce_while(missing, {:ok, resolved}, fn {key, {metric, labels}}, {:ok, acc} ->
+      case Nif.engine_resolve_series(ref(store), metric, labels) |> unwrap_nif_ok() do
+        {:ok, series_id} ->
+          cache_series_id(cache, key, series_id)
+          {:cont, {:ok, Map.put(acc, key, series_id)}}
+
+        {:error, _} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp encode_raw_batch(entries) do
+    for {series_id, ts, value} <- entries, into: <<>> do
+      <<series_id::signed-native-64, ts::signed-native-64, value * 1.0::float-native-64>>
+    end
+  end
 
   defp bucket_to_seconds(nil), do: nil
   defp bucket_to_seconds(:minute), do: 60

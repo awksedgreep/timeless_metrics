@@ -129,8 +129,12 @@ defmodule TimelessMetrics do
   Cache the result for repeated writes to the same series.
   """
   def resolve_series(store, metric_name, labels) do
-    registry = :"#{store}_registry"
-    TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.resolve_series(store, metric_name, labels)
+    else
+      registry = :"#{store}_registry"
+      TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+    end
   end
 
   @doc """
@@ -141,9 +145,14 @@ defmodule TimelessMetrics do
   """
   def write_resolved(store, series_id, value, opts \\ []) do
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
-    shard_count = buffer_shard_count(store)
-    shard_idx = rem(abs(series_id), shard_count)
-    TimelessMetrics.Buffer.write(:"#{store}_shard_#{shard_idx}", series_id, timestamp, value)
+
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.write_resolved(store, series_id, value, timestamp)
+    else
+      shard_count = buffer_shard_count(store)
+      shard_idx = rem(abs(series_id), shard_count)
+      TimelessMetrics.Buffer.write(:"#{store}_shard_#{shard_idx}", series_id, timestamp, value)
+    end
   end
 
   @doc """

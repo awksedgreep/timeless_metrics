@@ -125,6 +125,26 @@ defmodule TimelessMetrics.RustHTTPAPITest do
     assert is_binary(val_str)
   end
 
+  test "resolve_series and write_resolved work with rust engine" do
+    now = System.os_time(:second)
+    labels = %{"host" => "resolver-1"}
+
+    {:ok, series_id} = TimelessMetrics.resolve_series(:rust_http_test, "resolved_metric", labels)
+    assert is_integer(series_id)
+
+    :ok = TimelessMetrics.write_resolved(:rust_http_test, series_id, 12.5, timestamp: now)
+    :ok = TimelessMetrics.write_resolved(:rust_http_test, series_id, 15.0, timestamp: now + 1)
+    TimelessMetrics.flush(:rust_http_test)
+
+    {:ok, points} =
+      TimelessMetrics.query(:rust_http_test, "resolved_metric", labels,
+        from: now - 1,
+        to: now + 5
+      )
+
+    assert points == [{now, 12.5}, {now + 1, 15.0}]
+  end
+
   test "GET /prometheus/api/v1/labels returns label names with rust engine" do
     now = System.os_time(:second)
 
