@@ -52,6 +52,53 @@ defmodule TimelessMetrics.RustEngine do
     end
   end
 
+  def resolve_series_batch(store, pairs) do
+    if pairs == [] do
+      {:ok, %{}}
+    else
+      cache = cache_ref(store)
+
+      {resolved, missing} =
+        Enum.reduce(pairs, {%{}, %{}}, fn {metric, labels}, {resolved, missing} ->
+          key = {metric, labels}
+
+          cond do
+            Map.has_key?(resolved, key) ->
+              {resolved, missing}
+
+            true ->
+              case :ets.lookup(cache, key) do
+                [{^key, series_id}] ->
+                  {Map.put(resolved, key, series_id), missing}
+
+                [] ->
+                  {resolved, Map.put(missing, key, {metric, labels})}
+              end
+          end
+        end)
+
+      if map_size(missing) == 0 do
+        {:ok, resolved}
+      else
+        missing_list = Map.values(missing)
+
+        with {:ok, ids} <-
+               Nif.engine_resolve_series_batch(ref(store), missing_list)
+               |> unwrap_nif_ok() do
+          merged =
+            Enum.zip(missing_list, ids)
+            |> Enum.reduce(resolved, fn {{metric, labels}, series_id}, acc ->
+              key = {metric, labels}
+              cache_series_id(cache, key, series_id)
+              Map.put(acc, key, series_id)
+            end)
+
+          {:ok, merged}
+        end
+      end
+    end
+  end
+
   def write(store, metric_name, labels, value, timestamp) do
     with {:ok, series_id} <- resolve_series(store, metric_name, labels) do
       write_resolved(store, series_id, value, timestamp)
@@ -379,37 +426,11 @@ defmodule TimelessMetrics.RustEngine do
   end
 
   defp resolve_series_ids(store, entries) do
-    cache = cache_ref(store)
+    pairs =
+      entries
+      |> Enum.map(fn {metric, labels, _ts, _value} -> {metric, labels} end)
 
-    {resolved, missing} =
-      Enum.reduce(entries, {%{}, %{}}, fn {metric, labels, _ts, _value}, {resolved, missing} ->
-        key = {metric, labels}
-
-        cond do
-          Map.has_key?(resolved, key) ->
-            {resolved, missing}
-
-          true ->
-            case :ets.lookup(cache, key) do
-              [{^key, series_id}] ->
-                {Map.put(resolved, key, series_id), missing}
-
-              [] ->
-                {resolved, Map.put(missing, key, {metric, labels})}
-            end
-        end
-      end)
-
-    Enum.reduce_while(missing, {:ok, resolved}, fn {key, {metric, labels}}, {:ok, acc} ->
-      case Nif.engine_resolve_series(ref(store), metric, labels) |> unwrap_nif_ok() do
-        {:ok, series_id} ->
-          cache_series_id(cache, key, series_id)
-          {:cont, {:ok, Map.put(acc, key, series_id)}}
-
-        {:error, _} = error ->
-          {:halt, error}
-      end
-    end)
+    resolve_series_batch(store, pairs)
   end
 
   defp encode_raw_batch(entries) do

@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 pco = "1"
 rustler = "0.37"
 dashmap = "6"
+rayon = "1"

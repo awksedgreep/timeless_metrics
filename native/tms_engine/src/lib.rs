@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use dashmap::DashMap;
+use rayon::prelude::*;
 use rustler::{Atom, Binary, ResourceArc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -456,6 +457,38 @@ impl Engine {
         // Slow: write lock + persist
         let mut reg = self.series.write().unwrap();
         Ok(reg.get_or_create(metric_name, labels))
+    }
+
+    fn resolve_series_batch(&self, entries: &[(String, Labels)]) -> EngineResult<Vec<i64>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::with_capacity(entries.len());
+        let mut misses: Vec<(usize, &str, &Labels)> = Vec::new();
+
+        {
+            let reg = self.series.read().unwrap();
+            for (idx, (metric_name, labels)) in entries.iter().enumerate() {
+                if let Some(&id) = reg.series_map.get(&(metric_name.clone(), labels.clone())) {
+                    out.push(id);
+                } else {
+                    out.push(0);
+                    misses.push((idx, metric_name.as_str(), labels));
+                }
+            }
+        }
+
+        if misses.is_empty() {
+            return Ok(out);
+        }
+
+        let mut reg = self.series.write().unwrap();
+        for (idx, metric_name, labels) in misses {
+            out[idx] = reg.get_or_create(metric_name, labels);
+        }
+
+        Ok(out)
     }
 
     fn save_series(&self) -> EngineResult<()> {
@@ -989,22 +1022,30 @@ impl Engine {
         t_start: i64,
         t_end: i64,
     ) -> EngineResult<Vec<(Labels, Vec<(i64, f64)>)>> {
-        let reg = self.series.read().unwrap();
-        let series_ids = reg.find_series(metric_name, label_filter);
-        let mut out = Vec::new();
-        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        let candidates: Vec<(i64, Labels)> = {
+            let reg = self.series.read().unwrap();
+            reg.find_series(metric_name, label_filter)
+                .into_iter()
+                .filter_map(|sid| reg.info_for(sid).map(|info| (sid, info.labels.clone())))
+                .collect()
+        };
 
-        for sid in series_ids {
-            if let Some(info) = reg.info_for(sid) {
-                let labels = info.labels.clone();
-                let points = self.query_range_by_id_cached(sid, t_start, t_end, &mut file_cache)?;
-                if points.is_empty() {
-                    continue;
-                }
-                out.push((labels, points));
-            }
-        }
-        Ok(out)
+        candidates
+            .into_par_iter()
+            .map(|(sid, labels)| {
+                let points = self.query_range_by_id(sid, t_start, t_end)?;
+                Ok(if points.is_empty() {
+                    None
+                } else {
+                    Some((labels, points))
+                })
+            })
+            .filter_map(|result: EngineResult<Option<(Labels, Vec<(i64, f64)>)>>| match result {
+                Ok(Some(value)) => Some(Ok(value)),
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect()
     }
 
     /// Query a single series by ID.
@@ -1066,22 +1107,26 @@ impl Engine {
         t_end: i64,
         agg: AggFn,
     ) -> EngineResult<Vec<(Labels, f64)>> {
-        let reg = self.series.read().unwrap();
-        let series_ids = reg.find_series(metric_name, label_filter);
-        let mut out = Vec::new();
-        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        let candidates: Vec<(i64, Labels)> = {
+            let reg = self.series.read().unwrap();
+            reg.find_series(metric_name, label_filter)
+                .into_iter()
+                .filter_map(|sid| reg.info_for(sid).map(|info| (sid, info.labels.clone())))
+                .collect()
+        };
 
-        for sid in series_ids {
-            if let Some(info) = reg.info_for(sid) {
-                let labels = info.labels.clone();
-                if let Some(val) =
-                    self.query_aggregate_by_id_cached(sid, t_start, t_end, agg, &mut file_cache)?
-                {
-                    out.push((labels, val));
-                }
-            }
-        }
-        Ok(out)
+        candidates
+            .into_par_iter()
+            .map(|(sid, labels)| {
+                let value = self.query_aggregate_by_id(sid, t_start, t_end, agg)?;
+                Ok(value.map(|val| (labels, val)))
+            })
+            .filter_map(|result: EngineResult<Option<(Labels, f64)>>| match result {
+                Ok(Some(value)) => Some(Ok(value)),
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect()
     }
 
     fn query_aggregate_by_id(
@@ -1621,6 +1666,25 @@ fn engine_resolve_series(
             .deref()
             .engine
             .resolve_series(&metric, &labels_bt)?,
+    ))
+}
+
+#[rustler::nif]
+fn engine_resolve_series_batch(
+    resource: ResourceArc<EngineResource>,
+    entries: Vec<(String, HashMap<String, String>)>,
+) -> Result<(Atom, Vec<i64>), String> {
+    let normalized: Vec<(String, BTreeMap<String, String>)> = entries
+        .into_iter()
+        .map(|(metric, labels)| (metric, labels.into_iter().collect()))
+        .collect();
+
+    Ok((
+        atoms::ok(),
+        resource
+            .deref()
+            .engine
+            .resolve_series_batch(&normalized)?,
     ))
 }
 
