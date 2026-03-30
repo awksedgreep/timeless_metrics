@@ -12,6 +12,8 @@
 
 # Temporary files, for example, from tests.
 /tmp/
+/data/
+.DS_Store
 
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
@@ -26,6 +28,7 @@ priv/*.so
 
 # Ignore package tarball (built via "mix hex.build").
 timeless-*.tar
+timeless_metrics-*.tar
 
 # Environment files
 .env
