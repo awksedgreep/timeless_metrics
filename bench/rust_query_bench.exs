@@ -12,6 +12,8 @@ defmodule RustQueryBench do
   """
 
   alias TimelessMetrics.DataGenerator
+  alias TimelessMetrics.RustEngine
+  alias TimelessMetrics.RustEngine.Nif
 
   @default_series 12_000
   @default_points 60
@@ -52,6 +54,7 @@ defmodule RustQueryBench do
       )
 
     try do
+      ref = RustEngine.ref(store)
       metric = "query_hot_metric"
       query_filter = %{"env" => "prod"}
       now = System.os_time(:second)
@@ -82,6 +85,10 @@ defmodule RustQueryBench do
       {:ok, warm_range} =
         TimelessMetrics.query_multi(store, metric, query_filter, from: start_ts, to: end_ts)
 
+      {:ok, warm_nif_range} =
+        Nif.engine_query_range(ref, metric, query_filter, start_ts, end_ts)
+        |> unwrap_nif_ok()
+
       {:ok, warm_agg} =
         TimelessMetrics.query_aggregate_multi(store, metric, query_filter,
           from: start_ts,
@@ -103,6 +110,18 @@ defmodule RustQueryBench do
           )
         end
 
+      nif_range_runs =
+        for _ <- 1..runs do
+          elem(
+            :timer.tc(fn ->
+              {:ok, _} =
+                Nif.engine_query_range(ref, metric, query_filter, start_ts, end_ts)
+                |> unwrap_nif_ok()
+            end),
+            0
+          )
+        end
+
       aggregate_runs =
         for _ <- 1..runs do
           elem(
@@ -119,6 +138,7 @@ defmodule RustQueryBench do
         end
 
       range_stats = summarize_us(range_runs)
+      nif_range_stats = summarize_us(nif_range_runs)
       aggregate_stats = summarize_us(aggregate_runs)
       total_points = series_count * points_per_series
 
@@ -128,10 +148,14 @@ defmodule RustQueryBench do
 
       IO.puts("Flush:                         #{div(flush_us, 1000)}ms")
       IO.puts("Warm range result:             #{length(warm_range)} series")
+      IO.puts("Warm direct NIF range result:  #{length(warm_nif_range)} series")
       IO.puts("Warm aggregate result:         #{length(warm_agg)} series")
       IO.puts("Range query median:            #{format_ms(range_stats.median_us)}ms")
       IO.puts("Range query best:              #{format_ms(range_stats.min_us)}ms")
       IO.puts("Range query worst:             #{format_ms(range_stats.max_us)}ms")
+      IO.puts("Direct NIF range median:       #{format_ms(nif_range_stats.median_us)}ms")
+      IO.puts("Direct NIF range best:         #{format_ms(nif_range_stats.min_us)}ms")
+      IO.puts("Direct NIF range worst:        #{format_ms(nif_range_stats.max_us)}ms")
       IO.puts("Aggregate query median:        #{format_ms(aggregate_stats.median_us)}ms")
       IO.puts("Aggregate query best:          #{format_ms(aggregate_stats.min_us)}ms")
       IO.puts("Aggregate query worst:         #{format_ms(aggregate_stats.max_us)}ms")
@@ -201,6 +225,10 @@ defmodule RustQueryBench do
     |> String.replace(~r/.{3}(?=.)/, "\\0,")
     |> String.reverse()
   end
+
+  defp unwrap_nif_ok({:ok, {:ok, value}}), do: {:ok, value}
+  defp unwrap_nif_ok({:ok, value}), do: {:ok, value}
+  defp unwrap_nif_ok({:error, _} = error), do: error
 end
 
 RustQueryBench.run(System.argv())
