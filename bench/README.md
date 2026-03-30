@@ -12,6 +12,10 @@ This directory contains the current benchmark set for `timeless_metrics`.
   Focused Rust-engine benchmark for labeled writes, new-series creation, raw binary writes, flush cost, and targeted query latency.
   Use this before and after Rust/Rustler hot-path changes.
 
+- [rust_query_bench.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/rust_query_bench.exs)
+  Focused Rust-engine query benchmark for high-fanout multi-series range and aggregate queries over flushed batch files.
+  Use this when changing Rust query internals, file reuse, or decode behavior.
+
 - [http_concurrency.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/http_concurrency.exs)
   HTTP ingest concurrency benchmark for Prometheus text and JSON line imports under mixed read load.
   Use this when changing the HTTP ingest path or request handling.
@@ -33,6 +37,7 @@ This directory contains the current benchmark set for `timeless_metrics`.
 
 - Prefer `write_bench.exs` for engine-only regressions.
 - Prefer `rust_engine_baseline.exs` when changing Rust NIF write/query internals.
+- Prefer `rust_query_bench.exs` when changing multi-series Rust query internals.
 - Prefer `http_concurrency.exs` or `realistic_workload.exs` for HTTP path changes.
 - Prefer `tsbs_bench.exs` when you want an external, standardized workload.
 - Prefer `vs_victoriametrics.exs` only when you specifically need a product-to-product comparison.

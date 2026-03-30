@@ -455,10 +455,7 @@ impl Engine {
         }
         // Slow: write lock + persist
         let mut reg = self.series.write().unwrap();
-        let id = reg.get_or_create(metric_name, labels);
-        reg.save(&Self::series_path(&self.data_dir))
-            .map_err(|err| format!("failed to persist series registry: {err}"))?;
-        Ok(id)
+        Ok(reg.get_or_create(metric_name, labels))
     }
 
     fn save_series(&self) -> EngineResult<()> {
@@ -580,6 +577,7 @@ impl Engine {
                 count += 1;
             }
         }
+        self.save_series()?;
         Ok(count)
     }
 
@@ -634,6 +632,7 @@ impl Engine {
             files_written += 1;
         }
 
+        self.save_series()?;
         Ok((flushed, evicted, files_written))
     }
 
@@ -676,6 +675,7 @@ impl Engine {
                 }
             }
         }
+        self.save_series()?;
         Ok(count)
     }
 
@@ -713,6 +713,7 @@ impl Engine {
                 index.insert((key, meta.min_ts), meta);
             }
         }
+        self.save_series()?;
         Ok(())
     }
 
@@ -991,11 +992,12 @@ impl Engine {
         let reg = self.series.read().unwrap();
         let series_ids = reg.find_series(metric_name, label_filter);
         let mut out = Vec::new();
+        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
 
         for sid in series_ids {
             if let Some(info) = reg.info_for(sid) {
                 let labels = info.labels.clone();
-                let points = self.query_range_by_id(sid, t_start, t_end)?;
+                let points = self.query_range_by_id_cached(sid, t_start, t_end, &mut file_cache)?;
                 if points.is_empty() {
                     continue;
                 }
@@ -1012,6 +1014,17 @@ impl Engine {
         t_start: i64,
         t_end: i64,
     ) -> EngineResult<Vec<(i64, f64)>> {
+        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        self.query_range_by_id_cached(series_id, t_start, t_end, &mut file_cache)
+    }
+
+    fn query_range_by_id_cached(
+        &self,
+        series_id: i64,
+        t_start: i64,
+        t_end: i64,
+        file_cache: &mut HashMap<PathBuf, Vec<u8>>,
+    ) -> EngineResult<Vec<(i64, f64)>> {
         let pk = PartitionKey { series_id };
         let mut results = Vec::new();
 
@@ -1027,7 +1040,7 @@ impl Engine {
                 if meta.max_ts < t_start {
                     continue;
                 }
-                results.extend(Self::read_chunk_data(meta, t_start, t_end)?);
+                results.extend(Self::read_chunk_data_cached(meta, t_start, t_end, file_cache)?);
             }
         }
 
@@ -1056,11 +1069,14 @@ impl Engine {
         let reg = self.series.read().unwrap();
         let series_ids = reg.find_series(metric_name, label_filter);
         let mut out = Vec::new();
+        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
 
         for sid in series_ids {
             if let Some(info) = reg.info_for(sid) {
                 let labels = info.labels.clone();
-                if let Some(val) = self.query_aggregate_by_id(sid, t_start, t_end, agg)? {
+                if let Some(val) =
+                    self.query_aggregate_by_id_cached(sid, t_start, t_end, agg, &mut file_cache)?
+                {
                     out.push((labels, val));
                 }
             }
@@ -1074,6 +1090,18 @@ impl Engine {
         t_start: i64,
         t_end: i64,
         agg: AggFn,
+    ) -> EngineResult<Option<f64>> {
+        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        self.query_aggregate_by_id_cached(series_id, t_start, t_end, agg, &mut file_cache)
+    }
+
+    fn query_aggregate_by_id_cached(
+        &self,
+        series_id: i64,
+        t_start: i64,
+        t_end: i64,
+        agg: AggFn,
+        file_cache: &mut HashMap<PathBuf, Vec<u8>>,
     ) -> EngineResult<Option<f64>> {
         let pk = PartitionKey { series_id };
 
@@ -1107,7 +1135,7 @@ impl Engine {
                         None => meta.max_val,
                     });
                 } else {
-                    let points = Self::read_chunk_data(meta, t_start, t_end)?;
+                    let points = Self::read_chunk_data_cached(meta, t_start, t_end, file_cache)?;
                     for &(_, val) in &points {
                         total_count += 1;
                         total_sum += val;
@@ -1161,7 +1189,22 @@ impl Engine {
         t_start: i64,
         t_end: i64,
     ) -> Result<Vec<(i64, f64)>, String> {
-        let data = fs::read(&meta.path).map_err(|e| e.to_string())?;
+        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        Self::read_chunk_data_cached(meta, t_start, t_end, &mut file_cache)
+    }
+
+    fn read_chunk_data_cached(
+        meta: &ChunkMeta,
+        t_start: i64,
+        t_end: i64,
+        file_cache: &mut HashMap<PathBuf, Vec<u8>>,
+    ) -> Result<Vec<(i64, f64)>, String> {
+        let data = if let Some(data) = file_cache.get(&meta.path) {
+            data
+        } else {
+            let data = fs::read(&meta.path).map_err(|e| e.to_string())?;
+            file_cache.entry(meta.path.clone()).or_insert(data)
+        };
         let (ts_data, val_data) = if meta.data_offset > 0 {
             Self::parse_partition_data(&data, meta.data_offset as usize)?
         } else {
