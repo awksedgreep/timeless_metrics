@@ -38,16 +38,6 @@ defmodule TimelessMetrics.Supervisor do
     :persistent_term.put({TimelessMetrics, name, :engine}, :rust)
     :persistent_term.put({TimelessMetrics, name, :shard_count}, 1)
 
-    :persistent_term.put(
-      {TimelessMetrics, name, :raw_retention_seconds},
-      Keyword.get(opts, :raw_retention_seconds, 604_800)
-    )
-
-    :persistent_term.put(
-      {TimelessMetrics, name, :daily_retention_seconds},
-      Keyword.get(opts, :daily_retention_seconds, 31_536_000)
-    )
-
     TimelessMetrics.Stats.init(name)
 
     # Ingest queue for HTTP layer
@@ -146,9 +136,6 @@ defmodule TimelessMetrics.Supervisor do
     segment_duration = Keyword.get(opts, :segment_duration, 14_400)
     compression = Keyword.get(opts, :compression, :zstd)
     compression_level = Keyword.get(opts, :compression_level, 2)
-
-    raw_retention_seconds = Keyword.get(opts, :raw_retention_seconds, 604_800)
-    daily_retention_seconds = Keyword.get(opts, :daily_retention_seconds, 31_536_000)
     _rollup_interval = Keyword.get(opts, :rollup_interval, :timer.minutes(5))
     _retention_interval = Keyword.get(opts, :retention_interval, :timer.hours(1))
 
@@ -162,12 +149,6 @@ defmodule TimelessMetrics.Supervisor do
     :persistent_term.put({TimelessMetrics, name, :schema}, schema)
     :persistent_term.put({TimelessMetrics, name, :shard_count}, shard_count)
     :persistent_term.put({TimelessMetrics, name, :data_dir}, data_dir)
-    :persistent_term.put({TimelessMetrics, name, :raw_retention_seconds}, raw_retention_seconds)
-
-    :persistent_term.put(
-      {TimelessMetrics, name, :daily_retention_seconds},
-      daily_retention_seconds
-    )
 
     TimelessMetrics.Stats.init(name)
 
