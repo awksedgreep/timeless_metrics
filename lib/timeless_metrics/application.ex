@@ -26,8 +26,6 @@ defmodule TimelessMetrics.Application do
               :gc_on_compress,
               :defer_compression,
               :raw_buffer_max,
-              :raw_retention_seconds,
-              :daily_retention_seconds,
               :rollup_interval,
               :retention_interval
             ])
