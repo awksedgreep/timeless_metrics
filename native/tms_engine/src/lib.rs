@@ -1876,7 +1876,7 @@ fn engine_query_aggregate(
         &label_filter,
         t_start,
         t_end,
-        match_agg(agg),
+        match_agg(agg)?,
     )?;
     let out: Vec<(HashMap<String, String>, f64)> = results
         .into_iter()
@@ -1979,19 +1979,19 @@ fn engine_info(resource: ResourceArc<EngineResource>) -> Result<HashMap<String, 
     Ok(m)
 }
 
-fn match_agg(atom: Atom) -> AggFn {
+fn match_agg(atom: Atom) -> Result<AggFn, String> {
     if atom == atoms::avg() {
-        AggFn::Avg
+        Ok(AggFn::Avg)
     } else if atom == atoms::sum() {
-        AggFn::Sum
+        Ok(AggFn::Sum)
     } else if atom == atoms::min() {
-        AggFn::Min
+        Ok(AggFn::Min)
     } else if atom == atoms::max() {
-        AggFn::Max
+        Ok(AggFn::Max)
     } else if atom == atoms::count() {
-        AggFn::Count
+        Ok(AggFn::Count)
     } else {
-        AggFn::Avg
+        Err(format!("unknown aggregation function: {:?}", atom))
     }
 }
 
