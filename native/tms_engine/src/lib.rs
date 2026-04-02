@@ -932,9 +932,12 @@ impl Engine {
         out.extend_from_slice(&(cp.val_compressed.len() as u32).to_be_bytes());
         out.extend_from_slice(&cp.val_compressed);
 
-        fs::File::create(&path)
+        let tmp_path = path.with_extension("pco1.tmp");
+        fs::File::create(&tmp_path)
             .and_then(|mut file| file.write_all(&out))
             .map_err(|err| format!("failed to write chunk {}: {err}", path.display()))?;
+        fs::rename(&tmp_path, &path)
+            .map_err(|err| format!("failed to rename chunk {}: {err}", path.display()))?;
 
         Ok(ChunkMeta {
             min_ts: cp.min_ts,
@@ -1004,9 +1007,12 @@ impl Engine {
             out.extend_from_slice(&cp.val_compressed);
         }
 
-        fs::File::create(&path)
+        let tmp_path = path.with_extension("pcb1.tmp");
+        fs::File::create(&tmp_path)
             .and_then(|mut file| file.write_all(&out))
             .map_err(|err| format!("failed to write batch {}: {err}", path.display()))?;
+        fs::rename(&tmp_path, &path)
+            .map_err(|err| format!("failed to rename batch {}: {err}", path.display()))?;
 
         Ok(partitions
             .iter()
@@ -1459,6 +1465,9 @@ impl Engine {
                                 index.insert((pk, meta.min_ts), meta);
                             }
                         }
+                    }
+                    Some("tmp") => {
+                        let _ = fs::remove_file(&path);
                     }
                     _ => {}
                 }
