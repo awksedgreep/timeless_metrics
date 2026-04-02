@@ -2,7 +2,7 @@
 
 use dashmap::DashMap;
 use rayon::prelude::*;
-use rustler::{Atom, Binary, ResourceArc};
+use rustler::{Atom, Binary, Encoder, ResourceArc, Term};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -2008,30 +2008,50 @@ fn engine_list_series(
 }
 
 #[rustler::nif]
-fn engine_info(resource: ResourceArc<EngineResource>) -> Result<HashMap<String, f64>, String> {
+fn engine_info<'a>(resource: ResourceArc<EngineResource>, env: rustler::Env<'a>) -> Term<'a> {
     let info = resource.deref().engine.info();
-    let mut m = HashMap::new();
-    m.insert("chunk_count".into(), info.chunk_count as f64);
-    m.insert("partition_count".into(), info.partition_count as f64);
-    m.insert("series_count".into(), info.series_count as f64);
-    m.insert("disk_points".into(), info.disk_points as f64);
-    m.insert("buffered_points".into(), info.buffered_points as f64);
-    m.insert("total_points".into(), info.total_points as f64);
-    m.insert("total_bytes".into(), info.total_bytes as f64);
-    m.insert("bytes_per_point".into(), info.bytes_per_point);
-    m.insert("buffer_memory_bytes".into(), info.buffer_memory as f64);
-    m.insert(
-        "buffer_memory_mb".into(),
-        info.buffer_memory as f64 / 1024.0 / 1024.0,
-    );
-    m.insert("file_count".into(), info.file_count as f64);
+    let mut map = rustler::types::map::map_new(env);
+    map = map
+        .insert("chunk_count", info.chunk_count as i64)
+        .encode(env);
+    map = map
+        .insert("partition_count", info.partition_count as i64)
+        .encode(env);
+    map = map
+        .insert("series_count", info.series_count as i64)
+        .encode(env);
+    map = map
+        .insert("disk_points", info.disk_points as i64)
+        .encode(env);
+    map = map
+        .insert("buffered_points", info.buffered_points as i64)
+        .encode(env);
+    map = map
+        .insert("total_points", info.total_points as i64)
+        .encode(env);
+    map = map
+        .insert("total_bytes", info.total_bytes as i64)
+        .encode(env);
+    map = map
+        .insert("bytes_per_point", info.bytes_per_point)
+        .encode(env);
+    map = map
+        .insert("buffer_memory_bytes", info.buffer_memory as i64)
+        .encode(env);
+    map = map
+        .insert(
+            "buffer_memory_mb",
+            info.buffer_memory as f64 / 1024.0 / 1024.0,
+        )
+        .encode(env);
+    map = map.insert("file_count", info.file_count as i64).encode(env);
     if let Some(oldest_ts) = info.oldest_ts {
-        m.insert("oldest_timestamp".into(), oldest_ts as f64);
+        map = map.insert("oldest_timestamp", oldest_ts).encode(env);
     }
     if let Some(newest_ts) = info.newest_ts {
-        m.insert("newest_timestamp".into(), newest_ts as f64);
+        map = map.insert("newest_timestamp", newest_ts).encode(env);
     }
-    Ok(m)
+    map
 }
 
 fn match_agg(atom: Atom) -> Result<AggFn, String> {
