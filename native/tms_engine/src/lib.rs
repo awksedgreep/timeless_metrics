@@ -46,6 +46,7 @@ struct PartitionBuffer {
     timestamps: Vec<i64>,
     values: Vec<f64>,
     last_write: Instant,
+    out_of_order: bool,
 }
 
 impl PartitionBuffer {
@@ -54,6 +55,7 @@ impl PartitionBuffer {
             timestamps: Vec::new(),
             values: Vec::new(),
             last_write: Instant::now(),
+            out_of_order: false,
         }
     }
     fn memory_bytes(&self) -> usize {
@@ -591,6 +593,9 @@ impl Engine {
                 .or_insert_with(PartitionBuffer::new);
             let buf = entry.value_mut();
             let old_cap = buf.memory_bytes();
+            if !buf.timestamps.is_empty() && ts < *buf.timestamps.last().unwrap() {
+                buf.out_of_order = true;
+            }
             buf.timestamps.push(ts);
             buf.values.push(val);
             buf.last_write = Instant::now();
@@ -730,10 +735,10 @@ impl Engine {
     }
 
     fn flush_partition_individual(&self, key: &PartitionKey) -> EngineResult<()> {
-        if let Some((timestamps, values)) =
+        if let Some((timestamps, values, out_of_order)) =
             self.drain_partition_if(key, |buf| !buf.timestamps.is_empty())
         {
-            let cp = self.compress_partition(key, &timestamps, &values)?;
+            let cp = self.compress_partition(key, &timestamps, &values, out_of_order)?;
             let meta = self.write_individual_chunk(&cp)?;
             self.index
                 .write()
@@ -768,11 +773,16 @@ impl Engine {
         let mut evicted = 0;
 
         for key in &cold_keys {
-            if let Some((timestamps, values)) = self.drain_partition_if(key, |buf| {
+            if let Some((timestamps, values, out_of_order)) = self.drain_partition_if(key, |buf| {
                 now.duration_since(buf.last_write).as_secs() >= max_idle_secs
                     && !buf.timestamps.is_empty()
             }) {
-                compressed.push(self.compress_partition(key, &timestamps, &values)?);
+                compressed.push(self.compress_partition(
+                    key,
+                    &timestamps,
+                    &values,
+                    out_of_order,
+                )?);
                 evicted += 1;
             }
         }
@@ -817,11 +827,11 @@ impl Engine {
             if freed >= overage {
                 break;
             }
-            if let Some((timestamps, values)) =
+            if let Some((timestamps, values, out_of_order)) =
                 self.drain_partition_if(&key, |buf| !buf.timestamps.is_empty())
             {
                 freed += partition_vec_memory(&timestamps, &values);
-                compressed.push(self.compress_partition(&key, &timestamps, &values)?);
+                compressed.push(self.compress_partition(&key, &timestamps, &values, out_of_order)?);
             }
         }
 
@@ -851,10 +861,10 @@ impl Engine {
         let mut new_individual: Vec<(PartitionKey, ChunkMeta)> = Vec::new();
 
         for (key, len) in keys {
-            if let Some((timestamps, values)) =
+            if let Some((timestamps, values, out_of_order)) =
                 self.drain_partition_if(&key, |buf| !buf.timestamps.is_empty())
             {
-                let cp = self.compress_partition(&key, &timestamps, &values)?;
+                let cp = self.compress_partition(&key, &timestamps, &values, out_of_order)?;
                 if len >= self.min_flush_size {
                     new_individual.push((key, self.write_individual_chunk(&cp)?));
                 } else {
@@ -889,6 +899,7 @@ impl Engine {
         key: &PartitionKey,
         timestamps: &[i64],
         values: &[f64],
+        out_of_order: bool,
     ) -> EngineResult<CompressedPartition> {
         if timestamps.is_empty() || timestamps.len() != values.len() {
             return Err(format!(
@@ -899,8 +910,7 @@ impl Engine {
             ));
         }
 
-        let needs_sort = timestamps.windows(2).any(|w| w[0] > w[1]);
-        let sorted_points = if needs_sort {
+        let sorted_points = if out_of_order {
             let mut points: Vec<(i64, f64)> = timestamps
                 .iter()
                 .copied()
@@ -1131,7 +1141,7 @@ impl Engine {
         &self,
         key: &PartitionKey,
         should_drain: F,
-    ) -> Option<(Vec<i64>, Vec<f64>)>
+    ) -> Option<(Vec<i64>, Vec<f64>, bool)>
     where
         F: FnOnce(&PartitionBuffer) -> bool,
     {
@@ -1143,6 +1153,8 @@ impl Engine {
         let freed = entry.memory_bytes();
         let timestamps = std::mem::take(&mut entry.timestamps);
         let values = std::mem::take(&mut entry.values);
+        let out_of_order = entry.out_of_order;
+        entry.out_of_order = false;
         entry.last_write = Instant::now();
         drop(entry);
 
@@ -1150,7 +1162,7 @@ impl Engine {
             self.buffer_memory.fetch_sub(freed, Ordering::Relaxed);
         }
 
-        Some((timestamps, values))
+        Some((timestamps, values, out_of_order))
     }
 
     // ── Queries ──────────────────────────────────────────────────────
