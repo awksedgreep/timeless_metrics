@@ -43,8 +43,7 @@ struct SeriesInfo {
 }
 
 struct PartitionBuffer {
-    timestamps: Vec<i64>,
-    values: Vec<f64>,
+    points: Vec<(i64, f64)>,
     last_write: Instant,
     out_of_order: bool,
 }
@@ -52,8 +51,7 @@ struct PartitionBuffer {
 impl PartitionBuffer {
     fn new() -> Self {
         PartitionBuffer {
-            timestamps: Vec::new(),
-            values: Vec::new(),
+            points: Vec::new(),
             last_write: Instant::now(),
             out_of_order: false,
         }
@@ -592,15 +590,14 @@ impl Engine {
                 .or_insert_with(PartitionBuffer::new);
             let buf = entry.value_mut();
             let old_cap = buf.memory_bytes();
-            if !buf.timestamps.is_empty() && ts < *buf.timestamps.last().unwrap() {
+            if !buf.points.is_empty() && ts < buf.points.last().unwrap().0 {
                 buf.out_of_order = true;
             }
-            buf.timestamps.push(ts);
-            buf.values.push(val);
+            buf.points.push((ts, val));
             buf.last_write = Instant::now();
             let new_cap = buf.memory_bytes();
             mem_delta = (new_cap as isize) - (old_cap as isize);
-            needs_flush = buf.timestamps.len() >= self.flush_threshold;
+            needs_flush = buf.points.len() >= self.flush_threshold;
         }
 
         if mem_delta > 0 {
@@ -730,10 +727,10 @@ impl Engine {
     }
 
     fn flush_partition_individual(&self, key: &PartitionKey) -> EngineResult<()> {
-        if let Some((timestamps, values, out_of_order)) =
-            self.drain_partition_if(key, |buf| !buf.timestamps.is_empty())
+        if let Some((points, out_of_order)) =
+            self.drain_partition_if(key, |buf| !buf.points.is_empty())
         {
-            let cp = self.compress_partition(key, &timestamps, &values, out_of_order)?;
+            let cp = self.compress_partition(key, &points, out_of_order)?;
             let meta = self.write_individual_chunk(&cp)?;
             self.index
                 .write()
@@ -760,7 +757,7 @@ impl Engine {
         let cold_keys: Vec<PartitionKey> = self
             .partitions
             .iter()
-            .filter(|e| now.duration_since(e.value().last_write).as_secs() >= max_idle_secs)
+            .filter(|e| !e.value().points.is_empty() && now.duration_since(e.value().last_write).as_secs() >= max_idle_secs)
             .map(|e| *e.key())
             .collect();
 
@@ -853,18 +850,18 @@ impl Engine {
         let keys: Vec<(PartitionKey, usize)> = self
             .partitions
             .iter()
-            .filter(|e| !e.value().timestamps.is_empty())
-            .map(|e| (*e.key(), e.value().timestamps.len()))
+            .filter(|e| !e.value().points.is_empty())
+            .map(|e| (*e.key(), e.value().points.len()))
             .collect();
 
         let mut small_compressed: Vec<CompressedPartition> = Vec::new();
         let mut new_individual: Vec<(PartitionKey, ChunkMeta)> = Vec::new();
 
         for (key, len) in keys {
-            if let Some((timestamps, values, out_of_order)) =
-                self.drain_partition_if(&key, |buf| !buf.timestamps.is_empty())
+            if let Some((points, out_of_order)) =
+                self.drain_partition_if(&key, |buf| !buf.points.is_empty())
             {
-                let cp = self.compress_partition(&key, &timestamps, &values, out_of_order)?;
+                let cp = self.compress_partition(&key, &points, out_of_order)?);
                 if len >= self.min_flush_size {
                     new_individual.push((key, self.write_individual_chunk(&cp)?));
                 } else {
@@ -897,33 +894,24 @@ impl Engine {
     fn compress_partition(
         &self,
         key: &PartitionKey,
-        timestamps: &[i64],
-        values: &[f64],
+        points: &[(i64, f64)],
         out_of_order: bool,
     ) -> EngineResult<CompressedPartition> {
-        if timestamps.is_empty() || timestamps.len() != values.len() {
+        if points.is_empty() {
             return Err(format!(
-                "invalid partition payload for series {}: {} timestamps, {} values",
+                "invalid partition payload for series {}: 0 points",
                 key.series_id,
-                timestamps.len(),
-                values.len()
             ));
         }
 
-        let sorted_points = if out_of_order {
-            let mut points: Vec<(i64, f64)> = timestamps
-                .iter()
-                .copied()
-                .zip(values.iter().copied())
-                .collect();
-            points.sort_unstable_by_key(|&(ts, _)| ts);
-            Some(points.into_iter().unzip::<_, _, Vec<i64>, Vec<f64>>())
+        let (ts_slice, val_slice) = if out_of_order {
+            let mut sorted: Vec<(i64, f64)> = points.to_vec();
+            sorted.sort_unstable_by_key(|&(ts, _)| ts);
+            let (ts, vals): (Vec<i64>, Vec<f64>) = sorted.into_iter().unzip();
+            (ts, vals)
         } else {
-            None
-        };
-        let (ts_slice, val_slice) = match &sorted_points {
-            Some((ts, vals)) => (&ts[..], &vals[..]),
-            None => (timestamps, values),
+            let (ts, vals): (Vec<i64>, Vec<f64>) = points.iter().copied().unzip();
+            (ts, vals)
         };
 
         let config = pco::ChunkConfig::default().with_compression_level(self.compression_level);
@@ -1151,8 +1139,7 @@ impl Engine {
         }
 
         let freed = entry.memory_bytes();
-        let timestamps = std::mem::take(&mut entry.timestamps);
-        let values = std::mem::take(&mut entry.values);
+        let points = std::mem::take(&mut entry.points);
         let out_of_order = entry.out_of_order;
         entry.out_of_order = false;
         entry.last_write = Instant::now();
@@ -1162,7 +1149,7 @@ impl Engine {
             self.buffer_memory.fetch_sub(freed, Ordering::Relaxed);
         }
 
-        Some((timestamps, values, out_of_order))
+        Some((points, out_of_order))
     }
 
     // ── Queries ──────────────────────────────────────────────────────
@@ -1239,10 +1226,9 @@ impl Engine {
         }
 
         if let Some(buf) = self.partitions.get(&pk) {
-            for i in 0..buf.timestamps.len() {
-                let ts = buf.timestamps[i];
+            for &(ts, val) in &buf.points {
                 if ts >= t_start && ts <= t_end {
-                    results.push((ts, buf.values[i]));
+                    results.push((ts, val));
                 }
             }
         }
@@ -1348,9 +1334,8 @@ impl Engine {
         }
 
         if let Some(buf) = self.partitions.get(&pk) {
-            for i in 0..buf.timestamps.len() {
-                if buf.timestamps[i] >= t_start && buf.timestamps[i] <= t_end {
-                    let val = buf.values[i];
+            for &(ts, val) in &buf.points {
+                if ts >= t_start && ts <= t_end {
                     total_count += 1;
                     total_sum += val;
                     global_min = Some(match global_min {
@@ -1699,7 +1684,7 @@ impl Engine {
         let buffered_points: usize = self
             .partitions
             .iter()
-            .map(|e| e.value().timestamps.len())
+            .map(|e| e.value().points.len())
             .sum();
         let buffer_memory = self.buffer_memory.load(Ordering::Relaxed);
 
@@ -1722,13 +1707,13 @@ impl Engine {
 
         for entry in self.partitions.iter() {
             let buf = entry.value();
-            if let Some(min_ts) = buf.timestamps.iter().min() {
+            if let Some(min_ts) = buf.points.iter().map(|(ts, _)| ts).min() {
                 oldest_ts = match oldest_ts {
                     Some(existing) => Some(existing.min(*min_ts)),
                     None => Some(*min_ts),
                 };
             }
-            if let Some(max_ts) = buf.timestamps.iter().max() {
+            if let Some(max_ts) = buf.points.iter().map(|(ts, _)| ts).max() {
                 newest_ts = match newest_ts {
                     Some(existing) => Some(existing.max(*max_ts)),
                     None => Some(*max_ts),
