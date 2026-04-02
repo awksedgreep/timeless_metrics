@@ -677,8 +677,13 @@ impl Engine {
         &self,
         entries: Vec<(String, HashMap<String, String>, i64, f64)>,
     ) -> EngineResult<()> {
+        let mut resolved: Vec<(i64, i64, f64)> = Vec::with_capacity(entries.len());
         for (metric, labels_hm, ts, val) in entries {
             let series_id = self.resolve_cached(&metric, &labels_hm)?;
+            resolved.push((series_id, ts, val));
+        }
+        resolved.sort_unstable_by_key(|(sid, _, _)| *sid);
+        for (series_id, ts, val) in resolved {
             self.write_point(series_id, ts, val);
         }
         Ok(())
