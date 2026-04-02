@@ -1063,7 +1063,15 @@ impl Engine {
     }
 
     fn ensure_dir(&self, path: &PathBuf) -> io::Result<()> {
-        let dir = path.parent().unwrap().to_path_buf();
+        let dir = path
+            .parent()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("path has no parent: {:?}", path),
+                )
+            })?
+            .to_path_buf();
         let mut dirs = self.created_dirs_lock();
         if !dirs.contains(&dir) {
             fs::create_dir_all(&dir)?;
