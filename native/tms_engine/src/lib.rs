@@ -6,7 +6,7 @@ use rustler::{Atom, Binary, Encoder, ResourceArc, Term};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -1569,8 +1569,12 @@ impl Engine {
     }
 
     fn read_pco1_header(path: &PathBuf) -> Result<Vec<(PartitionKey, ChunkMeta)>, String> {
-        let data = fs::read(path).map_err(|e| e.to_string())?;
-        if data.len() < 4 || &data[0..4] != b"PCO1" {
+        let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; 4096];
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        let data = &buf[..n];
+
+        if data.len() < 5 || &data[0..4] != b"PCO1" {
             return Err("invalid".into());
         }
 
@@ -1617,39 +1621,44 @@ impl Engine {
     }
 
     fn read_pcb1_headers(path: &PathBuf) -> Result<Vec<(PartitionKey, ChunkMeta)>, String> {
-        let data = fs::read(path).map_err(|e| e.to_string())?;
-        if data.len() < 9 || &data[0..4] != b"PCB1" {
+        let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+
+        let mut header_buf = [0u8; 9];
+        file.read_exact(&mut header_buf)
+            .map_err(|e| e.to_string())?;
+        if &header_buf[0..4] != b"PCB1" {
             return Err("invalid".into());
         }
 
-        let n = u32::from_be_bytes(data[5..9].try_into().unwrap()) as usize;
-        let mut results = Vec::with_capacity(n);
-        let mut pos = 9;
+        let n = u32::from_be_bytes(header_buf[5..9].try_into().unwrap()) as usize;
         let table_len = n
             .checked_mul(64)
             .ok_or_else(|| "PCB1 table overflow".to_string())?;
-        if pos + table_len > data.len() {
-            return Err("truncated PCB1 header".into());
-        }
+
+        let mut table_buf = vec![0u8; table_len];
+        file.read_exact(&mut table_buf).map_err(|e| e.to_string())?;
+
+        let mut results = Vec::with_capacity(n);
+        let mut pos = 0;
 
         for _ in 0..n {
-            let series_id = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let series_id = i64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let point_count = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+            let point_count = u32::from_be_bytes(table_buf[pos..pos + 4].try_into().unwrap());
             pos += 4;
-            let min_ts = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let min_ts = i64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let max_ts = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let max_ts = i64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let min_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let min_val = f64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let max_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let max_val = f64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let sum_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let sum_val = f64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let data_offset = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let data_offset = u64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let data_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+            let data_len = u32::from_be_bytes(table_buf[pos..pos + 4].try_into().unwrap());
             pos += 4;
 
             results.push((
