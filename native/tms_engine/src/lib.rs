@@ -1436,7 +1436,7 @@ impl Engine {
 
     // ── Retention ────────────────────────────────────────────────────
 
-    fn delete_before(&self, before_ts: i64) -> (usize, usize) {
+    fn delete_before(&self, before_ts: i64) -> (usize, usize, Vec<String>) {
         let mut index = self.index_write();
 
         let to_remove: Vec<(PartitionKey, i64)> = index
@@ -1465,14 +1465,17 @@ impl Engine {
 
         drop(index);
         let files_deleted = files_to_delete.len();
+        let mut errors: Vec<String> = Vec::new();
         for path in &files_to_delete {
-            let _ = fs::remove_file(path);
+            if let Err(e) = fs::remove_file(path) {
+                errors.push(format!("failed to remove {}: {}", path.display(), e));
+            }
             if let Some(dir) = path.parent() {
                 let _ = fs::remove_dir(dir);
             }
         }
 
-        (entries_removed, files_deleted)
+        (entries_removed, files_deleted, errors)
     }
 
     // ── Index rebuild ────────────────────────────────────────────────
@@ -1833,9 +1836,9 @@ fn engine_flush(resource: ResourceArc<EngineResource>) -> Result<Atom, String> {
 fn engine_delete_before(
     resource: ResourceArc<EngineResource>,
     before_ts: i64,
-) -> (Atom, usize, usize) {
-    let (e, f) = resource.deref().engine.delete_before(before_ts);
-    (atoms::ok(), e, f)
+) -> (Atom, usize, usize, Vec<String>) {
+    let (e, f, errors) = resource.deref().engine.delete_before(before_ts);
+    (atoms::ok(), e, f, errors)
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
