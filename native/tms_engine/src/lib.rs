@@ -413,7 +413,7 @@ struct Engine {
     index: RwLock<BTreeMap<(PartitionKey, i64), ChunkMeta>>,
     series: RwLock<SeriesRegistry>,
     created_dirs: Mutex<HashSet<PathBuf>>,
-    flush_queue: Mutex<Vec<PartitionKey>>,
+    flush_queue: DashSet<PartitionKey>,
     buffer_memory: AtomicUsize,
     batch_counter: AtomicUsize,
     instance_id: u128,
@@ -472,9 +472,6 @@ impl Engine {
         self.series.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn flush_queue_lock(&self) -> MutexGuard<'_, Vec<PartitionKey>> {
-        self.flush_queue.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     fn created_dirs_lock(&self) -> MutexGuard<'_, HashSet<PathBuf>> {
         self.created_dirs.lock().unwrap_or_else(|e| e.into_inner())
@@ -510,7 +507,7 @@ impl Engine {
             index: RwLock::new(BTreeMap::new()),
             series: RwLock::new(registry),
             created_dirs: Mutex::new(HashSet::new()),
-            flush_queue: Mutex::new(Vec::new()),
+            flush_queue: DashSet::new(),
             buffer_memory: AtomicUsize::new(0),
             batch_counter: AtomicUsize::new(0),
             instance_id,
@@ -615,7 +612,7 @@ impl Engine {
         }
 
         if needs_flush {
-            self.flush_queue_lock().push(key);
+            self.flush_queue.insert(key);
         }
     }
 
@@ -713,12 +710,8 @@ impl Engine {
     // ── Flush ────────────────────────────────────────────────────────
 
     fn flush_pending(&self) -> EngineResult<usize> {
-        let keys: Vec<PartitionKey> = {
-            let mut queue = self.flush_queue_lock();
-            std::mem::take(&mut *queue)
-        };
-        let mut seen = HashSet::new();
-        let unique: Vec<PartitionKey> = keys.into_iter().filter(|k| seen.insert(*k)).collect();
+        let unique: Vec<PartitionKey> = self.flush_queue.iter().map(|r| *r.key()).collect();
+        self.flush_queue.clear();
 
         let mut count = 0;
         for key in unique {
