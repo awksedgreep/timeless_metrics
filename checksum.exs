@@ -1,6 +1,6 @@
 %{
-  "timeless_metrics-nif-2.17-aarch64-apple-darwin-6.0.11.tar.gz" => "sha256:70b582752916483296d63b4b9cfb56e320461fa7d726c27a57b357fed9956f9a",
-  "timeless_metrics-nif-2.17-aarch64-linux-gnu-6.0.11.tar.gz" => "sha256:a179ee4ffc230a336889f059862a7e191c3809c5d7a7833cf51eaaf51df30cb2",
-  "timeless_metrics-nif-2.17-x86_64-apple-darwin-6.0.11.tar.gz" => "sha256:348a396f09cddc4139f3975f6b401fae58321e9be687227160cfe4c1c9e82568",
-  "timeless_metrics-nif-2.17-x86_64-linux-gnu-6.0.11.tar.gz" => "sha256:e7006d599695cf91c3aa2c9c6a96338ad91c90fc2bef24ae03d371945095aa35",
+  "timeless_metrics-nif-2.17-aarch64-apple-darwin-6.0.12.tar.gz" => "sha256:8b8db1bcf0757e5e4bd35d5eca112ac2ae261ef1103b50a2ec18d6a76075bcaa",
+  "timeless_metrics-nif-2.17-aarch64-linux-gnu-6.0.12.tar.gz" => "sha256:55a535e6bf5681ae27068edb28d1b43061ae4856a05641716128a7f7bdfd5924",
+  "timeless_metrics-nif-2.17-x86_64-apple-darwin-6.0.12.tar.gz" => "sha256:3b79c7c2ead5e1bcd965f9d8a79425299a70b750a0a7975b4264d900157d0ede",
+  "timeless_metrics-nif-2.17-x86_64-linux-gnu-6.0.12.tar.gz" => "sha256:10634c33ae21ebade2a88b16af92f7e0b41efd599a4bd2df23b2e8378a292f60",
 }
