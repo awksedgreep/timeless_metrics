@@ -6,11 +6,11 @@ use rustler::{Atom, Binary, Encoder, ResourceArc, Term};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod atoms {
@@ -43,17 +43,17 @@ struct SeriesInfo {
 }
 
 struct PartitionBuffer {
-    points: Vec<(i64, f64)>,
+    timestamps: Vec<i64>,
+    values: Vec<f64>,
     last_write: Instant,
-    out_of_order: bool,
 }
 
 impl PartitionBuffer {
     fn new() -> Self {
         PartitionBuffer {
-            points: Vec::new(),
+            timestamps: Vec::new(),
+            values: Vec::new(),
             last_write: Instant::now(),
-            out_of_order: false,
         }
     }
     fn memory_bytes(&self) -> usize {
@@ -79,10 +79,15 @@ struct ChunkMeta {
 // ═══════════════════════════════════════════════════════════════════════
 
 struct SeriesRegistry {
-    series_map: HashMap<String, HashMap<Labels, i64>>,
+    /// Forward: (metric, labels) → series_id
+    series_map: HashMap<(String, Labels), i64>,
+    /// Reverse: series_id → SeriesInfo
     series_info: HashMap<i64, SeriesInfo>,
+    /// Inverted label index: (label_key, label_value) → set of series_ids
     label_index: HashMap<(String, String), HashSet<i64>>,
+    /// Metric name → set of series_ids
     metric_index: HashMap<String, HashSet<i64>>,
+    /// Next ID
     next_id: AtomicI64,
     dirty: bool,
 }
@@ -101,18 +106,15 @@ impl SeriesRegistry {
 
     /// Resolve (metric_name, labels) → series_id. Creates if new.
     fn get_or_create(&mut self, metric_name: &str, labels: &Labels) -> i64 {
-        if let Some(inner) = self.series_map.get(metric_name) {
-            if let Some(&id) = inner.get(labels) {
-                return id;
-            }
+        let key = (metric_name.to_string(), labels.clone());
+        if let Some(&id) = self.series_map.get(&key) {
+            return id;
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        self.series_map
-            .entry(metric_name.to_string())
-            .or_default()
-            .insert(labels.clone(), id);
+        // Forward map
+        self.series_map.insert(key, id);
 
         // Reverse map
         self.series_info.insert(
@@ -206,7 +208,7 @@ impl SeriesRegistry {
     }
 
     fn series_count(&self) -> usize {
-        self.series_map.values().map(|m| m.len()).sum()
+        self.series_map.len()
     }
 
     /// Persist to disk.
@@ -351,10 +353,7 @@ impl SeriesRegistry {
             }
 
             let key = (metric_name.clone(), labels.clone());
-            reg.series_map
-                .entry(metric_name.clone())
-                .or_default()
-                .insert(labels.clone(), id);
+            reg.series_map.insert(key, id);
             reg.series_info.insert(
                 id,
                 SeriesInfo {
@@ -411,7 +410,7 @@ struct Engine {
     index: RwLock<BTreeMap<(PartitionKey, i64), ChunkMeta>>,
     series: RwLock<SeriesRegistry>,
     created_dirs: Mutex<HashSet<PathBuf>>,
-    flush_queue: DashSet<PartitionKey>,
+    flush_queue: Mutex<Vec<PartitionKey>>,
     buffer_memory: AtomicUsize,
     batch_counter: AtomicUsize,
     instance_id: u128,
@@ -470,6 +469,9 @@ impl Engine {
         self.series.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn flush_queue_lock(&self) -> MutexGuard<'_, Vec<PartitionKey>> {
+        self.flush_queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn created_dirs_lock(&self) -> MutexGuard<'_, HashSet<PathBuf>> {
         self.created_dirs.lock().unwrap_or_else(|e| e.into_inner())
@@ -505,7 +507,7 @@ impl Engine {
             index: RwLock::new(BTreeMap::new()),
             series: RwLock::new(registry),
             created_dirs: Mutex::new(HashSet::new()),
-            flush_queue: DashSet::new(),
+            flush_queue: Mutex::new(Vec::new()),
             buffer_memory: AtomicUsize::new(0),
             batch_counter: AtomicUsize::new(0),
             instance_id,
@@ -526,8 +528,7 @@ impl Engine {
             let reg = self.series_read();
             if let Some(&id) = reg
                 .series_map
-                .get(metric_name)
-                .and_then(|inner| inner.get(labels))
+                .get(&(metric_name.to_string(), labels.clone()))
             {
                 return Ok(id);
             }
@@ -548,7 +549,7 @@ impl Engine {
         {
             let reg = self.series_read();
             for (idx, (metric_name, labels)) in entries.iter().enumerate() {
-                if let Some(&id) = reg.series_map.get(metric_name).and_then(|inner| inner.get(labels)) {
+                if let Some(&id) = reg.series_map.get(&(metric_name.clone(), labels.clone())) {
                     out.push(id);
                 } else {
                     out.push(0);
@@ -590,14 +591,12 @@ impl Engine {
                 .or_insert_with(PartitionBuffer::new);
             let buf = entry.value_mut();
             let old_cap = buf.memory_bytes();
-            if !buf.points.is_empty() && ts < buf.points.last().unwrap().0 {
-                buf.out_of_order = true;
-            }
-            buf.points.push((ts, val));
+            buf.timestamps.push(ts);
+            buf.values.push(val);
             buf.last_write = Instant::now();
             let new_cap = buf.memory_bytes();
             mem_delta = (new_cap as isize) - (old_cap as isize);
-            needs_flush = buf.points.len() >= self.flush_threshold;
+            needs_flush = buf.timestamps.len() >= self.flush_threshold;
         }
 
         if mem_delta > 0 {
@@ -609,7 +608,7 @@ impl Engine {
         }
 
         if needs_flush {
-            self.flush_queue.insert(key);
+            self.flush_queue_lock().push(key);
         }
     }
 
@@ -677,13 +676,8 @@ impl Engine {
         &self,
         entries: Vec<(String, HashMap<String, String>, i64, f64)>,
     ) -> EngineResult<()> {
-        let mut resolved: Vec<(i64, i64, f64)> = Vec::with_capacity(entries.len());
         for (metric, labels_hm, ts, val) in entries {
             let series_id = self.resolve_cached(&metric, &labels_hm)?;
-            resolved.push((series_id, ts, val));
-        }
-        resolved.sort_unstable_by_key(|(sid, _, _)| *sid);
-        for (series_id, ts, val) in resolved {
             self.write_point(series_id, ts, val);
         }
         Ok(())
@@ -700,10 +694,12 @@ impl Engine {
                 ENTRY_SIZE
             ));
         }
-        for chunk in data.chunks_exact(ENTRY_SIZE) {
-            let series_id = i64::from_ne_bytes(chunk[0..8].try_into().unwrap());
-            let ts = i64::from_ne_bytes(chunk[8..16].try_into().unwrap());
-            let val = f64::from_ne_bytes(chunk[16..24].try_into().unwrap());
+        let count = data.len() / ENTRY_SIZE;
+        for i in 0..count {
+            let o = i * ENTRY_SIZE;
+            let series_id = i64::from_ne_bytes(data[o..o + 8].try_into().unwrap());
+            let ts = i64::from_ne_bytes(data[o + 8..o + 16].try_into().unwrap());
+            let val = f64::from_ne_bytes(data[o + 16..o + 24].try_into().unwrap());
             self.write_point(series_id, ts, val);
         }
         Ok(())
@@ -712,8 +708,12 @@ impl Engine {
     // ── Flush ────────────────────────────────────────────────────────
 
     fn flush_pending(&self) -> EngineResult<usize> {
-        let unique: Vec<PartitionKey> = self.flush_queue.iter().map(|r| *r.key()).collect();
-        self.flush_queue.clear();
+        let keys: Vec<PartitionKey> = {
+            let mut queue = self.flush_queue_lock();
+            std::mem::take(&mut *queue)
+        };
+        let mut seen = HashSet::new();
+        let unique: Vec<PartitionKey> = keys.into_iter().filter(|k| seen.insert(*k)).collect();
 
         let mut count = 0;
         for key in unique {
@@ -732,10 +732,10 @@ impl Engine {
     }
 
     fn flush_partition_individual(&self, key: &PartitionKey) -> EngineResult<()> {
-        if let Some((points, out_of_order)) =
-            self.drain_partition_if(key, |buf| !buf.points.is_empty())
+        if let Some((timestamps, values)) =
+            self.drain_partition_if(key, |buf| !buf.timestamps.is_empty())
         {
-            let cp = self.compress_partition(key, &points, out_of_order)?;
+            let cp = self.compress_partition(key, &timestamps, &values)?;
             let meta = self.write_individual_chunk(&cp)?;
             self.index
                 .write()
@@ -762,7 +762,7 @@ impl Engine {
         let cold_keys: Vec<PartitionKey> = self
             .partitions
             .iter()
-            .filter(|e| !e.value().points.is_empty() && now.duration_since(e.value().last_write).as_secs() >= max_idle_secs)
+            .filter(|e| now.duration_since(e.value().last_write).as_secs() >= max_idle_secs)
             .map(|e| *e.key())
             .collect();
 
@@ -770,16 +770,11 @@ impl Engine {
         let mut evicted = 0;
 
         for key in &cold_keys {
-            if let Some((timestamps, values, out_of_order)) = self.drain_partition_if(key, |buf| {
+            if let Some((timestamps, values)) = self.drain_partition_if(key, |buf| {
                 now.duration_since(buf.last_write).as_secs() >= max_idle_secs
                     && !buf.timestamps.is_empty()
             }) {
-                compressed.push(self.compress_partition(
-                    key,
-                    &timestamps,
-                    &values,
-                    out_of_order,
-                )?);
+                compressed.push(self.compress_partition(key, &timestamps, &values)?);
                 evicted += 1;
             }
         }
@@ -824,16 +819,11 @@ impl Engine {
             if freed >= overage {
                 break;
             }
-            if let Some((timestamps, values, out_of_order)) =
+            if let Some((timestamps, values)) =
                 self.drain_partition_if(&key, |buf| !buf.timestamps.is_empty())
             {
                 freed += partition_vec_memory(&timestamps, &values);
-                compressed.push(self.compress_partition(
-                    &key,
-                    &timestamps,
-                    &values,
-                    out_of_order,
-                )?);
+                compressed.push(self.compress_partition(&key, &timestamps, &values)?);
             }
         }
 
@@ -855,18 +845,18 @@ impl Engine {
         let keys: Vec<(PartitionKey, usize)> = self
             .partitions
             .iter()
-            .filter(|e| !e.value().points.is_empty())
-            .map(|e| (*e.key(), e.value().points.len()))
+            .filter(|e| !e.value().timestamps.is_empty())
+            .map(|e| (*e.key(), e.value().timestamps.len()))
             .collect();
 
         let mut small_compressed: Vec<CompressedPartition> = Vec::new();
         let mut new_individual: Vec<(PartitionKey, ChunkMeta)> = Vec::new();
 
         for (key, len) in keys {
-            if let Some((points, out_of_order)) =
-                self.drain_partition_if(&key, |buf| !buf.points.is_empty())
+            if let Some((timestamps, values)) =
+                self.drain_partition_if(&key, |buf| !buf.timestamps.is_empty())
             {
-                let cp = self.compress_partition(&key, &points, out_of_order)?);
+                let cp = self.compress_partition(&key, &timestamps, &values)?;
                 if len >= self.min_flush_size {
                     new_individual.push((key, self.write_individual_chunk(&cp)?));
                 } else {
@@ -899,24 +889,33 @@ impl Engine {
     fn compress_partition(
         &self,
         key: &PartitionKey,
-        points: &[(i64, f64)],
-        out_of_order: bool,
+        timestamps: &[i64],
+        values: &[f64],
     ) -> EngineResult<CompressedPartition> {
-        if points.is_empty() {
+        if timestamps.is_empty() || timestamps.len() != values.len() {
             return Err(format!(
-                "invalid partition payload for series {}: 0 points",
+                "invalid partition payload for series {}: {} timestamps, {} values",
                 key.series_id,
+                timestamps.len(),
+                values.len()
             ));
         }
 
-        let (ts_slice, val_slice) = if out_of_order {
-            let mut sorted: Vec<(i64, f64)> = points.to_vec();
-            sorted.sort_unstable_by_key(|&(ts, _)| ts);
-            let (ts, vals): (Vec<i64>, Vec<f64>) = sorted.into_iter().unzip();
-            (ts, vals)
+        let needs_sort = timestamps.windows(2).any(|w| w[0] > w[1]);
+        let sorted_points = if needs_sort {
+            let mut points: Vec<(i64, f64)> = timestamps
+                .iter()
+                .copied()
+                .zip(values.iter().copied())
+                .collect();
+            points.sort_unstable_by_key(|&(ts, _)| ts);
+            Some(points.into_iter().unzip::<_, _, Vec<i64>, Vec<f64>>())
         } else {
-            let (ts, vals): (Vec<i64>, Vec<f64>) = points.iter().copied().unzip();
-            (ts, vals)
+            None
+        };
+        let (ts_slice, val_slice) = match &sorted_points {
+            Some((ts, vals)) => (&ts[..], &vals[..]),
+            None => (timestamps, values),
         };
 
         let config = pco::ChunkConfig::default().with_compression_level(self.compression_level);
@@ -1134,7 +1133,7 @@ impl Engine {
         &self,
         key: &PartitionKey,
         should_drain: F,
-    ) -> Option<(Vec<i64>, Vec<f64>, bool)>
+    ) -> Option<(Vec<i64>, Vec<f64>)>
     where
         F: FnOnce(&PartitionBuffer) -> bool,
     {
@@ -1144,9 +1143,8 @@ impl Engine {
         }
 
         let freed = entry.memory_bytes();
-        let points = std::mem::take(&mut entry.points);
-        let out_of_order = entry.out_of_order;
-        entry.out_of_order = false;
+        let timestamps = std::mem::take(&mut entry.timestamps);
+        let values = std::mem::take(&mut entry.values);
         entry.last_write = Instant::now();
         drop(entry);
 
@@ -1154,7 +1152,7 @@ impl Engine {
             self.buffer_memory.fetch_sub(freed, Ordering::Relaxed);
         }
 
-        Some((points, out_of_order))
+        Some((timestamps, values))
     }
 
     // ── Queries ──────────────────────────────────────────────────────
@@ -1231,9 +1229,10 @@ impl Engine {
         }
 
         if let Some(buf) = self.partitions.get(&pk) {
-            for &(ts, val) in &buf.points {
+            for i in 0..buf.timestamps.len() {
+                let ts = buf.timestamps[i];
                 if ts >= t_start && ts <= t_end {
-                    results.push((ts, val));
+                    results.push((ts, buf.values[i]));
                 }
             }
         }
@@ -1339,8 +1338,9 @@ impl Engine {
         }
 
         if let Some(buf) = self.partitions.get(&pk) {
-            for &(ts, val) in &buf.points {
-                if ts >= t_start && ts <= t_end {
+            for i in 0..buf.timestamps.len() {
+                if buf.timestamps[i] >= t_start && buf.timestamps[i] <= t_end {
+                    let val = buf.values[i];
                     total_count += 1;
                     total_sum += val;
                     global_min = Some(match global_min {
@@ -1569,12 +1569,8 @@ impl Engine {
     }
 
     fn read_pco1_header(path: &PathBuf) -> Result<Vec<(PartitionKey, ChunkMeta)>, String> {
-        let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-        let mut buf = vec![0u8; 4096];
-        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-        let data = &buf[..n];
-
-        if data.len() < 5 || &data[0..4] != b"PCO1" {
+        let data = fs::read(path).map_err(|e| e.to_string())?;
+        if data.len() < 4 || &data[0..4] != b"PCO1" {
             return Err("invalid".into());
         }
 
@@ -1621,44 +1617,39 @@ impl Engine {
     }
 
     fn read_pcb1_headers(path: &PathBuf) -> Result<Vec<(PartitionKey, ChunkMeta)>, String> {
-        let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-
-        let mut header_buf = [0u8; 9];
-        file.read_exact(&mut header_buf)
-            .map_err(|e| e.to_string())?;
-        if &header_buf[0..4] != b"PCB1" {
+        let data = fs::read(path).map_err(|e| e.to_string())?;
+        if data.len() < 9 || &data[0..4] != b"PCB1" {
             return Err("invalid".into());
         }
 
-        let n = u32::from_be_bytes(header_buf[5..9].try_into().unwrap()) as usize;
+        let n = u32::from_be_bytes(data[5..9].try_into().unwrap()) as usize;
+        let mut results = Vec::with_capacity(n);
+        let mut pos = 9;
         let table_len = n
             .checked_mul(64)
             .ok_or_else(|| "PCB1 table overflow".to_string())?;
-
-        let mut table_buf = vec![0u8; table_len];
-        file.read_exact(&mut table_buf).map_err(|e| e.to_string())?;
-
-        let mut results = Vec::with_capacity(n);
-        let mut pos = 0;
+        if pos + table_len > data.len() {
+            return Err("truncated PCB1 header".into());
+        }
 
         for _ in 0..n {
-            let series_id = i64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
+            let series_id = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let point_count = u32::from_be_bytes(table_buf[pos..pos + 4].try_into().unwrap());
+            let point_count = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
-            let min_ts = i64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
+            let min_ts = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let max_ts = i64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
+            let max_ts = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let min_val = f64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
+            let min_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let max_val = f64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
+            let max_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let sum_val = f64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
+            let sum_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let data_offset = u64::from_be_bytes(table_buf[pos..pos + 8].try_into().unwrap());
+            let data_offset = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let data_len = u32::from_be_bytes(table_buf[pos..pos + 4].try_into().unwrap());
+            let data_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
 
             results.push((
@@ -1689,7 +1680,7 @@ impl Engine {
         let buffered_points: usize = self
             .partitions
             .iter()
-            .map(|e| e.value().points.len())
+            .map(|e| e.value().timestamps.len())
             .sum();
         let buffer_memory = self.buffer_memory.load(Ordering::Relaxed);
 
@@ -1712,13 +1703,13 @@ impl Engine {
 
         for entry in self.partitions.iter() {
             let buf = entry.value();
-            if let Some(min_ts) = buf.points.iter().map(|(ts, _)| ts).min() {
+            if let Some(min_ts) = buf.timestamps.iter().min() {
                 oldest_ts = match oldest_ts {
                     Some(existing) => Some(existing.min(*min_ts)),
                     None => Some(*min_ts),
                 };
             }
-            if let Some(max_ts) = buf.points.iter().map(|(ts, _)| ts).max() {
+            if let Some(max_ts) = buf.timestamps.iter().max() {
                 newest_ts = match newest_ts {
                     Some(existing) => Some(existing.max(*max_ts)),
                     None => Some(*max_ts),
@@ -2017,49 +2008,47 @@ fn engine_list_series(
 }
 
 #[rustler::nif]
-fn engine_info<'a>(resource: ResourceArc<EngineResource>, env: rustler::Env<'a>) -> Term<'a> {
+fn engine_info<'a>(env: rustler::Env<'a>, resource: ResourceArc<EngineResource>) -> Term<'a> {
     let info = resource.deref().engine.info();
-    let mut map = rustler::types::map::map_new(env);
-    map = map
-        .insert("chunk_count", info.chunk_count as i64)
-        .encode(env);
-    map = map
-        .insert("partition_count", info.partition_count as i64)
-        .encode(env);
-    map = map
-        .insert("series_count", info.series_count as i64)
-        .encode(env);
-    map = map
-        .insert("disk_points", info.disk_points as i64)
-        .encode(env);
-    map = map
-        .insert("buffered_points", info.buffered_points as i64)
-        .encode(env);
-    map = map
-        .insert("total_points", info.total_points as i64)
-        .encode(env);
-    map = map
-        .insert("total_bytes", info.total_bytes as i64)
-        .encode(env);
-    map = map
-        .insert("bytes_per_point", info.bytes_per_point)
-        .encode(env);
-    map = map
-        .insert("buffer_memory_bytes", info.buffer_memory as i64)
-        .encode(env);
-    map = map
-        .insert(
+    let map = rustler::types::map::map_new(env);
+    let map = map.map_put("chunk_count", info.chunk_count as i64).unwrap();
+    let map = map
+        .map_put("partition_count", info.partition_count as i64)
+        .unwrap();
+    let map = map
+        .map_put("series_count", info.series_count as i64)
+        .unwrap();
+    let map = map.map_put("disk_points", info.disk_points as i64).unwrap();
+    let map = map
+        .map_put("buffered_points", info.buffered_points as i64)
+        .unwrap();
+    let map = map
+        .map_put("total_points", info.total_points as i64)
+        .unwrap();
+    let map = map.map_put("total_bytes", info.total_bytes as i64).unwrap();
+    let map = map
+        .map_put("bytes_per_point", info.bytes_per_point)
+        .unwrap();
+    let map = map
+        .map_put("buffer_memory_bytes", info.buffer_memory as i64)
+        .unwrap();
+    let map = map
+        .map_put(
             "buffer_memory_mb",
             info.buffer_memory as f64 / 1024.0 / 1024.0,
         )
-        .encode(env);
-    map = map.insert("file_count", info.file_count as i64).encode(env);
-    if let Some(oldest_ts) = info.oldest_ts {
-        map = map.insert("oldest_timestamp", oldest_ts).encode(env);
-    }
-    if let Some(newest_ts) = info.newest_ts {
-        map = map.insert("newest_timestamp", newest_ts).encode(env);
-    }
+        .unwrap();
+    let map = map.map_put("file_count", info.file_count as i64).unwrap();
+    let map = if let Some(oldest_ts) = info.oldest_ts {
+        map.map_put("oldest_timestamp", oldest_ts).unwrap()
+    } else {
+        map
+    };
+    let map = if let Some(newest_ts) = info.newest_ts {
+        map.map_put("newest_timestamp", newest_ts).unwrap()
+    } else {
+        map
+    };
     map
 }
 
