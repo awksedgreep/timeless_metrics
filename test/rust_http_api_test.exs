@@ -2,6 +2,8 @@ defmodule TimelessMetrics.RustHTTPAPITest do
   use ExUnit.Case, async: false
 
   alias TimelessMetrics.TestHelper
+  alias TimelessMetrics.RustEngine
+  alias TimelessMetrics.RustEngine.Nif
 
   @data_dir "/tmp/timeless_rust_http_test_#{System.os_time(:millisecond)}"
   @port 18_451
@@ -143,6 +145,44 @@ defmodule TimelessMetrics.RustHTTPAPITest do
       )
 
     assert points == [{now, 12.5}, {now + 1, 15.0}]
+  end
+
+  test "info returns stats with rust engine" do
+    now = System.os_time(:second)
+
+    TimelessMetrics.write(:rust_http_test, "info_metric", %{"host" => "web-1"}, 10.0,
+      timestamp: now
+    )
+
+    TimelessMetrics.write(:rust_http_test, "info_metric", %{"host" => "web-2"}, 20.0,
+      timestamp: now + 1
+    )
+
+    TimelessMetrics.flush(:rust_http_test)
+
+    info = TimelessMetrics.info(:rust_http_test)
+
+    assert info.series_count == 2
+    assert info.total_points == 2
+    assert info.disk_points >= 1
+    assert info.storage_bytes > 0
+    assert is_binary(info.db_path)
+  end
+
+  test "engine_info returns wrapped success payload" do
+    now = System.os_time(:second)
+
+    TimelessMetrics.write(:rust_http_test, "nif_info_metric", %{"host" => "web-1"}, 10.0,
+      timestamp: now
+    )
+
+    TimelessMetrics.flush(:rust_http_test)
+
+    assert {:ok, raw} = Nif.engine_info(RustEngine.ref(:rust_http_test))
+    assert is_map(raw)
+    assert raw["series_count"] == 1
+    assert raw["total_points"] == 1
+    assert is_number(raw["buffer_memory_bytes"])
   end
 
   test "query_aggregate_multi returns scalar aggregates without fetching raw points" do

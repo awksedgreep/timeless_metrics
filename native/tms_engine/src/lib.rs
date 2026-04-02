@@ -2018,7 +2018,10 @@ fn engine_list_series(
 }
 
 #[rustler::nif]
-fn engine_info<'a>(env: rustler::Env<'a>, resource: ResourceArc<EngineResource>) -> Term<'a> {
+fn engine_info<'a>(
+    env: rustler::Env<'a>,
+    resource: ResourceArc<EngineResource>,
+) -> Result<(Atom, Term<'a>), String> {
     let info = resource.deref().engine.info();
     let map = rustler::types::map::map_new(env);
     let map = map.map_put("chunk_count", info.chunk_count as i64).unwrap();
@@ -2059,7 +2062,7 @@ fn engine_info<'a>(env: rustler::Env<'a>, resource: ResourceArc<EngineResource>)
     } else {
         map
     };
-    map
+    Ok((atoms::ok(), map))
 }
 
 fn match_agg(atom: Atom) -> Result<AggFn, String> {
