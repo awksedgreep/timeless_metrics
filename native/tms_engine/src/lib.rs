@@ -81,15 +81,10 @@ struct ChunkMeta {
 // ═══════════════════════════════════════════════════════════════════════
 
 struct SeriesRegistry {
-    /// Forward: (metric, labels) → series_id
-    series_map: HashMap<(String, Labels), i64>,
-    /// Reverse: series_id → SeriesInfo
+    series_map: HashMap<String, HashMap<Labels, i64>>,
     series_info: HashMap<i64, SeriesInfo>,
-    /// Inverted label index: (label_key, label_value) → set of series_ids
     label_index: HashMap<(String, String), HashSet<i64>>,
-    /// Metric name → set of series_ids
     metric_index: HashMap<String, HashSet<i64>>,
-    /// Next ID
     next_id: AtomicI64,
     dirty: bool,
 }
@@ -108,15 +103,18 @@ impl SeriesRegistry {
 
     /// Resolve (metric_name, labels) → series_id. Creates if new.
     fn get_or_create(&mut self, metric_name: &str, labels: &Labels) -> i64 {
-        let key = (metric_name.to_string(), labels.clone());
-        if let Some(&id) = self.series_map.get(&key) {
-            return id;
+        if let Some(inner) = self.series_map.get(metric_name) {
+            if let Some(&id) = inner.get(labels) {
+                return id;
+            }
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        // Forward map
-        self.series_map.insert(key, id);
+        self.series_map
+            .entry(metric_name.to_string())
+            .or_default()
+            .insert(labels.clone(), id);
 
         // Reverse map
         self.series_info.insert(
@@ -210,7 +208,7 @@ impl SeriesRegistry {
     }
 
     fn series_count(&self) -> usize {
-        self.series_map.len()
+        self.series_map.values().map(|m| m.len()).sum()
     }
 
     /// Persist to disk.
@@ -355,7 +353,10 @@ impl SeriesRegistry {
             }
 
             let key = (metric_name.clone(), labels.clone());
-            reg.series_map.insert(key, id);
+            reg.series_map
+                .entry(metric_name.clone())
+                .or_default()
+                .insert(labels.clone(), id);
             reg.series_info.insert(
                 id,
                 SeriesInfo {
@@ -530,7 +531,8 @@ impl Engine {
             let reg = self.series_read();
             if let Some(&id) = reg
                 .series_map
-                .get(&(metric_name.to_string(), labels.clone()))
+                .get(metric_name)
+                .and_then(|inner| inner.get(labels))
             {
                 return Ok(id);
             }
@@ -551,7 +553,7 @@ impl Engine {
         {
             let reg = self.series_read();
             for (idx, (metric_name, labels)) in entries.iter().enumerate() {
-                if let Some(&id) = reg.series_map.get(&(metric_name.clone(), labels.clone())) {
+                if let Some(&id) = reg.series_map.get(metric_name).and_then(|inner| inner.get(labels)) {
                     out.push(id);
                 } else {
                     out.push(0);
@@ -831,7 +833,12 @@ impl Engine {
                 self.drain_partition_if(&key, |buf| !buf.timestamps.is_empty())
             {
                 freed += partition_vec_memory(&timestamps, &values);
-                compressed.push(self.compress_partition(&key, &timestamps, &values, out_of_order)?);
+                compressed.push(self.compress_partition(
+                    &key,
+                    &timestamps,
+                    &values,
+                    out_of_order,
+                )?);
             }
         }
 
