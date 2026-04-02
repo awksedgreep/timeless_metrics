@@ -252,13 +252,13 @@ impl SeriesRegistry {
         Ok(())
     }
 
-    fn load(path: &PathBuf) -> Self {
+    fn load(path: &PathBuf) -> Result<Self, String> {
         let data = match fs::read(path) {
             Ok(d) => d,
-            Err(_) => return Self::new(),
+            Err(_) => return Ok(Self::new()),
         };
         if data.len() < 4 {
-            return Self::new();
+            return Err("series registry file too small".to_string());
         }
 
         let count = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
@@ -266,51 +266,92 @@ impl SeriesRegistry {
         let mut max_id: i64 = 0;
         let mut pos = 4;
 
-        for _ in 0..count {
+        for entry_idx in 0..count {
             if pos + 10 > data.len() {
-                break;
+                return Err(format!(
+                    "series registry truncated at entry {} (pos {} of {})",
+                    entry_idx,
+                    pos,
+                    data.len()
+                ));
             }
             let id = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
             let ml = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
             if pos + ml > data.len() {
-                break;
+                return Err(format!(
+                    "series registry truncated: metric name at entry {} (pos {} of {})",
+                    entry_idx,
+                    pos,
+                    data.len()
+                ));
             }
-            let metric_name = String::from_utf8_lossy(&data[pos..pos + ml]).to_string();
+            let metric_name = String::from_utf8(data[pos..pos + ml].to_vec()).map_err(|e| {
+                format!("invalid UTF-8 in metric name at entry {}: {}", entry_idx, e)
+            })?;
             pos += ml;
 
             if pos + 2 > data.len() {
-                break;
+                return Err(format!(
+                    "series registry truncated: label count at entry {} (pos {} of {})",
+                    entry_idx,
+                    pos,
+                    data.len()
+                ));
             }
             let lc = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
             let mut labels = BTreeMap::new();
-            for _ in 0..lc {
+            for label_idx in 0..lc {
                 if pos + 2 > data.len() {
-                    break;
+                    return Err(format!(
+                        "series registry truncated: label key len at entry {} label {} (pos {} of {})",
+                        entry_idx, label_idx, pos, data.len()
+                    ));
                 }
                 let kl = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
                 pos += 2;
                 if pos + kl > data.len() {
-                    break;
+                    return Err(format!(
+                        "series registry truncated: label key at entry {} label {} (pos {} of {})",
+                        entry_idx,
+                        label_idx,
+                        pos,
+                        data.len()
+                    ));
                 }
-                let k = String::from_utf8_lossy(&data[pos..pos + kl]).to_string();
+                let k = String::from_utf8(data[pos..pos + kl].to_vec()).map_err(|e| {
+                    format!(
+                        "invalid UTF-8 in label key at entry {} label {}: {}",
+                        entry_idx, label_idx, e
+                    )
+                })?;
                 pos += kl;
                 if pos + 2 > data.len() {
-                    break;
+                    return Err(format!(
+                        "series registry truncated: label value len at entry {} label {} (pos {} of {})",
+                        entry_idx, label_idx, pos, data.len()
+                    ));
                 }
                 let vl = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
                 pos += 2;
                 if pos + vl > data.len() {
-                    break;
+                    return Err(format!(
+                        "series registry truncated: label value at entry {} label {} (pos {} of {})",
+                        entry_idx, label_idx, pos, data.len()
+                    ));
                 }
-                let v = String::from_utf8_lossy(&data[pos..pos + vl]).to_string();
+                let v = String::from_utf8(data[pos..pos + vl].to_vec()).map_err(|e| {
+                    format!(
+                        "invalid UTF-8 in label value at entry {} label {}: {}",
+                        entry_idx, label_idx, e
+                    )
+                })?;
                 pos += vl;
                 labels.insert(k, v);
             }
 
-            // Rebuild all indexes
             let key = (metric_name.clone(), labels.clone());
             reg.series_map.insert(key, id);
             reg.series_info.insert(
@@ -333,7 +374,7 @@ impl SeriesRegistry {
         }
 
         reg.next_id = AtomicI64::new(max_id + 1);
-        reg
+        Ok(reg)
     }
 }
 
@@ -447,7 +488,10 @@ impl Engine {
         compression_level: usize,
         memory_budget: usize,
     ) -> Self {
-        let registry = SeriesRegistry::load(&Self::series_path(&data_dir));
+        let registry = SeriesRegistry::load(&Self::series_path(&data_dir)).unwrap_or_else(|e| {
+            eprintln!("WARNING: corrupt series registry, starting fresh: {}", e);
+            SeriesRegistry::new()
+        });
         let instance_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
