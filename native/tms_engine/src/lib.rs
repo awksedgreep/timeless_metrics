@@ -694,12 +694,10 @@ impl Engine {
                 ENTRY_SIZE
             ));
         }
-        let count = data.len() / ENTRY_SIZE;
-        for i in 0..count {
-            let o = i * ENTRY_SIZE;
-            let series_id = i64::from_ne_bytes(data[o..o + 8].try_into().unwrap());
-            let ts = i64::from_ne_bytes(data[o + 8..o + 16].try_into().unwrap());
-            let val = f64::from_ne_bytes(data[o + 16..o + 24].try_into().unwrap());
+        for chunk in data.chunks_exact(ENTRY_SIZE) {
+            let series_id = i64::from_ne_bytes(chunk[0..8].try_into().unwrap());
+            let ts = i64::from_ne_bytes(chunk[8..16].try_into().unwrap());
+            let val = f64::from_ne_bytes(chunk[16..24].try_into().unwrap());
             self.write_point(series_id, ts, val);
         }
         Ok(())
