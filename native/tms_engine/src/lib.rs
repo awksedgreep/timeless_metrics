@@ -412,6 +412,30 @@ impl Drop for ColdFlushGuard<'_> {
 }
 
 impl Engine {
+    fn index_read(&self) -> RwLockReadGuard<'_, BTreeMap<(PartitionKey, i64), ChunkMeta>> {
+        self.index.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn index_write(&self) -> RwLockWriteGuard<'_, BTreeMap<(PartitionKey, i64), ChunkMeta>> {
+        self.index.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn series_read(&self) -> RwLockReadGuard<'_, SeriesRegistry> {
+        self.series.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn series_write(&self) -> RwLockWriteGuard<'_, SeriesRegistry> {
+        self.series.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn flush_queue_lock(&self) -> MutexGuard<'_, Vec<PartitionKey>> {
+        self.flush_queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn created_dirs_lock(&self) -> MutexGuard<'_, HashSet<PathBuf>> {
+        self.created_dirs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn series_path(data_dir: &PathBuf) -> PathBuf {
         data_dir.join("series.bin")
     }
@@ -456,7 +480,7 @@ impl Engine {
     fn resolve_series(&self, metric_name: &str, labels: &Labels) -> EngineResult<i64> {
         // Fast: read lock
         {
-            let reg = self.series.read().unwrap();
+            let reg = self.series_read();
             if let Some(&id) = reg
                 .series_map
                 .get(&(metric_name.to_string(), labels.clone()))
@@ -465,7 +489,7 @@ impl Engine {
             }
         }
         // Slow: write lock + persist
-        let mut reg = self.series.write().unwrap();
+        let mut reg = self.series_write();
         Ok(reg.get_or_create(metric_name, labels))
     }
 
@@ -478,7 +502,7 @@ impl Engine {
         let mut misses: Vec<(usize, &str, &Labels)> = Vec::new();
 
         {
-            let reg = self.series.read().unwrap();
+            let reg = self.series_read();
             for (idx, (metric_name, labels)) in entries.iter().enumerate() {
                 if let Some(&id) = reg.series_map.get(&(metric_name.clone(), labels.clone())) {
                     out.push(id);
@@ -493,7 +517,7 @@ impl Engine {
             return Ok(out);
         }
 
-        let mut reg = self.series.write().unwrap();
+        let mut reg = self.series_write();
         for (idx, metric_name, labels) in misses {
             out[idx] = reg.get_or_create(metric_name, labels);
         }
@@ -502,7 +526,7 @@ impl Engine {
     }
 
     fn save_series(&self) -> EngineResult<()> {
-        let mut reg = self.series.write().unwrap();
+        let mut reg = self.series_write();
         reg.save(&Self::series_path(&self.data_dir))
             .map_err(|err| format!("failed to persist series registry: {err}"))
     }
@@ -539,7 +563,7 @@ impl Engine {
         }
 
         if needs_flush {
-            self.flush_queue.lock().unwrap().push(key);
+            self.flush_queue_lock().push(key);
         }
     }
 
@@ -640,7 +664,7 @@ impl Engine {
 
     fn flush_pending(&self) -> EngineResult<usize> {
         let keys: Vec<PartitionKey> = {
-            let mut queue = self.flush_queue.lock().unwrap();
+            let mut queue = self.flush_queue_lock();
             std::mem::take(&mut *queue)
         };
         let mut seen = HashSet::new();
@@ -718,7 +742,7 @@ impl Engine {
         let mut files_written = 0;
         for batch in compressed.chunks(1000) {
             let metas = self.write_batched_chunk(batch)?;
-            let mut index = self.index.write().unwrap();
+            let mut index = self.index_write();
             for (key, meta) in metas {
                 index.insert((key, meta.min_ts), meta);
             }
@@ -762,7 +786,7 @@ impl Engine {
         if !compressed.is_empty() {
             for batch in compressed.chunks(1000) {
                 let metas = self.write_batched_chunk(batch)?;
-                let mut index = self.index.write().unwrap();
+                let mut index = self.index_write();
                 for (key, meta) in metas {
                     index.insert((key, meta.min_ts), meta);
                 }
@@ -801,7 +825,7 @@ impl Engine {
             all_metas.extend(self.write_batched_chunk(batch)?);
         }
         if !all_metas.is_empty() {
-            let mut index = self.index.write().unwrap();
+            let mut index = self.index_write();
             for (key, meta) in all_metas {
                 index.insert((key, meta.min_ts), meta);
             }
@@ -1039,7 +1063,7 @@ impl Engine {
 
     fn ensure_dir(&self, path: &PathBuf) -> io::Result<()> {
         let dir = path.parent().unwrap().to_path_buf();
-        let mut dirs = self.created_dirs.lock().unwrap();
+        let mut dirs = self.created_dirs_lock();
         if !dirs.contains(&dir) {
             fs::create_dir_all(&dir)?;
             dirs.insert(dir);
@@ -1089,7 +1113,7 @@ impl Engine {
         t_end: i64,
     ) -> EngineResult<Vec<(Labels, Vec<(i64, f64)>)>> {
         let candidates: Vec<(i64, Labels)> = {
-            let reg = self.series.read().unwrap();
+            let reg = self.series_read();
             reg.find_series(metric_name, label_filter)
                 .into_iter()
                 .filter_map(|sid| reg.info_for(sid).map(|info| (sid, info.labels.clone())))
@@ -1137,7 +1161,7 @@ impl Engine {
         let pk = PartitionKey { series_id };
 
         let matching: Vec<ChunkMeta> = {
-            let index = self.index.read().unwrap();
+            let index = self.index_read();
             index
                 .range((pk, i64::MIN)..)
                 .take_while(|((k, _), _)| k == &pk)
@@ -1176,7 +1200,7 @@ impl Engine {
         agg: AggFn,
     ) -> EngineResult<Vec<(Labels, f64)>> {
         let candidates: Vec<(i64, Labels)> = {
-            let reg = self.series.read().unwrap();
+            let reg = self.series_read();
             reg.find_series(metric_name, label_filter)
                 .into_iter()
                 .filter_map(|sid| reg.info_for(sid).map(|info| (sid, info.labels.clone())))
@@ -1224,7 +1248,7 @@ impl Engine {
         let mut global_max: Option<f64> = None;
 
         let chunks: Vec<ChunkMeta> = {
-            let index = self.index.read().unwrap();
+            let index = self.index_read();
             index
                 .range((pk, i64::MIN)..)
                 .take_while(|((k, _), _)| k == &pk)
@@ -1386,7 +1410,7 @@ impl Engine {
     // ── Retention ────────────────────────────────────────────────────
 
     fn delete_before(&self, before_ts: i64) -> (usize, usize) {
-        let mut index = self.index.write().unwrap();
+        let mut index = self.index_write();
 
         let to_remove: Vec<(PartitionKey, i64)> = index
             .iter()
@@ -1427,7 +1451,7 @@ impl Engine {
     // ── Index rebuild ────────────────────────────────────────────────
 
     fn rebuild_index(&self) {
-        let mut index = self.index.write().unwrap();
+        let mut index = self.index_write();
         for dir_name in &["chunks", "batches"] {
             let dir = self.data_dir.join(dir_name);
             if dir.exists() {
@@ -1574,8 +1598,8 @@ impl Engine {
     }
 
     fn info(&self) -> EngineInfo {
-        let index = self.index.read().unwrap();
-        let series_reg = self.series.read().unwrap();
+        let index = self.index_read();
+        let series_reg = self.series_read();
         let chunk_count = index.len();
         let partition_count = self.partitions.len();
         let series_count = series_reg.series_count();
@@ -1897,7 +1921,7 @@ fn engine_list_series(
     resource: ResourceArc<EngineResource>,
     metric: String,
 ) -> (Atom, Vec<HashMap<String, String>>) {
-    let reg = resource.deref().engine.series.read().unwrap();
+    let reg = resource.deref().engine.series_read();
     let ids = reg.find_series(&metric, &BTreeMap::new());
     let out: Vec<HashMap<String, String>> = ids
         .into_iter()
