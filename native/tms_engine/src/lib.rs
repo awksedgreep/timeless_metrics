@@ -1135,24 +1135,22 @@ impl Engine {
         file_cache: &mut HashMap<PathBuf, Vec<u8>>,
     ) -> EngineResult<Vec<(i64, f64)>> {
         let pk = PartitionKey { series_id };
-        let mut results = Vec::new();
 
-        {
+        let matching: Vec<ChunkMeta> = {
             let index = self.index.read().unwrap();
-            for ((k, _), meta) in index.range((pk, i64::MIN)..) {
-                if k != &pk {
-                    break;
-                }
-                if meta.min_ts > t_end {
-                    break;
-                }
-                if meta.max_ts < t_start {
-                    continue;
-                }
-                results.extend(Self::read_chunk_data_cached(
-                    meta, t_start, t_end, file_cache,
-                )?);
-            }
+            index
+                .range((pk, i64::MIN)..)
+                .take_while(|((k, _), _)| k == &pk)
+                .filter(|(_, meta)| meta.min_ts <= t_end && meta.max_ts >= t_start)
+                .map(|(_, meta)| meta.clone())
+                .collect()
+        };
+
+        let mut results = Vec::new();
+        for meta in &matching {
+            results.extend(Self::read_chunk_data_cached(
+                meta, t_start, t_end, file_cache,
+            )?);
         }
 
         if let Some(buf) = self.partitions.get(&pk) {
@@ -1225,44 +1223,41 @@ impl Engine {
         let mut global_min: Option<f64> = None;
         let mut global_max: Option<f64> = None;
 
-        {
+        let chunks: Vec<ChunkMeta> = {
             let index = self.index.read().unwrap();
-            for ((k, _), meta) in index.range((pk, i64::MIN)..) {
-                if k != &pk {
-                    break;
-                }
-                if meta.min_ts > t_end {
-                    break;
-                }
-                if meta.max_ts < t_start {
-                    continue;
-                }
+            index
+                .range((pk, i64::MIN)..)
+                .take_while(|((k, _), _)| k == &pk)
+                .filter(|(_, meta)| meta.min_ts <= t_end && meta.max_ts >= t_start)
+                .map(|(_, meta)| meta.clone())
+                .collect()
+        };
 
-                if meta.min_ts >= t_start && meta.max_ts <= t_end {
-                    total_count += meta.point_count as u64;
-                    total_sum += meta.sum_val;
+        for meta in &chunks {
+            if meta.min_ts >= t_start && meta.max_ts <= t_end {
+                total_count += meta.point_count as u64;
+                total_sum += meta.sum_val;
+                global_min = Some(match global_min {
+                    Some(m) => m.min(meta.min_val),
+                    None => meta.min_val,
+                });
+                global_max = Some(match global_max {
+                    Some(m) => m.max(meta.max_val),
+                    None => meta.max_val,
+                });
+            } else {
+                let points = Self::read_chunk_data_cached(meta, t_start, t_end, file_cache)?;
+                for &(_, val) in &points {
+                    total_count += 1;
+                    total_sum += val;
                     global_min = Some(match global_min {
-                        Some(m) => m.min(meta.min_val),
-                        None => meta.min_val,
+                        Some(m) => m.min(val),
+                        None => val,
                     });
                     global_max = Some(match global_max {
-                        Some(m) => m.max(meta.max_val),
-                        None => meta.max_val,
+                        Some(m) => m.max(val),
+                        None => val,
                     });
-                } else {
-                    let points = Self::read_chunk_data_cached(meta, t_start, t_end, file_cache)?;
-                    for &(_, val) in &points {
-                        total_count += 1;
-                        total_sum += val;
-                        global_min = Some(match global_min {
-                            Some(m) => m.min(val),
-                            None => val,
-                        });
-                        global_max = Some(match global_max {
-                            Some(m) => m.max(val),
-                            None => val,
-                        });
-                    }
                 }
             }
         }
