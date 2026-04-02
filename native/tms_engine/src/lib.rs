@@ -401,6 +401,16 @@ struct CompressedPartition {
     val_compressed: Vec<u8>,
 }
 
+struct ColdFlushGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for ColdFlushGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Engine {
     fn series_path(data_dir: &PathBuf) -> PathBuf {
         data_dir.join("series.bin")
@@ -667,6 +677,18 @@ impl Engine {
     }
 
     fn flush_cold(&self, max_idle_secs: u64) -> EngineResult<(usize, usize, usize)> {
+        if self
+            .cold_flush_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok((0, 0, 0));
+        }
+
+        let _guard = ColdFlushGuard {
+            flag: &self.cold_flush_running,
+        };
+
         let now = Instant::now();
         let cold_keys: Vec<PartitionKey> = self
             .partitions
