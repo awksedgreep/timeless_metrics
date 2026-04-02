@@ -477,6 +477,10 @@ impl Engine {
         self.created_dirs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn forget_created_dir(&self, dir: &std::path::Path) {
+        self.created_dirs_lock().remove(dir);
+    }
+
     fn series_path(data_dir: &PathBuf) -> PathBuf {
         data_dir.join("series.bin")
     }
@@ -1515,7 +1519,13 @@ impl Engine {
                 errors.push(format!("failed to remove {}: {}", path.display(), e));
             }
             if let Some(dir) = path.parent() {
-                let _ = fs::remove_dir(dir);
+                match fs::remove_dir(dir) {
+                    Ok(()) => self.forget_created_dir(dir),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        self.forget_created_dir(dir);
+                    }
+                    Err(_) => {}
+                }
             }
         }
 
@@ -2189,5 +2199,29 @@ mod tests {
 
         let err = engine.write_batch_raw(&[1, 2, 3]).unwrap_err();
         assert!(err.contains("not a multiple"));
+    }
+
+    #[test]
+    fn rewrite_after_retention_recreates_deleted_series_dir() {
+        let dir = test_dir("retention_rewrite");
+        let engine = Engine::new(dir.clone(), 1, 1, 8, usize::MAX);
+
+        engine.write_point(1, 1, 1.0);
+        engine.flush_all().unwrap();
+
+        let chunk_dir = dir.join("chunks").join("1");
+        assert!(chunk_dir.exists());
+
+        let (entries_removed, files_deleted, errors) = engine.delete_before(2);
+        assert_eq!(entries_removed, 1);
+        assert_eq!(files_deleted, 1);
+        assert!(errors.is_empty());
+        assert!(!chunk_dir.exists());
+
+        engine.write_point(1, 3, 3.0);
+        engine.flush_all().unwrap();
+
+        assert!(chunk_dir.exists());
+        assert_eq!(engine.query_range_by_id(1, 0, 10).unwrap(), vec![(3, 3.0)]);
     }
 }
