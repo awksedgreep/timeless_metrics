@@ -534,15 +534,20 @@ impl Engine {
     }
 
     /// Resolve series using the persistent hash cache.
-    /// Fast path: DashMap hash lookup (~50ns).
+    /// Fast path: DashMap hash lookup + verification (~100ns).
     /// Slow path: full registry resolve + cache insert.
+    /// Verification prevents silent data corruption from hash collisions.
     #[inline]
     fn resolve_cached(&self, metric: &str, labels: &HashMap<String, String>) -> EngineResult<i64> {
         let hash = fast_series_hash(metric, labels);
 
-        // Fast path: cache hit
+        // Fast path: cache hit with verification
         if let Some(id) = self.resolve_cache.get(&hash) {
-            return Ok(*id);
+            let series_id = *id;
+            if self.verify_series_identity(series_id, metric, labels) {
+                return Ok(series_id);
+            }
+            // Hash collision detected — fall through to slow path
         }
 
         // Slow path: full resolve + cache
@@ -551,6 +556,39 @@ impl Engine {
         let id = self.resolve_series(metric, &labels_bt)?;
         self.resolve_cache.insert(hash, id);
         Ok(id)
+    }
+
+    /// Verify that a cached series_id still matches (metric, labels).
+    /// Reads from series_info under read lock — single HashMap lookup.
+    #[inline]
+    fn verify_series_identity(
+        &self,
+        series_id: i64,
+        metric: &str,
+        labels: &HashMap<String, String>,
+    ) -> bool {
+        let reg = match self.series.read() {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        match reg.info_for(series_id) {
+            Some(info) => {
+                if info.metric_name != metric {
+                    return false;
+                }
+                if info.labels.len() != labels.len() {
+                    return false;
+                }
+                for (k, v) in labels {
+                    match info.labels.get(k) {
+                        Some(iv) if iv == v => {}
+                        _ => return false,
+                    }
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Write a batch of labeled entries. Resolves series internally.
@@ -1040,11 +1078,13 @@ impl Engine {
                     Some((labels, points))
                 })
             })
-            .filter_map(|result: EngineResult<Option<(Labels, Vec<(i64, f64)>)>>| match result {
-                Ok(Some(value)) => Some(Ok(value)),
-                Ok(None) => None,
-                Err(err) => Some(Err(err)),
-            })
+            .filter_map(
+                |result: EngineResult<Option<(Labels, Vec<(i64, f64)>)>>| match result {
+                    Ok(Some(value)) => Some(Ok(value)),
+                    Ok(None) => None,
+                    Err(err) => Some(Err(err)),
+                },
+            )
             .collect()
     }
 
@@ -1081,7 +1121,9 @@ impl Engine {
                 if meta.max_ts < t_start {
                     continue;
                 }
-                results.extend(Self::read_chunk_data_cached(meta, t_start, t_end, file_cache)?);
+                results.extend(Self::read_chunk_data_cached(
+                    meta, t_start, t_end, file_cache,
+                )?);
             }
         }
 
@@ -1681,10 +1723,7 @@ fn engine_resolve_series_batch(
 
     Ok((
         atoms::ok(),
-        resource
-            .deref()
-            .engine
-            .resolve_series_batch(&normalized)?,
+        resource.deref().engine.resolve_series_batch(&normalized)?,
     ))
 }
 
