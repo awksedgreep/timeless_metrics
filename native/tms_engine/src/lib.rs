@@ -10,9 +10,8 @@ use std::io::{self, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock};
-use std::time::Instant;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod atoms {
     rustler::atoms! {
@@ -378,6 +377,7 @@ struct Engine {
     /// Fast resolution cache: hash(metric, labels) → series_id.
     /// Persists across batches — steady-state scraping is pure cache hits.
     resolve_cache: DashMap<u64, i64>,
+    file_cache: DashMap<PathBuf, (Instant, Arc<Vec<u8>>)>,
 }
 
 struct EngineResource {
@@ -469,6 +469,7 @@ impl Engine {
             instance_id,
             cold_flush_running: AtomicBool::new(false),
             resolve_cache: DashMap::new(),
+            file_cache: DashMap::new(),
         };
         engine.rebuild_index();
         engine
@@ -1147,7 +1148,7 @@ impl Engine {
         t_start: i64,
         t_end: i64,
     ) -> EngineResult<Vec<(i64, f64)>> {
-        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        let mut file_cache: HashMap<PathBuf, Arc<Vec<u8>>> = HashMap::new();
         self.query_range_by_id_cached(series_id, t_start, t_end, &mut file_cache)
     }
 
@@ -1156,7 +1157,7 @@ impl Engine {
         series_id: i64,
         t_start: i64,
         t_end: i64,
-        file_cache: &mut HashMap<PathBuf, Vec<u8>>,
+        file_cache: &mut HashMap<PathBuf, Arc<Vec<u8>>>,
     ) -> EngineResult<Vec<(i64, f64)>> {
         let pk = PartitionKey { series_id };
 
@@ -1172,9 +1173,7 @@ impl Engine {
 
         let mut results = Vec::new();
         for meta in &matching {
-            results.extend(Self::read_chunk_data_cached(
-                meta, t_start, t_end, file_cache,
-            )?);
+            results.extend(self.read_chunk_data_cached(meta, t_start, t_end, file_cache)?);
         }
 
         if let Some(buf) = self.partitions.get(&pk) {
@@ -1228,7 +1227,7 @@ impl Engine {
         t_end: i64,
         agg: AggFn,
     ) -> EngineResult<Option<f64>> {
-        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        let mut file_cache: HashMap<PathBuf, Arc<Vec<u8>>> = HashMap::new();
         self.query_aggregate_by_id_cached(series_id, t_start, t_end, agg, &mut file_cache)
     }
 
@@ -1238,7 +1237,7 @@ impl Engine {
         t_start: i64,
         t_end: i64,
         agg: AggFn,
-        file_cache: &mut HashMap<PathBuf, Vec<u8>>,
+        file_cache: &mut HashMap<PathBuf, Arc<Vec<u8>>>,
     ) -> EngineResult<Option<f64>> {
         let pk = PartitionKey { series_id };
 
@@ -1270,7 +1269,7 @@ impl Engine {
                     None => meta.max_val,
                 });
             } else {
-                let points = Self::read_chunk_data_cached(meta, t_start, t_end, file_cache)?;
+                let points = self.read_chunk_data_cached(meta, t_start, t_end, file_cache)?;
                 for &(_, val) in &points {
                     total_count += 1;
                     total_sum += val;
@@ -1319,26 +1318,46 @@ impl Engine {
     // ── Chunk reading ────────────────────────────────────────────────
 
     fn read_chunk_data(
+        &self,
         meta: &ChunkMeta,
         t_start: i64,
         t_end: i64,
     ) -> Result<Vec<(i64, f64)>, String> {
-        let mut file_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
-        Self::read_chunk_data_cached(meta, t_start, t_end, &mut file_cache)
+        let mut file_cache: HashMap<PathBuf, Arc<Vec<u8>>> = HashMap::new();
+        self.read_chunk_data_cached(meta, t_start, t_end, &mut file_cache)
     }
 
     fn read_chunk_data_cached(
+        &self,
         meta: &ChunkMeta,
         t_start: i64,
         t_end: i64,
-        file_cache: &mut HashMap<PathBuf, Vec<u8>>,
+        per_query_cache: &mut HashMap<PathBuf, Arc<Vec<u8>>>,
     ) -> Result<Vec<(i64, f64)>, String> {
-        let data = if let Some(data) = file_cache.get(&meta.path) {
-            data
+        let data: Arc<Vec<u8>> = if let Some(d) = per_query_cache.get(&meta.path) {
+            Arc::clone(d)
+        } else if let Some(entry) = self.file_cache.get(&meta.path) {
+            if entry.0.elapsed() < Duration::from_secs(60) {
+                Arc::clone(&entry.1)
+            } else {
+                drop(entry);
+                self.file_cache.remove(&meta.path);
+                let data: Arc<Vec<u8>> = Arc::new(fs::read(&meta.path).map_err(|e| e.to_string())?);
+                self.file_cache
+                    .insert(meta.path.clone(), (Instant::now(), Arc::clone(&data)));
+                data
+            }
         } else {
-            let data = fs::read(&meta.path).map_err(|e| e.to_string())?;
-            file_cache.entry(meta.path.clone()).or_insert(data)
+            let data: Arc<Vec<u8>> = Arc::new(fs::read(&meta.path).map_err(|e| e.to_string())?);
+            self.file_cache
+                .insert(meta.path.clone(), (Instant::now(), Arc::clone(&data)));
+            data
         };
+
+        per_query_cache
+            .entry(meta.path.clone())
+            .or_insert_with(|| Arc::clone(&data));
+
         let (ts_data, val_data) = if meta.data_offset > 0 {
             Self::parse_partition_data(&data, meta.data_offset as usize)?
         } else {
