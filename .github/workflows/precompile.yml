@@ -116,7 +116,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           cp checksum.exs /tmp/checksum.exs
           git fetch origin main
-          git checkout -B main origin/main
+          git checkout -f -B main origin/main
           cp /tmp/checksum.exs checksum.exs
           git add checksum.exs
           git diff --cached --quiet || git commit -m "Update checksum.exs for ${GITHUB_REF_NAME}"
