@@ -225,6 +225,87 @@ defmodule TimelessMetrics.RustHTTPAPITest do
            ]
   end
 
+  test "query_aggregate_multi returns per-second rates for bucketed counter queries with rust engine" do
+    now = System.os_time(:second)
+    base = div(now, 300) * 300
+
+    for i <- 0..5 do
+      TimelessMetrics.write(:rust_http_test, "octets_in", %{"host" => "ap-1"}, i * 120.0,
+        timestamp: base + i * 60
+      )
+    end
+
+    TimelessMetrics.flush(:rust_http_test)
+
+    {:ok, [%{labels: %{"host" => "ap-1"}, data: data}]} =
+      TimelessMetrics.query_aggregate_multi(:rust_http_test, "octets_in", %{"host" => "ap-1"},
+        from: base,
+        to: base + 360,
+        bucket: {60, :seconds},
+        aggregate: :rate
+      )
+
+    assert length(data) >= 4
+
+    Enum.each(data, fn {_ts, rate} ->
+      assert_in_delta rate, 120.0 / 60, 0.1
+    end)
+
+    {:ok, [%{data: last_data}]} =
+      TimelessMetrics.query_aggregate_multi(:rust_http_test, "octets_in", %{"host" => "ap-1"},
+        from: base,
+        to: base + 360,
+        bucket: {60, :seconds},
+        aggregate: :last
+      )
+
+    refute data == last_data
+  end
+
+  test "query_aggregate_multi supports every bucketed aggregate with rust engine" do
+    base = div(System.os_time(:second), 180) * 180
+
+    points = [
+      {base + 0, 10.0},
+      {base + 20, 20.0},
+      {base + 40, 30.0},
+      {base + 60, 40.0},
+      {base + 80, 50.0},
+      {base + 100, 70.0},
+      {base + 120, 80.0},
+      {base + 140, 90.0},
+      {base + 160, 120.0}
+    ]
+
+    Enum.each(points, fn {ts, val} ->
+      TimelessMetrics.write(:rust_http_test, "agg_coverage", %{"host" => "agg-1"}, val,
+        timestamp: ts
+      )
+    end)
+
+    TimelessMetrics.flush(:rust_http_test)
+
+    assert_multi_aggregate(:avg, [{base, 20.0}, {base + 60, 160.0 / 3}, {base + 120, 290.0 / 3}])
+    assert_multi_aggregate(:min, [{base, 10.0}, {base + 60, 40.0}, {base + 120, 80.0}])
+    assert_multi_aggregate(:max, [{base, 30.0}, {base + 60, 70.0}, {base + 120, 120.0}])
+    assert_multi_aggregate(:sum, [{base, 60.0}, {base + 60, 160.0}, {base + 120, 290.0}])
+    assert_multi_aggregate(:count, [{base, 3.0}, {base + 60, 3.0}, {base + 120, 3.0}])
+    assert_multi_aggregate(:last, [{base, 30.0}, {base + 60, 70.0}, {base + 120, 120.0}])
+    assert_multi_aggregate(:first, [{base, 10.0}, {base + 60, 40.0}, {base + 120, 80.0}])
+
+    {:ok, [%{labels: %{"host" => "agg-1"}, data: rate_data}]} =
+      TimelessMetrics.query_aggregate_multi(:rust_http_test, "agg_coverage", %{"host" => "agg-1"},
+        from: base,
+        to: base + 180,
+        bucket: {60, :seconds},
+        aggregate: :rate
+      )
+
+    assert length(rate_data) == 2
+    assert_in_delta elem(Enum.at(rate_data, 0), 1), 40.0 / 60, 0.0001
+    assert_in_delta elem(Enum.at(rate_data, 1), 1), 50.0 / 60, 0.0001
+  end
+
   test "GET /prometheus/api/v1/labels returns label names with rust engine" do
     now = System.os_time(:second)
 
@@ -246,6 +327,27 @@ defmodule TimelessMetrics.RustHTTPAPITest do
     assert "__name__" in result["data"]
     assert "host" in result["data"]
     assert "region" in result["data"]
+  end
+
+  defp assert_multi_aggregate(aggregate, expected_data) do
+    base = elem(hd(expected_data), 0)
+    to = elem(List.last(expected_data), 0) + 60
+
+    {:ok, [%{labels: %{"host" => "agg-1"}, data: actual_data}]} =
+      TimelessMetrics.query_aggregate_multi(:rust_http_test, "agg_coverage", %{"host" => "agg-1"},
+        from: base,
+        to: to,
+        bucket: {60, :seconds},
+        aggregate: aggregate
+      )
+
+    assert length(actual_data) == length(expected_data)
+
+    Enum.zip(actual_data, expected_data)
+    |> Enum.each(fn {{actual_ts, actual_val}, {expected_ts, expected_val}} ->
+      assert actual_ts == expected_ts
+      assert_in_delta actual_val, expected_val, 0.0001
+    end)
   end
 
   test "GET /prometheus/api/v1/label/__name__/values returns metric names with rust engine" do

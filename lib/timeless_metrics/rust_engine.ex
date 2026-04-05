@@ -450,6 +450,43 @@ defmodule TimelessMetrics.RustEngine do
 
   defp bucket_points([], _from, _to, _step, _agg), do: []
 
+  defp bucket_points(points, from, to, step, :rate) do
+    buckets = Stream.iterate(from, &(&1 + step)) |> Enum.take_while(&(&1 < to))
+    point_map = Enum.group_by(points, fn {ts, _} -> from + div(ts - from, step) * step end)
+
+    last_per_bucket =
+      Enum.flat_map(buckets, fn bucket ->
+        case Map.get(point_map, bucket) do
+          nil ->
+            []
+
+          pts ->
+            [{bucket, aggregate_points(pts, :last)}]
+        end
+      end)
+
+    case last_per_bucket do
+      [] ->
+        []
+
+      [_single] ->
+        []
+
+      pairs ->
+        pairs
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.map(fn [{bucket, prev_last}, {_next_bucket, next_last}] ->
+          dv = next_last - prev_last
+
+          if dv >= 0 do
+            {bucket, dv / step}
+          else
+            {bucket, 0.0}
+          end
+        end)
+    end
+  end
+
   defp bucket_points(points, from, to, step, agg) do
     buckets = Stream.iterate(from, &(&1 + step)) |> Enum.take_while(&(&1 < to))
     point_map = Enum.group_by(points, fn {ts, _} -> from + div(ts - from, step) * step end)
@@ -460,10 +497,27 @@ defmodule TimelessMetrics.RustEngine do
           []
 
         pts ->
-          vals = Enum.map(pts, &elem(&1, 1))
-          [{b, aggregate_values(vals, agg)}]
+          [{b, aggregate_points(pts, agg)}]
       end
     end)
+  end
+
+  defp aggregate_points(points, :last) do
+    points
+    |> Enum.max_by(&elem(&1, 0))
+    |> elem(1)
+  end
+
+  defp aggregate_points(points, :first) do
+    points
+    |> Enum.min_by(&elem(&1, 0))
+    |> elem(1)
+  end
+
+  defp aggregate_points(points, agg) do
+    points
+    |> Enum.map(&elem(&1, 1))
+    |> aggregate_values(agg)
   end
 
   defp aggregate_values(vals, :avg), do: Enum.sum(vals) / length(vals)
