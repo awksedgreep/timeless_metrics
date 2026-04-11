@@ -41,6 +41,7 @@ defmodule TimelessMetrics.Chart do
       * `:theme` - `:light`, `:dark`, or `:auto` (default: `:auto`)
         * `:auto` uses CSS `prefers-color-scheme` to switch at render time
       * `:annotations` - List of `%{timestamp: ts, title: "..."}` for vertical markers
+      * `:x_domain` - `{from_ts, to_ts}` to force the visible time range
 
   Returns an SVG string.
   """
@@ -52,6 +53,7 @@ defmodule TimelessMetrics.Chart do
     annots = Keyword.get(opts, :annotations, [])
     forecast_data = Keyword.get(opts, :forecast, [])
     anomaly_points = Keyword.get(opts, :anomalies, [])
+    x_domain = Keyword.get(opts, :x_domain)
 
     has_legend = length(series) > 1
     label_key_val = label_key
@@ -62,12 +64,14 @@ defmodule TimelessMetrics.Chart do
 
     # Compute global bounds across all series + forecast + anomaly points
     extra_points = forecast_data ++ anomaly_points
-    {t_min, t_max, v_min, v_max} = compute_bounds(series, extra_points)
+    {data_t_min, data_t_max, v_min, v_max} = compute_bounds(series, extra_points)
 
     # Handle edge cases
-    if t_min == nil or t_max == nil do
+    if data_t_min == nil or data_t_max == nil do
       render_empty(title, width, height, theme)
     else
+      {t_min, t_max} = resolve_x_domain(x_domain, data_t_min, data_t_max)
+
       # Add 5% padding to value range
       v_range = v_max - v_min
       v_pad = if v_range == 0, do: 1.0, else: v_range * 0.05
@@ -491,6 +495,13 @@ defmodule TimelessMetrics.Chart do
       {Enum.min(timestamps), Enum.max(timestamps), Enum.min(values), Enum.max(values)}
     end
   end
+
+  defp resolve_x_domain({from_ts, to_ts}, _data_t_min, _data_t_max)
+       when is_integer(from_ts) and is_integer(to_ts) and from_ts < to_ts do
+    {from_ts, to_ts}
+  end
+
+  defp resolve_x_domain(_x_domain, data_t_min, data_t_max), do: {data_t_min, data_t_max}
 
   defp detect_label_key(series) do
     case series do

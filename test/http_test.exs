@@ -392,10 +392,49 @@ defmodule TimelessMetrics.HTTPTest do
     assert resp.body =~ "<polyline" or resp.body =~ "<circle"
   end
 
+  test "GET /chart preserves the requested time domain for sparse data" do
+    now = System.os_time(:second)
+    start_ts = now - 86_400
+    sparse_ts = start_ts + 1_200
+
+    seed_points(:http_test, "sparse_chart", %{"host" => "web-1"}, sparse_ts, [10.0, 20.0])
+
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
+        "/chart?metric=sparse_chart&host=web-1&from=#{start_ts}&to=#{now}&step=300"
+      )
+
+    assert resp.status == 200
+
+    xs = svg_x_positions(resp.body)
+
+    assert Enum.max(xs) < 80.0
+  end
+
   test "GET /chart requires metric param" do
     resp = TimelessMetrics.TestHTTP.get(@port, "/chart?from=-1h")
 
     assert resp.status == 400
+  end
+
+  defp svg_x_positions(svg) do
+    polyline_xs =
+      Regex.scan(~r/<polyline points="([^"]+)"/, svg, capture: :all_but_first)
+      |> Enum.flat_map(fn [points] ->
+        points
+        |> String.split(" ", trim: true)
+        |> Enum.map(fn point ->
+          [x, _y] = String.split(point, ",")
+          String.to_float(x)
+        end)
+      end)
+
+    circle_xs =
+      Regex.scan(~r/<circle cx="([^"]+)"/, svg, capture: :all_but_first)
+      |> Enum.map(fn [x] -> String.to_float(x) end)
+
+    polyline_xs ++ circle_xs
   end
 
   # --- Discovery endpoints ---
