@@ -985,6 +985,7 @@ defmodule TimelessMetrics.HTTP do
                 width: width,
                 height: height,
                 theme: theme,
+                x_domain: {from, to},
                 annotations: annots,
                 forecast: forecast_data,
                 anomalies: anomaly_points
