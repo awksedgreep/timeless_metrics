@@ -229,7 +229,7 @@ static ERL_NIF_TERM nif_parse(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
     // Reverse the list to preserve line order
     ERL_NIF_TERM reversed;
     if (!enif_make_reverse_list(env, list, &reversed)) {
-        reversed = list;
+        return enif_make_badarg(env);
     }
 
     return enif_make_tuple2(env, reversed, enif_make_int(env, error_count));

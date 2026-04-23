@@ -1,8 +1,6 @@
-#![allow(dead_code)]
-
 use dashmap::DashMap;
 use rayon::prelude::*;
-use rustler::{Atom, Binary, Encoder, ResourceArc, Term};
+use rustler::{Atom, Binary, ResourceArc, Term};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -20,6 +18,8 @@ mod atoms {
 }
 
 type EngineResult<T> = Result<T, String>;
+
+const BATCH_CHUNK_SIZE: usize = 1000;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Core types
@@ -57,7 +57,7 @@ impl PartitionBuffer {
         }
     }
     fn memory_bytes(&self) -> usize {
-        (self.timestamps.capacity() + self.values.capacity()) * 8
+        (self.timestamps.len() + self.values.len()) * 8
     }
 }
 
@@ -71,6 +71,7 @@ struct ChunkMeta {
     sum_val: f64,
     path: PathBuf,
     data_offset: u64,
+    #[allow(dead_code)]
     data_len: u32,
 }
 
@@ -527,18 +528,11 @@ impl Engine {
 
     /// Resolve (metric, labels) → series_id. Fast read path, slow write path.
     fn resolve_series(&self, metric_name: &str, labels: &Labels) -> EngineResult<i64> {
-        // Fast: read lock
-        {
-            let reg = self.series_read();
-            if let Some(&id) = reg
-                .series_map
-                .get(&(metric_name.to_string(), labels.clone()))
-            {
-                return Ok(id);
-            }
-        }
-        // Slow: write lock + persist
+        let key = (metric_name.to_string(), labels.clone());
         let mut reg = self.series_write();
+        if let Some(&id) = reg.series_map.get(&key) {
+            return Ok(id);
+        }
         Ok(reg.get_or_create(metric_name, labels))
     }
 
@@ -716,18 +710,17 @@ impl Engine {
             let mut queue = self.flush_queue_lock();
             std::mem::take(&mut *queue)
         };
-        let mut seen = HashSet::new();
-        let unique: Vec<PartitionKey> = keys.into_iter().filter(|k| seen.insert(*k)).collect();
-
         let mut count = 0;
-        for key in unique {
-            let should = self
-                .partitions
-                .get(&key)
-                .map(|b| b.timestamps.len() >= self.min_flush_size)
-                .unwrap_or(false);
-            if should {
-                self.flush_partition_individual(&key)?;
+        for key in keys {
+            if let Some((timestamps, values)) =
+                self.drain_partition_if(&key, |buf| buf.timestamps.len() >= self.min_flush_size)
+            {
+                let cp = self.compress_partition(&key, &timestamps, &values)?;
+                let meta = self.write_individual_chunk(&cp)?;
+                self.index
+                    .write()
+                    .unwrap()
+                    .insert((key, meta.min_ts), meta);
                 count += 1;
             }
         }
@@ -735,6 +728,7 @@ impl Engine {
         Ok(count)
     }
 
+    #[allow(dead_code)]
     fn flush_partition_individual(&self, key: &PartitionKey) -> EngineResult<()> {
         if let Some((timestamps, values)) =
             self.drain_partition_if(key, |buf| !buf.timestamps.is_empty())
@@ -833,7 +827,7 @@ impl Engine {
 
         let count = compressed.len();
         if !compressed.is_empty() {
-            for batch in compressed.chunks(1000) {
+        for batch in compressed.chunks(BATCH_CHUNK_SIZE) {
                 let metas = self.write_batched_chunk(batch)?;
                 let mut index = self.index_write();
                 for (key, meta) in metas {
@@ -870,7 +864,7 @@ impl Engine {
         }
 
         let mut all_metas = new_individual;
-        for batch in small_compressed.chunks(1000) {
+        for batch in small_compressed.chunks(BATCH_CHUNK_SIZE) {
             all_metas.extend(self.write_batched_chunk(batch)?);
         }
         if !all_metas.is_empty() {
@@ -1110,7 +1104,7 @@ impl Engine {
             .collect())
     }
 
-    fn ensure_dir(&self, path: &PathBuf) -> io::Result<()> {
+    fn ensure_dir(&self, path: &std::path::Path) -> io::Result<()> {
         let dir = path
             .parent()
             .ok_or_else(|| {
@@ -1373,6 +1367,7 @@ impl Engine {
 
     // ── Chunk reading ────────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn read_chunk_data(
         &self,
         meta: &ChunkMeta,
@@ -1474,11 +1469,18 @@ impl Engine {
         pos += 4;
         pos += 16;
         let pk_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
-        if pos + 2 + pk_len + 24 > data.len() {
+        pos += 2;
+        if pos + pk_len > data.len() {
             return Err("truncated PCO1 partition key".into());
         }
-        pos += 2 + pk_len;
+        pos += pk_len;
+        if pos + 24 > data.len() {
+            return Err("truncated PCO1 metadata".into());
+        }
         pos += 24;
+        if pos + 4 > data.len() {
+            return Err("truncated PCO1 partition data".into());
+        }
         Self::parse_partition_data(data, pos)
     }
 
@@ -1642,6 +1644,8 @@ impl Engine {
             return Err("truncated PCB1 header".into());
         }
 
+        let table_end = pos + table_len;
+        let mut data_entries: Vec<(u64, u32)> = Vec::with_capacity(n);
         for _ in 0..n {
             let series_id = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
@@ -1662,6 +1666,7 @@ impl Engine {
             let data_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
 
+            data_entries.push((data_offset, data_len));
             results.push((
                 PartitionKey { series_id },
                 ChunkMeta {
@@ -1676,6 +1681,22 @@ impl Engine {
                     data_len,
                 },
             ));
+        }
+
+        for (data_offset, data_len) in data_entries {
+            if (data_offset as usize) < table_end {
+                return Err(format!(
+                    "PCB1 data offset {} is within table region (table ends at {})",
+                    data_offset, table_end
+                ));
+            }
+            let end = (data_offset as usize) + (data_len as usize);
+            if end > data.len() {
+                return Err(format!(
+                    "PCB1 data entry overflows file at offset {} (end {} > {})",
+                    data_offset, end, data.len()
+                ));
+            }
         }
 
         Ok(results)
@@ -2021,7 +2042,7 @@ fn engine_list_series(
 fn engine_info<'a>(
     env: rustler::Env<'a>,
     resource: ResourceArc<EngineResource>,
-) -> Result<(Atom, Term<'a>), String> {
+) -> Result<Term<'a>, String> {
     let info = resource.deref().engine.info();
     let map = rustler::types::map::map_new(env);
     let map = map.map_put("chunk_count", info.chunk_count as i64).unwrap();
@@ -2062,7 +2083,7 @@ fn engine_info<'a>(
     } else {
         map
     };
-    Ok((atoms::ok(), map))
+    Ok(map)
 }
 
 fn match_agg(atom: Atom) -> Result<AggFn, String> {
@@ -2089,7 +2110,7 @@ fn load(env: rustler::Env, _info: rustler::Term) -> bool {
 rustler::init!("Elixir.TimelessMetrics.RustEngine.Nif", load = load);
 
 fn partition_vec_memory(timestamps: &Vec<i64>, values: &Vec<f64>) -> usize {
-    (timestamps.capacity() + values.capacity()) * 8
+    (timestamps.len() + values.len()) * 8
 }
 
 #[cfg(test)]
