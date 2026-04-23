@@ -58,7 +58,7 @@ TimelessMetrics.Supervisor
 
 ## Engine Selection
 
-`TimelessMetrics.Supervisor` defaults to:
+The default supervisor defaults to:
 
 ```elixir
 engine: :rust

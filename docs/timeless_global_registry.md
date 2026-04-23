@@ -77,8 +77,7 @@ Multiple nodes per series (primary + replica) for HA regardless of strategy.
 ## Node Discovery
 
 - **DNS** for initial discovery — fits Podman/container deployment model
-- **Erlang distribution** between gateways and nodes for internal communication
-  (`:net_adm.connect_node/1` after DNS resolution)
+- **Erlang distribution** between gateways and nodes for internal communication (connect_node after DNS resolution)
 - Gateways discover nodes, pull their series registries, build local ETS cache
 
 ## Bottleneck Analysis

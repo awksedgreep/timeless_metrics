@@ -93,11 +93,8 @@ The UI will need these functions from `timeless` (most already exist):
 | `TimelessMetrics.query_aggregate_multi/4` | Exists | For chart explorer |
 | `TimelessMetrics.forecast/4` | Exists | |
 | `TimelessMetrics.detect_anomalies/4` | Exists | |
-| `TimelessMetrics.get_schema/1` | Exists | Read schema config |
 | `TimelessMetrics.list_metrics/1` | **Needed** | List all metric names |
 | `TimelessMetrics.list_series/2` | **Needed** | List series for a metric with labels |
-| `TimelessMetrics.shard_stats/1` | **Needed** | Per-shard DB size, segment counts, watermarks |
-| `TimelessMetrics.rollup_status/1` | **Needed** | Last rollup time, duration, rows processed |
 | `TimelessMetrics.delete_annotation/2` | Exists | Via HTTP, may need Elixir API |
 
 Functions marked **Needed** would be added to the core library before building the UI.
