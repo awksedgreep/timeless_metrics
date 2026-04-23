@@ -123,6 +123,6 @@ jobs:
           git push
 
       - name: Publish to Hex
-        run: mix hex.publish --yes
+        run: mix hex.publish --yes --replace
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
