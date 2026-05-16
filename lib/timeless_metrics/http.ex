@@ -214,17 +214,27 @@ defmodule TimelessMetrics.HTTP do
   get "/health" do
     store = store()
     stats = TimelessMetrics.Stats.snapshot(store)
-    series_count = TimelessMetrics.SeriesRegistry.count(:"#{store}_registry")
+    {series_count, points, buffer_points} = health_counts(store, stats)
 
     json_resp(req, 200, %{
       status: "ok",
       series: series_count,
-      points: stats.points_ingested,
-      buffer_points: stats.points_ingested - stats.points_merged,
+      points: points,
+      buffer_points: buffer_points,
       queries: stats.queries,
       query_fast_path: stats.query_fast_path,
       query_slow_path: stats.query_slow_path
     })
+  end
+
+  defp health_counts(store, stats) do
+    if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust do
+      info = TimelessMetrics.info(store)
+      {info.series_count, info.total_points, info.raw_buffer_points}
+    else
+      series_count = TimelessMetrics.SeriesRegistry.count(:"#{store}_registry")
+      {series_count, stats.points_ingested, stats.points_ingested - stats.points_merged}
+    end
   end
 
   # Full diagnostic info — expensive, fans out to all series (auth required)

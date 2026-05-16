@@ -114,6 +114,30 @@ defmodule TimelessMetrics.HTTPTest do
     assert is_integer(body["queries"])
   end
 
+  test "GET /health returns store stats for rust engine stores" do
+    rust_dir = "/tmp/timeless_http_rust_test_#{System.unique_integer([:positive])}"
+    rust_port = @port + 1
+
+    start_supervised!({TimelessMetrics, name: :http_rust_test, data_dir: rust_dir, engine: :rust})
+    start_supervised!({TimelessMetrics.HTTP, store: :http_rust_test, port: rust_port})
+    Process.sleep(50)
+
+    on_exit(fn ->
+      File.rm_rf!(rust_dir)
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
+    end)
+
+    resp = TimelessMetrics.TestHTTP.get(rust_port, "/health")
+
+    assert resp.status == 200
+    body = :json.decode(resp.body)
+    assert body["status"] == "ok"
+    assert is_integer(body["series"])
+    assert is_integer(body["points"])
+    assert is_integer(body["buffer_points"])
+    assert is_integer(body["queries"])
+  end
+
   test "unknown route returns 404" do
     resp = TimelessMetrics.TestHTTP.get(@port, "/nonexistent")
 
