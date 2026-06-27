@@ -150,27 +150,41 @@ impl SeriesRegistry {
 
     /// Find all series_ids matching a metric name and optional label filters.
     fn find_series(&self, metric_name: &str, label_filter: &Labels) -> Vec<i64> {
-        // Start with all series for this metric
-        let candidates = match self.metric_index.get(metric_name) {
+        let metric_ids = match self.metric_index.get(metric_name) {
             Some(ids) => ids.clone(),
             None => return Vec::new(),
         };
 
         if label_filter.is_empty() {
-            return candidates.into_iter().collect();
+            return metric_ids.into_iter().collect();
         }
 
-        // Intersect with each label filter
-        let mut result = candidates;
+        let mut smallest = &metric_ids;
+
         for (k, v) in label_filter {
-            if let Some(matching) = self.label_index.get(&(k.clone(), v.clone())) {
-                result = result.intersection(matching).copied().collect();
-            } else {
-                return Vec::new();
+            let matching = match self.label_index.get(&(k.clone(), v.clone())) {
+                Some(ids) => ids,
+                None => return Vec::new(),
+            };
+            if matching.len() < smallest.len() {
+                smallest = matching;
             }
         }
 
-        result.into_iter().collect()
+        smallest
+            .iter()
+            .copied()
+            .filter(|id| {
+                let Some(info) = self.series_info.get(id) else {
+                    return false;
+                };
+
+                info.metric_name == metric_name
+                    && label_filter
+                        .iter()
+                        .all(|(k, v)| info.labels.get(k).is_some_and(|actual| actual == v))
+            })
+            .collect()
     }
 
     fn list_metrics(&self) -> Vec<String> {
@@ -2290,6 +2304,58 @@ mod tests {
         );
         assert_eq!(engine.flush_pending().unwrap(), 1);
         assert_eq!(engine.query_range_by_id(1, 0, 10).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn find_series_keeps_metric_scope_when_starting_from_label_index() {
+        let mut reg = SeriesRegistry::new();
+
+        let mut labels_a = BTreeMap::new();
+        labels_a.insert("host".to_string(), "shared".to_string());
+        labels_a.insert("region".to_string(), "west".to_string());
+
+        let mut labels_b = BTreeMap::new();
+        labels_b.insert("host".to_string(), "shared".to_string());
+        labels_b.insert("region".to_string(), "east".to_string());
+
+        let metric_a_id = reg.get_or_create("cpu_usage", &labels_a);
+        let metric_b_id = reg.get_or_create("mem_usage", &labels_b);
+
+        let mut filter = BTreeMap::new();
+        filter.insert("host".to_string(), "shared".to_string());
+
+        assert_eq!(reg.find_series("cpu_usage", &filter), vec![metric_a_id]);
+        assert_eq!(reg.find_series("mem_usage", &filter), vec![metric_b_id]);
+    }
+
+    #[test]
+    fn find_series_handles_multiple_label_filters_and_misses() {
+        let mut reg = SeriesRegistry::new();
+
+        let mut west_api = BTreeMap::new();
+        west_api.insert("region".to_string(), "west".to_string());
+        west_api.insert("service".to_string(), "api".to_string());
+
+        let mut west_db = BTreeMap::new();
+        west_db.insert("region".to_string(), "west".to_string());
+        west_db.insert("service".to_string(), "db".to_string());
+
+        let mut east_api = BTreeMap::new();
+        east_api.insert("region".to_string(), "east".to_string());
+        east_api.insert("service".to_string(), "api".to_string());
+
+        let west_api_id = reg.get_or_create("latency", &west_api);
+        reg.get_or_create("latency", &west_db);
+        reg.get_or_create("latency", &east_api);
+
+        let mut filter = BTreeMap::new();
+        filter.insert("region".to_string(), "west".to_string());
+        filter.insert("service".to_string(), "api".to_string());
+
+        assert_eq!(reg.find_series("latency", &filter), vec![west_api_id]);
+
+        filter.insert("service".to_string(), "queue".to_string());
+        assert!(reg.find_series("latency", &filter).is_empty());
     }
 
     #[test]
