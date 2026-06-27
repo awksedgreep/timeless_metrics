@@ -46,6 +46,7 @@ struct PartitionBuffer {
     timestamps: Vec<i64>,
     values: Vec<f64>,
     last_write: Instant,
+    queued_for_flush: bool,
 }
 
 impl PartitionBuffer {
@@ -54,6 +55,7 @@ impl PartitionBuffer {
             timestamps: Vec::new(),
             values: Vec::new(),
             last_write: Instant::now(),
+            queued_for_flush: false,
         }
     }
     fn memory_bytes(&self) -> usize {
@@ -580,7 +582,7 @@ impl Engine {
     #[inline]
     fn write_point(&self, series_id: i64, ts: i64, val: f64) {
         let key = PartitionKey { series_id };
-        let needs_flush;
+        let should_queue_flush;
         let mem_delta: isize;
 
         {
@@ -595,7 +597,11 @@ impl Engine {
             buf.last_write = Instant::now();
             let new_cap = buf.memory_bytes();
             mem_delta = (new_cap as isize) - (old_cap as isize);
-            needs_flush = buf.timestamps.len() >= self.flush_threshold;
+            should_queue_flush =
+                buf.timestamps.len() >= self.flush_threshold && !buf.queued_for_flush;
+            if should_queue_flush {
+                buf.queued_for_flush = true;
+            }
         }
 
         if mem_delta > 0 {
@@ -606,7 +612,7 @@ impl Engine {
                 .fetch_sub((-mem_delta) as usize, Ordering::Relaxed);
         }
 
-        if needs_flush {
+        if should_queue_flush {
             self.flush_queue_lock().push(key);
         }
     }
@@ -718,11 +724,10 @@ impl Engine {
             {
                 let cp = self.compress_partition(&key, &timestamps, &values)?;
                 let meta = self.write_individual_chunk(&cp)?;
-                self.index
-                    .write()
-                    .unwrap()
-                    .insert((key, meta.min_ts), meta);
+                self.index.write().unwrap().insert((key, meta.min_ts), meta);
                 count += 1;
+            } else {
+                self.clear_flush_queued(&key);
             }
         }
         self.save_series()?;
@@ -828,7 +833,7 @@ impl Engine {
 
         let count = compressed.len();
         if !compressed.is_empty() {
-        for batch in compressed.chunks(BATCH_CHUNK_SIZE) {
+            for batch in compressed.chunks(BATCH_CHUNK_SIZE) {
                 let metas = self.write_batched_chunk(batch)?;
                 let mut index = self.index_write();
                 for (key, meta) in metas {
@@ -1144,6 +1149,7 @@ impl Engine {
         let freed = entry.memory_bytes();
         let timestamps = std::mem::take(&mut entry.timestamps);
         let values = std::mem::take(&mut entry.values);
+        entry.queued_for_flush = false;
         entry.last_write = Instant::now();
         drop(entry);
 
@@ -1152,6 +1158,12 @@ impl Engine {
         }
 
         Some((timestamps, values))
+    }
+
+    fn clear_flush_queued(&self, key: &PartitionKey) {
+        if let Some(mut entry) = self.partitions.get_mut(key) {
+            entry.queued_for_flush = false;
+        }
     }
 
     // ── Queries ──────────────────────────────────────────────────────
@@ -1695,7 +1707,9 @@ impl Engine {
             if end > data.len() {
                 return Err(format!(
                     "PCB1 data entry overflows file at offset {} (end {} > {})",
-                    data_offset, end, data.len()
+                    data_offset,
+                    end,
+                    data.len()
                 ));
             }
         }
@@ -2214,6 +2228,68 @@ mod tests {
         assert_eq!(points.len(), 2_000);
         assert_eq!(points.first(), Some(&(0, 0.0)));
         assert_eq!(points.last(), Some(&(1_999, 1_999.0)));
+    }
+
+    #[test]
+    fn hot_partition_is_only_queued_once_before_flush() {
+        let dir = test_dir("dedupe_queue");
+        let engine = Engine::new(dir, 3, 1, 8, usize::MAX);
+
+        for i in 0..10 {
+            engine.write_point(1, i, i as f64);
+        }
+
+        assert_eq!(
+            engine.flush_queue_lock().len(),
+            1,
+            "hot partition should have one pending flush entry"
+        );
+
+        assert_eq!(engine.flush_pending().unwrap(), 1);
+        assert!(engine.flush_queue_lock().is_empty());
+        assert_eq!(engine.query_range_by_id(1, 0, 20).unwrap().len(), 10);
+
+        for i in 10..13 {
+            engine.write_point(1, i, i as f64);
+        }
+
+        assert_eq!(
+            engine.flush_queue_lock().len(),
+            1,
+            "partition should be queueable again after drain"
+        );
+        assert_eq!(engine.flush_pending().unwrap(), 1);
+        assert_eq!(engine.query_range_by_id(1, 0, 20).unwrap().len(), 13);
+    }
+
+    #[test]
+    fn pending_flush_that_does_not_drain_can_requeue_later() {
+        let dir = test_dir("dedupe_queue_min_size");
+        let engine = Engine::new(dir, 3, 5, 8, usize::MAX);
+
+        for i in 0..3 {
+            engine.write_point(1, i, i as f64);
+        }
+
+        assert_eq!(engine.flush_queue_lock().len(), 1);
+        assert_eq!(engine.flush_pending().unwrap(), 0);
+        assert!(engine.flush_queue_lock().is_empty());
+
+        engine.write_point(1, 3, 3.0);
+        assert_eq!(
+            engine.flush_queue_lock().len(),
+            1,
+            "partition should requeue after a skipped pending flush"
+        );
+
+        engine.write_point(1, 4, 4.0);
+        assert_eq!(
+            engine.flush_queue_lock().len(),
+            1,
+            "additional writes before drain should not duplicate the queue entry"
+        );
+        assert_eq!(engine.flush_pending().unwrap(), 1);
+        assert_eq!(engine.query_range_by_id(1, 0, 10).unwrap().len(), 5);
     }
 
     #[test]
