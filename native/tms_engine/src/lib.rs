@@ -2,9 +2,9 @@ use dashmap::DashMap;
 use rayon::prelude::*;
 use rustler::{Atom, Binary, ResourceArc, Term};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -1608,33 +1608,29 @@ impl Engine {
     }
 
     fn read_pco1_header(path: &PathBuf) -> Result<Vec<(PartitionKey, ChunkMeta)>, String> {
-        let data = fs::read(path).map_err(|e| e.to_string())?;
-        if data.len() < 4 || &data[0..4] != b"PCO1" {
+        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        let fixed = read_exact_at(&mut file, 0, 31)?;
+        if &fixed[0..4] != b"PCO1" {
             return Err("invalid".into());
         }
 
         let mut pos = 5;
-        if pos + 4 + 16 + 2 > data.len() {
-            return Err("truncated PCO1 header".into());
-        }
-        let point_count = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+        let point_count = u32::from_be_bytes(fixed[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let min_ts = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        let min_ts = i64::from_be_bytes(fixed[pos..pos + 8].try_into().unwrap());
         pos += 8;
-        let max_ts = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        let max_ts = i64::from_be_bytes(fixed[pos..pos + 8].try_into().unwrap());
         pos += 8;
-        let pk_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        let pk_len = u16::from_be_bytes(fixed[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
-        if pos + pk_len + 24 > data.len() {
-            return Err("truncated PCO1 metadata".into());
-        }
-        let pk_str = String::from_utf8_lossy(&data[pos..pos + pk_len]).to_string();
-        pos += pk_len;
-        let min_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        let variable = read_exact_at(&mut file, pos as u64, pk_len + 24)?;
+        let pk_str = String::from_utf8_lossy(&variable[0..pk_len]).to_string();
+        let mut pos = pk_len;
+        let min_val = f64::from_be_bytes(variable[pos..pos + 8].try_into().unwrap());
         pos += 8;
-        let max_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        let max_val = f64::from_be_bytes(variable[pos..pos + 8].try_into().unwrap());
         pos += 8;
-        let sum_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        let sum_val = f64::from_be_bytes(variable[pos..pos + 8].try_into().unwrap());
 
         // pk_str is the series_id as a string
         let series_id = pk_str.parse::<i64>().unwrap_or(0);
@@ -1656,41 +1652,43 @@ impl Engine {
     }
 
     fn read_pcb1_headers(path: &PathBuf) -> Result<Vec<(PartitionKey, ChunkMeta)>, String> {
-        let data = fs::read(path).map_err(|e| e.to_string())?;
-        if data.len() < 9 || &data[0..4] != b"PCB1" {
+        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+        let fixed = read_exact_at(&mut file, 0, 9)?;
+        if &fixed[0..4] != b"PCB1" {
             return Err("invalid".into());
         }
 
-        let n = u32::from_be_bytes(data[5..9].try_into().unwrap()) as usize;
-        let mut results = Vec::with_capacity(n);
-        let mut pos = 9;
+        let n = u32::from_be_bytes(fixed[5..9].try_into().unwrap()) as usize;
         let table_len = n
             .checked_mul(64)
             .ok_or_else(|| "PCB1 table overflow".to_string())?;
-        if pos + table_len > data.len() {
-            return Err("truncated PCB1 header".into());
-        }
-
-        let table_end = pos + table_len;
+        let table_start = 9usize;
+        let table_end = table_start
+            .checked_add(table_len)
+            .ok_or_else(|| "PCB1 table overflow".to_string())?;
+        let table = read_exact_at(&mut file, table_start as u64, table_len)?;
+        let mut results = Vec::with_capacity(n);
+        let mut pos = 0;
         let mut data_entries: Vec<(u64, u32)> = Vec::with_capacity(n);
         for _ in 0..n {
-            let series_id = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let series_id = i64::from_be_bytes(table[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let point_count = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+            let point_count = u32::from_be_bytes(table[pos..pos + 4].try_into().unwrap());
             pos += 4;
-            let min_ts = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let min_ts = i64::from_be_bytes(table[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let max_ts = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let max_ts = i64::from_be_bytes(table[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let min_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let min_val = f64::from_be_bytes(table[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let max_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let max_val = f64::from_be_bytes(table[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let sum_val = f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let sum_val = f64::from_be_bytes(table[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let data_offset = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let data_offset = u64::from_be_bytes(table[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            let data_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+            let data_len = u32::from_be_bytes(table[pos..pos + 4].try_into().unwrap());
             pos += 4;
 
             data_entries.push((data_offset, data_len));
@@ -1711,19 +1709,19 @@ impl Engine {
         }
 
         for (data_offset, data_len) in data_entries {
-            if (data_offset as usize) < table_end {
+            if data_offset < table_end as u64 {
                 return Err(format!(
                     "PCB1 data offset {} is within table region (table ends at {})",
                     data_offset, table_end
                 ));
             }
-            let end = (data_offset as usize) + (data_len as usize);
-            if end > data.len() {
+            let end = data_offset
+                .checked_add(data_len as u64)
+                .ok_or_else(|| "PCB1 data entry overflow".to_string())?;
+            if end > file_len {
                 return Err(format!(
                     "PCB1 data entry overflows file at offset {} (end {} > {})",
-                    data_offset,
-                    end,
-                    data.len()
+                    data_offset, end, file_len
                 ));
             }
         }
@@ -2141,6 +2139,14 @@ fn partition_vec_memory(timestamps: &Vec<i64>, values: &Vec<f64>) -> usize {
     (timestamps.len() + values.len()) * 8
 }
 
+fn read_exact_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>, String> {
+    let mut buf = vec![0u8; len];
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
+    file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2209,6 +2215,64 @@ mod tests {
             "expected two distinct batch files in {}",
             batch_dir.display()
         );
+    }
+
+    #[test]
+    fn rebuild_index_finds_individual_chunks_without_reading_payloads() {
+        let dir = test_dir("rebuild_individual");
+        let engine = Engine::new(dir.clone(), 1, 1, 8, usize::MAX);
+
+        for i in 0..5 {
+            engine.write_point(1, i, i as f64);
+        }
+        engine.flush_all().unwrap();
+        assert_eq!(engine.query_range_by_id(1, 0, 10).unwrap().len(), 5);
+
+        let restarted = Engine::new(dir, 1, 1, 8, usize::MAX);
+        assert_eq!(restarted.index_read().len(), 1);
+        assert_eq!(restarted.query_range_by_id(1, 0, 10).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn rebuild_index_finds_batched_chunks_without_reading_payloads() {
+        let dir = test_dir("rebuild_batched");
+        let engine = Engine::new(dir.clone(), 100, 64, 8, usize::MAX);
+
+        for series_id in 1..=3 {
+            for ts in 0..3 {
+                engine.write_point(series_id, ts, (series_id * 10 + ts) as f64);
+            }
+        }
+        engine.flush_all().unwrap();
+        assert_eq!(engine.index_read().len(), 3);
+
+        let restarted = Engine::new(dir, 100, 64, 8, usize::MAX);
+        assert_eq!(restarted.index_read().len(), 3);
+        assert_eq!(restarted.query_range_by_id(1, 0, 10).unwrap().len(), 3);
+        assert_eq!(restarted.query_range_by_id(2, 0, 10).unwrap().len(), 3);
+        assert_eq!(restarted.query_range_by_id(3, 0, 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn truncated_pco1_header_returns_error() {
+        let dir = test_dir("truncated_pco1");
+        let path = dir.join("bad.pco1");
+        fs::write(&path, b"PCO1\x01").unwrap();
+
+        assert!(Engine::read_pco1_header(&path).is_err());
+    }
+
+    #[test]
+    fn truncated_pcb1_header_returns_error() {
+        let dir = test_dir("truncated_pcb1");
+        let path = dir.join("bad.pcb1");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PCB1");
+        data.push(1);
+        data.extend_from_slice(&1u32.to_be_bytes());
+        fs::write(&path, data).unwrap();
+
+        assert!(Engine::read_pcb1_headers(&path).is_err());
     }
 
     #[test]
