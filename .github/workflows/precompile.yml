@@ -32,6 +32,10 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
+      - name: Normalize setup-beam runner image (Linux ARM)
+        if: matrix.runner == 'ubuntu-24.04-arm'
+        run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
+
       - name: Install Erlang & Elixir (Linux)
         if: runner.os == 'Linux'
         uses: erlef/setup-beam@v1
