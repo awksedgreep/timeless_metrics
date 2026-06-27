@@ -33,5 +33,6 @@ timeless_metrics-*.tar
 # Environment files
 .env
 .env.*
+.codex
 /native/*/target/
 /priv/native/
