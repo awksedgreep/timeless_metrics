@@ -2,7 +2,7 @@ defmodule TimelessMetrics.Query do
   @moduledoc """
   Query engine with automatic tier selection.
 
-  For raw queries, reads gorilla-compressed segments from shard DBs.
+  For raw queries, reads compressed segments from shard storage.
   For aggregate queries, reads from rollup tiers when the time range
   falls outside raw retention, or when a matching tier resolution exists.
   Stitches results across tiers for queries spanning multiple windows.
@@ -15,7 +15,7 @@ defmodule TimelessMetrics.Query do
 
   Returns `{:ok, [{timestamp, value}, ...]}` sorted by timestamp.
   """
-  # Dict-compressed blob prefix marker (matches segment_builder.ex)
+  # Legacy dict-compressed Gorilla blob prefix marker.
   @dict_marker 0xFF
 
   def raw(store, series_id, opts \\ []) do
@@ -479,26 +479,17 @@ defmodule TimelessMetrics.Query do
     {:ok, [{ts, val}]}
   end
 
-  # Legacy: dict-compressed gorilla blobs (<<0xFF, dict_version, data...>>)
+  # Legacy: dict-compressed Gorilla blobs (<<0xFF, dict_version, data...>>)
   defp decompress_blob(
-         <<@dict_marker, _dict_version::8, compressed::binary>>,
+         <<@dict_marker, _dict_version::8, _compressed::binary>>,
          store,
          _compression
        ) do
-    ddict = TimelessMetrics.DictTrainer.get_ddict(store)
-
-    if ddict do
-      with {:ok, gorilla_blob} <-
-             GorillaStream.Compression.Container.decompress_with_dict(compressed, ddict) do
-        GorillaStream.decompress(gorilla_blob, compression: :none)
-      end
-    else
-      {:error, "Dict-compressed blob but no dictionary loaded for store #{store}"}
-    end
+    {:error, "Legacy Gorilla-compressed segment is no longer supported for store #{store}"}
   end
 
-  # Legacy: standard gorilla blobs
-  defp decompress_blob(blob, _store, compression) do
-    GorillaStream.decompress(blob, compression: compression)
+  # Legacy: standard Gorilla blobs.
+  defp decompress_blob(_blob, store, _compression) do
+    {:error, "Legacy Gorilla-compressed segment is no longer supported for store #{store}"}
   end
 end

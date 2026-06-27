@@ -202,7 +202,6 @@ static ERL_NIF_TERM nif_parse(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
 
     ERL_NIF_TERM list = enif_make_list(env, 0);
     int error_count = 0;
-    int entry_count = 0;
 
     const char* line_start = data;
     while (line_start < end) {
@@ -213,7 +212,6 @@ static ERL_NIF_TERM nif_parse(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
         ERL_NIF_TERM entry;
         if (parse_line(env, line_start, line_end, &entry)) {
             list = enif_make_list_cell(env, entry, list);
-            entry_count++;
         } else {
             // Check if it was a non-empty, non-comment line (actual parse error)
             const char* p = skip_ws(line_start, line_end);

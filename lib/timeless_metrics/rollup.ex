@@ -403,7 +403,7 @@ defmodule TimelessMetrics.Rollup do
     end
   end
 
-  # Auto-detect segment format: ALP (0xA1), text (0xFE), or legacy gorilla
+  # Auto-detect segment format: ALP (0xA1), text (0xFE), or raw single point (0xA2).
   defp decompress_segment(<<0xA1, alp_blob::binary>>, _compression) do
     ExAlp.decompress(alp_blob, compression: :zstd)
   end
@@ -416,8 +416,8 @@ defmodule TimelessMetrics.Rollup do
     TimelessMetrics.TextCodec.decompress(text_blob)
   end
 
-  defp decompress_segment(blob, compression) do
-    GorillaStream.decompress(blob, compression: compression)
+  defp decompress_segment(_blob, _compression) do
+    {:error, "Legacy Gorilla-compressed segment is no longer supported"}
   end
 
   defp schedule_tick(interval) do

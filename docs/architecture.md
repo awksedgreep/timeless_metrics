@@ -6,7 +6,7 @@ The important versioned truth is:
 - the default engine is the Rust engine
 - the legacy Elixir engine still exists, but it is no longer the primary design target
 
-If you are reading older notes that describe ETS shard buffers, SegmentBuilder, Gorilla, ALP, or SQLite-backed raw storage as the hot path, those describe the legacy engine, not the default runtime on `main`.
+If you are reading older notes that describe ETS shard buffers, SegmentBuilder, ALP, or SQLite-backed raw storage as the hot path, those describe the legacy engine, not the default runtime on `main`.
 
 ## High-Level Design
 
@@ -230,7 +230,7 @@ The maintained benchmarks are:
 
 If you need the legacy engine, keep these distinctions in mind:
 - old docs describing ETS shard buffers and SegmentBuilder are about the legacy path
-- old compression references to Gorilla or ALP as the primary active engine are legacy descriptions
+- old compression references to ALP as the primary active engine are legacy descriptions
 - old benchmark scripts that depended on actor-era internals were intentionally removed
 
 The codebase still contains compatibility paths, but the primary architecture is now the rust-default engine described above.

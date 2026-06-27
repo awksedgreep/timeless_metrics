@@ -1,13 +1,14 @@
 defmodule TimelessMetrics.MixProject do
   use Mix.Project
 
-  @version "6.0.18"
+  @version "6.0.19"
 
   def project do
     [
       app: :timeless_metrics,
       version: @version,
       elixir: "~> 1.18",
+      test_ignore_filters: [&String.starts_with?(&1, "test/support/")],
       start_permanent: Mix.env() == :prod,
       compilers: [:elixir_make] ++ Mix.compilers(),
       make_env: fn ->
@@ -26,7 +27,7 @@ defmodule TimelessMetrics.MixProject do
         "https://github.com/awksedgreep/timeless_metrics/releases/download/v#{@version}/@{artefact_filename}",
       make_precompiler_filename: "prometheus_nif",
       make_precompiler_priv_paths: ["prometheus_nif.*", "native/tms_engine.*"],
-      make_precompiler_nif_versions: [versions: ["2.16", "2.17"]],
+      make_precompiler_nif_versions: [versions: ["2.16", "2.17", "2.18"]],
       description: "Embedded time series database for Elixir with a Rust-native hot path.",
       source_url: "https://github.com/awksedgreep/timeless_metrics",
       homepage_url: "https://github.com/awksedgreep/timeless_metrics",
@@ -74,7 +75,6 @@ defmodule TimelessMetrics.MixProject do
 
   defp deps do
     [
-      {:gorilla_stream, "~> 3.0"},
       {:ex_alp, "~> 0.1"},
       {:ex_openzl, "~> 0.4"},
       {:exqlite, "~> 0.27"},

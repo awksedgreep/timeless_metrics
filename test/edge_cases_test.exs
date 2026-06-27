@@ -54,7 +54,7 @@ defmodule TimelessMetrics.EdgeCasesTest do
     {:ok, points} =
       TimelessMetrics.query(:edge_test, "dup", %{"id" => "1"}, from: now - 60, to: now + 60)
 
-    # Both points should be stored (gorilla allows duplicate timestamps)
+    # Both points should be stored.
     assert length(points) == 2
   end
 

@@ -525,8 +525,6 @@ defmodule TimelessMetrics.RustEngine do
   defp aggregate_values(vals, :max), do: Enum.max(vals)
   defp aggregate_values(vals, :sum), do: Enum.sum(vals)
   defp aggregate_values(vals, :count), do: length(vals) * 1.0
-  defp aggregate_values([_ | _] = vals, :last), do: List.last(vals)
-  defp aggregate_values([first | _], :first), do: first
   defp aggregate_values(vals, _), do: Enum.sum(vals) / length(vals)
 
   defp filter_series(series, filter) when map_size(filter) == 0, do: series

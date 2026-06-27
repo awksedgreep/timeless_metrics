@@ -1,6 +1,6 @@
 defmodule TimelessMetrics.DictTrainer do
   @moduledoc """
-  Manages zstd dictionaries for improved compression of Gorilla-compressed segments.
+  Manages zstd dictionaries for legacy compressed segments.
 
   On startup, loads any existing dictionary from `data_dir/dict_v*.zstd`.
   Stores compiled cdict/ddict in persistent_term for zero-cost access
@@ -44,8 +44,8 @@ defmodule TimelessMetrics.DictTrainer do
   @doc """
   Train a dictionary from existing segment data.
 
-  Reads Gorilla-compressed blobs (pre-zstd) from the store's segments,
-  uses them as training samples for zstd dictionary building.
+  Reads compressed blobs from the store's segments and uses them as training
+  samples for zstd dictionary building.
 
   Options:
     * `:sample_count` - Number of segments to sample (default: 500)
@@ -142,7 +142,7 @@ defmodule TimelessMetrics.DictTrainer do
 
   @doc false
   def collect_samples(data_dir, max_samples) do
-    # Read Gorilla+zstd compressed blobs from .seg files and WAL
+    # Read compressed blobs from .seg files and WAL.
     shard_dirs =
       case File.ls(data_dir) do
         {:ok, files} ->
@@ -232,7 +232,7 @@ defmodule TimelessMetrics.DictTrainer do
             acc ->
               entry_offset = index_start + i * 40
 
-              <<_pre::binary-size(entry_offset), _sid::64, _start::64, _end::64, _count::32,
+              <<_pre::binary-size(^entry_offset), _sid::64, _start::64, _end::64, _count::32,
                 offset::unsigned-big-64, len::unsigned-big-32, _rest::binary>> = data
 
               blob_start = header_size + offset

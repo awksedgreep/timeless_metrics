@@ -1,12 +1,12 @@
 defmodule TimelessMetrics.SegmentBuilder do
   @moduledoc """
-  Accumulates points per series and writes gorilla-compressed segments to
-  file-based storage (ShardStore).
+  Accumulates points per series and writes compressed segments to file-based
+  storage (ShardStore).
 
   Each SegmentBuilder owns its own shard directory. Points arrive in batches
   from the paired Buffer shard. The SegmentBuilder groups them into
-  time-bounded segments (default 4h), compresses with GorillaStream + zstd,
-  and writes to ShardStore (WAL + immutable .seg files).
+  time-bounded segments, compresses with the current fast/ALP/text codecs, and
+  writes to ShardStore (WAL + immutable .seg files).
 
   Tier chunks, watermarks, and raw segments are all in ShardStore.
   No SQLite is used for shard data.

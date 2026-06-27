@@ -133,7 +133,7 @@ defmodule TimelessMetrics.TextCodec do
     ts_bytes = ts_count * 8
 
     case rest do
-      <<ts_data::binary-size(ts_bytes), value_len::unsigned-32, value::binary-size(value_len),
+      <<ts_data::binary-size(^ts_bytes), value_len::unsigned-32, value::binary-size(value_len),
         more::binary>> ->
         timestamps = decode_timestamps(ts_data, ts_count, [])
         decode_entries(more, remaining - 1, [{timestamps, value} | acc])

@@ -430,6 +430,7 @@ unsafe impl Send for EngineResource {}
 unsafe impl Sync for EngineResource {}
 impl std::panic::RefUnwindSafe for EngineResource {}
 impl std::panic::UnwindSafe for EngineResource {}
+impl rustler::Resource for EngineResource {}
 
 struct CompressedPartition {
     key: PartitionKey,
@@ -2103,8 +2104,7 @@ fn match_agg(atom: Atom) -> Result<AggFn, String> {
 }
 
 fn load(env: rustler::Env, _info: rustler::Term) -> bool {
-    let _ = rustler::resource!(EngineResource, env);
-    true
+    env.register::<EngineResource>().is_ok()
 }
 
 rustler::init!("Elixir.TimelessMetrics.RustEngine.Nif", load = load);
