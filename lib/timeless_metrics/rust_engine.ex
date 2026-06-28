@@ -28,7 +28,8 @@ defmodule TimelessMetrics.RustEngine do
   end
 
   def write_resolved(store, series_id, value, timestamp) do
-    case Nif.engine_write_batch_raw(ref(store), encode_raw_batch([{series_id, timestamp, value}])) do
+    case Nif.engine_write_batch_raw(ref(store), encode_raw_batch([{series_id, timestamp, value}]))
+         |> normalize_nif_result() do
       {:ok, :ok} -> :ok
       {:error, _} = error -> error
     end
@@ -45,7 +46,7 @@ defmodule TimelessMetrics.RustEngine do
       [] ->
         with {:ok, series_id} <-
                Nif.engine_resolve_series(ref(store), metric_name, labels)
-               |> unwrap_nif_ok() do
+               |> normalize_nif_result() do
           cache_series_id(cache, key, series_id)
           {:ok, series_id}
         end
@@ -84,7 +85,7 @@ defmodule TimelessMetrics.RustEngine do
 
         with {:ok, ids} <-
                Nif.engine_resolve_series_batch(ref(store), missing_list)
-               |> unwrap_nif_ok() do
+               |> normalize_nif_result() do
           merged =
             Enum.zip(missing_list, ids)
             |> Enum.reduce(resolved, fn {{metric, labels}, series_id}, acc ->
@@ -119,7 +120,8 @@ defmodule TimelessMetrics.RustEngine do
             {Map.fetch!(series_ids, {metric, labels}), ts, value}
           end)
 
-        case Nif.engine_write_batch_raw(ref(store), encode_raw_batch(raw_entries)) do
+        case Nif.engine_write_batch_raw(ref(store), encode_raw_batch(raw_entries))
+             |> normalize_nif_result() do
           {:ok, :ok} -> :ok
           {:error, _} = error -> error
         end
@@ -128,7 +130,8 @@ defmodule TimelessMetrics.RustEngine do
   end
 
   def flush(store) do
-    case Nif.engine_flush(ref(store)) do
+    case Nif.engine_flush(ref(store))
+         |> normalize_nif_result() do
       {:ok, :ok} -> :ok
       {:error, _} = error -> error
     end
@@ -140,7 +143,7 @@ defmodule TimelessMetrics.RustEngine do
 
     {:ok, results} =
       Nif.engine_query_range(ref(store), metric_name, labels, from, to)
-      |> unwrap_nif_ok()
+      |> normalize_nif_result()
 
     case results do
       [{_labels, points}] ->
@@ -160,7 +163,7 @@ defmodule TimelessMetrics.RustEngine do
 
     {:ok, results} =
       Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
-      |> unwrap_nif_ok()
+      |> normalize_nif_result()
 
     formatted =
       results
@@ -182,7 +185,7 @@ defmodule TimelessMetrics.RustEngine do
       # No bucketing — return scalar aggregate
       {:ok, results} =
         Nif.engine_query_aggregate(ref(store), metric_name, labels, from, to, agg)
-        |> unwrap_nif_ok()
+        |> normalize_nif_result()
 
       case results do
         [{_labels, val}] -> {:ok, [{from, val}]}
@@ -194,7 +197,7 @@ defmodule TimelessMetrics.RustEngine do
       # (the Rust engine doesn't have bucketed aggregation built in yet)
       {:ok, results} =
         Nif.engine_query_range(ref(store), metric_name, labels, from, to)
-        |> unwrap_nif_ok()
+        |> normalize_nif_result()
 
       points =
         case results do
@@ -224,7 +227,7 @@ defmodule TimelessMetrics.RustEngine do
     if bucket_seconds do
       {:ok, results} =
         Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
-        |> unwrap_nif_ok()
+        |> normalize_nif_result()
 
       formatted =
         results
@@ -237,7 +240,7 @@ defmodule TimelessMetrics.RustEngine do
     else
       {:ok, results} =
         Nif.engine_query_aggregate(ref(store), metric_name, label_filter, from, to, agg)
-        |> unwrap_nif_ok()
+        |> normalize_nif_result()
 
       formatted =
         results
@@ -255,7 +258,7 @@ defmodule TimelessMetrics.RustEngine do
 
     {:ok, results} =
       Nif.engine_query_range(ref(store), metric_name, labels, now - 300, now)
-      |> unwrap_nif_ok()
+      |> normalize_nif_result()
 
     case results do
       [{_labels, points}] when points != [] ->
@@ -268,26 +271,26 @@ defmodule TimelessMetrics.RustEngine do
 
   def list_metrics(store) do
     Nif.engine_list_metrics(ref(store))
-    |> unwrap_nif_ok()
+    |> normalize_nif_result()
   end
 
   def list_series(store, metric_name) do
     {:ok, series} =
       Nif.engine_list_series(ref(store), metric_name)
-      |> unwrap_nif_ok()
+      |> normalize_nif_result()
 
     {:ok, Enum.map(series, fn labels -> %{labels: labels} end)}
   end
 
   def label_values(store, metric_name, label_key) do
     Nif.engine_label_values(ref(store), metric_name, label_key)
-    |> unwrap_nif_ok()
+    |> normalize_nif_result()
   end
 
   def find_series(store, metric_name, label_filter) do
     {:ok, series} =
       Nif.engine_list_series(ref(store), metric_name)
-      |> unwrap_nif_ok()
+      |> normalize_nif_result()
 
     filter_series(series, label_filter)
   end
@@ -299,27 +302,31 @@ defmodule TimelessMetrics.RustEngine do
   def info(store) do
     {:ok, raw} =
       Nif.engine_info(ref(store))
-      |> unwrap_nif_ok()
+      |> normalize_nif_result()
 
     data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir}, nil)
-    total_points = trunc(raw["total_points"])
-    storage_bytes = trunc(raw["total_bytes"])
-    disk_points = trunc(raw["disk_points"])
+    total_points = raw_stat(raw, "total_points", 0) |> trunc()
+    storage_bytes = raw_stat(raw, "total_bytes", 0) |> trunc()
+    disk_points = raw_stat(raw, "disk_points", total_points) |> trunc()
+
+    buffer_memory_bytes =
+      raw_stat(raw, "buffer_memory_bytes", raw_stat(raw, "buffer_memory_mb", 0) * 1024 * 1024)
+      |> trunc()
 
     %{
-      series_count: trunc(raw["series_count"]),
+      series_count: raw_stat(raw, "series_count", 0) |> trunc(),
       disk_points: disk_points,
       total_points: total_points,
       points_ingested: total_points,
       storage_bytes: storage_bytes,
       compressed_bytes: storage_bytes,
-      bytes_per_point: raw["bytes_per_point"],
-      raw_buffer_points: trunc(raw["buffered_points"]),
-      buffer_points: trunc(raw["buffered_points"]),
-      block_count: trunc(raw["chunk_count"]),
+      bytes_per_point: raw_stat(raw, "bytes_per_point", 0.0),
+      raw_buffer_points: raw_stat(raw, "buffered_points", 0) |> trunc(),
+      buffer_points: raw_stat(raw, "buffered_points", 0) |> trunc(),
+      block_count: raw_stat(raw, "chunk_count", 0) |> trunc(),
       process_count: 1,
       index_ets_bytes: 0,
-      buffer_memory_bytes: trunc(raw["buffer_memory_bytes"] || 0),
+      buffer_memory_bytes: buffer_memory_bytes,
       daily_rollup_rows: 0,
       db_path: if(data_dir, do: Path.join(data_dir, "metrics.db"), else: nil),
       oldest_timestamp:
@@ -405,9 +412,18 @@ defmodule TimelessMetrics.RustEngine do
 
   # ── Helpers ─────────────────────────────────────────────────────────
 
-  defp unwrap_nif_ok({:ok, {:ok, value}}), do: {:ok, value}
-  defp unwrap_nif_ok({:ok, value}), do: {:ok, value}
-  defp unwrap_nif_ok({:error, _} = error), do: error
+  @doc false
+  def normalize_nif_result({:ok, {:ok, value}}), do: {:ok, value}
+  def normalize_nif_result({:ok, value}), do: {:ok, value}
+  def normalize_nif_result({:error, _} = error), do: error
+  def normalize_nif_result(value), do: {:ok, value}
+
+  defp raw_stat(raw, key, default) do
+    case Map.get(raw, key) do
+      nil -> default
+      value -> value
+    end
+  end
 
   defp cache_ref(store) do
     :persistent_term.get({__MODULE__, store, :series_cache})
