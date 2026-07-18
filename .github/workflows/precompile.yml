@@ -7,18 +7,35 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }} (${{ matrix.otp && format('OTP {0}', matrix.otp) || 'brew' }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # OTP 27 builds produce NIF 2.17 artifacts (OTP 26-28 consumers);
+          # OTP 29 builds produce NIF 2.18 artifacts. macOS uses brew
+          # (currently OTP 29 -> NIF 2.18).
           - target: x86_64-linux-gnu
             rust_target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            otp: "27"
+            elixir: "1.19"
+          - target: x86_64-linux-gnu
+            rust_target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            otp: "29"
+            elixir: "1.20"
           - target: aarch64-linux-gnu
             rust_target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            otp: "27"
+            elixir: "1.19"
+          - target: aarch64-linux-gnu
+            rust_target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            otp: "29"
+            elixir: "1.20"
           - target: aarch64-apple-darwin
             rust_target: aarch64-apple-darwin
             runner: macos-14
@@ -40,8 +57,8 @@ jobs:
         if: runner.os == 'Linux'
         uses: erlef/setup-beam@v1
         with:
-          otp-version: "27"
-          elixir-version: "1.19"
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
 
       - name: Install Erlang & Elixir (macOS)
         if: runner.os == 'macOS'
@@ -67,7 +84,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
         with:
-          name: nif-${{ matrix.target }}
+          name: nif-${{ matrix.target }}-${{ matrix.otp || 'brew' }}
           path: cache/*.tar.gz
           if-no-files-found: error
 
