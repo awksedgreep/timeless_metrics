@@ -33,4 +33,8 @@ defmodule TimelessMetrics.RustEngine.Nif do
   def engine_label_values(_engine, _metric, _label_key), do: :erlang.nif_error(:nif_not_loaded)
   def engine_list_series(_engine, _metric), do: :erlang.nif_error(:nif_not_loaded)
   def engine_info(_engine), do: :erlang.nif_error(:nif_not_loaded)
+
+  # Bench prototypes for the fused-ingest experiment (bench/ingest_segments_bench.exs)
+  def parse_prometheus_count(_body), do: :erlang.nif_error(:nif_not_loaded)
+  def parse_prometheus_terms(_body), do: :erlang.nif_error(:nif_not_loaded)
 end

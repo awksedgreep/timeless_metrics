@@ -1829,6 +1829,177 @@ enum AggFn {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Prometheus text-format parser (bench prototype)
+//
+// Mirrors c_src/prometheus_nif.cpp semantics: entries are
+// (name, [(label_key, label_value)], value, timestamp), timestamp 0 when
+// absent, NaN/Inf values rejected, malformed non-comment lines counted
+// as errors. Exposed as two NIFs so parse cost and term-materialization
+// cost can be measured separately.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// One parsed sample. The slices borrow from the request body — parsing
+/// allocates nothing per entry except the label Vec.
+struct PromEntry<'a> {
+    name: &'a [u8],
+    labels: Vec<(&'a [u8], &'a [u8])>,
+    value: f64,
+    timestamp: i64,
+}
+
+/// Parse a Prometheus sample value. Rejects NaN/Inf — the BEAM cannot
+/// represent non-finite floats.
+fn parse_prom_value(bytes: &[u8]) -> Option<f64> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    let v: f64 = s.parse().ok()?;
+    v.is_finite().then_some(v)
+}
+
+/// Parse the inside of a `{key="val",key2="val2"}` label block.
+/// Escaped characters in values are kept raw, as the C++ parser does.
+fn parse_prom_labels(mut s: &[u8]) -> Vec<(&[u8], &[u8])> {
+    let mut labels = Vec::new();
+    loop {
+        while let Some((&b, rest)) = s.split_first() {
+            if b == b' ' || b == b',' {
+                s = rest;
+            } else {
+                break;
+            }
+        }
+        if s.is_empty() {
+            break;
+        }
+
+        let Some(eq) = s.iter().position(|&b| b == b'=') else {
+            break;
+        };
+        let mut key = &s[..eq];
+        while let [rest @ .., b' '] = key {
+            key = rest;
+        }
+        s = &s[eq + 1..];
+
+        let Some((&b'"', rest)) = s.split_first() else {
+            break;
+        };
+        s = rest;
+
+        let mut i = 0;
+        while i < s.len() && s[i] != b'"' {
+            if s[i] == b'\\' && i + 1 < s.len() {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        labels.push((key, &s[..i]));
+        s = if i < s.len() { &s[i + 1..] } else { &s[i..] };
+    }
+    labels
+}
+
+/// Parse one exposition line. Returns None for comments, blanks, and
+/// malformed lines — the caller decides which of those count as errors.
+fn parse_prom_line(line: &[u8]) -> Option<PromEntry<'_>> {
+    let line = line.trim_ascii();
+    if line.is_empty() || line[0] == b'#' {
+        return None;
+    }
+
+    let name_end = line
+        .iter()
+        .position(|&b| b == b'{' || b == b' ' || b == b'\t')?;
+    if name_end == 0 {
+        return None;
+    }
+    let name = &line[..name_end];
+
+    let (labels, rest) = if line[name_end] == b'{' {
+        let close = name_end
+            + 1
+            + line[name_end + 1..].iter().position(|&b| b == b'}')?;
+        (parse_prom_labels(&line[name_end + 1..close]), &line[close + 1..])
+    } else {
+        (Vec::new(), &line[name_end..])
+    };
+
+    let mut fields = rest
+        .split(|&b| b == b' ' || b == b'\t')
+        .filter(|f| !f.is_empty());
+    let value = parse_prom_value(fields.next()?)?;
+    let timestamp = fields
+        .next()
+        .and_then(|f| std::str::from_utf8(f).ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    Some(PromEntry {
+        name,
+        labels,
+        value,
+        timestamp,
+    })
+}
+
+fn parse_prom_body(data: &[u8]) -> (Vec<PromEntry<'_>>, usize) {
+    let mut entries = Vec::new();
+    let mut errors = 0;
+    for line in data.split(|&b| b == b'\n') {
+        match parse_prom_line(line) {
+            Some(entry) => entries.push(entry),
+            None => {
+                let t = line.trim_ascii();
+                if !t.is_empty() && t[0] != b'#' {
+                    errors += 1;
+                }
+            }
+        }
+    }
+    (entries, errors)
+}
+
+/// Bench NIF: parse the body and return only (entry_count, error_count).
+/// Zero BEAM terms are built per entry — this measures pure parse cost.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn parse_prometheus_count(body: Binary) -> (usize, usize) {
+    let (entries, errors) = parse_prom_body(body.as_slice());
+    (entries.len(), errors)
+}
+
+/// Bench NIF: parse the body and build the same term shape as the C++
+/// parser: {[{name, [{k, v}, ...], value, ts}, ...], error_count}.
+/// The delta vs parse_prometheus_count is the term-materialization cost.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn parse_prometheus_terms(
+    body: Binary,
+) -> (Vec<(String, Vec<(String, String)>, f64, i64)>, usize) {
+    let (entries, errors) = parse_prom_body(body.as_slice());
+    let terms = entries
+        .into_iter()
+        .map(|e| {
+            let labels = e
+                .labels
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        String::from_utf8_lossy(k).into_owned(),
+                        String::from_utf8_lossy(v).into_owned(),
+                    )
+                })
+                .collect();
+            (
+                String::from_utf8_lossy(e.name).into_owned(),
+                labels,
+                e.value,
+                e.timestamp,
+            )
+        })
+        .collect();
+    (terms, errors)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // NIF interface
 // ═══════════════════════════════════════════════════════════════════════
 
