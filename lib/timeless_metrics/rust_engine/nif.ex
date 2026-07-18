@@ -36,6 +36,10 @@ defmodule TimelessMetrics.RustEngine.Nif do
 
   # Prometheus text parser (production; wrapped by TimelessMetrics.PrometheusNif)
   def parse_prometheus(_body), do: :erlang.nif_error(:nif_not_loaded)
+  # Fused parse -> resolve -> write ingest; returns {:ok, {count, errors}}
+  def engine_ingest_prometheus(_engine, _body, _default_ts),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   # Bench-only: parse without term materialization (bench/ingest_segments_bench.exs)
   def parse_prometheus_count(_body), do: :erlang.nif_error(:nif_not_loaded)
 end

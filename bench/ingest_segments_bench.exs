@@ -117,6 +117,15 @@ defmodule IngestSegmentsBench do
 
       report("write/raw(enc+nif)", {times, gc_times})
 
+      # Fused path: parse + resolve + write in one NIF call, no per-sample terms
+      {times, gc_times} =
+        bench_indexed(@write_iters, fn i ->
+          ts = base_ts + 2 * @write_iters + i + 3
+          {:ok, _count, 0} = RustEngine.ingest_prometheus(store, body, ts)
+        end)
+
+      report("fused/ingest", {times, gc_times})
+
       # Sanity: everything landed
       info = RustEngine.info(store)
       total = raw_stat(info, samples)

@@ -406,15 +406,22 @@ impl SeriesRegistry {
 /// Fast hash of (metric, labels) for the resolution cache.
 /// Uses std DefaultHasher which is SipHash — fast and collision-resistant.
 fn fast_series_hash(metric: &str, labels: &HashMap<String, String>) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    metric.hash(&mut hasher);
-    // Sort label keys for deterministic hashing without BTreeMap conversion
     let mut pairs: Vec<(&str, &str)> = labels
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     pairs.sort_unstable_by_key(|&(k, _)| k);
-    for (k, v) in pairs {
+    fast_series_hash_pairs(metric, &pairs)
+}
+
+/// Hash core shared by the HashMap path and the fused-ingest path.
+/// Pairs MUST be sorted by key and deduplicated — both callers guarantee
+/// it — so both paths produce identical hashes for the same series and
+/// share the resolve cache.
+fn fast_series_hash_pairs(metric: &str, sorted_pairs: &[(&str, &str)]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    metric.hash(&mut hasher);
+    for &(k, v) in sorted_pairs {
         k.hash(&mut hasher);
         v.hash(&mut hasher);
     }
@@ -726,6 +733,143 @@ impl Engine {
             self.write_point(series_id, ts, val);
         }
         Ok(())
+    }
+
+    /// Verify a cached series_id against borrowed (metric, sorted pairs).
+    /// BTreeMap iterates sorted by key, so element-wise zip comparison works.
+    #[inline]
+    fn verify_series_identity_pairs(
+        &self,
+        series_id: i64,
+        metric: &str,
+        sorted_pairs: &[(&str, &str)],
+    ) -> bool {
+        let reg = self.series_read();
+        match reg.info_for(series_id) {
+            Some(info) => {
+                info.metric_name == metric
+                    && info.labels.len() == sorted_pairs.len()
+                    && info
+                        .labels
+                        .iter()
+                        .zip(sorted_pairs)
+                        .all(|((ik, iv), &(k, v))| ik == k && iv == v)
+            }
+            None => false,
+        }
+    }
+
+    /// Slow path for the fused ingest: materialize owned strings, resolve
+    /// through the registry, and cache under the precomputed hash.
+    fn resolve_pairs_slow(
+        &self,
+        hash: u64,
+        metric: &str,
+        sorted_pairs: &[(&str, &str)],
+    ) -> EngineResult<i64> {
+        let labels_bt: Labels = sorted_pairs
+            .iter()
+            .map(|&(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let id = self.resolve_series(metric, &labels_bt)?;
+        self.resolve_cache.insert(hash, id);
+        Ok(id)
+    }
+
+    /// Fused ingest: Prometheus text → resolve → buffer in one pass.
+    /// No BEAM terms are built per sample; on the steady-state cache-hit
+    /// path no allocations happen per sample either. `default_ts` (epoch
+    /// seconds) is used for samples without a timestamp; millisecond
+    /// timestamps are normalized to seconds, matching the scraper.
+    /// Returns (samples_written, parse_errors).
+    fn ingest_prometheus(&self, body: &[u8], default_ts: i64) -> EngineResult<(usize, usize)> {
+        let mut sorted: Vec<(&str, &str)> = Vec::with_capacity(16);
+        let mut failure: EngineResult<()> = Ok(());
+
+        let (count, errors) = parse_prom_body_visit(body, |name, labels, value, ts| {
+            if failure.is_err() {
+                return;
+            }
+
+            let ts = if ts == 0 {
+                default_ts
+            } else if ts > 1_000_000_000_000 {
+                ts / 1000
+            } else {
+                ts
+            };
+
+            match self.resolve_entry(name, labels, &mut sorted) {
+                Ok(series_id) => self.write_point(series_id, ts, value),
+                Err(e) => failure = Err(e),
+            }
+        });
+
+        failure?;
+        Ok((count, errors))
+    }
+
+    /// Resolve one parsed sample to a series_id. Cache hits touch only
+    /// borrowed data; UTF-8 validation (not conversion) keeps hashing
+    /// identical to the String-based path so both share resolve_cache.
+    fn resolve_entry<'a>(
+        &self,
+        name: &'a [u8],
+        labels: &[(&'a [u8], &'a [u8])],
+        sorted: &mut Vec<(&'a str, &'a str)>,
+    ) -> EngineResult<i64> {
+        let Some(metric) = std::str::from_utf8(name).ok() else {
+            return self.resolve_lossy(name, labels);
+        };
+
+        sorted.clear();
+        for &(k, v) in labels {
+            match (std::str::from_utf8(k), std::str::from_utf8(v)) {
+                (Ok(k), Ok(v)) => sorted.push((k, v)),
+                _ => return self.resolve_lossy(name, labels),
+            }
+        }
+
+        // Sort by key (stable) and keep the LAST occurrence of duplicate
+        // keys, matching HashMap/BTreeMap insert semantics downstream.
+        sorted.sort_by_key(|&(k, _)| k);
+        let mut w = 0;
+        for i in 0..sorted.len() {
+            if i + 1 < sorted.len() && sorted[i + 1].0 == sorted[i].0 {
+                continue;
+            }
+            sorted[w] = sorted[i];
+            w += 1;
+        }
+        sorted.truncate(w);
+
+        let hash = fast_series_hash_pairs(metric, sorted);
+
+        if let Some(id) = self.resolve_cache.get(&hash) {
+            let series_id = *id;
+            if self.verify_series_identity_pairs(series_id, metric, sorted) {
+                return Ok(series_id);
+            }
+            // Hash collision — fall through to the verified slow path
+        }
+
+        self.resolve_pairs_slow(hash, metric, sorted)
+    }
+
+    /// Rare fallback for invalid UTF-8 in names/labels: resolve through
+    /// the registry with lossy conversion, bypassing the hash cache.
+    fn resolve_lossy(&self, name: &[u8], labels: &[(&[u8], &[u8])]) -> EngineResult<i64> {
+        let metric = String::from_utf8_lossy(name);
+        let labels_bt: Labels = labels
+            .iter()
+            .map(|&(k, v)| {
+                (
+                    String::from_utf8_lossy(k).into_owned(),
+                    String::from_utf8_lossy(v).into_owned(),
+                )
+            })
+            .collect();
+        self.resolve_series(&metric, &labels_bt)
     }
 
     // ── Flush ────────────────────────────────────────────────────────
@@ -2116,6 +2260,20 @@ fn engine_resolve_series_batch(
     ))
 }
 
+/// Fused ingest: parse Prometheus text and write points in one NIF call.
+/// Returns {:ok, {samples_written, parse_errors}}.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn engine_ingest_prometheus(
+    resource: ResourceArc<EngineResource>,
+    body: Binary,
+    default_ts: i64,
+) -> Result<(usize, usize), String> {
+    resource
+        .deref()
+        .engine
+        .ingest_prometheus(body.as_slice(), default_ts)
+}
+
 #[rustler::nif(schedule = "DirtyCpu")]
 fn engine_flush_pending(resource: ResourceArc<EngineResource>) -> Result<(Atom, usize), String> {
     Ok((atoms::ok(), resource.deref().engine.flush_pending()?))
@@ -2357,6 +2515,54 @@ fn read_exact_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_hash_matches_hashmap_hash() {
+        // Both resolve paths must produce identical cache keys.
+        let mut hm = HashMap::new();
+        hm.insert("host".to_string(), "web-1".to_string());
+        hm.insert("region".to_string(), "us-east".to_string());
+        let pairs = [("host", "web-1"), ("region", "us-east")];
+        assert_eq!(
+            fast_series_hash("cpu", &hm),
+            fast_series_hash_pairs("cpu", &pairs)
+        );
+    }
+
+    #[test]
+    fn fused_ingest_shares_series_with_labeled_path() {
+        let engine = Engine::new(test_dir("fused"), 100, 64, 8, usize::MAX);
+
+        // Create the series through the labeled (HashMap) path first
+        let mut hm = HashMap::new();
+        hm.insert("host".to_string(), "a".to_string());
+        let labeled_id = engine.resolve_cached("cpu", &hm).unwrap();
+
+        // Fused ingest of the same series must resolve to the same id
+        let body = b"cpu{host=\"a\"} 1.5 1700000000000\ncpu{host=\"a\"} 2.5\n";
+        let (count, errors) = engine.ingest_prometheus(body, 1_700_000_100).unwrap();
+        assert_eq!((count, errors), (2, 0));
+
+        assert_eq!(engine.series_read().series_count(), 1);
+        let points = engine
+            .query_range_by_id(labeled_id, 0, i64::MAX)
+            .unwrap();
+        // ms timestamp normalized to seconds; missing timestamp -> default
+        assert_eq!(points, vec![(1_700_000_000, 1.5), (1_700_000_100, 2.5)]);
+    }
+
+    #[test]
+    fn fused_ingest_duplicate_label_keys_keep_last() {
+        let engine = Engine::new(test_dir("fused_dup"), 100, 64, 8, usize::MAX);
+        let (count, errors) = engine
+            .ingest_prometheus(b"m{k=\"1\",k=\"2\"} 5.0\n", 100)
+            .unwrap();
+        assert_eq!((count, errors), (1, 0));
+
+        let reg = engine.series_read();
+        let info = reg.info_for(1).unwrap();
+        assert_eq!(info.labels.get("k").map(String::as_str), Some("2"));
+    }
 
     #[test]
     fn sweep_file_cache_drops_only_expired_entries() {

@@ -137,6 +137,27 @@ defmodule TimelessMetrics.IngestWorker do
   end
 
   defp process_prometheus(body, store, registry, shard_count) do
+    rust? = :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust
+
+    if rust? and TimelessMetrics.PrometheusNif.available?() do
+      # Fused ingest: parse -> resolve -> write inside the engine in one
+      # NIF call, no per-sample terms. This path has no relabeling,
+      # matching the previous parse+write_batch behavior.
+      case TimelessMetrics.RustEngine.ingest_prometheus(store, body) do
+        {:ok, count, _errors} when count > 0 ->
+          TimelessMetrics.Stats.incr_writes(store)
+          TimelessMetrics.Stats.add_points(store, count)
+          :ok
+
+        _ ->
+          :ok
+      end
+    else
+      process_prometheus_grouped(body, store, registry, shard_count)
+    end
+  end
+
+  defp process_prometheus_grouped(body, store, registry, shard_count) do
     {groups, count, _errors, _samples} =
       if TimelessMetrics.PrometheusNif.available?() do
         parse_prometheus_nif(body)
@@ -149,8 +170,8 @@ defmodule TimelessMetrics.IngestWorker do
       TimelessMetrics.Stats.add_points(store, count)
 
       if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust do
-        # Rust engine: route through the optimized write path so steady-state
-        # ingest uses the Elixir-side series-id cache and raw batch NIF.
+        # Rust engine without the parser NIF: optimized write path using
+        # the Elixir-side series-id cache and raw batch NIF.
         entries =
           Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
             Enum.map(batch, fn {ts, val} -> {metric_name, labels, ts, val} end)

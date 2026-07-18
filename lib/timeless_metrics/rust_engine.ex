@@ -129,6 +129,25 @@ defmodule TimelessMetrics.RustEngine do
     end
   end
 
+  @doc """
+  Fused Prometheus ingest: parse exposition text and write all samples in a
+  single NIF call — no per-sample terms cross the boundary. Samples without
+  a timestamp get `default_ts` (epoch seconds).
+
+  Returns `{:ok, count, errors}` where count is samples written and errors
+  is malformed line count. Note: labels are stored exactly as scraped; no
+  relabeling is applied. Callers needing relabel rules must use
+  `PrometheusNif.parse/1` + `write_batch/2` instead.
+  """
+  def ingest_prometheus(store, body, default_ts \\ nil) do
+    ts = default_ts || System.os_time(:second)
+
+    case Nif.engine_ingest_prometheus(ref(store), body, ts) |> normalize_nif_result() do
+      {:ok, {count, errors}} -> {:ok, count, errors}
+      {:error, _} = error -> error
+    end
+  end
+
   def flush(store) do
     case Nif.engine_flush(ref(store))
          |> normalize_nif_result() do
