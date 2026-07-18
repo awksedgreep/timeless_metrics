@@ -18,9 +18,14 @@
 #           forwarding costs ~13-18% at saturation; use "host" for engine
 #           ceilings, "published" to match the i185 bank config
 #   SCALES  device counts, default "5000 12500 25000 50000" (series = 20x)
+#   DATA_MODE "hostdir" (default, bind-mount a /tmp dir — tmpfs on the Linux
+#           bank machines) or "tmpfs" (tmpfs inside the container — use on
+#           macOS podman machine, where a host bind mount goes through
+#           virtiofs and bottlenecks flush I/O)
 set -u
 IMAGE=${IMAGE:-ghcr.io/awksedgreep/timeless-stack:latest}
 NETWORK=${NETWORK:-published}
+DATA_MODE=${DATA_MODE:-hostdir}
 SCALES=${SCALES:-"5000 12500 25000 50000"}
 OUT=${1:-bench_bank_$(date +%Y%m%d_%H%M)}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,10 +36,16 @@ if [ "$NETWORK" = "host" ]; then NETFLAGS="--network=host"; else NETFLAGS="-p 84
 
 for DEVICES in $SCALES; do
   LOG="$OUT/bank_${DEVICES}dev.log"
-  DATA=$(mktemp -d /tmp/tms_bench_data.XXXX)
+  if [ "$DATA_MODE" = "tmpfs" ]; then
+    DATA=""
+    DATAFLAGS="--mount type=tmpfs,destination=/data"
+  else
+    DATA=$(mktemp -d /tmp/tms_bench_data.XXXX)
+    DATAFLAGS="-v $DATA:/data"
+  fi
   echo "=== SCALE $DEVICES devices ($((DEVICES * 20)) series) ==="
   podman run -d --rm --name tms-bench $NETFLAGS \
-    -v "$DATA":/data \
+    $DATAFLAGS \
     -e SECRET_KEY_BASE="$SECRET" \
     -e PHX_HOST=localhost \
     "$IMAGE" >/dev/null || { echo "container start failed"; exit 1; }
@@ -58,7 +69,8 @@ for DEVICES in $SCALES; do
   grep -E 'TM peak|Saturated' "$LOG"
 
   podman rm -f -t 2 tms-bench >/dev/null 2>&1
-  rm -rf "$DATA" /tmp/tm_client_scratch
+  [ -n "$DATA" ] && rm -rf "$DATA"
+  rm -rf /tmp/tm_client_scratch
   sleep 3
 done
 echo "=== BANK COMPLETE — logs in $OUT ==="
