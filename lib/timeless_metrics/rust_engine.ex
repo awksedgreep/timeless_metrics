@@ -438,8 +438,7 @@ defmodule TimelessMetrics.RustEngine do
   # (see PrometheusNif); copying on the rare insert path keeps cache
   # entries from pinning entire request bodies in memory.
   defp copy_key({metric, labels}) do
-    {:binary.copy(metric),
-     Map.new(labels, fn {k, v} -> {:binary.copy(k), :binary.copy(v)} end)}
+    {:binary.copy(metric), Map.new(labels, fn {k, v} -> {:binary.copy(k), :binary.copy(v)} end)}
   end
 
   defp normalize_entries(entries, now) do
