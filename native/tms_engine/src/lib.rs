@@ -1962,8 +1962,9 @@ where
     (count, errors)
 }
 
-/// Bench NIF: parse the body and return only (entry_count, error_count).
-/// Zero BEAM terms are built per entry — this measures pure parse cost.
+/// Bench-only NIF: parse the body and return (entry_count, error_count).
+/// Zero BEAM terms are built per entry — this measures pure parse cost
+/// (see bench/ingest_segments_bench.exs).
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_prometheus_count(body: Binary) -> (usize, usize) {
     parse_prom_body_visit(body.as_slice(), |_name, _labels, _value, _ts| {})
@@ -1979,16 +1980,18 @@ fn slice_term<'a>(env: Env<'a>, body: &Binary<'a>, slice: &[u8]) -> Term<'a> {
         .encode(env)
 }
 
-/// Bench NIF: parse the body and build the same term shape as the C++
-/// parser: {[{name, [{k, v}, ...], value, ts}, ...], error_count}.
-/// The delta vs parse_prometheus_count is the term-materialization cost.
+/// Production Prometheus text parser (replaced the former C++ NIF):
+/// {[{name, [{k, v}, ...], value, ts}, ...], error_count}, timestamp 0
+/// when absent.
 ///
 /// Strings are emitted as sub-binaries of the request body: O(1) each,
 /// zero copies. Trade-off: the entry terms keep the whole body binary
 /// alive until they are garbage collected — fine for transient scrape
-/// processing, wrong for long-lived storage of small pieces.
+/// processing, wrong for long-lived storage of small pieces. Anything
+/// that stores these binaries long-term must :binary.copy/1 them first
+/// (see cache_series_id in TimelessMetrics.RustEngine).
 #[rustler::nif(schedule = "DirtyCpu")]
-fn parse_prometheus_terms<'a>(
+fn parse_prometheus<'a>(
     env: Env<'a>,
     body: Binary<'a>,
 ) -> rustler::NifResult<(Term<'a>, usize)> {

@@ -430,8 +430,16 @@ defmodule TimelessMetrics.RustEngine do
   end
 
   defp cache_series_id(cache, key, series_id) do
-    true = :ets.insert(cache, {key, series_id})
+    true = :ets.insert(cache, {copy_key(key), series_id})
     series_id
+  end
+
+  # Parsed metric/label binaries are sub-binaries of the scrape body
+  # (see PrometheusNif); copying on the rare insert path keeps cache
+  # entries from pinning entire request bodies in memory.
+  defp copy_key({metric, labels}) do
+    {:binary.copy(metric),
+     Map.new(labels, fn {k, v} -> {:binary.copy(k), :binary.copy(v)} end)}
   end
 
   defp normalize_entries(entries, now) do

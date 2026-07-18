@@ -1,7 +1,7 @@
 defmodule TimelessMetrics.MixProject do
   use Mix.Project
 
-  @version "6.0.22"
+  @version "6.1.0"
 
   def project do
     [
@@ -11,22 +11,12 @@ defmodule TimelessMetrics.MixProject do
       test_ignore_filters: [&String.starts_with?(&1, "test/support/")],
       start_permanent: Mix.env() == :prod,
       compilers: [:elixir_make] ++ Mix.compilers(),
-      make_env: fn ->
-        erts_include_dir =
-          Path.join([
-            to_string(:code.root_dir()),
-            "erts-#{:erlang.system_info(:version)}",
-            "include"
-          ])
-
-        %{"ERTS_INCLUDE_DIR" => erts_include_dir}
-      end,
       make_clean: ["clean"],
       make_precompiler: {:nif, CCPrecompiler},
       make_precompiler_url:
         "https://github.com/awksedgreep/timeless_metrics/releases/download/v#{@version}/@{artefact_filename}",
-      make_precompiler_filename: "prometheus_nif",
-      make_precompiler_priv_paths: ["prometheus_nif.*", "native/tms_engine.*"],
+      make_precompiler_filename: "tms_engine",
+      make_precompiler_priv_paths: ["native/tms_engine.*"],
       make_precompiler_nif_versions: [versions: ["2.16", "2.17", "2.18"]],
       description: "Embedded time series database for Elixir with a Rust-native hot path.",
       source_url: "https://github.com/awksedgreep/timeless_metrics",
@@ -45,7 +35,6 @@ defmodule TimelessMetrics.MixProject do
         native/tms_engine/Cargo.toml
         native/tms_engine/Cargo.lock
         native/tms_engine/src
-        c_src
         Makefile
         mix.exs
         checksum.exs

@@ -350,9 +350,12 @@ defmodule TimelessMetrics.Scraper.Worker do
         TimelessMetrics.register_metric(state.store, name, type, unit: unit)
       end)
 
+      # Names are sub-binaries of the scrape body; copy before storing in
+      # long-lived state so the MapSet doesn't pin whole bodies in memory.
       %{
         state
-        | registered_names: Enum.reduce(new_names, state.registered_names, &MapSet.put(&2, &1))
+        | registered_names:
+            Enum.reduce(new_names, state.registered_names, &MapSet.put(&2, :binary.copy(&1)))
       }
     end
   end

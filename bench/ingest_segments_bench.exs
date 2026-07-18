@@ -5,16 +5,14 @@ defmodule IngestSegmentsBench do
   Isolates each stage of scrape/push ingestion to locate where time goes,
   to test the assumptions behind a possible fused parse->resolve->write NIF:
 
-    parse/cpp          C++ NIF parse (includes BEAM term materialization)
-    parse/rust-count   Rust parse only, zero terms built (bench prototype)
-    parse/rust-terms   Rust parse + same term shape as the C++ NIF
+    parse/nif          production Rust parse (includes term materialization)
+    parse/count        Rust parse only, zero terms built (bench-only NIF)
     middle/write_batch normalize + resolve (warm ETS cache) + encode + raw write
     write/raw          pre-resolved ids: encode 24B/point binary + raw write
 
   Interpretation:
-    (rust-terms - rust-count)  = exact term-materialization cost, same parser
-    (cpp - rust-count)         ~ terms + parser implementation delta
-    (write_batch - raw)        = Elixir middle (normalize/resolve/encode) cost
+    (nif - count)       = exact term-materialization cost
+    (write_batch - raw) = Elixir middle (normalize/resolve/encode) cost
 
   Usage:
     mix run bench/ingest_segments_bench.exs
@@ -35,40 +33,11 @@ defmodule IngestSegmentsBench do
     IO.puts("  Parse iters: #{@parse_iters}, write iters: #{@write_iters}")
     IO.puts("==================================================\n")
 
-    verify_parser_equivalence()
-
     for samples <- [1_000, 10_000, 50_000] do
       run_scale(samples)
     end
 
     IO.puts("Done. Raw numbers above; see moduledoc for interpretation.\n")
-  end
-
-  # ── Correctness: Rust parser must agree with C++ parser ─────────────
-
-  defp verify_parser_equivalence do
-    body = gen_body(500)
-    {cpp_entries, cpp_errors} = PrometheusNif.parse(body)
-    {rust_entries, rust_errors} = Nif.parse_prometheus_terms(body)
-    {count, count_errors} = Nif.parse_prometheus_count(body)
-
-    cpp_norm = Enum.map(cpp_entries, fn {n, l, v, t} -> {n, Map.new(l), v, t} end)
-    rust_norm = Enum.map(rust_entries, fn {n, l, v, t} -> {n, Map.new(l), v, t} end)
-
-    cond do
-      cpp_norm != rust_norm ->
-        diff = Enum.zip(cpp_norm, rust_norm) |> Enum.find(fn {a, b} -> a != b end)
-        raise "parser mismatch: #{inspect(diff, limit: 5)}"
-
-      cpp_errors != rust_errors or count_errors != cpp_errors ->
-        raise "error count mismatch: cpp=#{cpp_errors} rust=#{rust_errors} count=#{count_errors}"
-
-      count != length(cpp_norm) ->
-        raise "entry count mismatch: cpp=#{length(cpp_norm)} rust-count=#{count}"
-
-      true ->
-        IO.puts("parser equivalence: OK (#{count} entries, #{cpp_errors} errors)\n")
-    end
   end
 
   # ── Benchmark one body size ─────────────────────────────────────────
@@ -86,9 +55,8 @@ defmodule IngestSegmentsBench do
         String.pad_leading("+GC", 10)
     )
 
-    report("parse/cpp", bench(@parse_iters, fn -> PrometheusNif.parse(body) end))
-    report("parse/rust-count", bench(@parse_iters, fn -> Nif.parse_prometheus_count(body) end))
-    report("parse/rust-terms", bench(@parse_iters, fn -> Nif.parse_prometheus_terms(body) end))
+    report("parse/nif", bench(@parse_iters, fn -> PrometheusNif.parse(body) end))
+    report("parse/count", bench(@parse_iters, fn -> Nif.parse_prometheus_count(body) end))
 
     bench_writes(body, samples)
     IO.puts("")

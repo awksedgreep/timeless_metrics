@@ -50,6 +50,12 @@ defmodule TimelessMetrics.SeriesRegistry do
             id
 
           [] ->
+            # Copy before storing: parsed binaries may be sub-binaries of a
+            # large scrape body (see PrometheusNif) — don't pin it in ETS.
+            metric_name = :binary.copy(metric_name)
+            labels = Map.new(labels, fn {k, v} -> {:binary.copy(k), :binary.copy(v)} end)
+            key = {metric_name, labels}
+
             # Lock-free creation: atomically assign an ID and CAS into ETS
             id_counter = :persistent_term.get({__MODULE__, registry, :id_counter})
             id = :atomics.add_get(id_counter, 1, 1)
@@ -196,6 +202,12 @@ defmodule TimelessMetrics.SeriesRegistry do
             {:reply, id, state}
 
           [] ->
+            # Copy before storing (see get_or_create) — avoid pinning
+            # scrape bodies via sub-binary keys in long-lived state.
+            metric_name = :binary.copy(metric_name)
+            labels = Map.new(labels, fn {k, v} -> {:binary.copy(k), :binary.copy(v)} end)
+            key = {metric_name, labels}
+
             # Assign ID from counter — no SQLite on hot path
             id = state.next_id
             labels_json = encode_labels(labels)
