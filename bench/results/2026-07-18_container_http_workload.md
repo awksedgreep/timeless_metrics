@@ -5,7 +5,7 @@
 **Runtime:** rootless podman quadlet, published ports, bind-mounted /data
 **Workload:** 500 devices × 20 metrics (10K series), auto-ramp ÷2 from 4s interval, 20 query workers ramped alongside writes
 **Benchmark script:** `bench/realistic_workload.exs --tm-url http://127.0.0.1:8428 --vm-url "" --devices 500 --metrics 20`
-**Client:** separate host BEAM (pure HTTP), 22 schedulers
+**Client:** separate host BEAM (pure HTTP), Intel Core Ultra 9 185H ("i185"), 22 schedulers
 **Batch:** 1 device/POST (20 pts/request) — **HTTP-request-bound configuration**
 
 ## Summary

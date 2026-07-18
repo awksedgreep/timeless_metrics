@@ -4,7 +4,7 @@
 **Commit:** 8b57eda (Rust parser replaces C++ NIF), released as v6.1.0/v6.1.1
 **Workload:** Generated Prometheus exposition bodies, 8 labels/series
 **Benchmark script:** `bench/ingest_segments_bench.exs`
-**Machine:** Linux workstation, 22 schedulers
+**Machine:** Intel Core Ultra 9 185H ("i185"), Linux, 22 schedulers
 
 ## Context
 

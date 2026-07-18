@@ -4,7 +4,7 @@
 **Version:** 6.1.2-dev (engine_ingest_prometheus)
 **Workload:** Generated exposition bodies, 8 labels/series, warm series cache
 **Benchmark script:** `bench/ingest_segments_bench.exs`
-**Machine:** Linux workstation, 22 schedulers
+**Machine:** Intel Core Ultra 9 185H ("i185"), Linux, 22 schedulers
 
 ## What changed
 

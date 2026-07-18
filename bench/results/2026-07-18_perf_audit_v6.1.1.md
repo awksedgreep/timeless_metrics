@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-18
 **Version:** timeless_metrics 6.1.1 (Rust parser), stack image 0.6.4
-**Machine:** Linux workstation, 22 schedulers; container = rootless podman quadlet
+**Machine:** Intel Core Ultra 9 185H ("i185"), Linux, 22 schedulers; container = rootless podman quadlet
 **Purpose:** Baseline snapshot after the Rust parser swap and containerization,
 and the "before" picture for the planned fused parse→resolve→write NIF.
 

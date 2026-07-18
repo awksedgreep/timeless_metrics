@@ -2,6 +2,7 @@
 
 **Date:** 2026-07-18
 **Image:** ghcr.io/awksedgreep/timeless-stack:0.6.4 (timeless_metrics 6.1.1)
+**Machine:** Intel Core Ultra 9 185H ("i185"), Linux, 22 schedulers
 **Workload:** 50,000 devices x 20 metrics = 1.0M series, batch 50 devices/POST
 **Benchmark script:** `bench/realistic_workload.exs --devices 50000 --metrics 20 --batch 50`
 
