@@ -2,6 +2,15 @@
 
 This directory contains the current benchmark set for `timeless_metrics`.
 
+> **New machine?** Run `mise trust && mise install` in the repo root first.
+> An untrusted `mise.toml` silently falls back to the machine's global
+> Erlang/Elixir — an OTP 28 client generates ~15% less load than the
+> pinned OTP 29 toolchain and skews every HTTP benchmark low (see
+> `results/2026-07-18_cardinality_bank_14700hx_v0.6.6.md`).
+>
+> For the cross-machine cardinality bank, use `cardinality_bank.sh` —
+> methodology reference in `results/2026-07-18_cardinality_bank_i185_v0.6.5.md`.
+
 ## Benchmarks
 
 - [write_bench.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/write_bench.exs)
