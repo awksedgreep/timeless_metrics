@@ -2340,6 +2340,125 @@ fn read_exact_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Prometheus parser ────────────────────────────────────────────
+
+    /// Collect parsed entries into owned data for assertions.
+    fn parse_collect(data: &[u8]) -> (Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, f64, i64)>, usize) {
+        let mut out = Vec::new();
+        let (_count, errors) = parse_prom_body_visit(data, |name, labels, value, ts| {
+            let owned_labels = labels
+                .iter()
+                .map(|&(k, v)| (k.to_vec(), v.to_vec()))
+                .collect();
+            out.push((name.to_vec(), owned_labels, value, ts));
+        });
+        (out, errors)
+    }
+
+    #[test]
+    fn prom_parses_basic_line() {
+        let (entries, errors) = parse_collect(b"cpu{host=\"a\",dc=\"b\"} 42.5 1700000000000\n");
+        assert_eq!(errors, 0);
+        let (name, labels, value, ts) = &entries[0];
+        assert_eq!(name, b"cpu");
+        assert_eq!(labels.len(), 2);
+        assert_eq!(*value, 42.5);
+        assert_eq!(*ts, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn prom_label_scratch_does_not_leak_between_lines() {
+        // The visitor reuses one scratch Vec; a labelless line after a
+        // labeled one must see an empty slice, not the previous labels.
+        let (entries, errors) = parse_collect(b"a{k=\"v\"} 1\nb 2\n");
+        assert_eq!(errors, 0);
+        assert_eq!(entries[0].1.len(), 1);
+        assert!(entries[1].1.is_empty());
+    }
+
+    #[test]
+    fn prom_eof_mid_escape_is_error() {
+        // Body ends inside an escape sequence, no closing brace.
+        let (entries, errors) = parse_collect(b"m{k=\"v\\");
+        assert!(entries.is_empty());
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn prom_escaped_quote_kept_raw_and_truncated_at_brace() {
+        // Input line: m{k="a\"} 1 — the '}' is found before label parsing,
+        // so the escaped quote runs to the end of the label block.
+        let (entries, errors) = parse_collect(b"m{k=\"a\\\"} 1\n");
+        assert_eq!(errors, 0);
+        assert_eq!(entries[0].1[0], (b"k".to_vec(), b"a\\\"".to_vec()));
+        assert_eq!(entries[0].2, 1.0);
+    }
+
+    #[test]
+    fn prom_rejects_nonfinite_and_hex_values() {
+        for body in [
+            &b"m NaN\n"[..],
+            b"m nan\n",
+            b"m +Inf\n",
+            b"m -Inf\n",
+            b"m inf\n",
+            b"m infinity\n",
+            b"m 1e400\n",
+            // Contract decision: hex floats are not valid Prometheus even
+            // though C's strtod accepts them.
+            b"m 0x10\n",
+            b"m 0x1p3\n",
+        ] {
+            let (entries, errors) = parse_collect(body);
+            assert!(entries.is_empty(), "accepted {:?}", body);
+            assert_eq!(errors, 1, "no error for {:?}", body);
+        }
+    }
+
+    #[test]
+    fn prom_timestamp_overflow_uses_zero_sentinel() {
+        // Contract decision: an out-of-range timestamp is garbage and gets
+        // the 0 sentinel ("no timestamp"), unlike strtoll's i64::MAX
+        // saturation in the old C++ parser.
+        let (entries, errors) = parse_collect(b"m 1.0 99999999999999999999\n");
+        assert_eq!(errors, 0);
+        assert_eq!(entries[0].3, 0);
+    }
+
+    #[test]
+    fn prom_long_numeric_fields_parse() {
+        // Contract decision: no 64-byte field limit (the old C++ parser
+        // rejected numerics >= 64 chars due to a fixed stack buffer).
+        let body = format!("m {}5\n", "0".repeat(80));
+        let (entries, errors) = parse_collect(body.as_bytes());
+        assert_eq!(errors, 0);
+        assert_eq!(entries[0].2, 5.0);
+    }
+
+    #[test]
+    fn prom_error_and_skip_accounting() {
+        let body = b"# comment\n\n   \nok 1\nbad line here\n# more\nok2 2 123\n";
+        let mut count = 0;
+        let (visited, errors) = parse_prom_body_visit(body, |_, _, _, _| count += 1);
+        assert_eq!(visited, 2);
+        assert_eq!(count, 2);
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn prom_labels_edge_cases() {
+        // Trailing comma, empty value, spaces around entries.
+        let (entries, errors) = parse_collect(b"m{ a=\"\", b=\"x\" ,} 1\n");
+        assert_eq!(errors, 0);
+        assert_eq!(
+            entries[0].1,
+            vec![
+                (b"a".to_vec(), b"".to_vec()),
+                (b"b".to_vec(), b"x".to_vec())
+            ]
+        );
+    }
     use std::sync::Arc;
     use std::thread;
 
