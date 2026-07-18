@@ -25,6 +25,10 @@ const BATCH_CHUNK_SIZE: usize = 1000;
 /// How long a compressed chunk file stays in the read cache.
 const FILE_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Chunks newer than this are never compacted: the recent window keeps
+/// small chunks so narrow dashboard queries stay cheap.
+const COMPACT_MIN_AGE_SECS: i64 = 3600;
+
 // ═══════════════════════════════════════════════════════════════════════
 // Core types
 // ═══════════════════════════════════════════════════════════════════════
@@ -950,9 +954,16 @@ impl Engine {
         self.sweep_file_cache();
 
         // In raw-first mode, the same timer drives compaction of raw and
-        // undersized chunks into large pco chunks.
+        // undersized chunks into large pco chunks. Recent chunks are
+        // excluded: dashboards query recent windows, and small chunks
+        // keep those narrow reads cheap (no whole-chunk decompression).
         if self.defer_compression {
-            self.compact_partitions()?;
+            let cutoff = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+                - COMPACT_MIN_AGE_SECS;
+            self.compact_partitions(cutoff)?;
         }
 
         let now = Instant::now();
@@ -1337,15 +1348,18 @@ impl Engine {
     // ── Compaction ───────────────────────────────────────────────────
 
     /// Merge each series' raw and undersized chunks into one large pco
-    /// chunk at maximum compression. Old files are deleted only when no
-    /// index entry references them anymore (batch files are shared by
+    /// chunk at maximum compression. Only chunks entirely older than
+    /// `cutoff_ts` are eligible — the recent window stays in small/raw
+    /// chunks so narrow dashboard queries never pay whole-chunk
+    /// decompression of a large block. Old files are deleted only when
+    /// no index entry references them anymore (batch files are shared by
     /// many series). Crash window: a crash after writing the compacted
     /// chunk but before deleting the old files leaves duplicates behind
     /// for rebuild_index to pick up; acceptable for this experiment,
     /// a compaction manifest would close it for production.
-    fn compact_partitions(&self) -> EngineResult<(usize, usize)> {
-        const SMALL_CHUNK_POINTS: u32 = 32 * 1024;
-        const MAX_OUTPUT_POINTS: usize = 512 * 1024;
+    fn compact_partitions(&self, cutoff_ts: i64) -> EngineResult<(usize, usize)> {
+        const SMALL_CHUNK_POINTS: u32 = 16 * 1024;
+        const MAX_OUTPUT_POINTS: usize = 32 * 1024;
         const COMPACTION_LEVEL: usize = 12;
 
         // Group eligible chunks by series: all raw chunks, plus pco
@@ -1354,7 +1368,9 @@ impl Engine {
         {
             let index = self.index_read();
             for ((key, min_ts), meta) in index.iter() {
-                if meta.encoding == ENC_RAW || meta.point_count < SMALL_CHUNK_POINTS {
+                let eligible = meta.max_ts < cutoff_ts
+                    && (meta.encoding == ENC_RAW || meta.point_count < SMALL_CHUNK_POINTS);
+                if eligible {
                     candidates
                         .entry(*key)
                         .or_default()
@@ -2380,8 +2396,11 @@ fn engine_new(
 /// Force a compaction pass (raw/undersized chunks -> large pco chunks).
 /// Also runs automatically from the cold-flush timer in raw-first mode.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn engine_compact(resource: ResourceArc<EngineResource>) -> Result<(usize, usize), String> {
-    resource.deref().engine.compact_partitions()
+fn engine_compact(
+    resource: ResourceArc<EngineResource>,
+    cutoff_ts: i64,
+) -> Result<(usize, usize), String> {
+    resource.deref().engine.compact_partitions(cutoff_ts)
 }
 
 /// Write labeled entries: [{metric_name, %{label => value}, timestamp, value}]
@@ -2778,7 +2797,7 @@ mod tests {
         }
         assert_eq!(engine.index_read().len(), 3);
 
-        let (series, replaced) = engine.compact_partitions().unwrap();
+        let (series, replaced) = engine.compact_partitions(i64::MAX).unwrap();
         assert_eq!((series, replaced), (1, 3));
 
         // One pco chunk remains; data intact and ordered
@@ -2794,6 +2813,31 @@ mod tests {
         let points = engine.query_range_by_id(1, 0, 1000).unwrap();
         assert_eq!(points.len(), 150);
         assert!(points.windows(2).all(|w| w[0].0 <= w[1].0));
+    }
+
+    #[test]
+    fn compaction_age_gate_spares_recent_chunks() {
+        let dir = test_dir("compact_age");
+        let engine = Engine::new(dir, 100, 1, 8, usize::MAX, true);
+
+        for i in 0..50 {
+            engine.write_point(1, i, i as f64);
+        }
+        engine.flush_all().unwrap();
+        for i in 0..50 {
+            engine.write_point(1, 1000 + i, i as f64);
+        }
+        engine.flush_all().unwrap();
+
+        // Cutoff between the two chunks: only the old one is eligible
+        let (series, replaced) = engine.compact_partitions(500).unwrap();
+        assert_eq!((series, replaced), (1, 1));
+
+        let index = engine.index_read();
+        assert_eq!(index.len(), 2);
+        let encodings: Vec<u8> = index.values().map(|m| m.encoding).collect();
+        assert!(encodings.contains(&ENC_PCO), "old chunk compacted to pco");
+        assert!(encodings.contains(&ENC_RAW), "recent chunk left raw");
     }
 
     #[test]
@@ -2817,7 +2861,7 @@ mod tests {
         }
         engine.flush_all().unwrap();
 
-        let (series, _) = engine.compact_partitions().unwrap();
+        let (series, _) = engine.compact_partitions(i64::MAX).unwrap();
         assert_eq!(series, 3);
 
         for id in 1..=3 {

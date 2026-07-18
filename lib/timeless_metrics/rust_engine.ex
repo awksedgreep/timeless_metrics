@@ -157,12 +157,16 @@ defmodule TimelessMetrics.RustEngine do
   end
 
   @doc """
-  Force a compaction pass: merge raw and undersized chunks into large
-  pco chunks. Runs automatically on the cold-flush timer when the store
-  uses `defer_compression: true`. Returns `{:ok, series, chunks_replaced}`.
+  Force a compaction pass: merge raw and undersized chunks older than
+  `cutoff_ts` into large pco chunks (`:all` compacts regardless of age).
+  Runs automatically on the cold-flush timer when the store uses
+  `defer_compression: true`, sparing the last hour so narrow recent
+  queries stay on small chunks. Returns `{:ok, series, chunks_replaced}`.
   """
-  def compact(store) do
-    case Nif.engine_compact(ref(store)) |> normalize_nif_result() do
+  def compact(store, cutoff_ts \\ :all) do
+    cutoff = if cutoff_ts == :all, do: 9_223_372_036_854_775_807, else: cutoff_ts
+
+    case Nif.engine_compact(ref(store), cutoff) |> normalize_nif_result() do
       {:ok, {series, chunks}} -> {:ok, series, chunks}
       {:error, _} = error -> error
     end

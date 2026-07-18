@@ -12,7 +12,7 @@ defmodule TimelessMetrics.RustEngine.Nif do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
-  def engine_compact(_engine), do: :erlang.nif_error(:nif_not_loaded)
+  def engine_compact(_engine, _cutoff_ts), do: :erlang.nif_error(:nif_not_loaded)
 
   def engine_write_batch_labeled(_engine, _entries), do: :erlang.nif_error(:nif_not_loaded)
   def engine_write_batch_raw(_engine, _binary), do: :erlang.nif_error(:nif_not_loaded)

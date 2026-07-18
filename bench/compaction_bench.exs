@@ -79,7 +79,7 @@ defmodule CompactionBench do
 
       compact_us =
         if opts[:defer] do
-          {us, {:ok, _series, _chunks}} = :timer.tc(fn -> RustEngine.compact(store) end)
+          {us, {:ok, _series, _chunks}} = :timer.tc(fn -> RustEngine.compact(store, :all) end)
           us
         else
           0
