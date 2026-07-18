@@ -67,6 +67,12 @@ impl PartitionBuffer {
     }
 }
 
+/// Payload encoding for a chunk: pco-compressed (the durable format) or
+/// raw big-endian arrays (transient, written by deferred-compression
+/// flushes and consumed by compaction).
+const ENC_PCO: u8 = 0;
+const ENC_RAW: u8 = 1;
+
 #[derive(Clone)]
 struct ChunkMeta {
     min_ts: i64,
@@ -79,6 +85,7 @@ struct ChunkMeta {
     data_offset: u64,
     #[allow(dead_code)]
     data_len: u32,
+    encoding: u8,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -434,6 +441,9 @@ struct Engine {
     min_flush_size: usize,
     compression_level: usize,
     memory_budget: usize,
+    /// Raw-first mode: flushes write raw (uncompressed) chunks; the
+    /// periodic compactor later merges them into large pco chunks.
+    defer_compression: bool,
     partitions: DashMap<PartitionKey, PartitionBuffer>,
     index: RwLock<BTreeMap<(PartitionKey, i64), ChunkMeta>>,
     series: RwLock<SeriesRegistry>,
@@ -469,6 +479,8 @@ struct CompressedPartition {
     sum_val: f64,
     ts_compressed: Vec<u8>,
     val_compressed: Vec<u8>,
+    /// ENC_PCO or ENC_RAW — what ts_compressed/val_compressed contain.
+    encoding: u8,
 }
 
 struct ColdFlushGuard<'a> {
@@ -520,6 +532,7 @@ impl Engine {
         min_flush_size: usize,
         compression_level: usize,
         memory_budget: usize,
+        defer_compression: bool,
     ) -> Self {
         let registry = SeriesRegistry::load(&Self::series_path(&data_dir)).unwrap_or_else(|e| {
             eprintln!("WARNING: corrupt series registry, starting fresh: {}", e);
@@ -536,6 +549,7 @@ impl Engine {
             min_flush_size,
             compression_level,
             memory_budget,
+            defer_compression,
             partitions: DashMap::new(),
             index: RwLock::new(BTreeMap::new()),
             series: RwLock::new(registry),
@@ -935,6 +949,12 @@ impl Engine {
         // Piggyback on the periodic cold-flush timer to bound cache memory.
         self.sweep_file_cache();
 
+        // In raw-first mode, the same timer drives compaction of raw and
+        // undersized chunks into large pco chunks.
+        if self.defer_compression {
+            self.compact_partitions()?;
+        }
+
         let now = Instant::now();
         let cold_keys: Vec<PartitionKey> = self
             .partitions
@@ -1069,6 +1089,21 @@ impl Engine {
         timestamps: &[i64],
         values: &[f64],
     ) -> EngineResult<CompressedPartition> {
+        if self.defer_compression {
+            self.encode_partition(key, timestamps, values, ENC_RAW, self.compression_level)
+        } else {
+            self.encode_partition(key, timestamps, values, ENC_PCO, self.compression_level)
+        }
+    }
+
+    fn encode_partition(
+        &self,
+        key: &PartitionKey,
+        timestamps: &[i64],
+        values: &[f64],
+        encoding: u8,
+        level: usize,
+    ) -> EngineResult<CompressedPartition> {
         if timestamps.is_empty() || timestamps.len() != values.len() {
             return Err(format!(
                 "invalid partition payload for series {}: {} timestamps, {} values",
@@ -1095,24 +1130,33 @@ impl Engine {
             None => (timestamps, values),
         };
 
-        let config = pco::ChunkConfig::default().with_compression_level(self.compression_level);
-        let ts_compressed = match pco::standalone::simple_compress(ts_slice, &config) {
-            Ok(data) => data,
-            Err(err) => {
-                return Err(format!(
-                    "failed to compress timestamps for series {}: {err}",
-                    key.series_id
-                ));
+        let (ts_compressed, val_compressed) = if encoding == ENC_RAW {
+            let mut ts_raw = Vec::with_capacity(ts_slice.len() * 8);
+            for ts in ts_slice {
+                ts_raw.extend_from_slice(&ts.to_be_bytes());
             }
-        };
-        let val_compressed = match pco::standalone::simple_compress(val_slice, &config) {
-            Ok(data) => data,
-            Err(err) => {
-                return Err(format!(
-                    "failed to compress values for series {}: {err}",
-                    key.series_id
-                ));
+            let mut val_raw = Vec::with_capacity(val_slice.len() * 8);
+            for v in val_slice {
+                val_raw.extend_from_slice(&v.to_be_bytes());
             }
+            (ts_raw, val_raw)
+        } else {
+            let config = pco::ChunkConfig::default().with_compression_level(level);
+            let ts_compressed = pco::standalone::simple_compress(ts_slice, &config)
+                .map_err(|err| {
+                    format!(
+                        "failed to compress timestamps for series {}: {err}",
+                        key.series_id
+                    )
+                })?;
+            let val_compressed = pco::standalone::simple_compress(val_slice, &config)
+                .map_err(|err| {
+                    format!(
+                        "failed to compress values for series {}: {err}",
+                        key.series_id
+                    )
+                })?;
+            (ts_compressed, val_compressed)
         };
 
         let min_ts = ts_slice[0];
@@ -1139,6 +1183,7 @@ impl Engine {
             sum_val,
             ts_compressed,
             val_compressed,
+            encoding,
         })
     }
 
@@ -1164,7 +1209,8 @@ impl Engine {
             64 + pk_bytes.len() + cp.ts_compressed.len() + cp.val_compressed.len(),
         );
         out.extend_from_slice(b"PCO1");
-        out.push(1u8);
+        // Version byte doubles as payload encoding: 1 = pco, 2 = raw
+        out.push(if cp.encoding == ENC_RAW { 2u8 } else { 1u8 });
         out.extend_from_slice(&cp.point_count.to_be_bytes());
         out.extend_from_slice(&cp.min_ts.to_be_bytes());
         out.extend_from_slice(&cp.max_ts.to_be_bytes());
@@ -1195,6 +1241,7 @@ impl Engine {
             path,
             data_offset: 0,
             data_len: 0,
+            encoding: cp.encoding,
         })
     }
 
@@ -1230,7 +1277,10 @@ impl Engine {
         let mut out = Vec::with_capacity(offset);
 
         out.extend_from_slice(b"PCB1");
-        out.push(1u8);
+        // Version byte doubles as payload encoding for ALL partitions in
+        // the batch (flushes produce uniform encoding): 1 = pco, 2 = raw
+        let batch_encoding = partitions.first().map(|cp| cp.encoding).unwrap_or(ENC_PCO);
+        out.push(if batch_encoding == ENC_RAW { 2u8 } else { 1u8 });
         out.extend_from_slice(&n.to_be_bytes());
 
         for (i, cp) in partitions.iter().enumerate() {
@@ -1277,10 +1327,108 @@ impl Engine {
                         path: path.clone(),
                         data_offset: data_offsets[i] as u64,
                         data_len,
+                        encoding: cp.encoding,
                     },
                 )
             })
             .collect())
+    }
+
+    // ── Compaction ───────────────────────────────────────────────────
+
+    /// Merge each series' raw and undersized chunks into one large pco
+    /// chunk at maximum compression. Old files are deleted only when no
+    /// index entry references them anymore (batch files are shared by
+    /// many series). Crash window: a crash after writing the compacted
+    /// chunk but before deleting the old files leaves duplicates behind
+    /// for rebuild_index to pick up; acceptable for this experiment,
+    /// a compaction manifest would close it for production.
+    fn compact_partitions(&self) -> EngineResult<(usize, usize)> {
+        const SMALL_CHUNK_POINTS: u32 = 32 * 1024;
+        const MAX_OUTPUT_POINTS: usize = 512 * 1024;
+        const COMPACTION_LEVEL: usize = 12;
+
+        // Group eligible chunks by series: all raw chunks, plus pco
+        // chunks small enough that merging improves the ratio.
+        let mut candidates: HashMap<PartitionKey, Vec<(i64, ChunkMeta)>> = HashMap::new();
+        {
+            let index = self.index_read();
+            for ((key, min_ts), meta) in index.iter() {
+                if meta.encoding == ENC_RAW || meta.point_count < SMALL_CHUNK_POINTS {
+                    candidates
+                        .entry(*key)
+                        .or_default()
+                        .push((*min_ts, meta.clone()));
+                }
+            }
+        }
+        candidates.retain(|_, chunks| {
+            chunks.len() >= 2 || chunks.iter().any(|(_, m)| m.encoding == ENC_RAW)
+        });
+
+        if candidates.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let mut series_compacted = 0;
+        let mut chunks_replaced = 0;
+        let mut old_paths: HashSet<PathBuf> = HashSet::new();
+
+        for (key, chunks) in &candidates {
+            // Gather every point from the eligible chunks.
+            let mut per_query_cache: HashMap<PathBuf, Arc<Vec<u8>>> = HashMap::new();
+            let mut points: Vec<(i64, f64)> = Vec::new();
+            for (_, meta) in chunks {
+                points.extend(self.read_chunk_data_cached(
+                    meta,
+                    i64::MIN,
+                    i64::MAX,
+                    &mut per_query_cache,
+                )?);
+            }
+            if points.is_empty() {
+                continue;
+            }
+            points.sort_unstable_by_key(|&(ts, _)| ts);
+
+            // Write replacement chunks (already sorted; encode won't re-sort).
+            let mut new_metas: Vec<ChunkMeta> = Vec::new();
+            for slice in points.chunks(MAX_OUTPUT_POINTS) {
+                let (ts, vals): (Vec<i64>, Vec<f64>) = slice.iter().copied().unzip();
+                let cp = self.encode_partition(key, &ts, &vals, ENC_PCO, COMPACTION_LEVEL)?;
+                new_metas.push(self.write_individual_chunk(&cp)?);
+            }
+
+            // Swap index entries for this series.
+            {
+                let mut index = self.index_write();
+                for (min_ts, meta) in chunks {
+                    index.remove(&(*key, *min_ts));
+                    old_paths.insert(meta.path.clone());
+                }
+                for meta in new_metas {
+                    index.insert((*key, meta.min_ts), meta);
+                }
+            }
+
+            series_compacted += 1;
+            chunks_replaced += chunks.len();
+        }
+
+        // Delete files no longer referenced by any index entry (batch
+        // files may still hold partitions for series not compacted yet).
+        let referenced: HashSet<PathBuf> = {
+            let index = self.index_read();
+            index.values().map(|m| m.path.clone()).collect()
+        };
+        for path in old_paths {
+            if !referenced.contains(&path) {
+                self.file_cache.remove(&path);
+                let _ = fs::remove_file(&path);
+            }
+        }
+
+        Ok((series_compacted, chunks_replaced))
     }
 
     fn ensure_dir(&self, path: &std::path::Path) -> io::Result<()> {
@@ -1601,10 +1749,26 @@ impl Engine {
             Self::parse_pco1_data(&data)?
         };
 
-        let timestamps: Vec<i64> =
-            pco::standalone::simple_decompress(ts_data).map_err(|e| e.to_string())?;
-        let values: Vec<f64> =
-            pco::standalone::simple_decompress(val_data).map_err(|e| e.to_string())?;
+        let (timestamps, values): (Vec<i64>, Vec<f64>) = if meta.encoding == ENC_RAW {
+            if ts_data.len() % 8 != 0 || val_data.len() % 8 != 0 {
+                return Err(format!("raw payload misaligned in {}", meta.path.display()));
+            }
+            (
+                ts_data
+                    .chunks_exact(8)
+                    .map(|b| i64::from_be_bytes(b.try_into().unwrap()))
+                    .collect(),
+                val_data
+                    .chunks_exact(8)
+                    .map(|b| f64::from_be_bytes(b.try_into().unwrap()))
+                    .collect(),
+            )
+        } else {
+            (
+                pco::standalone::simple_decompress(ts_data).map_err(|e| e.to_string())?,
+                pco::standalone::simple_decompress(val_data).map_err(|e| e.to_string())?,
+            )
+        };
         if timestamps.len() != values.len() {
             return Err(format!(
                 "timestamp/value length mismatch in {}: {} vs {}",
@@ -1772,6 +1936,7 @@ impl Engine {
         if &fixed[0..4] != b"PCO1" {
             return Err("invalid".into());
         }
+        let encoding = if fixed[4] == 2 { ENC_RAW } else { ENC_PCO };
 
         let mut pos = 5;
         let point_count = u32::from_be_bytes(fixed[pos..pos + 4].try_into().unwrap());
@@ -1806,6 +1971,7 @@ impl Engine {
                 path: path.clone(),
                 data_offset: 0,
                 data_len: 0,
+                encoding,
             },
         )])
     }
@@ -1817,6 +1983,7 @@ impl Engine {
         if &fixed[0..4] != b"PCB1" {
             return Err("invalid".into());
         }
+        let encoding = if fixed[4] == 2 { ENC_RAW } else { ENC_PCO };
 
         let n = u32::from_be_bytes(fixed[5..9].try_into().unwrap()) as usize;
         let table_len = n
@@ -1863,6 +2030,7 @@ impl Engine {
                     path: path.clone(),
                     data_offset,
                     data_len,
+                    encoding,
                 },
             ));
         }
@@ -2190,6 +2358,7 @@ fn engine_new(
     min_flush_size: usize,
     compression_level: usize,
     memory_budget_mb: usize,
+    defer_compression: bool,
 ) -> ResourceArc<EngineResource> {
     let budget = if memory_budget_mb == 0 {
         usize::MAX
@@ -2203,8 +2372,16 @@ fn engine_new(
             min_flush_size,
             compression_level,
             budget,
+            defer_compression,
         ),
     })
+}
+
+/// Force a compaction pass (raw/undersized chunks -> large pco chunks).
+/// Also runs automatically from the cold-flush timer in raw-first mode.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn engine_compact(resource: ResourceArc<EngineResource>) -> Result<(usize, usize), String> {
+    resource.deref().engine.compact_partitions()
 }
 
 /// Write labeled entries: [{metric_name, %{label => value}, timestamp, value}]
@@ -2531,7 +2708,7 @@ mod tests {
 
     #[test]
     fn fused_ingest_shares_series_with_labeled_path() {
-        let engine = Engine::new(test_dir("fused"), 100, 64, 8, usize::MAX);
+        let engine = Engine::new(test_dir("fused"), 100, 64, 8, usize::MAX, false);
 
         // Create the series through the labeled (HashMap) path first
         let mut hm = HashMap::new();
@@ -2553,7 +2730,7 @@ mod tests {
 
     #[test]
     fn fused_ingest_duplicate_label_keys_keep_last() {
-        let engine = Engine::new(test_dir("fused_dup"), 100, 64, 8, usize::MAX);
+        let engine = Engine::new(test_dir("fused_dup"), 100, 64, 8, usize::MAX, false);
         let (count, errors) = engine
             .ingest_prometheus(b"m{k=\"1\",k=\"2\"} 5.0\n", 100)
             .unwrap();
@@ -2565,8 +2742,97 @@ mod tests {
     }
 
     #[test]
+    fn raw_first_flush_roundtrips_and_survives_restart() {
+        let dir = test_dir("raw_first");
+        let engine = Engine::new(dir.clone(), 100, 1, 8, usize::MAX, true);
+
+        for i in 0..10 {
+            engine.write_point(1, i, i as f64 * 1.5);
+        }
+        engine.flush_all().unwrap();
+
+        // Chunk on disk is raw-encoded and queryable
+        assert!(engine.index_read().values().all(|m| m.encoding == ENC_RAW));
+        assert_eq!(engine.query_range_by_id(1, 0, 100).unwrap().len(), 10);
+
+        // Restart: rebuild_index must recover the raw encoding from the
+        // version byte and still serve the data
+        let restarted = Engine::new(dir, 100, 1, 8, usize::MAX, true);
+        assert!(restarted.index_read().values().all(|m| m.encoding == ENC_RAW));
+        let points = restarted.query_range_by_id(1, 0, 100).unwrap();
+        assert_eq!(points.len(), 10);
+        assert_eq!(points[3], (3, 4.5));
+    }
+
+    #[test]
+    fn compaction_merges_raw_chunks_into_one_pco_chunk() {
+        let dir = test_dir("compact");
+        let engine = Engine::new(dir, 100, 1, 8, usize::MAX, true);
+
+        // Three separate raw flushes -> three raw chunks for series 1
+        for round in 0..3 {
+            for i in 0..50 {
+                engine.write_point(1, round * 50 + i, i as f64);
+            }
+            engine.flush_all().unwrap();
+        }
+        assert_eq!(engine.index_read().len(), 3);
+
+        let (series, replaced) = engine.compact_partitions().unwrap();
+        assert_eq!((series, replaced), (1, 3));
+
+        // One pco chunk remains; data intact and ordered
+        let (encoding, point_count) = {
+            let index = engine.index_read();
+            assert_eq!(index.len(), 1);
+            let meta = index.values().next().unwrap();
+            (meta.encoding, meta.point_count)
+        };
+        assert_eq!(encoding, ENC_PCO);
+        assert_eq!(point_count, 150);
+
+        let points = engine.query_range_by_id(1, 0, 1000).unwrap();
+        assert_eq!(points.len(), 150);
+        assert!(points.windows(2).all(|w| w[0].0 <= w[1].0));
+    }
+
+    #[test]
+    fn compaction_handles_shared_batch_files() {
+        let dir = test_dir("compact_batch");
+        // min_flush_size high so flush_all routes partitions into a
+        // shared PCB1 batch file
+        let engine = Engine::new(dir, 10_000, 1_000, 8, usize::MAX, true);
+
+        for series in 1..=3 {
+            for i in 0..20 {
+                engine.write_point(series, i, i as f64);
+            }
+        }
+        engine.flush_all().unwrap();
+        assert_eq!(engine.index_read().len(), 3);
+
+        // A second raw chunk for series 1, then compact everything.
+        for i in 20..40 {
+            engine.write_point(1, i, i as f64);
+        }
+        engine.flush_all().unwrap();
+
+        let (series, _) = engine.compact_partitions().unwrap();
+        assert_eq!(series, 3);
+
+        for id in 1..=3 {
+            let expected = if id == 1 { 40 } else { 20 };
+            assert_eq!(
+                engine.query_range_by_id(id, 0, 1000).unwrap().len(),
+                expected
+            );
+        }
+        assert!(engine.index_read().values().all(|m| m.encoding == ENC_PCO));
+    }
+
+    #[test]
     fn sweep_file_cache_drops_only_expired_entries() {
-        let engine = Engine::new(test_dir("sweep"), 100, 64, 8, usize::MAX);
+        let engine = Engine::new(test_dir("sweep"), 100, 64, 8, usize::MAX, false);
         let fresh = PathBuf::from("/fresh.tms");
         let stale = PathBuf::from("/stale.tms");
 
@@ -2721,7 +2987,7 @@ mod tests {
     #[test]
     fn flush_sorts_out_of_order_points() {
         let dir = test_dir("sorts");
-        let engine = Engine::new(dir, 100, 64, 8, usize::MAX);
+        let engine = Engine::new(test_dir("fused"), 100, 64, 8, usize::MAX, false);
         let key = PartitionKey { series_id: 1 };
 
         engine.write_point(1, 30, 3.0);
@@ -2748,7 +3014,7 @@ mod tests {
     fn restart_does_not_overwrite_existing_batch_files() {
         let dir = test_dir("restart");
 
-        let engine = Engine::new(dir.clone(), 100, 64, 8, usize::MAX);
+        let engine = Engine::new(dir.clone(), 100, 64, 8, usize::MAX, false);
         for i in 0..10 {
             engine.write_point(1, i, i as f64);
         }
@@ -2756,7 +3022,7 @@ mod tests {
         let first_files = fs::read_dir(dir.join("batches")).unwrap().count();
         assert_eq!(first_files, 1);
 
-        let engine = Engine::new(dir.clone(), 100, 64, 8, usize::MAX);
+        let engine = Engine::new(dir.clone(), 100, 64, 8, usize::MAX, false);
         for i in 10..20 {
             engine.write_point(1, i, i as f64);
         }
@@ -2775,7 +3041,7 @@ mod tests {
     #[test]
     fn rebuild_index_finds_individual_chunks_without_reading_payloads() {
         let dir = test_dir("rebuild_individual");
-        let engine = Engine::new(dir.clone(), 1, 1, 8, usize::MAX);
+        let engine = Engine::new(dir.clone(), 1, 1, 8, usize::MAX, false);
 
         for i in 0..5 {
             engine.write_point(1, i, i as f64);
@@ -2783,7 +3049,7 @@ mod tests {
         engine.flush_all().unwrap();
         assert_eq!(engine.query_range_by_id(1, 0, 10).unwrap().len(), 5);
 
-        let restarted = Engine::new(dir, 1, 1, 8, usize::MAX);
+        let restarted = Engine::new(dir, 1, 1, 8, usize::MAX, false);
         assert_eq!(restarted.index_read().len(), 1);
         assert_eq!(restarted.query_range_by_id(1, 0, 10).unwrap().len(), 5);
     }
@@ -2791,7 +3057,7 @@ mod tests {
     #[test]
     fn rebuild_index_finds_batched_chunks_without_reading_payloads() {
         let dir = test_dir("rebuild_batched");
-        let engine = Engine::new(dir.clone(), 100, 64, 8, usize::MAX);
+        let engine = Engine::new(dir.clone(), 100, 64, 8, usize::MAX, false);
 
         for series_id in 1..=3 {
             for ts in 0..3 {
@@ -2801,7 +3067,7 @@ mod tests {
         engine.flush_all().unwrap();
         assert_eq!(engine.index_read().len(), 3);
 
-        let restarted = Engine::new(dir, 100, 64, 8, usize::MAX);
+        let restarted = Engine::new(dir, 100, 64, 8, usize::MAX, false);
         assert_eq!(restarted.index_read().len(), 3);
         assert_eq!(restarted.query_range_by_id(1, 0, 10).unwrap().len(), 3);
         assert_eq!(restarted.query_range_by_id(2, 0, 10).unwrap().len(), 3);
@@ -2833,7 +3099,7 @@ mod tests {
     #[test]
     fn concurrent_flushes_do_not_drop_writes() {
         let dir = test_dir("concurrent");
-        let engine = Arc::new(Engine::new(dir, 10_000, 64, 8, usize::MAX));
+        let engine = Arc::new(Engine::new(dir, 10_000, 64, 8, usize::MAX, false));
 
         let writer = {
             let engine = Arc::clone(&engine);
@@ -2866,7 +3132,7 @@ mod tests {
     #[test]
     fn hot_partition_is_only_queued_once_before_flush() {
         let dir = test_dir("dedupe_queue");
-        let engine = Engine::new(dir, 3, 1, 8, usize::MAX);
+        let engine = Engine::new(dir, 3, 1, 8, usize::MAX, false);
 
         for i in 0..10 {
             engine.write_point(1, i, i as f64);
@@ -2898,7 +3164,7 @@ mod tests {
     #[test]
     fn pending_flush_that_does_not_drain_can_requeue_later() {
         let dir = test_dir("dedupe_queue_min_size");
-        let engine = Engine::new(dir, 3, 5, 8, usize::MAX);
+        let engine = Engine::new(dir, 3, 5, 8, usize::MAX, false);
 
         for i in 0..3 {
             engine.write_point(1, i, i as f64);
@@ -2980,7 +3246,7 @@ mod tests {
     #[test]
     fn raw_batch_rejects_invalid_payload_length() {
         let dir = test_dir("raw_batch");
-        let engine = Engine::new(dir, 100, 64, 8, usize::MAX);
+        let engine = Engine::new(dir, 100, 64, 8, usize::MAX, false);
 
         let err = engine.write_batch_raw(&[1, 2, 3]).unwrap_err();
         assert!(err.contains("not a multiple"));
@@ -2989,7 +3255,7 @@ mod tests {
     #[test]
     fn rewrite_after_retention_recreates_deleted_series_dir() {
         let dir = test_dir("retention_rewrite");
-        let engine = Engine::new(dir.clone(), 1, 1, 8, usize::MAX);
+        let engine = Engine::new(dir.clone(), 1, 1, 8, usize::MAX, false);
 
         engine.write_point(1, 1, 1.0);
         engine.flush_all().unwrap();

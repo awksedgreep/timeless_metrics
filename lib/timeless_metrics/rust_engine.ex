@@ -156,6 +156,18 @@ defmodule TimelessMetrics.RustEngine do
     end
   end
 
+  @doc """
+  Force a compaction pass: merge raw and undersized chunks into large
+  pco chunks. Runs automatically on the cold-flush timer when the store
+  uses `defer_compression: true`. Returns `{:ok, series, chunks_replaced}`.
+  """
+  def compact(store) do
+    case Nif.engine_compact(ref(store)) |> normalize_nif_result() do
+      {:ok, {series, chunks}} -> {:ok, series, chunks}
+      {:error, _} = error -> error
+    end
+  end
+
   def query_raw(store, metric_name, labels, opts) do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
@@ -381,7 +393,8 @@ defmodule TimelessMetrics.RustEngine do
         @flush_threshold,
         @min_flush_size,
         @compression_level,
-        @memory_budget_mb
+        @memory_budget_mb,
+        Keyword.get(opts, :defer_compression, false)
       )
 
     cache =

@@ -7,9 +7,12 @@ defmodule TimelessMetrics.RustEngine.Nif do
         _flush_threshold,
         _min_flush_size,
         _compression_level,
-        _memory_budget_mb
+        _memory_budget_mb,
+        _defer_compression
       ),
       do: :erlang.nif_error(:nif_not_loaded)
+
+  def engine_compact(_engine), do: :erlang.nif_error(:nif_not_loaded)
 
   def engine_write_batch_labeled(_engine, _entries), do: :erlang.nif_error(:nif_not_loaded)
   def engine_write_batch_raw(_engine, _binary), do: :erlang.nif_error(:nif_not_loaded)

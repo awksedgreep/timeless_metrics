@@ -118,7 +118,10 @@ defmodule TimelessMetrics.Supervisor do
         # SQLite for admin (alerts, annotations, metadata, scrape targets, rollups)
         {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
         # Rust engine for hot data path
-        {TimelessMetrics.RustEngine, store: name, data_dir: data_dir}
+        {TimelessMetrics.RustEngine,
+         store: name,
+         data_dir: data_dir,
+         defer_compression: Keyword.get(opts, :defer_compression, false)}
       ] ++
         if(memory_only, do: [], else: ingest_workers) ++
         alert_children ++
