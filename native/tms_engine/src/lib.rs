@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use rayon::prelude::*;
-use rustler::{Atom, Binary, ResourceArc, Term};
+use rustler::types::tuple::make_tuple;
+use rustler::{Atom, Binary, Encoder, Env, ResourceArc, Term};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -1838,15 +1839,6 @@ enum AggFn {
 // cost can be measured separately.
 // ═══════════════════════════════════════════════════════════════════════
 
-/// One parsed sample. The slices borrow from the request body — parsing
-/// allocates nothing per entry except the label Vec.
-struct PromEntry<'a> {
-    name: &'a [u8],
-    labels: Vec<(&'a [u8], &'a [u8])>,
-    value: f64,
-    timestamp: i64,
-}
-
 /// Parse a Prometheus sample value. Rejects NaN/Inf — the BEAM cannot
 /// represent non-finite floats.
 fn parse_prom_value(bytes: &[u8]) -> Option<f64> {
@@ -1855,10 +1847,9 @@ fn parse_prom_value(bytes: &[u8]) -> Option<f64> {
     v.is_finite().then_some(v)
 }
 
-/// Parse the inside of a `{key="val",key2="val2"}` label block.
+/// Parse the inside of a `{key="val",key2="val2"}` label block into `out`.
 /// Escaped characters in values are kept raw, as the C++ parser does.
-fn parse_prom_labels(mut s: &[u8]) -> Vec<(&[u8], &[u8])> {
-    let mut labels = Vec::new();
+fn parse_prom_labels_into<'a>(mut s: &'a [u8], out: &mut Vec<(&'a [u8], &'a [u8])>) {
     loop {
         while let Some((&b, rest)) = s.split_first() {
             if b == b' ' || b == b',' {
@@ -1893,15 +1884,18 @@ fn parse_prom_labels(mut s: &[u8]) -> Vec<(&[u8], &[u8])> {
                 i += 1;
             }
         }
-        labels.push((key, &s[..i]));
+        out.push((key, &s[..i]));
         s = if i < s.len() { &s[i + 1..] } else { &s[i..] };
     }
-    labels
 }
 
-/// Parse one exposition line. Returns None for comments, blanks, and
-/// malformed lines — the caller decides which of those count as errors.
-fn parse_prom_line(line: &[u8]) -> Option<PromEntry<'_>> {
+/// Parse one exposition line. Labels land in the caller's scratch buffer;
+/// returns (name, value, timestamp) on success. Returns None for comments,
+/// blanks, and malformed lines — the caller decides which count as errors.
+fn parse_prom_line_into<'a>(
+    line: &'a [u8],
+    labels: &mut Vec<(&'a [u8], &'a [u8])>,
+) -> Option<(&'a [u8], f64, i64)> {
     let line = line.trim_ascii();
     if line.is_empty() || line[0] == b'#' {
         return None;
@@ -1915,13 +1909,14 @@ fn parse_prom_line(line: &[u8]) -> Option<PromEntry<'_>> {
     }
     let name = &line[..name_end];
 
-    let (labels, rest) = if line[name_end] == b'{' {
+    let rest = if line[name_end] == b'{' {
         let close = name_end
             + 1
             + line[name_end + 1..].iter().position(|&b| b == b'}')?;
-        (parse_prom_labels(&line[name_end + 1..close]), &line[close + 1..])
+        parse_prom_labels_into(&line[name_end + 1..close], labels);
+        &line[close + 1..]
     } else {
-        (Vec::new(), &line[name_end..])
+        &line[name_end..]
     };
 
     let mut fields = rest
@@ -1934,20 +1929,28 @@ fn parse_prom_line(line: &[u8]) -> Option<PromEntry<'_>> {
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
 
-    Some(PromEntry {
-        name,
-        labels,
-        value,
-        timestamp,
-    })
+    Some((name, value, timestamp))
 }
 
-fn parse_prom_body(data: &[u8]) -> (Vec<PromEntry<'_>>, usize) {
-    let mut entries = Vec::new();
+/// Streaming parse: invokes `sink` once per valid sample with borrowed
+/// views into `data`. One scratch label buffer is reused across all lines,
+/// so steady-state parsing performs zero heap allocations. Returns
+/// (entry_count, error_count).
+fn parse_prom_body_visit<'a, F>(data: &'a [u8], mut sink: F) -> (usize, usize)
+where
+    F: FnMut(&'a [u8], &[(&'a [u8], &'a [u8])], f64, i64),
+{
+    let mut labels: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+    let mut count = 0;
     let mut errors = 0;
+
     for line in data.split(|&b| b == b'\n') {
-        match parse_prom_line(line) {
-            Some(entry) => entries.push(entry),
+        labels.clear();
+        match parse_prom_line_into(line, &mut labels) {
+            Some((name, value, timestamp)) => {
+                count += 1;
+                sink(name, &labels, value, timestamp);
+            }
             None => {
                 let t = line.trim_ascii();
                 if !t.is_empty() && t[0] != b'#' {
@@ -1956,47 +1959,63 @@ fn parse_prom_body(data: &[u8]) -> (Vec<PromEntry<'_>>, usize) {
             }
         }
     }
-    (entries, errors)
+    (count, errors)
 }
 
 /// Bench NIF: parse the body and return only (entry_count, error_count).
 /// Zero BEAM terms are built per entry — this measures pure parse cost.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn parse_prometheus_count(body: Binary) -> (usize, usize) {
-    let (entries, errors) = parse_prom_body(body.as_slice());
-    (entries.len(), errors)
+    parse_prom_body_visit(body.as_slice(), |_name, _labels, _value, _ts| {})
+}
+
+/// Make a zero-copy sub-binary term for a parse slice. The slice is
+/// guaranteed to point into `body`, so (offset, len) is always in range.
+/// The resulting term shares the body's bytes — no allocation, no copy.
+fn slice_term<'a>(env: Env<'a>, body: &Binary<'a>, slice: &[u8]) -> Term<'a> {
+    let offset = slice.as_ptr() as usize - body.as_slice().as_ptr() as usize;
+    body.make_subbinary(offset, slice.len())
+        .expect("parse slice within body")
+        .encode(env)
 }
 
 /// Bench NIF: parse the body and build the same term shape as the C++
 /// parser: {[{name, [{k, v}, ...], value, ts}, ...], error_count}.
 /// The delta vs parse_prometheus_count is the term-materialization cost.
+///
+/// Strings are emitted as sub-binaries of the request body: O(1) each,
+/// zero copies. Trade-off: the entry terms keep the whole body binary
+/// alive until they are garbage collected — fine for transient scrape
+/// processing, wrong for long-lived storage of small pieces.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn parse_prometheus_terms(
-    body: Binary,
-) -> (Vec<(String, Vec<(String, String)>, f64, i64)>, usize) {
-    let (entries, errors) = parse_prom_body(body.as_slice());
-    let terms = entries
-        .into_iter()
-        .map(|e| {
-            let labels = e
-                .labels
-                .into_iter()
-                .map(|(k, v)| {
-                    (
-                        String::from_utf8_lossy(k).into_owned(),
-                        String::from_utf8_lossy(v).into_owned(),
-                    )
-                })
-                .collect();
-            (
-                String::from_utf8_lossy(e.name).into_owned(),
-                labels,
-                e.value,
-                e.timestamp,
-            )
-        })
-        .collect();
-    (terms, errors)
+fn parse_prometheus_terms<'a>(
+    env: Env<'a>,
+    body: Binary<'a>,
+) -> rustler::NifResult<(Term<'a>, usize)> {
+    let mut list = Term::list_new_empty(env);
+    let mut pair_scratch: Vec<Term<'a>> = Vec::with_capacity(16);
+
+    let (_count, errors) = parse_prom_body_visit(body.as_slice(), |name, labels, value, ts| {
+        pair_scratch.clear();
+        for &(k, v) in labels {
+            pair_scratch.push(make_tuple(
+                env,
+                &[slice_term(env, &body, k), slice_term(env, &body, v)],
+            ));
+        }
+        let entry = make_tuple(
+            env,
+            &[
+                slice_term(env, &body, name),
+                pair_scratch.encode(env),
+                value.encode(env),
+                ts.encode(env),
+            ],
+        );
+        list = list.list_prepend(entry);
+    });
+
+    Ok((list.list_reverse()?, errors))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
