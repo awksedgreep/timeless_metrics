@@ -22,6 +22,9 @@ type EngineResult<T> = Result<T, String>;
 
 const BATCH_CHUNK_SIZE: usize = 1000;
 
+/// How long a compressed chunk file stays in the read cache.
+const FILE_CACHE_TTL: Duration = Duration::from_secs(60);
+
 // ═══════════════════════════════════════════════════════════════════════
 // Core types
 // ═══════════════════════════════════════════════════════════════════════
@@ -764,6 +767,14 @@ impl Engine {
         Ok(())
     }
 
+    /// Drop expired file-cache entries. The read path only evicts entries
+    /// it happens to touch after expiry, so a file read once and never
+    /// again would stay resident forever without this periodic sweep.
+    fn sweep_file_cache(&self) {
+        self.file_cache
+            .retain(|_, (cached_at, _)| cached_at.elapsed() < FILE_CACHE_TTL);
+    }
+
     fn flush_cold(&self, max_idle_secs: u64) -> EngineResult<(usize, usize, usize)> {
         if self
             .cold_flush_running
@@ -776,6 +787,9 @@ impl Engine {
         let _guard = ColdFlushGuard {
             flag: &self.cold_flush_running,
         };
+
+        // Piggyback on the periodic cold-flush timer to bound cache memory.
+        self.sweep_file_cache();
 
         let now = Instant::now();
         let cold_keys: Vec<PartitionKey> = self
@@ -1416,7 +1430,7 @@ impl Engine {
         let data: Arc<Vec<u8>> = if let Some(d) = per_query_cache.get(&meta.path) {
             Arc::clone(d)
         } else if let Some(entry) = self.file_cache.get(&meta.path) {
-            if entry.0.elapsed() < Duration::from_secs(60) {
+            if entry.0.elapsed() < FILE_CACHE_TTL {
                 Arc::clone(&entry.1)
             } else {
                 drop(entry);
@@ -2343,6 +2357,29 @@ fn read_exact_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_file_cache_drops_only_expired_entries() {
+        let engine = Engine::new(test_dir("sweep"), 100, 64, 8, usize::MAX);
+        let fresh = PathBuf::from("/fresh.tms");
+        let stale = PathBuf::from("/stale.tms");
+
+        engine
+            .file_cache
+            .insert(fresh.clone(), (Instant::now(), Arc::new(vec![1u8])));
+        engine.file_cache.insert(
+            stale.clone(),
+            (
+                Instant::now() - (FILE_CACHE_TTL + Duration::from_secs(60)),
+                Arc::new(vec![2u8]),
+            ),
+        );
+
+        engine.sweep_file_cache();
+
+        assert!(engine.file_cache.contains_key(&fresh));
+        assert!(!engine.file_cache.contains_key(&stale));
+    }
 
     // ── Prometheus parser ────────────────────────────────────────────
 
