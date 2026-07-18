@@ -43,14 +43,23 @@ series' raw + undersized chunks into large pco chunks at level 12.
 - Disk write amplification ~7x raw-vs-final (trivial on NVMe; note for
   modest disks). Raw window on disk is bounded by compaction cadence.
 
-## Next steps before merge
+## Merge readiness (updated same day)
 
-1. Startup dedup or manifest for the crash window
-2. Honor the existing TIMELESS_DEFER_COMPRESSION config end to end
-3. Rerun the 1M-series workload with defer on — expect the 3.9M pts/s
-   saturation wall to move
-4. Codec shootout in the compaction slot (pco@12 vs ALP/Vortex) on real
-   website chunk data
+1. ~~Crash window~~ CLOSED: compaction manifest protocol — replacement
+   chunks written as .pending (invisible to rebuild_index), manifest
+   records renames+deletions durably before either happens, startup
+   recovery completes or abandons cleanly. Crash-simulation tests cover
+   both sides of the manifest write. Compaction is also single-flight
+   guarded (timer + explicit NIF can no longer race).
+2. ~~TIMELESS_DEFER_COMPRESSION~~ already wired end to end
+   (runtime.exs -> application.ex -> supervisor -> engine_new).
+
+Post-merge follow-ups (not blockers):
+- Rerun the 1M-series workload with defer on — expect the 3.9M pts/s
+  saturation wall to move
+- Codec shootout in the compaction slot (pco@12 vs ALP/Vortex) on real
+  website chunk data
+- Time-bucketed compaction outputs if mid-window latency ever matters
 
 ## Query regression verification (added same day)
 

@@ -457,6 +457,7 @@ struct Engine {
     batch_counter: AtomicUsize,
     instance_id: u128,
     cold_flush_running: AtomicBool,
+    compaction_running: AtomicBool,
     /// Fast resolution cache: hash(metric, labels) → series_id.
     /// Persists across batches — steady-state scraping is pure cache hits.
     resolve_cache: DashMap<u64, i64>,
@@ -563,9 +564,13 @@ impl Engine {
             batch_counter: AtomicUsize::new(0),
             instance_id,
             cold_flush_running: AtomicBool::new(false),
+            compaction_running: AtomicBool::new(false),
             resolve_cache: DashMap::new(),
             file_cache: DashMap::new(),
         };
+        // Finish any compaction interrupted by a crash BEFORE scanning
+        // files into the index, so superseded chunks never resurface.
+        Self::recover_compaction_manifest(&engine.data_dir);
         engine.rebuild_index();
         engine
     }
@@ -1201,6 +1206,20 @@ impl Engine {
     // ── Individual chunk writer (PCO1) ───────────────────────────────
 
     fn write_individual_chunk(&self, cp: &CompressedPartition) -> EngineResult<ChunkMeta> {
+        let (meta, _written) = self.write_individual_chunk_at(cp, false)?;
+        Ok(meta)
+    }
+
+    /// Write a chunk file. With `pending`, the file is left at
+    /// `<final>.pending` — invisible to rebuild_index — and the caller
+    /// renames it to the final path later (compaction manifest protocol).
+    /// The returned meta always carries the FINAL path; the second value
+    /// is the path actually on disk.
+    fn write_individual_chunk_at(
+        &self,
+        cp: &CompressedPartition,
+        pending: bool,
+    ) -> EngineResult<(ChunkMeta, PathBuf)> {
         let series_id_str = cp.key.series_id.to_string();
         let file_id = self.next_file_id();
 
@@ -1239,21 +1258,30 @@ impl Engine {
         fs::File::create(&tmp_path)
             .and_then(|mut file| file.write_all(&out))
             .map_err(|err| format!("failed to write chunk {}: {err}", path.display()))?;
-        fs::rename(&tmp_path, &path)
-            .map_err(|err| format!("failed to rename chunk {}: {err}", path.display()))?;
 
-        Ok(ChunkMeta {
-            min_ts: cp.min_ts,
-            max_ts: cp.max_ts,
-            point_count: cp.point_count,
-            min_val: cp.min_val,
-            max_val: cp.max_val,
-            sum_val: cp.sum_val,
-            path,
-            data_offset: 0,
-            data_len: 0,
-            encoding: cp.encoding,
-        })
+        let written = if pending {
+            path.with_extension("pco1.pending")
+        } else {
+            path.clone()
+        };
+        fs::rename(&tmp_path, &written)
+            .map_err(|err| format!("failed to rename chunk {}: {err}", written.display()))?;
+
+        Ok((
+            ChunkMeta {
+                min_ts: cp.min_ts,
+                max_ts: cp.max_ts,
+                point_count: cp.point_count,
+                min_val: cp.min_val,
+                max_val: cp.max_val,
+                sum_val: cp.sum_val,
+                path,
+                data_offset: 0,
+                data_len: 0,
+                encoding: cp.encoding,
+            },
+            written,
+        ))
     }
 
     // ── Batched chunk writer (PCB1) ──────────────────────────────────
@@ -1347,20 +1375,36 @@ impl Engine {
 
     // ── Compaction ───────────────────────────────────────────────────
 
-    /// Merge each series' raw and undersized chunks into one large pco
-    /// chunk at maximum compression. Only chunks entirely older than
-    /// `cutoff_ts` are eligible — the recent window stays in small/raw
-    /// chunks so narrow dashboard queries never pay whole-chunk
-    /// decompression of a large block. Old files are deleted only when
-    /// no index entry references them anymore (batch files are shared by
-    /// many series). Crash window: a crash after writing the compacted
-    /// chunk but before deleting the old files leaves duplicates behind
-    /// for rebuild_index to pick up; acceptable for this experiment,
-    /// a compaction manifest would close it for production.
+    /// Merge each series' raw and undersized chunks into large pco chunks
+    /// at maximum compression. Only chunks entirely older than `cutoff_ts`
+    /// are eligible — the recent window stays in small/raw chunks so
+    /// narrow dashboard queries never pay whole-chunk decompression.
+    ///
+    /// Crash safety (manifest protocol): replacement chunks are written
+    /// as `.pending` files (invisible to rebuild_index), then a manifest
+    /// records the renames and deletions before either happens. A crash
+    /// at any point either leaves the pre-compaction state (stray
+    /// .pending files are swept at startup) or is completed by
+    /// `recover_compaction_manifest` on the next start. Old files are
+    /// deleted only when no surviving index entry references them (batch
+    /// files are shared across series).
     fn compact_partitions(&self, cutoff_ts: i64) -> EngineResult<(usize, usize)> {
         const SMALL_CHUNK_POINTS: u32 = 16 * 1024;
         const MAX_OUTPUT_POINTS: usize = 32 * 1024;
         const COMPACTION_LEVEL: usize = 12;
+
+        // Single-flight: the cold-flush timer and the explicit NIF may
+        // both call in; one compaction at a time.
+        if self
+            .compaction_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok((0, 0));
+        }
+        let _guard = ColdFlushGuard {
+            flag: &self.compaction_running,
+        };
 
         // Group eligible chunks by series: all raw chunks, plus pco
         // chunks small enough that merging improves the ratio.
@@ -1386,15 +1430,15 @@ impl Engine {
             return Ok((0, 0));
         }
 
-        let mut series_compacted = 0;
-        let mut chunks_replaced = 0;
-        let mut old_paths: HashSet<PathBuf> = HashSet::new();
+        // Phase 1: write every replacement chunk as .pending — nothing
+        // is visible to queries or rebuild_index yet.
+        let mut plans: Vec<(PartitionKey, Vec<(i64, ChunkMeta)>, Vec<ChunkMeta>)> = Vec::new();
+        let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
 
-        for (key, chunks) in &candidates {
-            // Gather every point from the eligible chunks.
+        for (key, chunks) in candidates {
             let mut per_query_cache: HashMap<PathBuf, Arc<Vec<u8>>> = HashMap::new();
             let mut points: Vec<(i64, f64)> = Vec::new();
-            for (_, meta) in chunks {
+            for (_, meta) in &chunks {
                 points.extend(self.read_chunk_data_cached(
                     meta,
                     i64::MIN,
@@ -1407,44 +1451,135 @@ impl Engine {
             }
             points.sort_unstable_by_key(|&(ts, _)| ts);
 
-            // Write replacement chunks (already sorted; encode won't re-sort).
             let mut new_metas: Vec<ChunkMeta> = Vec::new();
             for slice in points.chunks(MAX_OUTPUT_POINTS) {
                 let (ts, vals): (Vec<i64>, Vec<f64>) = slice.iter().copied().unzip();
-                let cp = self.encode_partition(key, &ts, &vals, ENC_PCO, COMPACTION_LEVEL)?;
-                new_metas.push(self.write_individual_chunk(&cp)?);
+                let cp = self.encode_partition(&key, &ts, &vals, ENC_PCO, COMPACTION_LEVEL)?;
+                let (meta, written) = self.write_individual_chunk_at(&cp, true)?;
+                renames.push((written, meta.path.clone()));
+                new_metas.push(meta);
             }
+            plans.push((key, chunks, new_metas));
+        }
 
-            // Swap index entries for this series.
-            {
-                let mut index = self.index_write();
-                for (min_ts, meta) in chunks {
+        if plans.is_empty() {
+            return Ok((0, 0));
+        }
+
+        // Old files are deletable only if no surviving (non-replaced)
+        // index entry still references them.
+        let removed: HashSet<(PartitionKey, i64)> = plans
+            .iter()
+            .flat_map(|(key, chunks, _)| chunks.iter().map(move |(ts, _)| (*key, *ts)))
+            .collect();
+        let deletable: HashSet<PathBuf> = {
+            let index = self.index_read();
+            let survivors: HashSet<&PathBuf> = index
+                .iter()
+                .filter(|(entry_key, _)| !removed.contains(entry_key))
+                .map(|(_, m)| &m.path)
+                .collect();
+            plans
+                .iter()
+                .flat_map(|(_, chunks, _)| chunks.iter().map(|(_, m)| m.path.clone()))
+                .filter(|p| !survivors.contains(p))
+                .collect()
+        };
+
+        // Phase 2: durable intent, then execute. From here, a crash is
+        // completed by recovery at next startup.
+        self.write_compaction_manifest(&renames, &deletable)?;
+
+        for (pending, final_path) in &renames {
+            fs::rename(pending, final_path).map_err(|err| {
+                format!("failed to finalize chunk {}: {err}", final_path.display())
+            })?;
+        }
+
+        {
+            let mut index = self.index_write();
+            for (key, chunks, new_metas) in &plans {
+                for (min_ts, _) in chunks {
                     index.remove(&(*key, *min_ts));
-                    old_paths.insert(meta.path.clone());
                 }
                 for meta in new_metas {
-                    index.insert((*key, meta.min_ts), meta);
+                    index.insert((*key, meta.min_ts), meta.clone());
                 }
             }
-
-            series_compacted += 1;
-            chunks_replaced += chunks.len();
         }
 
-        // Delete files no longer referenced by any index entry (batch
-        // files may still hold partitions for series not compacted yet).
-        let referenced: HashSet<PathBuf> = {
-            let index = self.index_read();
-            index.values().map(|m| m.path.clone()).collect()
+        for path in &deletable {
+            self.file_cache.remove(path);
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_file(Self::manifest_path(&self.data_dir));
+
+        let series_compacted = plans.len();
+        let chunks_replaced = plans.iter().map(|(_, chunks, _)| chunks.len()).sum();
+        Ok((series_compacted, chunks_replaced))
+    }
+
+    fn manifest_path(data_dir: &std::path::Path) -> PathBuf {
+        data_dir.join("compaction.manifest")
+    }
+
+    /// Durably record compaction intent: pending->final renames and the
+    /// old files to delete. Written via tmp+rename so it is atomic.
+    fn write_compaction_manifest(
+        &self,
+        renames: &[(PathBuf, PathBuf)],
+        deletes: &HashSet<PathBuf>,
+    ) -> EngineResult<()> {
+        let mut out = String::new();
+        for (pending, final_path) in renames {
+            out.push_str(&format!(
+                "P\t{}\t{}\n",
+                pending.display(),
+                final_path.display()
+            ));
+        }
+        for path in deletes {
+            out.push_str(&format!("D\t{}\n", path.display()));
+        }
+
+        let manifest = Self::manifest_path(&self.data_dir);
+        let tmp = manifest.with_extension("manifest.tmp");
+        fs::write(&tmp, out).map_err(|e| format!("failed to write manifest: {e}"))?;
+        fs::rename(&tmp, &manifest).map_err(|e| format!("failed to commit manifest: {e}"))?;
+        Ok(())
+    }
+
+    /// Complete an interrupted compaction at startup: finish any pending
+    /// renames, delete superseded files, remove the manifest. Called
+    /// before rebuild_index. If no manifest exists this is a no-op
+    /// (stray .pending files from a pre-manifest crash are swept by
+    /// scan_dir_recursive instead, leaving the pre-compaction state).
+    fn recover_compaction_manifest(data_dir: &std::path::Path) {
+        let manifest = Self::manifest_path(data_dir);
+        let Ok(content) = fs::read_to_string(&manifest) else {
+            return;
         };
-        for path in old_paths {
-            if !referenced.contains(&path) {
-                self.file_cache.remove(&path);
-                let _ = fs::remove_file(&path);
+
+        for line in content.lines() {
+            let mut parts = line.split('\t');
+            match parts.next() {
+                Some("P") => {
+                    if let (Some(pending), Some(final_path)) = (parts.next(), parts.next()) {
+                        let pending = PathBuf::from(pending);
+                        if pending.exists() {
+                            let _ = fs::rename(&pending, PathBuf::from(final_path));
+                        }
+                    }
+                }
+                Some("D") => {
+                    if let Some(path) = parts.next() {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+                _ => {}
             }
         }
-
-        Ok((series_compacted, chunks_replaced))
+        let _ = fs::remove_file(&manifest);
     }
 
     fn ensure_dir(&self, path: &std::path::Path) -> io::Result<()> {
@@ -1937,7 +2072,10 @@ impl Engine {
                             }
                         }
                     }
-                    Some("tmp") => {
+                    // tmp: interrupted chunk write; pending: compaction
+                    // that crashed before its manifest — old chunks are
+                    // still intact, so dropping the orphan is correct.
+                    Some("tmp") | Some("pending") => {
                         let _ = fs::remove_file(&path);
                     }
                     _ => {}
@@ -2813,6 +2951,73 @@ mod tests {
         let points = engine.query_range_by_id(1, 0, 1000).unwrap();
         assert_eq!(points.len(), 150);
         assert!(points.windows(2).all(|w| w[0].0 <= w[1].0));
+    }
+
+    #[test]
+    fn compaction_crash_after_manifest_recovers_without_duplicates() {
+        let dir = test_dir("compact_crash");
+        let engine = Engine::new(dir.clone(), 100, 1, 8, usize::MAX, true);
+
+        // Two raw chunks for series 1
+        for round in 0..2 {
+            for i in 0..50 {
+                engine.write_point(1, round * 50 + i, i as f64);
+            }
+            engine.flush_all().unwrap();
+        }
+        let old_paths: Vec<PathBuf> =
+            engine.index_read().values().map(|m| m.path.clone()).collect();
+        assert_eq!(old_paths.len(), 2);
+
+        // Simulate a crash mid-compaction, right after the manifest is
+        // durably written: pending chunk exists, manifest exists, but no
+        // rename/index-swap/deletion has happened.
+        let points = engine.query_range_by_id(1, 0, 1000).unwrap();
+        let (ts, vals): (Vec<i64>, Vec<f64>) = points.iter().copied().unzip();
+        let key = PartitionKey { series_id: 1 };
+        let cp = engine.encode_partition(&key, &ts, &vals, ENC_PCO, 12).unwrap();
+        let (meta, written) = engine.write_individual_chunk_at(&cp, true).unwrap();
+        let deletable: HashSet<PathBuf> = old_paths.iter().cloned().collect();
+        engine
+            .write_compaction_manifest(&[(written, meta.path.clone())], &deletable)
+            .unwrap();
+        drop(engine); // "crash"
+
+        // Restart: recovery must finalize the pending chunk, delete the
+        // superseded files, and leave exactly the compacted data.
+        let restarted = Engine::new(dir.clone(), 100, 1, 8, usize::MAX, true);
+        assert!(!Engine::manifest_path(&dir).exists());
+        assert!(meta.path.exists());
+        assert!(old_paths.iter().all(|p| !p.exists()));
+        assert_eq!(restarted.index_read().len(), 1);
+        let recovered = restarted.query_range_by_id(1, 0, 1000).unwrap();
+        assert_eq!(recovered.len(), 100, "no duplicates, no loss");
+    }
+
+    #[test]
+    fn compaction_crash_before_manifest_leaves_prior_state() {
+        let dir = test_dir("compact_crash_early");
+        let engine = Engine::new(dir.clone(), 100, 1, 8, usize::MAX, true);
+
+        for i in 0..50 {
+            engine.write_point(1, i, i as f64);
+        }
+        engine.flush_all().unwrap();
+
+        // Simulate a crash after writing a pending chunk but BEFORE the
+        // manifest: the orphan .pending must be swept, old data intact.
+        let points = engine.query_range_by_id(1, 0, 1000).unwrap();
+        let (ts, vals): (Vec<i64>, Vec<f64>) = points.iter().copied().unzip();
+        let key = PartitionKey { series_id: 1 };
+        let cp = engine.encode_partition(&key, &ts, &vals, ENC_PCO, 12).unwrap();
+        let (_meta, written) = engine.write_individual_chunk_at(&cp, true).unwrap();
+        assert!(written.exists());
+        drop(engine); // "crash"
+
+        let restarted = Engine::new(dir, 100, 1, 8, usize::MAX, true);
+        assert!(!written.exists(), "orphan pending file swept");
+        assert_eq!(restarted.index_read().len(), 1);
+        assert_eq!(restarted.query_range_by_id(1, 0, 1000).unwrap().len(), 50);
     }
 
     #[test]
