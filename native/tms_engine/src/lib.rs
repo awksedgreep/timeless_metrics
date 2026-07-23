@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +42,13 @@ type Labels = BTreeMap<String, String>;
 struct PartitionKey {
     series_id: i64,
 }
+
+/// Chunk index key. The trailing sequence number is a per-engine
+/// monotonic id (not persisted): two chunks for the same series may
+/// legitimately share a min_ts (backfill, duplicate timestamps across
+/// flush boundaries, compaction output), and a two-field key would let
+/// the second insert silently shadow the first.
+type ChunkKey = (PartitionKey, i64, u64);
 
 /// Full identity of a series for reverse lookups and label queries.
 #[derive(Clone)]
@@ -449,7 +456,10 @@ struct Engine {
     /// periodic compactor later merges them into large pco chunks.
     defer_compression: bool,
     partitions: DashMap<PartitionKey, PartitionBuffer>,
-    index: RwLock<BTreeMap<(PartitionKey, i64), ChunkMeta>>,
+    index: RwLock<BTreeMap<ChunkKey, ChunkMeta>>,
+    /// Source of the ChunkKey sequence field. In-memory only — restart
+    /// recovery re-assigns fresh values while scanning.
+    chunk_seq: AtomicU64,
     series: RwLock<SeriesRegistry>,
     created_dirs: Mutex<HashSet<PathBuf>>,
     flush_queue: Mutex<Vec<PartitionKey>>,
@@ -499,12 +509,16 @@ impl Drop for ColdFlushGuard<'_> {
 }
 
 impl Engine {
-    fn index_read(&self) -> RwLockReadGuard<'_, BTreeMap<(PartitionKey, i64), ChunkMeta>> {
+    fn index_read(&self) -> RwLockReadGuard<'_, BTreeMap<ChunkKey, ChunkMeta>> {
         self.index.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn index_write(&self) -> RwLockWriteGuard<'_, BTreeMap<(PartitionKey, i64), ChunkMeta>> {
+    fn index_write(&self) -> RwLockWriteGuard<'_, BTreeMap<ChunkKey, ChunkMeta>> {
         self.index.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn next_chunk_seq(&self) -> u64 {
+        self.chunk_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     fn series_read(&self) -> RwLockReadGuard<'_, SeriesRegistry> {
@@ -562,6 +576,7 @@ impl Engine {
             flush_queue: Mutex::new(Vec::new()),
             buffer_memory: AtomicUsize::new(0),
             batch_counter: AtomicUsize::new(0),
+            chunk_seq: AtomicU64::new(0),
             instance_id,
             cold_flush_running: AtomicBool::new(false),
             compaction_running: AtomicBool::new(false),
@@ -909,7 +924,10 @@ impl Engine {
             {
                 let cp = self.compress_partition(&key, &timestamps, &values)?;
                 let meta = self.write_individual_chunk(&cp)?;
-                self.index.write().unwrap().insert((key, meta.min_ts), meta);
+                self.index
+                    .write()
+                    .unwrap()
+                    .insert((key, meta.min_ts, self.next_chunk_seq()), meta);
                 count += 1;
             } else {
                 self.clear_flush_queued(&key);
@@ -929,7 +947,7 @@ impl Engine {
             self.index
                 .write()
                 .unwrap()
-                .insert((*key, meta.min_ts), meta);
+                .insert((*key, meta.min_ts, self.next_chunk_seq()), meta);
         }
         Ok(())
     }
@@ -1002,7 +1020,7 @@ impl Engine {
             let metas = self.write_batched_chunk(batch)?;
             let mut index = self.index_write();
             for (key, meta) in metas {
-                index.insert((key, meta.min_ts), meta);
+                index.insert((key, meta.min_ts, self.next_chunk_seq()), meta);
             }
             files_written += 1;
         }
@@ -1046,7 +1064,7 @@ impl Engine {
                 let metas = self.write_batched_chunk(batch)?;
                 let mut index = self.index_write();
                 for (key, meta) in metas {
-                    index.insert((key, meta.min_ts), meta);
+                    index.insert((key, meta.min_ts, self.next_chunk_seq()), meta);
                 }
             }
         }
@@ -1085,7 +1103,7 @@ impl Engine {
         if !all_metas.is_empty() {
             let mut index = self.index_write();
             for (key, meta) in all_metas {
-                index.insert((key, meta.min_ts), meta);
+                index.insert((key, meta.min_ts, self.next_chunk_seq()), meta);
             }
         }
         self.save_series()?;
@@ -1408,17 +1426,17 @@ impl Engine {
 
         // Group eligible chunks by series: all raw chunks, plus pco
         // chunks small enough that merging improves the ratio.
-        let mut candidates: HashMap<PartitionKey, Vec<(i64, ChunkMeta)>> = HashMap::new();
+        let mut candidates: HashMap<PartitionKey, Vec<(ChunkKey, ChunkMeta)>> = HashMap::new();
         {
             let index = self.index_read();
-            for ((key, min_ts), meta) in index.iter() {
+            for (chunk_key, meta) in index.iter() {
                 let eligible = meta.max_ts < cutoff_ts
                     && (meta.encoding == ENC_RAW || meta.point_count < SMALL_CHUNK_POINTS);
                 if eligible {
                     candidates
-                        .entry(*key)
+                        .entry(chunk_key.0)
                         .or_default()
-                        .push((*min_ts, meta.clone()));
+                        .push((*chunk_key, meta.clone()));
                 }
             }
         }
@@ -1432,7 +1450,7 @@ impl Engine {
 
         // Phase 1: write every replacement chunk as .pending — nothing
         // is visible to queries or rebuild_index yet.
-        let mut plans: Vec<(PartitionKey, Vec<(i64, ChunkMeta)>, Vec<ChunkMeta>)> = Vec::new();
+        let mut plans: Vec<(PartitionKey, Vec<(ChunkKey, ChunkMeta)>, Vec<ChunkMeta>)> = Vec::new();
         let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
 
         for (key, chunks) in candidates {
@@ -1468,9 +1486,9 @@ impl Engine {
 
         // Old files are deletable only if no surviving (non-replaced)
         // index entry still references them.
-        let removed: HashSet<(PartitionKey, i64)> = plans
+        let removed: HashSet<ChunkKey> = plans
             .iter()
-            .flat_map(|(key, chunks, _)| chunks.iter().map(move |(ts, _)| (*key, *ts)))
+            .flat_map(|(_, chunks, _)| chunks.iter().map(|(chunk_key, _)| *chunk_key))
             .collect();
         let deletable: HashSet<PathBuf> = {
             let index = self.index_read();
@@ -1499,11 +1517,11 @@ impl Engine {
         {
             let mut index = self.index_write();
             for (key, chunks, new_metas) in &plans {
-                for (min_ts, _) in chunks {
-                    index.remove(&(*key, *min_ts));
+                for (chunk_key, _) in chunks {
+                    index.remove(chunk_key);
                 }
                 for meta in new_metas {
-                    index.insert((*key, meta.min_ts), meta.clone());
+                    index.insert((*key, meta.min_ts, self.next_chunk_seq()), meta.clone());
                 }
             }
         }
@@ -1699,8 +1717,8 @@ impl Engine {
         let matching: Vec<ChunkMeta> = {
             let index = self.index_read();
             index
-                .range((pk, i64::MIN)..)
-                .take_while(|((k, _), _)| k == &pk)
+                .range((pk, i64::MIN, u64::MIN)..)
+                .take_while(|((k, _, _), _)| k == &pk)
                 .filter(|(_, meta)| meta.min_ts <= t_end && meta.max_ts >= t_start)
                 .map(|(_, meta)| meta.clone())
                 .collect()
@@ -1784,8 +1802,8 @@ impl Engine {
         let chunks: Vec<ChunkMeta> = {
             let index = self.index_read();
             index
-                .range((pk, i64::MIN)..)
-                .take_while(|((k, _), _)| k == &pk)
+                .range((pk, i64::MIN, u64::MIN)..)
+                .take_while(|((k, _, _), _)| k == &pk)
                 .filter(|(_, meta)| meta.min_ts <= t_end && meta.max_ts >= t_start)
                 .map(|(_, meta)| meta.clone())
                 .collect()
@@ -1990,10 +2008,10 @@ impl Engine {
     fn delete_before(&self, before_ts: i64) -> (usize, usize, Vec<String>) {
         let mut index = self.index_write();
 
-        let to_remove: Vec<(PartitionKey, i64)> = index
+        let to_remove: Vec<ChunkKey> = index
             .iter()
             .filter(|(_, meta)| meta.max_ts < before_ts)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| *k)
             .collect();
 
         let entries_removed = to_remove.len();
@@ -2042,12 +2060,12 @@ impl Engine {
         for dir_name in &["chunks", "batches"] {
             let dir = self.data_dir.join(dir_name);
             if dir.exists() {
-                Self::scan_dir_recursive(&dir, &mut index);
+                self.scan_dir_recursive(&dir, &mut index);
             }
         }
     }
 
-    fn scan_dir_recursive(dir: &PathBuf, index: &mut BTreeMap<(PartitionKey, i64), ChunkMeta>) {
+    fn scan_dir_recursive(&self, dir: &PathBuf, index: &mut BTreeMap<ChunkKey, ChunkMeta>) {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -2055,20 +2073,20 @@ impl Engine {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                Self::scan_dir_recursive(&path, index);
+                self.scan_dir_recursive(&path, index);
             } else {
                 match path.extension().and_then(|e| e.to_str()) {
                     Some("pco1") => {
                         if let Ok(entries) = Self::read_pco1_header(&path) {
                             for (pk, meta) in entries {
-                                index.insert((pk, meta.min_ts), meta);
+                                index.insert((pk, meta.min_ts, self.next_chunk_seq()), meta);
                             }
                         }
                     }
                     Some("pcb1") => {
                         if let Ok(entries) = Self::read_pcb1_headers(&path) {
                             for (pk, meta) in entries {
-                                index.insert((pk, meta.min_ts), meta);
+                                index.insert((pk, meta.min_ts, self.next_chunk_seq()), meta);
                             }
                         }
                     }
@@ -3245,11 +3263,10 @@ mod tests {
         engine.flush_all().unwrap();
 
         let meta = engine
-            .index
-            .read()
-            .unwrap()
-            .get(&(key, 10))
-            .cloned()
+            .index_read()
+            .range((key, 10, u64::MIN)..)
+            .next()
+            .map(|(_, m)| m.clone())
             .unwrap();
         assert_eq!(meta.min_ts, 10);
         assert_eq!(meta.max_ts, 30);
@@ -3257,6 +3274,32 @@ mod tests {
             engine.query_range_by_id(1, 0, 100).unwrap(),
             vec![(10, 1.0), (20, 2.0), (30, 3.0)]
         );
+    }
+
+    #[test]
+    fn duplicate_min_ts_chunks_do_not_shadow() {
+        // Two flush cycles producing chunks with the same (series, min_ts)
+        // — e.g. backfill re-ingesting an overlapping export. Both chunks
+        // must stay queryable, in memory and across restart.
+        let dir = test_dir("dup_min_ts");
+        let engine = Engine::new(dir.clone(), 100, 1, 8, usize::MAX, false);
+
+        engine.write_point(1, 100, 1.0);
+        engine.flush_all().unwrap(); // chunk A: min_ts=100
+        engine.write_point(1, 100, 2.0);
+        engine.write_point(1, 200, 3.0);
+        engine.flush_all().unwrap(); // chunk B: min_ts=100
+
+        assert_eq!(engine.index_read().len(), 2);
+        let points = engine.query_range_by_id(1, 0, 1000).unwrap();
+        assert_eq!(
+            points.iter().map(|&(ts, _)| ts).collect::<Vec<_>>(),
+            vec![100, 100, 200]
+        );
+
+        let restarted = Engine::new(dir, 100, 1, 8, usize::MAX, false);
+        assert_eq!(restarted.index_read().len(), 2);
+        assert_eq!(restarted.query_range_by_id(1, 0, 1000).unwrap().len(), 3);
     }
 
     #[test]
