@@ -136,7 +136,20 @@ defmodule VMDiff do
         ~s|g_sparse{host="a"} #{5.0 + i} #{ts_ms}|
       end
 
-    Enum.join(List.flatten(lines) ++ sparse, "\n")
+    # info-style metric (one per host, extra label) and a per-host+core
+    # metric (many series per host) to exercise group_left
+    extra =
+      for host <- ["a", "b"], i <- 0..239 do
+        ts_ms = (base + i * 15) * 1000
+
+        [
+          ~s|host_info{host="#{host}",os="linux-#{host}"} 1 #{ts_ms}|,
+          ~s|core_load{host="#{host}",core="0"} #{1.0 + i * 0.01} #{ts_ms}|,
+          ~s|core_load{host="#{host}",core="1"} #{2.0 + i * 0.01} #{ts_ms}|
+        ]
+      end
+
+    Enum.join(List.flatten(lines) ++ sparse ++ List.flatten(extra), "\n")
   end
 
   defp import_both!(body) do
@@ -254,7 +267,19 @@ defmodule VMDiff do
       ~s|label_replace(g_ramp, "host", "", "nope", "missing.*")|,
       ~s|label_join(g_ramp, "hj", "-", "host", "host")|,
       ~s|count_values("v", g_const)|,
-      ~s|count_values("v", floor(g_ramp / 100))|
+      ~s|count_values("v", floor(g_ramp / 100))|,
+      # Phase 2C: vector matching
+      "g_ramp / on(host) g_const",
+      "g_ramp / ignoring(host) g_const",
+      "g_ramp * on(host) group_left g_const",
+      "core_load / on(host) group_left g_const",
+      ~s|core_load * on(host) group_left(os) host_info|,
+      "g_const * on(host) group_right core_load",
+      "g_ramp > on(host) g_const",
+      "g_ramp and on(host) g_const",
+      "g_ramp or on(host) g_const",
+      "g_ramp unless on(host) g_sparse",
+      "sum by (host) (core_load) / on(host) g_const"
     ]
   end
 
@@ -266,8 +291,16 @@ defmodule VMDiff do
 
     verdict =
       case {vm, tl} do
-        {{:ok, vm_body}, {:ok, tl_body}} -> diff_bodies(vm_body, tl_body)
-        {vm_err, tl_err} -> {:transport, vm_err, tl_err}
+        {{:ok, vm_body}, {:ok, tl_body}} ->
+          diff_bodies(vm_body, tl_body)
+
+        # both reject the query (e.g. many-to-many matching) — that's parity
+        {{:error, {vm_code, _}}, {:error, {tl_code, _}}}
+        when vm_code in 400..499 and tl_code in 400..499 ->
+          :ok
+
+        {vm_err, tl_err} ->
+          {:transport, vm_err, tl_err}
       end
 
     tag = if verdict == :ok, do: "ok  ", else: "DIFF"

@@ -168,7 +168,14 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     # label manipulation + count_values (Phase 2B)
     ~s|label_replace(cpu, "h2", "$1", "host", "(.*)")|,
     ~s|label_join(cpu, "hj", "-", "host")|,
-    ~s|count_values("v", cpu)|
+    ~s|count_values("v", cpu)|,
+    # vector matching (Phase 2C)
+    "cpu + on(host) mem",
+    "cpu + ignoring(cpu) mem",
+    "cpu / on(host) group_left mem",
+    "cpu > on(host) mem",
+    "cpu and on(host) mem",
+    "cpu or ignoring(host) mem"
   ]
 
   # ❌ Rejected with a message naming the construct (not a generic parse error)
@@ -177,9 +184,6 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     "cpu @ start()",
     "cpu[5m:1m]",
     "(rate(cpu[1m]))[5m:]",
-    "cpu + on(host) mem",
-    "cpu + ignoring(cpu) mem",
-    "cpu / on(host) group_left mem",
     "limitk(2, cpu)",
     "limit_ratio(0.5, cpu)",
     "mad_over_time(cpu[1m])",

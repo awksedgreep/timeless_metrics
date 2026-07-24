@@ -146,17 +146,19 @@ defmodule TimelessMetrics.PromQLTest do
   describe "parse/1 - binary operators" do
     test "scalar division (bug report regression)" do
       {:ok, ast} = PromQL.parse("cpu_usage / 10")
-      assert {:binop, :div, false, {:selector, %{metric: "cpu_usage"}}, {:number, 10.0}} = ast
+
+      assert {:binop, :div, %{bool: false}, {:selector, %{metric: "cpu_usage"}}, {:number, 10.0}} =
+               ast
     end
 
     test "scalar multiplication" do
       {:ok, ast} = PromQL.parse("ifHCInOctets * 8")
-      assert {:binop, :mul, false, _, {:number, 8.0}} = ast
+      assert {:binop, :mul, %{bool: false}, _, {:number, 8.0}} = ast
     end
 
     test "parenthesized aggregation with arithmetic (bug report regression)" do
       {:ok, ast} = PromQL.parse("(avg(cpu_usage)) / 10")
-      assert {:binop, :div, false, {:agg, :avg, nil, nil, _}, {:number, 10.0}} = ast
+      assert {:binop, :div, %{bool: false}, {:agg, :avg, nil, nil, _}, {:number, 10.0}} = ast
     end
 
     test "threshold comparison" do
@@ -165,7 +167,8 @@ defmodule TimelessMetrics.PromQLTest do
           "max(max_over_time(cpu_usage_user{hostname=~\"host_0\"}[1h])) by (hostname) > 90"
         )
 
-      assert {:binop, :gt, false, {:agg, :max, {:by, ["hostname"]}, nil, _}, {:number, 90.0}} =
+      assert {:binop, :gt, %{bool: false}, {:agg, :max, {:by, ["hostname"]}, nil, _},
+              {:number, 90.0}} =
                ast
     end
 
@@ -175,22 +178,24 @@ defmodule TimelessMetrics.PromQLTest do
           "max(max_over_time(cpu_usage_user{hostname=\"host_0\"}[1h])) by (hostname) < 10.5"
         )
 
-      assert {:binop, :lt, false, _, {:number, 10.5}} = ast
+      assert {:binop, :lt, %{bool: false}, _, {:number, 10.5}} = ast
     end
 
     test "bool modifier" do
       {:ok, ast} = PromQL.parse("cpu_usage > bool 90")
-      assert {:binop, :gt, true, _, {:number, 90.0}} = ast
+      assert {:binop, :gt, %{bool: true}, _, {:number, 90.0}} = ast
     end
 
     test "operator precedence: mul binds tighter than add" do
       {:ok, ast} = PromQL.parse("a + b * 2")
-      assert {:binop, :add, false, _, {:binop, :mul, false, _, {:number, 2.0}}} = ast
+
+      assert {:binop, :add, %{bool: false}, _, {:binop, :mul, %{bool: false}, _, {:number, 2.0}}} =
+               ast
     end
 
     test "vector-vector arithmetic parses" do
       {:ok, ast} = PromQL.parse("errors_total / requests_total")
-      assert {:binop, :div, false, {:selector, _}, {:selector, _}} = ast
+      assert {:binop, :div, %{bool: false}, {:selector, _}, {:selector, _}} = ast
     end
   end
 
@@ -308,7 +313,8 @@ defmodule TimelessMetrics.PromQLTest do
           "max(max_over_time(cpu_usage_user{hostname=~\"host_.*\"}[1h])) by (hostname) > 90"
         )
 
-      assert {:binop, :gt, false, {:agg, :max, {:by, ["hostname"]}, nil, _}, {:number, 90.0}} =
+      assert {:binop, :gt, %{bool: false}, {:agg, :max, {:by, ["hostname"]}, nil, _},
+              {:number, 90.0}} =
                ast
     end
   end
@@ -347,9 +353,17 @@ defmodule TimelessMetrics.PromQLTest do
       assert {:error, _} = PromQL.parse("cpu_usage cpu_usage")
     end
 
-    test "vector matching modifiers are rejected with a clear message" do
-      assert {:error, msg} = PromQL.parse("a / on (host) b")
-      assert msg =~ "on/ignoring"
+    test "vector matching modifiers parse into the matching spec" do
+      assert {:ok, {:binop, :div, %{matching: %{mode: :on, labels: ["host"], group: nil}}, _, _}} =
+               PromQL.parse("a / on (host) b")
+
+      assert {:ok,
+              {:binop, :mul,
+               %{matching: %{mode: :ignoring, labels: ["x"], group: {:left, ["y"]}}}, _, _}} =
+               PromQL.parse("a * ignoring (x) group_left (y) b")
+
+      assert {:error, msg} = PromQL.parse("a * group_left b")
+      assert msg =~ "must follow on"
     end
 
     test "subqueries are rejected" do

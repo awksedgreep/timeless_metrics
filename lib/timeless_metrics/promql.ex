@@ -421,9 +421,9 @@ defmodule TimelessMetrics.PromQL do
   end
 
   defp parse_or_loop(left, [{:kw, :or} | rest]) do
-    with {:ok, rest} <- reject_vector_matching(rest),
+    with {:ok, matching, rest} <- parse_matching(rest),
          {:ok, right, rest2} <- parse_and(rest) do
-      parse_or_loop({:binop, :or, false, left, right}, rest2)
+      parse_or_loop({:binop, :or, binop_opts(false, matching), left, right}, rest2)
     end
   end
 
@@ -434,9 +434,9 @@ defmodule TimelessMetrics.PromQL do
   end
 
   defp parse_and_loop(left, [{:kw, op} | rest]) when op in [:and, :unless] do
-    with {:ok, rest} <- reject_vector_matching(rest),
+    with {:ok, matching, rest} <- parse_matching(rest),
          {:ok, right, rest2} <- parse_cmp(rest) do
-      parse_and_loop({:binop, op, false, left, right}, rest2)
+      parse_and_loop({:binop, op, binop_opts(false, matching), left, right}, rest2)
     end
   end
 
@@ -454,9 +454,9 @@ defmodule TimelessMetrics.PromQL do
         _ -> {false, rest}
       end
 
-    with {:ok, rest} <- reject_vector_matching(rest),
+    with {:ok, matching, rest} <- parse_matching(rest),
          {:ok, right, rest2} <- parse_add(rest) do
-      parse_cmp_loop({:binop, op, bool?, left, right}, rest2)
+      parse_cmp_loop({:binop, op, binop_opts(bool?, matching), left, right}, rest2)
     end
   end
 
@@ -467,9 +467,9 @@ defmodule TimelessMetrics.PromQL do
   end
 
   defp parse_add_loop(left, [{:op, op} | rest]) when op in [:add, :sub] do
-    with {:ok, rest} <- reject_vector_matching(rest),
+    with {:ok, matching, rest} <- parse_matching(rest),
          {:ok, right, rest2} <- parse_mul(rest) do
-      parse_add_loop({:binop, op, false, left, right}, rest2)
+      parse_add_loop({:binop, op, binop_opts(false, matching), left, right}, rest2)
     end
   end
 
@@ -480,28 +480,50 @@ defmodule TimelessMetrics.PromQL do
   end
 
   defp parse_mul_loop(left, [{:op, op} | rest]) when op in [:mul, :div, :mod] do
-    with {:ok, rest} <- reject_vector_matching(rest),
+    with {:ok, matching, rest} <- parse_matching(rest),
          {:ok, right, rest2} <- parse_unary(rest) do
-      parse_mul_loop({:binop, op, false, left, right}, rest2)
+      parse_mul_loop({:binop, op, binop_opts(false, matching), left, right}, rest2)
     end
   end
 
   defp parse_mul_loop(left, rest), do: {:ok, left, rest}
 
-  defp reject_vector_matching([{:kw, kw} | _])
-       when kw in [:on, :ignoring, :group_left, :group_right] do
-    {:error,
-     "vector matching modifiers (on/ignoring/group_left/group_right) are not supported yet"}
+  # on(...)/ignoring(...) with optional group_left(...)/group_right(...)
+  defp parse_matching([{:kw, kw} | rest]) when kw in [:on, :ignoring] do
+    with {:ok, {_kw, labels}, rest2} <- parse_grouping(kw, rest) do
+      case rest2 do
+        [{:kw, gkw} | rest3] when gkw in [:group_left, :group_right] ->
+          side = if gkw == :group_left, do: :left, else: :right
+
+          case rest3 do
+            [:lparen | _] ->
+              with {:ok, {_gkw, extras}, rest4} <- parse_grouping(gkw, rest3) do
+                {:ok, %{mode: kw, labels: labels, group: {side, extras}}, rest4}
+              end
+
+            _ ->
+              {:ok, %{mode: kw, labels: labels, group: {side, []}}, rest3}
+          end
+
+        _ ->
+          {:ok, %{mode: kw, labels: labels, group: nil}, rest2}
+      end
+    end
   end
 
-  defp reject_vector_matching(tokens), do: {:ok, tokens}
+  defp parse_matching([{:kw, gkw} | _]) when gkw in [:group_left, :group_right],
+    do: {:error, "group_left/group_right must follow on(...) or ignoring(...)"}
+
+  defp parse_matching(tokens), do: {:ok, nil, tokens}
+
+  defp binop_opts(bool?, matching), do: %{bool: bool?, matching: matching}
 
   defp parse_unary([{:op, :sub} | rest]) do
     with {:ok, node, rest2} <- parse_unary(rest) do
       node =
         case node do
           {:number, n} -> {:number, -n}
-          other -> {:binop, :mul, false, {:number, -1.0}, other}
+          other -> {:binop, :mul, binop_opts(false, nil), {:number, -1.0}, other}
         end
 
       {:ok, node, rest2}
@@ -515,8 +537,9 @@ defmodule TimelessMetrics.PromQL do
     with {:ok, left, rest} <- parse_atom(tokens) do
       case rest do
         [{:op, :pow} | rest2] ->
-          with {:ok, right, rest3} <- parse_unary(rest2) do
-            {:ok, {:binop, :pow, false, left, right}, rest3}
+          with {:ok, matching, rest2} <- parse_matching(rest2),
+               {:ok, right, rest3} <- parse_unary(rest2) do
+            {:ok, {:binop, :pow, binop_opts(false, matching), left, right}, rest3}
           end
 
         _ ->
@@ -843,7 +866,7 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval({:call, f, args}, ctx), do: eval_call(f, args, ctx)
   defp eval({:agg, op, grouping, param, expr}, ctx), do: eval_agg(op, grouping, param, expr, ctx)
-  defp eval({:binop, op, bool?, l, r}, ctx), do: eval_binop(op, bool?, l, r, ctx)
+  defp eval({:binop, op, opts, l, r}, ctx), do: eval_binop(op, opts, l, r, ctx)
 
   defp eval_vector(node, ctx) do
     case eval(node, ctx) do
@@ -1140,14 +1163,6 @@ defmodule TimelessMetrics.PromQL do
     {:ok, {:vector, result}}
   end
 
-  # VM/Prometheus format count_values label values compactly: 42, not 42.0
-  defp count_values_label(v) when is_float(v) do
-    t = trunc(v)
-    if t * 1.0 == v, do: Integer.to_string(t), else: Float.to_string(v)
-  end
-
-  defp count_values_label(v), do: format_value(v)
-
   defp do_aggregate(op, grouping, param, series) when op in [:topk, :bottomk] do
     k = trunc(param || 1)
 
@@ -1177,6 +1192,14 @@ defmodule TimelessMetrics.PromQL do
 
     {:ok, {:vector, result}}
   end
+
+  # VM/Prometheus format count_values label values compactly: 42, not 42.0
+  defp count_values_label(v) when is_float(v) do
+    t = trunc(v)
+    if t * 1.0 == v, do: Integer.to_string(t), else: Float.to_string(v)
+  end
+
+  defp count_values_label(v), do: format_value(v)
 
   defp group_labels(labels, {:by, keys}), do: Map.take(labels, keys)
 
@@ -1289,44 +1312,55 @@ defmodule TimelessMetrics.PromQL do
 
   @comparison_ops [:eq, :neq, :gt, :lt, :gte, :lte]
 
-  defp eval_binop(op, bool?, l, r, ctx) do
+  defp eval_binop(op, opts, l, r, ctx) do
     with {:ok, lv} <- eval(l, ctx),
          {:ok, rv} <- eval(r, ctx) do
-      apply_binop(op, bool?, lv, rv)
+      apply_binop(op, opts, lv, rv)
     end
   end
 
   # set operators
-  defp apply_binop(op, _bool, {:vector, ls}, {:vector, rs}) when op in [:and, :or, :unless] do
-    {:ok, {:vector, set_op(op, ls, rs)}}
+  defp apply_binop(op, opts, {:vector, ls}, {:vector, rs}) when op in [:and, :or, :unless] do
+    case opts.matching do
+      %{group: {_side, _extras}} ->
+        {:error, "group_left/group_right are not allowed with #{op}"}
+
+      matching ->
+        {:ok, {:vector, set_op(op, ls, rs, matching)}}
+    end
   end
 
-  defp apply_binop(op, _bool, _l, _r) when op in [:and, :or, :unless] do
+  defp apply_binop(op, _opts, _l, _r) when op in [:and, :or, :unless] do
     {:error, "#{op} requires instant vectors on both sides"}
   end
 
   # scalar ∘ scalar
-  defp apply_binop(op, bool?, {:scalar, a}, {:scalar, b}) do
+  defp apply_binop(op, opts, {:scalar, a}, {:scalar, b}) do
     cond do
       op not in @comparison_ops -> {:ok, {:scalar, arith(op, a, b)}}
-      bool? -> {:ok, {:scalar, if(cmp(op, a, b), do: 1.0, else: 0.0)}}
+      opts.bool -> {:ok, {:scalar, if(cmp(op, a, b), do: 1.0, else: 0.0)}}
       true -> {:error, "comparisons between scalars must use the bool modifier (e.g. 1 > bool 2)"}
     end
   end
 
-  # vector ∘ scalar / scalar ∘ vector
-  defp apply_binop(op, bool?, {:vector, series}, {:scalar, n}),
-    do: vector_scalar(op, bool?, series, n, :scalar_right)
+  # vector ∘ scalar / scalar ∘ vector — matching modifiers don't apply
+  defp apply_binop(_op, %{matching: matching}, l, r)
+       when matching != nil and (elem(l, 0) == :scalar or elem(r, 0) == :scalar) do
+    {:error, "vector matching (on/ignoring) is only allowed between two instant vectors"}
+  end
 
-  defp apply_binop(op, bool?, {:scalar, n}, {:vector, series}),
-    do: vector_scalar(op, bool?, series, n, :scalar_left)
+  defp apply_binop(op, opts, {:vector, series}, {:scalar, n}),
+    do: vector_scalar(op, opts.bool, series, n, :scalar_right)
+
+  defp apply_binop(op, opts, {:scalar, n}, {:vector, series}),
+    do: vector_scalar(op, opts.bool, series, n, :scalar_left)
 
   # vector ∘ vector
-  defp apply_binop(op, bool?, {:vector, ls}, {:vector, rs}) do
+  defp apply_binop(op, opts, {:vector, ls}, {:vector, rs}) do
     if op in @comparison_ops do
-      vector_vector_cmp(op, bool?, ls, rs)
+      vector_vector_cmp(op, opts, ls, rs)
     else
-      vector_vector_arith(op, ls, rs)
+      vector_vector_arith(op, opts, ls, rs)
     end
   end
 
@@ -1375,52 +1409,124 @@ defmodule TimelessMetrics.PromQL do
     {:ok, {:vector, result}}
   end
 
-  defp vector_vector_arith(op, ls, rs) do
-    with {:ok, rmap} <- sig_map(rs),
-         {:ok, _} <- sig_map(ls) do
-      series =
-        ls
-        |> Enum.flat_map(fn %{labels: labels, data: data} ->
-          sig = Map.delete(labels, "__name__")
+  # --- vector-vector matching ---
 
-          case Map.fetch(rmap, sig) do
-            {:ok, rdata} ->
-              joined =
-                Enum.flat_map(data, fn {ts, v} ->
-                  case Map.fetch(rdata, ts) do
-                    {:ok, rv} -> [{ts, arith(op, v, rv)}]
-                    :error -> []
+  defp match_sig(labels, nil), do: Map.delete(labels, "__name__")
+  defp match_sig(labels, %{mode: :on, labels: ls}), do: Map.take(labels, ls)
+
+  defp match_sig(labels, %{mode: :ignoring, labels: ls}),
+    do: labels |> Map.drop(ls) |> Map.delete("__name__")
+
+  # For group_left the left side is the "many" side; group_right mirrors.
+  defp orient_sides(ls, rs, %{group: {:right, _}}), do: {rs, ls, :swapped}
+  defp orient_sides(ls, rs, _matching), do: {ls, rs, :normal}
+
+  defp vector_vector_arith(op, opts, ls, rs) do
+    matching = opts.matching
+
+    case matching do
+      %{group: {_side, extras}} ->
+        {many, one, orientation} = orient_sides(ls, rs, matching)
+
+        with {:ok, one_map} <- sig_map(one, matching, "the \"one\" side") do
+          series =
+            Enum.flat_map(many, fn %{labels: labels, data: data} ->
+              sig = match_sig(labels, matching)
+
+              case Map.fetch(one_map, sig) do
+                {:ok, {one_labels, one_data}} ->
+                  joined = join_arith(op, data, one_data, orientation)
+
+                  if joined == [] do
+                    []
+                  else
+                    out_labels =
+                      labels
+                      |> Map.delete("__name__")
+                      |> copy_extra_labels(one_labels, extras)
+
+                    [%{labels: out_labels, data: joined}]
                   end
-                end)
 
-              if joined == [], do: [], else: [%{labels: sig, data: joined}]
+                :error ->
+                  []
+              end
+            end)
 
-            :error ->
-              []
-          end
-        end)
+          {:ok, {:vector, series}}
+        end
 
-      {:ok, {:vector, series}}
+      _ ->
+        with {:ok, rmap} <- sig_map(rs, matching, "the right side"),
+             {:ok, _} <- sig_map(ls, matching, "the left side") do
+          series =
+            Enum.flat_map(ls, fn %{labels: labels, data: data} ->
+              sig = match_sig(labels, matching)
+
+              case Map.fetch(rmap, sig) do
+                {:ok, {_rlabels, rdata}} ->
+                  joined = join_arith(op, data, rdata, :normal)
+                  if joined == [], do: [], else: [%{labels: sig, data: joined}]
+
+                :error ->
+                  []
+              end
+            end)
+
+          {:ok, {:vector, series}}
+        end
     end
   end
 
-  defp vector_vector_cmp(op, bool?, ls, rs) do
-    with {:ok, rmap} <- sig_map(rs),
-         {:ok, _} <- sig_map(ls) do
-      series =
-        ls
-        |> Enum.flat_map(fn %{labels: labels, data: data} = s ->
-          sig = Map.delete(labels, "__name__")
+  defp join_arith(op, many_data, one_map, orientation) do
+    Enum.flat_map(many_data, fn {ts, v} ->
+      case Map.fetch(one_map, ts) do
+        {:ok, ov} ->
+          value =
+            case orientation do
+              :normal -> arith(op, v, ov)
+              :swapped -> arith(op, ov, v)
+            end
 
-          case Map.fetch(rmap, sig) do
-            {:ok, rdata} ->
+          [{ts, value}]
+
+        :error ->
+          []
+      end
+    end)
+  end
+
+  defp copy_extra_labels(labels, from_labels, extras) do
+    Enum.reduce(extras, labels, fn k, acc ->
+      case Map.fetch(from_labels, k) do
+        {:ok, v} -> Map.put(acc, k, v)
+        :error -> Map.delete(acc, k)
+      end
+    end)
+  end
+
+  defp vector_vector_cmp(op, opts, ls, rs) do
+    matching = opts.matching
+
+    {many, one, orientation} = orient_sides(ls, rs, matching)
+
+    with {:ok, one_map} <- sig_map(one, matching, "one side"),
+         :ok <- check_unique_when_one_to_one(matching, many) do
+      series =
+        Enum.flat_map(many, fn %{labels: labels, data: data} = s ->
+          sig = match_sig(labels, matching)
+
+          case Map.fetch(one_map, sig) do
+            {:ok, {_olabels, odata}} ->
               matched =
                 Enum.flat_map(data, fn {ts, v} ->
-                  case Map.fetch(rdata, ts) do
-                    {:ok, rv} ->
+                  case Map.fetch(odata, ts) do
+                    {:ok, ov} ->
+                      {a, b} = if orientation == :normal, do: {v, ov}, else: {ov, v}
+
                       cond do
-                        bool? -> [{ts, if(cmp(op, v, rv), do: 1.0, else: 0.0)}]
-                        cmp(op, v, rv) -> [{ts, v}]
+                        opts.bool -> [{ts, if(cmp(op, a, b), do: 1.0, else: 0.0)}]
+                        cmp(op, a, b) -> [{ts, v}]
                         true -> []
                       end
 
@@ -1430,9 +1536,19 @@ defmodule TimelessMetrics.PromQL do
                 end)
 
               cond do
-                matched == [] -> []
-                bool? -> [%{labels: sig, data: matched}]
-                true -> [%{s | data: matched}]
+                matched == [] ->
+                  []
+
+                opts.bool ->
+                  [%{labels: Map.delete(labels, "__name__"), data: matched}]
+
+                # with a matching modifier VM drops __name__ even on
+                # filtering comparisons (verified via vm_diff)
+                matching != nil ->
+                  [%{s | labels: Map.delete(labels, "__name__"), data: matched}]
+
+                true ->
+                  [%{s | data: matched}]
               end
 
             :error ->
@@ -1444,29 +1560,46 @@ defmodule TimelessMetrics.PromQL do
     end
   end
 
-  defp sig_map(series) do
+  defp check_unique_when_one_to_one(%{group: {_side, _}}, _series), do: :ok
+
+  defp check_unique_when_one_to_one(matching, series) do
+    case sig_map(series, matching, "one side") do
+      {:ok, _} -> :ok
+      {:error, _} = err -> err
+    end
+  end
+
+  # Map sig -> {labels, %{ts => value}}; errors when two series share a sig.
+  defp sig_map(series, matching, side_desc) do
     Enum.reduce_while(series, {:ok, %{}}, fn %{labels: l, data: d}, {:ok, acc} ->
-      sig = Map.delete(l, "__name__")
+      sig = match_sig(l, matching)
 
       if Map.has_key?(acc, sig) do
         {:halt,
          {:error,
-          "many-to-many vector matching: multiple series share labels #{inspect(sig)} — aggregate first"}}
+          "many-to-many vector matching: multiple series on #{side_desc} share the match group #{inspect(sig)} — use group_left/group_right or aggregate first"}}
       else
-        {:cont, {:ok, Map.put(acc, sig, Map.new(d))}}
+        {:cont, {:ok, Map.put(acc, sig, {l, Map.new(d)})}}
       end
     end)
   end
 
-  defp set_op(:and, ls, rs) do
+  defp set_op(:and, ls, rs, matching) do
     rsigs =
-      Map.new(rs, fn %{labels: l, data: d} ->
-        {Map.delete(l, "__name__"), MapSet.new(d, &elem(&1, 0))}
+      Enum.reduce(rs, %{}, fn %{labels: l, data: d}, acc ->
+        sig = match_sig(l, matching)
+
+        Map.update(
+          acc,
+          sig,
+          MapSet.new(d, &elem(&1, 0)),
+          &MapSet.union(&1, MapSet.new(d, fn p -> elem(p, 0) end))
+        )
       end)
 
     ls
     |> Enum.flat_map(fn %{labels: l, data: data} = s ->
-      case Map.fetch(rsigs, Map.delete(l, "__name__")) do
+      case Map.fetch(rsigs, match_sig(l, matching)) do
         {:ok, ts_set} ->
           kept = Enum.filter(data, fn {ts, _} -> MapSet.member?(ts_set, ts) end)
           if kept == [], do: [], else: [%{s | data: kept}]
@@ -1477,15 +1610,22 @@ defmodule TimelessMetrics.PromQL do
     end)
   end
 
-  defp set_op(:unless, ls, rs) do
+  defp set_op(:unless, ls, rs, matching) do
     rsigs =
-      Map.new(rs, fn %{labels: l, data: d} ->
-        {Map.delete(l, "__name__"), MapSet.new(d, &elem(&1, 0))}
+      Enum.reduce(rs, %{}, fn %{labels: l, data: d}, acc ->
+        sig = match_sig(l, matching)
+
+        Map.update(
+          acc,
+          sig,
+          MapSet.new(d, &elem(&1, 0)),
+          &MapSet.union(&1, MapSet.new(d, fn p -> elem(p, 0) end))
+        )
       end)
 
     ls
     |> Enum.flat_map(fn %{labels: l, data: data} = s ->
-      case Map.fetch(rsigs, Map.delete(l, "__name__")) do
+      case Map.fetch(rsigs, match_sig(l, matching)) do
         {:ok, ts_set} ->
           kept = Enum.reject(data, fn {ts, _} -> MapSet.member?(ts_set, ts) end)
           if kept == [], do: [], else: [%{s | data: kept}]
@@ -1496,17 +1636,24 @@ defmodule TimelessMetrics.PromQL do
     end)
   end
 
-  defp set_op(:or, ls, rs) do
+  defp set_op(:or, ls, rs, matching) do
     lmap =
-      Map.new(ls, fn %{labels: l} = s -> {Map.delete(l, "__name__"), s} end)
+      Enum.reduce(ls, %{}, fn %{labels: l, data: d}, acc ->
+        sig = match_sig(l, matching)
+
+        Map.update(
+          acc,
+          sig,
+          MapSet.new(d, &elem(&1, 0)),
+          &MapSet.union(&1, MapSet.new(d, fn p -> elem(p, 0) end))
+        )
+      end)
 
     extra =
       rs
       |> Enum.flat_map(fn %{labels: l, data: data} = s ->
-        case Map.fetch(lmap, Map.delete(l, "__name__")) do
-          {:ok, %{data: ldata}} ->
-            # per-timestamp union: lhs wins where both have a sample
-            lts = MapSet.new(ldata, &elem(&1, 0))
+        case Map.fetch(lmap, match_sig(l, matching)) do
+          {:ok, lts} ->
             missing = Enum.reject(data, fn {ts, _} -> MapSet.member?(lts, ts) end)
             if missing == [], do: [], else: [%{s | data: missing}]
 
