@@ -38,7 +38,7 @@ defmodule VMDiff do
       seed = seed_lines(base)
       import_both!(seed)
 
-      corpus = corpus()
+      corpus = corpus(base)
       results = Enum.map(corpus, &compare(&1, q_start, q_end, step))
 
       diffs = Enum.reject(results, fn {_q, verdict} -> verdict == :ok end)
@@ -182,7 +182,9 @@ defmodule VMDiff do
 
   # --- corpus ---
 
-  defp corpus do
+  defp corpus(base) do
+    _ = base
+
     [
       "g_ramp",
       ~s|g_ramp{host="a"}|,
@@ -328,7 +330,30 @@ defmodule VMDiff do
       "days_in_month()",
       "month()",
       "year()",
-      "hour(g_ramp * 0 + 1700000000)"
+      "hour(g_ramp * 0 + 1700000000)",
+      # Phase 3: MetricsQL tier
+      "(g_ramp > 200) default 0",
+      "(g_ramp > 200) default g_const",
+      "g_ramp if g_const",
+      "g_ramp ifnot g_sparse",
+      "rate(c_reqs[5m]) keep_metric_names",
+      ~s|alias(g_ramp, "renamed")|,
+      ~s|label_set(g_ramp, "dc", "east")|,
+      ~s|label_del(g_ramp, "host")|,
+      "union(g_ramp, g_const)",
+      "default_rollup(g_ramp)",
+      "range_avg(g_ramp)",
+      "range_max(g_ramp)",
+      "running_max(g_ramp)",
+      "running_avg(g_ramp)",
+      # Phase 3: subqueries, @, step durations, window-less rollups
+      "max_over_time(rate(c_reqs[1m])[10m:1m])",
+      "avg_over_time((g_ramp)[10m:2m])",
+      "avg_over_time(g_ramp[3i])",
+      "rate(c_reqs)",
+      "g_ramp @ #{base + 600}",
+      "avg(g_ramp @ end())",
+      "g_ramp offset 5m @ #{base + 600}"
     ]
   end
 

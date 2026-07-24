@@ -197,15 +197,32 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     "month()",
     "year()",
     "hour(cpu * 0)",
-    "vector(scalar(sum(cpu)))"
+    "vector(scalar(sum(cpu)))",
+    # MetricsQL tier (Phase 3)
+    "cpu default 0",
+    "cpu if mem",
+    "cpu ifnot mem",
+    "default_rollup(cpu)",
+    ~s|label_set(cpu, "x", "y")|,
+    ~s|label_del(cpu, "nosuch")|,
+    "range_avg(cpu)",
+    "running_max(cpu)",
+    ~s|alias(cpu, "c")|,
+    "union(cpu, mem)",
+    "rate(cpu[1m]) keep_metric_names",
+    # subqueries + @ + step durations (Phase 3)
+    "cpu @ 1700000000",
+    "cpu @ start()",
+    "cpu @ end()",
+    "avg_over_time(cpu[5m:1m])",
+    "max_over_time(rate(reqs_total[1m])[5m:1m])",
+    "avg_over_time((cpu)[5m:])",
+    "avg_over_time(cpu[3i])",
+    "rate(reqs_total)"
   ]
 
   # ❌ Rejected with a message naming the construct (not a generic parse error)
   @rejected_named [
-    "cpu @ 1700000000",
-    "cpu @ start()",
-    "cpu[5m:1m]",
-    "(rate(cpu[1m]))[5m:]",
     "limitk(2, cpu)",
     "limit_ratio(0.5, cpu)",
     "mad_over_time(cpu[1m])",
@@ -221,17 +238,12 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     "info(cpu)"
   ]
 
-  # ❌ MetricsQL extensions: rejected with a message naming MetricsQL
+  # ❌ MetricsQL extensions still rejected with a message naming MetricsQL
   @rejected_metricsql [
-    "cpu default 0",
-    "cpu if mem",
-    "default_rollup(cpu)",
-    ~s|label_set(cpu, "x", "y")|,
-    "range_avg(cpu)",
-    ~s|alias(cpu, "c")|,
-    "union(cpu, mem)",
+    ~s|quantiles("q", 0.5, 0.9, cpu[1m])|,
     "with (f = cpu) f",
-    "rate(cpu[1m]) keep_metric_names"
+    "keep_last_value(cpu)",
+    "interpolate(cpu)"
   ]
 
   test "all supported constructs parse and execute" do

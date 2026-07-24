@@ -134,7 +134,20 @@ defmodule TimelessMetrics.PromQL do
                  :day_of_year,
                  :days_in_month,
                  :month,
-                 :year
+                 :year,
+                 :union,
+                 :alias,
+                 :label_set,
+                 :label_del,
+                 :default_rollup,
+                 :range_avg,
+                 :range_min,
+                 :range_max,
+                 :range_sum,
+                 :running_avg,
+                 :running_min,
+                 :running_max,
+                 :running_sum
                ]
 
   # Recognized PromQL functions we don't implement yet — named in the error
@@ -148,14 +161,15 @@ defmodule TimelessMetrics.PromQL do
 
   # VictoriaMetrics MetricsQL extensions — distinct message so VM users know
   # the construct exists but is VM-specific.
-  @metricsql_fns ~w(default_rollup label_set label_del label_keep label_map
-    alias union range_avg range_max range_min range_sum running_avg running_sum
+  @metricsql_fns ~w(label_keep label_map
     quantiles distinct increase_pure remove_resets interpolate keep_last_value
     keep_next_value drop_common_labels rate_over_sum with)
 
-  # MetricsQL infix/suffix operators that appear after a complete PromQL
-  # expression (e.g. `expr default 0`, `expr keep_metric_names`).
-  @metricsql_operators ~w(default if ifnot keep_metric_names)
+  @range_agg_fns [:range_avg, :range_min, :range_max, :range_sum]
+  @running_agg_fns [:running_avg, :running_min, :running_max, :running_sum]
+
+  # MetricsQL binary operators parsed at the lowest precedence level
+  @metricsql_binops %{"default" => :default, "if" => :if, "ifnot" => :ifnot}
 
   # ===== Public API =====
 
@@ -176,10 +190,6 @@ defmodule TimelessMetrics.PromQL do
         case rest do
           [] ->
             {:ok, node}
-
-          [{:ident, name} | _] when name in @metricsql_operators ->
-            {:error,
-             "'#{name}' is a VictoriaMetrics MetricsQL operator and is not supported (standard PromQL only)"}
 
           [t | _] ->
             {:error, "unexpected #{describe_token(t)} after complete expression"}
@@ -447,13 +457,28 @@ defmodule TimelessMetrics.PromQL do
   defp parse_expr(tokens), do: parse_or(tokens)
 
   defp parse_or(tokens) do
-    with {:ok, left, rest} <- parse_and(tokens), do: parse_or_loop(left, rest)
+    with {:ok, left, rest} <- parse_and(tokens),
+         {:ok, node, rest2} <- parse_or_loop(left, rest) do
+      case rest2 do
+        [{:ident, "keep_metric_names"} | rest3] -> {:ok, {:keep_names, node}, rest3}
+        _ -> {:ok, node, rest2}
+      end
+    end
   end
 
   defp parse_or_loop(left, [{:kw, :or} | rest]) do
     with {:ok, matching, rest} <- parse_matching(rest),
          {:ok, right, rest2} <- parse_and(rest) do
       parse_or_loop({:binop, :or, binop_opts(false, matching), left, right}, rest2)
+    end
+  end
+
+  defp parse_or_loop(left, [{:ident, name} | rest]) when is_map_key(@metricsql_binops, name) do
+    op = @metricsql_binops[name]
+
+    with {:ok, matching, rest} <- parse_matching(rest),
+         {:ok, right, rest2} <- parse_and(rest) do
+      parse_or_loop({:binop, op, binop_opts(false, matching), left, right}, rest2)
     end
   end
 
@@ -583,8 +608,8 @@ defmodule TimelessMetrics.PromQL do
   defp parse_atom([:lparen | rest]) do
     with {:ok, node, rest2} <- parse_expr(rest) do
       case rest2 do
-        [:rparen, :lbracket | _] ->
-          {:error, "subqueries like (expr)[5m:] are not supported"}
+        [:rparen, :lbracket | rest3] ->
+          parse_subquery_postfix(node, rest3)
 
         [:rparen | rest3] ->
           {:ok, node, rest3}
@@ -612,7 +637,12 @@ defmodule TimelessMetrics.PromQL do
 
         cond do
           fname in @functions ->
-            parse_call(fname, rest)
+            with {:ok, node, rest2} <- parse_call(fname, rest) do
+              case rest2 do
+                [:lbracket | rest3] -> parse_subquery_postfix(node, rest3)
+                _ -> {:ok, node, rest2}
+              end
+            end
 
           name in @known_unsupported ->
             {:error, "function #{name}() is not supported yet"}
@@ -815,16 +845,16 @@ defmodule TimelessMetrics.PromQL do
         {:error, "selector must specify a metric name or at least one label matcher"}
 
       {nil, []} ->
-        {:ok, %{metric: nil, pattern: ".+", labels: labels, offset: 0}}
+        {:ok, %{metric: nil, pattern: ".+", labels: labels, offset: 0, at: nil}}
 
       {name, []} ->
-        {:ok, %{metric: name, pattern: nil, labels: labels, offset: 0}}
+        {:ok, %{metric: name, pattern: nil, labels: labels, offset: 0, at: nil}}
 
       {nil, [{_, exact}]} when is_binary(exact) ->
-        {:ok, %{metric: exact, pattern: nil, labels: labels, offset: 0}}
+        {:ok, %{metric: exact, pattern: nil, labels: labels, offset: 0, at: nil}}
 
       {nil, [{_, {:regex, p}}]} ->
-        {:ok, %{metric: nil, pattern: p, labels: labels, offset: 0}}
+        {:ok, %{metric: nil, pattern: p, labels: labels, offset: 0, at: nil}}
 
       {name, [_ | _]} when is_binary(name) ->
         {:error, "metric name specified twice (as name and __name__ matcher)"}
@@ -837,37 +867,95 @@ defmodule TimelessMetrics.PromQL do
   defp parse_selector_postfix(node, [:lbracket | rest]) do
     case rest do
       [{:duration, secs}, :rbracket | rest2] ->
-        parse_offset_postfix({:range, node, secs}, rest2)
+        parse_modifiers({:range, node, secs}, rest2)
+
+      [{:number, n}, {:ident, "i"}, :rbracket | rest2] ->
+        parse_modifiers({:range, node, {:steps, trunc(n)}}, rest2)
 
       [{:number, n}, :rbracket | rest2] ->
-        parse_offset_postfix({:range, node, trunc(n)}, rest2)
+        parse_modifiers({:range, node, trunc(n)}, rest2)
 
-      [{:duration, _}, {:ident, ":" <> _} | _] ->
-        {:error, "subqueries like metric[5m:1m] are not supported"}
+      [{:duration, w}, {:ident, ":" <> res}, :rbracket | rest2] ->
+        with {:ok, resolution} <- parse_subquery_resolution(res) do
+          parse_modifiers({:subquery, node, w, resolution}, rest2)
+        end
 
       _ ->
-        {:error, "expected a duration like [5m]"}
+        {:error, "expected a duration like [5m] or a subquery like [5m:1m]"}
     end
   end
 
-  defp parse_selector_postfix(node, tokens), do: parse_offset_postfix(node, tokens)
+  defp parse_selector_postfix(node, tokens), do: parse_modifiers(node, tokens)
 
-  defp parse_offset_postfix(node, [{:kw, :offset} | rest]) do
+  # Shared with parenthesized expressions: (expr)[5m:1m]
+  defp parse_subquery_postfix(node, tokens) do
+    case tokens do
+      [{:duration, w}, {:ident, ":" <> res}, :rbracket | rest] ->
+        with {:ok, resolution} <- parse_subquery_resolution(res) do
+          parse_modifiers({:subquery, node, w, resolution}, rest)
+        end
+
+      _ ->
+        {:error, "expected a subquery range like [5m:1m] after a parenthesized expression"}
+    end
+  end
+
+  defp parse_subquery_resolution(""), do: {:ok, nil}
+
+  defp parse_subquery_resolution(res) do
+    if Regex.match?(~r/^(?:\d+(?:ms|[smhdwy]))+$/, res) do
+      {:ok, duration_seconds(res)}
+    else
+      {:error, "invalid subquery resolution: #{inspect(res)}"}
+    end
+  end
+
+  # offset and @ may appear in either order
+  defp parse_modifiers(node, [{:kw, :offset} | rest]) do
     case rest do
-      [{:duration, secs} | rest2] -> {:ok, apply_offset(node, secs), rest2}
-      [{:number, n} | rest2] -> {:ok, apply_offset(node, trunc(n)), rest2}
-      [{:op, :sub}, {:duration, secs} | rest2] -> {:ok, apply_offset(node, -secs), rest2}
-      _ -> {:error, "expected a duration after offset"}
+      [{:duration, secs} | rest2] ->
+        parse_modifiers(apply_offset(node, secs), rest2)
+
+      [{:number, n} | rest2] ->
+        parse_modifiers(apply_offset(node, trunc(n)), rest2)
+
+      [{:op, :sub}, {:duration, secs} | rest2] ->
+        parse_modifiers(apply_offset(node, -secs), rest2)
+
+      _ ->
+        {:error, "expected a duration after offset"}
     end
   end
 
-  defp parse_offset_postfix(_node, [:at | _]),
-    do: {:error, "the @ modifier is not supported"}
+  defp parse_modifiers(node, [:at | rest]) do
+    case rest do
+      [{:number, ts} | rest2] ->
+        parse_modifiers(apply_at(node, trunc(ts)), rest2)
 
-  defp parse_offset_postfix(node, tokens), do: {:ok, node, tokens}
+      [{:ident, "start"}, :lparen, :rparen | rest2] ->
+        parse_modifiers(apply_at(node, :start), rest2)
+
+      [{:ident, "end"}, :lparen, :rparen | rest2] ->
+        parse_modifiers(apply_at(node, :end), rest2)
+
+      _ ->
+        {:error, "expected a unix timestamp, start(), or end() after @"}
+    end
+  end
+
+  defp parse_modifiers(node, tokens), do: {:ok, node, tokens}
 
   defp apply_offset({:range, sel_node, d}, secs), do: {:range, apply_offset(sel_node, secs), d}
+
+  defp apply_offset({:subquery, inner, w, r}, secs),
+    do: {:subquery, apply_offset(inner, secs), w, r}
+
   defp apply_offset({:selector, sel}, secs), do: {:selector, %{sel | offset: secs}}
+  defp apply_offset(node, _secs), do: node
+
+  defp apply_at({:range, sel_node, d}, at), do: {:range, apply_at(sel_node, at), d}
+  defp apply_at({:selector, sel}, at), do: {:selector, %{sel | at: at}}
+  defp apply_at(node, _at), do: node
 
   # ===== Evaluator =====
   #
@@ -880,6 +968,29 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval({:string, _s}, _ctx),
     do: {:error, "string literals are only valid as function arguments"}
+
+  # MetricsQL keep_metric_names: restore __name__ on the result when the
+  # underlying selector names a single metric
+  defp eval({:keep_names, expr}, ctx) do
+    case eval(expr, ctx) do
+      {:ok, {:vector, series}} ->
+        series =
+          case selector_info(expr) do
+            %{metric: m} when is_binary(m) ->
+              Enum.map(series, fn %{labels: l} = s ->
+                %{s | labels: Map.put(l, "__name__", m)}
+              end)
+
+            _ ->
+              series
+          end
+
+        {:ok, {:vector, series}}
+
+      other ->
+        other
+    end
+  end
 
   # Instant selector: at each grid point, the most recent sample within the
   # lookback window (keeps __name__, like Prometheus).
@@ -922,17 +1033,32 @@ defmodule TimelessMetrics.PromQL do
   # (T - window, T] at each grid point T. Counter functions additionally see
   # the sample just before the window (carry-in) for accurate increase math.
   defp eval_call(f, [arg], ctx) when f in @rollup_fns do
+    keep_name = f in @name_keeping_rollups
+
     case arg do
-      {:range, {:selector, sel}, window} when window > 0 ->
-        keep_name = f in @name_keeping_rollups
+      {:range, {:selector, sel}, w} ->
+        case resolve_window(w, ctx) do
+          window when window > 0 ->
+            with {:ok, series} <-
+                   eval_windowed(sel, window, keep_name, ctx, rollup_window_fun(f, window)) do
+              {:ok, {:vector, series}}
+            end
+
+          _ ->
+            {:error, "#{f}() requires a non-zero range window"}
+        end
+
+      # MetricsQL window-less form: rate(m) — lookbehind defaults to the step
+      {:selector, sel} ->
+        window = max(ctx.step, 1)
 
         with {:ok, series} <-
                eval_windowed(sel, window, keep_name, ctx, rollup_window_fun(f, window)) do
           {:ok, {:vector, series}}
         end
 
-      {:range, {:selector, _sel}, _zero} ->
-        {:error, "#{f}() requires a non-zero range window"}
+      {:subquery, inner, w, resolution} ->
+        eval_subquery_rollup(f, inner, w, resolution, keep_name, ctx)
 
       _ ->
         {:error, "#{f}() expects a range vector argument like metric[5m]"}
@@ -995,8 +1121,10 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval_call(:pi, [], _ctx), do: {:ok, {:scalar, :math.pi()}}
 
-  defp eval_call(:quantile_over_time, [phi_node, {:range, {:selector, sel}, window}], ctx)
-       when window > 0 do
+  defp eval_call(:quantile_over_time, [phi_node, {:range, {:selector, sel}, w}], ctx)
+       when w != 0 do
+    window = resolve_window(w, ctx)
+
     with {:ok, phi} <- eval_scalar(phi_node, ctx) do
       fun =
         stat_fun(fn vals ->
@@ -1016,8 +1144,10 @@ defmodule TimelessMetrics.PromQL do
   defp eval_call(:quantile_over_time, [_phi, _arg], _ctx),
     do: {:error, "quantile_over_time() expects (scalar, metric[5m])"}
 
-  defp eval_call(:predict_linear, [{:range, {:selector, sel}, window}, t_node], ctx)
-       when window > 0 do
+  defp eval_call(:predict_linear, [{:range, {:selector, sel}, w}, t_node], ctx)
+       when w != 0 do
+    window = resolve_window(w, ctx)
+
     with {:ok, horizon} <- eval_scalar(t_node, ctx) do
       fun = fn
         slice, _prev, t when length(slice) >= 2 ->
@@ -1160,8 +1290,10 @@ defmodule TimelessMetrics.PromQL do
     end
   end
 
-  defp eval_call(:absent_over_time, [{:range, {:selector, sel}, window} = _arg], ctx)
-       when window > 0 do
+  defp eval_call(:absent_over_time, [{:range, {:selector, sel}, w} = _arg], ctx)
+       when w != 0 do
+    window = resolve_window(w, ctx)
+
     fun = fn
       [], _prev, _t -> :skip
       _slice, _prev, _t -> 1.0
@@ -1188,6 +1320,143 @@ defmodule TimelessMetrics.PromQL do
     end
   end
 
+  # --- MetricsQL functions ---
+
+  defp eval_call(:union, args, ctx) when args != [] do
+    Enum.reduce_while(args, {:ok, []}, fn arg, {:ok, acc} ->
+      case eval_vector(arg, ctx) do
+        {:ok, series} -> {:cont, {:ok, acc ++ series}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      # first series wins on duplicate label sets, as in MetricsQL
+      {:ok, series} -> {:ok, {:vector, Enum.uniq_by(series, & &1.labels)}}
+      err -> err
+    end
+  end
+
+  defp eval_call(:alias, [arg, {:string, name}], ctx) do
+    with {:ok, series} <- eval_vector(arg, ctx) do
+      {:ok,
+       {:vector,
+        Enum.map(series, fn %{labels: l} = s -> %{s | labels: Map.put(l, "__name__", name)} end)}}
+    end
+  end
+
+  defp eval_call(:label_set, [arg | pairs], ctx)
+       when pairs != [] and rem(length(pairs), 2) == 0 do
+    with {:ok, kvs} <- string_args(pairs, "label_set() label/value arguments"),
+         {:ok, series} <- eval_vector(arg, ctx) do
+      updates = kvs |> Enum.chunk_every(2) |> Enum.map(fn [k, v] -> {k, v} end)
+
+      series =
+        Enum.map(series, fn %{labels: l} = s ->
+          labels =
+            Enum.reduce(updates, l, fn
+              {k, ""}, acc -> Map.delete(acc, k)
+              {k, v}, acc -> Map.put(acc, k, v)
+            end)
+
+          %{s | labels: labels}
+        end)
+
+      with :ok <- check_unique_output(series) do
+        {:ok, {:vector, series}}
+      end
+    end
+  end
+
+  defp eval_call(:label_del, [arg | keys], ctx) when keys != [] do
+    with {:ok, names} <- string_args(keys, "label_del() label arguments"),
+         {:ok, series} <- eval_vector(arg, ctx) do
+      series = Enum.map(series, fn %{labels: l} = s -> %{s | labels: Map.drop(l, names)} end)
+
+      with :ok <- check_unique_output(series) do
+        {:ok, {:vector, series}}
+      end
+    end
+  end
+
+  # VM rejects label transforms whose output contains colliding label sets
+  defp check_unique_output(series) do
+    dup =
+      series
+      |> Enum.frequencies_by(& &1.labels)
+      |> Enum.find(fn {_labels, n} -> n > 1 end)
+
+    case dup do
+      nil -> :ok
+      {labels, _n} -> {:error, "duplicate output timeseries: #{inspect(labels)}"}
+    end
+  end
+
+  # default_rollup(m) — the last raw sample within the lookback window,
+  # i.e. exactly our instant-selector semantics
+  defp eval_call(:default_rollup, [{:selector, _} = sel_node], ctx), do: eval(sel_node, ctx)
+
+  defp eval_call(:default_rollup, [_arg], _ctx),
+    do: {:error, "default_rollup() expects an instant vector selector"}
+
+  # range_*: one aggregate over the whole queried range, repeated at each step
+  defp eval_call(f, [arg], ctx) when f in @range_agg_fns do
+    with {:ok, series} <- eval_vector(arg, ctx) do
+      series =
+        series
+        |> Enum.map(fn %{data: data} = s ->
+          vals = Enum.map(data, &elem(&1, 1))
+
+          agg =
+            case f do
+              :range_avg -> Enum.sum(vals) / length(vals)
+              :range_min -> Enum.min(vals)
+              :range_max -> Enum.max(vals)
+              :range_sum -> Enum.sum(vals) * 1.0
+            end
+
+          %{s | data: Enum.map(data, fn {ts, _} -> {ts, agg} end)}
+        end)
+        |> drop_names()
+
+      {:ok, {:vector, series}}
+    end
+  end
+
+  # running_*: cumulative aggregate from the range start to each step
+  defp eval_call(f, [arg], ctx) when f in @running_agg_fns do
+    with {:ok, series} <- eval_vector(arg, ctx) do
+      series =
+        Enum.map(series, fn %{data: data} = s ->
+          {out, _} =
+            Enum.map_reduce(data, nil, fn {ts, v}, acc ->
+              acc =
+                case {f, acc} do
+                  {_, nil} ->
+                    %{sum: v, min: v, max: v, count: 1}
+
+                  {_, a} ->
+                    %{sum: a.sum + v, min: min(a.min, v), max: max(a.max, v), count: a.count + 1}
+                end
+
+              value =
+                case f do
+                  :running_avg -> acc.sum / acc.count
+                  :running_min -> acc.min
+                  :running_max -> acc.max
+                  :running_sum -> acc.sum * 1.0
+                end
+
+              {{ts, value}, acc}
+            end)
+
+          %{s | data: out}
+        end)
+        |> drop_names()
+
+      {:ok, {:vector, series}}
+    end
+  end
+
   defp eval_call(:histogram_quantile, [phi_node, arg], ctx) do
     with {:ok, phi} <- eval_scalar(phi_node, ctx),
          {:ok, series} <- eval_vector(arg, ctx) do
@@ -1197,6 +1466,38 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval_call(f, args, _ctx),
     do: {:error, "#{f}() called with #{length(args)} argument(s) — wrong arity"}
+
+  defp resolve_window({:steps, n}, ctx), do: n * ctx.step
+  defp resolve_window(seconds, _ctx) when is_integer(seconds), do: seconds
+
+  # Subquery: evaluate the inner expression on a finer grid over
+  # [from - window, to], then treat its output samples as the raw input to
+  # the outer rollup's sliding window.
+  defp eval_subquery_rollup(f, inner, w, resolution, keep_name, ctx) do
+    window = resolve_window(w, ctx)
+    res = resolution || ctx.step
+
+    # Prometheus/VM align subquery evaluation times to multiples of the
+    # resolution, not to the outer range start.
+    inner_from = div(ctx.from - window + res - 1, res) * res
+    inner_to = div(ctx.to, res) * res
+
+    inner_ctx = %{ctx | from: inner_from, to: inner_to, step: res}
+
+    with {:ok, series} <- eval_vector(inner, inner_ctx) do
+      fun = rollup_window_fun(f, window)
+
+      out =
+        series
+        |> Enum.map(fn %{labels: labels, data: data} ->
+          labels = if keep_name, do: labels, else: Map.delete(labels, "__name__")
+          %{labels: labels, data: grid_eval(data, ctx.from, ctx.to, ctx.step, window, fun)}
+        end)
+        |> Enum.reject(&(&1.data == []))
+
+      {:ok, {:vector, out}}
+    end
+  end
 
   defp grid(ctx), do: Enum.to_list(ctx.from..ctx.to//ctx.step)
 
@@ -1599,11 +1900,84 @@ defmodule TimelessMetrics.PromQL do
 
   @comparison_ops [:eq, :neq, :gt, :lt, :gte, :lte]
 
+  defp eval_binop(op, opts, l, r, ctx) when op in [:default, :if, :ifnot] do
+    with {:ok, lv} <- eval(l, ctx),
+         {:ok, rv} <- eval(r, ctx) do
+      metricsql_binop(op, opts, lv, rv, ctx)
+    end
+  end
+
   defp eval_binop(op, opts, l, r, ctx) do
     with {:ok, lv} <- eval(l, ctx),
          {:ok, rv} <- eval(r, ctx) do
       apply_binop(op, opts, lv, rv)
     end
+  end
+
+  # MetricsQL: q default v fills gaps in q's series; q if v keeps points
+  # where v is defined; q ifnot v keeps points where v is absent.
+  defp metricsql_binop(:default, _opts, {:vector, ls}, {:scalar, n}, ctx),
+    do: {:ok, {:vector, fill_default_fun(ls, fn _sig, _ts -> n end, ctx)}}
+
+  defp metricsql_binop(:default, _opts, {:vector, ls}, {:scalar_fn, f}, ctx),
+    do: {:ok, {:vector, fill_default_fun(ls, fn _sig, ts -> f.(ts) end, ctx)}}
+
+  defp metricsql_binop(:default, opts, {:vector, ls}, {:vector, rs}, ctx) do
+    matching = opts.matching
+
+    rmap =
+      Map.new(rs, fn %{labels: l, data: d} -> {match_sig(l, matching), Map.new(d)} end)
+
+    fill = fn sig, ts ->
+      case Map.fetch(rmap, sig) do
+        {:ok, m} -> Map.get(m, ts)
+        :error -> nil
+      end
+    end
+
+    series =
+      Enum.map(ls, fn %{labels: l, data: data} = s ->
+        sig = match_sig(l, opts.matching)
+        have = MapSet.new(data, &elem(&1, 0))
+
+        extra =
+          for ts <- grid(ctx),
+              not MapSet.member?(have, ts),
+              v = fill.(sig, ts),
+              v != nil,
+              do: {ts, v}
+
+        %{s | data: Enum.sort_by(data ++ extra, &elem(&1, 0))}
+      end)
+
+    {:ok, {:vector, series}}
+  end
+
+  defp metricsql_binop(:if, opts, {:vector, ls}, {:vector, rs}, _ctx),
+    do: {:ok, {:vector, set_op(:and, ls, rs, opts.matching)}}
+
+  defp metricsql_binop(:if, _opts, {:vector, ls}, _scalar, _ctx),
+    do: {:ok, {:vector, ls}}
+
+  defp metricsql_binop(:ifnot, opts, {:vector, ls}, {:vector, rs}, _ctx),
+    do: {:ok, {:vector, set_op(:unless, ls, rs, opts.matching)}}
+
+  defp metricsql_binop(:ifnot, _opts, {:vector, _ls}, _scalar, _ctx),
+    do: {:ok, {:vector, []}}
+
+  defp metricsql_binop(op, _opts, _l, _r, _ctx),
+    do: {:error, "#{op} requires an instant vector on the left side"}
+
+  defp fill_default_fun(series, fill, ctx) do
+    Enum.map(series, fn %{labels: l, data: data} = s ->
+      sig = Map.delete(l, "__name__")
+      have = MapSet.new(data, &elem(&1, 0))
+
+      extra =
+        for ts <- grid(ctx), not MapSet.member?(have, ts), do: {ts, fill.(sig, ts)}
+
+      %{s | data: Enum.sort_by(data ++ extra, &elem(&1, 0))}
+    end)
   end
 
   # set operators
@@ -2154,6 +2528,33 @@ defmodule TimelessMetrics.PromQL do
   # :skip (no sample emitted at that grid point).
 
   @default_max_samples 10_000_000
+
+  defp eval_windowed(%{at: at} = sel, window, keep_name, ctx, window_fun) when at != nil do
+    # @ pins the evaluation time: compute once at the fixed instant, then
+    # broadcast that value across the output grid.
+    t0 =
+      case at do
+        :start -> ctx.from
+        :end -> ctx.to
+        ts -> ts
+      end
+
+    fixed_ctx = %{ctx | from: t0, to: t0}
+
+    with {:ok, series} <-
+           eval_windowed(%{sel | at: nil}, window, keep_name, fixed_ctx, window_fun) do
+      series =
+        series
+        |> Enum.flat_map(fn %{labels: labels, data: data} ->
+          case data do
+            [{_t, v}] -> [%{labels: labels, data: for(ts <- grid(ctx), do: {ts, v})}]
+            _ -> []
+          end
+        end)
+
+      {:ok, series}
+    end
+  end
 
   defp eval_windowed(sel, window, keep_name, ctx, window_fun) do
     with {:ok, raw} <- fetch_raw(sel, window, keep_name, ctx),

@@ -366,14 +366,21 @@ defmodule TimelessMetrics.PromQLTest do
       assert msg =~ "must follow on"
     end
 
-    test "subqueries are rejected" do
+    test "subqueries parse; plain range on an expression stays rejected" do
+      assert {:ok, {:subquery, {:call, :rate, _}, 1800, nil}} =
+               PromQL.parse("(rate(m[5m]))[30m:]")
+
+      assert {:ok, {:subquery, {:selector, _}, 300, 60}} = PromQL.parse("m[5m:1m]")
       assert {:error, msg} = PromQL.parse("(rate(m[5m]))[30m]")
-      assert msg =~ "subquer"
+      assert msg =~ "subquery"
     end
 
-    test "@ modifier is rejected" do
-      assert {:error, msg} = PromQL.parse("cpu_usage @ 1609746000")
-      assert msg =~ "@"
+    test "@ modifier parses onto the selector" do
+      assert {:ok, {:selector, %{at: 1_609_746_000}}} = PromQL.parse("cpu_usage @ 1609746000")
+      assert {:ok, {:selector, %{at: :start}}} = PromQL.parse("cpu_usage @ start()")
+
+      assert {:ok, {:range, {:selector, %{at: :end}}, 300}} =
+               PromQL.parse("cpu_usage[5m] @ end()")
     end
 
     test "count_values parses with a string label parameter" do
