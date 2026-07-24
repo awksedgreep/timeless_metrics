@@ -248,7 +248,13 @@ defmodule VMDiff do
       "atanh(g_ramp / 1000)",
       "deg(g_ramp)",
       "rad(g_ramp)",
-      "g_ramp + 0 * pi()"
+      "g_ramp + 0 * pi()",
+      # Phase 2B: label manipulation + count_values
+      ~s|label_replace(g_ramp, "h2", "x-$1", "host", "(.*)")|,
+      ~s|label_replace(g_ramp, "host", "", "nope", "missing.*")|,
+      ~s|label_join(g_ramp, "hj", "-", "host", "host")|,
+      ~s|count_values("v", g_const)|,
+      ~s|count_values("v", floor(g_ramp / 100))|
     ]
   end
 

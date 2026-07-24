@@ -98,14 +98,23 @@ defmodule TimelessMetrics.PromQL do
 
   @functions @rollup_fns ++
                @transform_fns ++
-               [:clamp, :clamp_min, :clamp_max, :pi, :predict_linear, :quantile_over_time]
+               [
+                 :clamp,
+                 :clamp_min,
+                 :clamp_max,
+                 :pi,
+                 :predict_linear,
+                 :quantile_over_time,
+                 :label_replace,
+                 :label_join
+               ]
 
   # Recognized PromQL functions we don't implement yet — named in the error
   # message so clients can tell "unsupported" from "typo".
   @known_unsupported ~w(histogram_quantile
     histogram_fraction histogram_avg histogram_count histogram_sum
     histogram_stddev histogram_stdvar
-    label_replace label_join sort sort_desc sort_by_label sort_by_label_desc
+    sort sort_desc sort_by_label sort_by_label_desc
     scalar vector absent absent_over_time
     time timestamp mad_over_time
     ceil_over_time floor_over_time
@@ -569,7 +578,7 @@ defmodule TimelessMetrics.PromQL do
   end
 
   defp parse_atom([{:kw, kw} | _]), do: {:error, "unexpected keyword: #{kw}"}
-  defp parse_atom([{:string, s} | _]), do: {:error, "unexpected string literal #{inspect(s)}"}
+  defp parse_atom([{:string, s} | rest]), do: {:ok, {:string, s}, rest}
   defp parse_atom([t | _]), do: {:error, "unexpected #{describe_token(t)}"}
   defp parse_atom([]), do: {:error, "unexpected end of query"}
 
@@ -609,8 +618,16 @@ defmodule TimelessMetrics.PromQL do
   defp parse_agg(name, _grouping, _tokens),
     do: {:error, "expected ( after aggregation operator #{name}"}
 
+  defp parse_agg_args(:count_values, [{:string, label}, :comma | rest]) do
+    with {:ok, expr, rest2} <- parse_expr(rest),
+         {:ok, rest3} <- expect_rparen(rest2, :count_values) do
+      {:ok, {:string, label}, expr, rest3}
+    end
+  end
+
   defp parse_agg_args(:count_values, _tokens),
-    do: {:error, "count_values() is not supported yet"}
+    do:
+      {:error, ~s|count_values() requires a string label parameter: count_values("label", expr)|}
 
   defp parse_agg_args(op, tokens) when op in [:topk, :bottomk, :quantile] do
     with {:ok, param, rest} <- parse_expr(tokens) do
@@ -808,6 +825,9 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval({:number, n}, _ctx), do: {:ok, {:scalar, n}}
 
+  defp eval({:string, _s}, _ctx),
+    do: {:error, "string literals are only valid as function arguments"}
+
   # Instant selector: at each grid point, the most recent sample within the
   # lookback window (keeps __name__, like Prometheus).
   defp eval({:selector, sel}, ctx) do
@@ -967,8 +987,86 @@ defmodule TimelessMetrics.PromQL do
   defp eval_call(:predict_linear, [_arg, _t], _ctx),
     do: {:error, "predict_linear() expects (metric[5m], scalar)"}
 
+  @label_name_re ~r/^[a-zA-Z_][a-zA-Z0-9_]*$/
+
+  defp eval_call(
+         :label_replace,
+         [arg, {:string, dst}, {:string, repl}, {:string, src}, {:string, regex}],
+         ctx
+       ) do
+    with :ok <- validate_label_name(dst),
+         {:ok, re} <- compile_anchored(regex),
+         {:ok, series} <- eval_vector(arg, ctx) do
+      series =
+        Enum.map(series, fn %{labels: labels} = s ->
+          src_val = Map.get(labels, src, "")
+
+          case Regex.run(re, src_val) do
+            nil ->
+              s
+
+            captures ->
+              case expand_template(repl, captures) do
+                "" -> %{s | labels: Map.delete(labels, dst)}
+                new_val -> %{s | labels: Map.put(labels, dst, new_val)}
+              end
+          end
+        end)
+
+      {:ok, {:vector, series}}
+    end
+  end
+
+  defp eval_call(:label_replace, args, _ctx) when length(args) == 5,
+    do: {:error, "label_replace() arguments 2-5 must be string literals"}
+
+  defp eval_call(:label_join, [arg, {:string, dst}, {:string, sep} | srcs], ctx)
+       when srcs != [] do
+    with :ok <- validate_label_name(dst),
+         {:ok, src_names} <- string_args(srcs, "label_join() source labels"),
+         {:ok, series} <- eval_vector(arg, ctx) do
+      series =
+        Enum.map(series, fn %{labels: labels} = s ->
+          case Enum.map_join(src_names, sep, &Map.get(labels, &1, "")) do
+            "" -> %{s | labels: Map.delete(labels, dst)}
+            joined -> %{s | labels: Map.put(labels, dst, joined)}
+          end
+        end)
+
+      {:ok, {:vector, series}}
+    end
+  end
+
+  defp eval_call(:label_join, args, _ctx) when length(args) >= 3,
+    do: {:error, "label_join() expects (vector, \"dst\", \"separator\", \"src\", ...)"}
+
   defp eval_call(f, args, _ctx),
     do: {:error, "#{f}() called with #{length(args)} argument(s) — wrong arity"}
+
+  defp validate_label_name(name) do
+    if Regex.match?(@label_name_re, name) or name == "__name__" do
+      :ok
+    else
+      {:error, "invalid destination label name: #{inspect(name)}"}
+    end
+  end
+
+  defp string_args(nodes, what) do
+    Enum.reduce_while(nodes, {:ok, []}, fn
+      {:string, s}, {:ok, acc} -> {:cont, {:ok, acc ++ [s]}}
+      _other, _acc -> {:halt, {:error, "#{what} must be string literals"}}
+    end)
+  end
+
+  # $1..$9 capture references, $$ escapes a literal dollar
+  defp expand_template(template, captures) do
+    Regex.replace(~r/\$(\$|\d)/, template, fn _whole, ref ->
+      case ref do
+        "$" -> "$"
+        d -> Enum.at(captures, String.to_integer(d), "")
+      end
+    end)
+  end
 
   defp apply_name_policy(series, f) when f in @name_keeping_transforms, do: series
   defp apply_name_policy(series, _f), do: drop_names(series)
@@ -1017,7 +1115,38 @@ defmodule TimelessMetrics.PromQL do
   end
 
   defp eval_agg_param(nil, _ctx), do: {:ok, nil}
+  defp eval_agg_param({:string, s}, _ctx), do: {:ok, {:string, s}}
   defp eval_agg_param(node, ctx), do: eval_scalar(node, ctx)
+
+  defp do_aggregate(:count_values, grouping, {:string, label}, series) do
+    result =
+      series
+      |> Enum.group_by(&group_labels(&1.labels, grouping))
+      |> Enum.flat_map(fn {key, group_series} ->
+        group_series
+        |> Enum.flat_map(& &1.data)
+        |> Enum.group_by(fn {_ts, v} -> count_values_label(v) end)
+        |> Enum.map(fn {value_str, points} ->
+          data =
+            points
+            |> Enum.group_by(&elem(&1, 0))
+            |> Enum.map(fn {ts, pts} -> {ts, length(pts) * 1.0} end)
+            |> Enum.sort_by(&elem(&1, 0))
+
+          %{labels: Map.put(key, label, value_str), data: data}
+        end)
+      end)
+
+    {:ok, {:vector, result}}
+  end
+
+  # VM/Prometheus format count_values label values compactly: 42, not 42.0
+  defp count_values_label(v) when is_float(v) do
+    t = trunc(v)
+    if t * 1.0 == v, do: Integer.to_string(t), else: Float.to_string(v)
+  end
+
+  defp count_values_label(v), do: format_value(v)
 
   defp do_aggregate(op, grouping, param, series) when op in [:topk, :bottomk] do
     k = trunc(param || 1)

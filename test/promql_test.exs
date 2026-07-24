@@ -362,8 +362,11 @@ defmodule TimelessMetrics.PromQLTest do
       assert msg =~ "@"
     end
 
-    test "count_values is rejected with a clear message" do
-      assert {:error, msg} = PromQL.parse(~s|count_values("version", build_info)|)
+    test "count_values parses with a string label parameter" do
+      assert {:ok, {:agg, :count_values, nil, {:string, "version"}, _}} =
+               PromQL.parse(~s|count_values("version", build_info)|)
+
+      assert {:error, msg} = PromQL.parse("count_values(0.5, build_info)")
       assert msg =~ "count_values"
     end
   end
