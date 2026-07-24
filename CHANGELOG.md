@@ -1,5 +1,15 @@
 # Changelog
 
+## 6.2.2 (2026-07-24)
+
+Performance: PromQL evaluation parallelizes per series across schedulers,
+and the redundant re-sort of engine-sorted points is gone. No semantic
+changes — 182/182 VM differential parity retained. On a 200-series /
+1.15M-point / 24h workload: `sum by (host) (rate(m[5m]))` 423ms → 188ms,
+`rate` 371ms → 244ms, and wide-window rollups improved ~10x
+(`max_over_time(m[6h])` at 60s step: 2.7s → 254ms). Baseline and floor
+analysis in `bench/results/2026-07-24_promql_windowed_eval.md`.
+
 ## 6.2.1 (2026-07-24)
 
 Completes the Prometheus/VM API-compat surface started in 6.2.0. The
