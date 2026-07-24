@@ -43,7 +43,15 @@ defmodule TimelessMetrics.PromQL do
     :sum_over_time,
     :count_over_time,
     :last_over_time,
-    :first_over_time
+    :first_over_time,
+    :delta,
+    :idelta,
+    :deriv,
+    :changes,
+    :resets,
+    :present_over_time,
+    :stddev_over_time,
+    :stdvar_over_time
   ]
   # VM name policy (verified against a real VM instance via scripts/vm_diff.exs):
   # rollups whose result is "the same quantity" keep the metric name; rate-like
@@ -57,28 +65,53 @@ defmodule TimelessMetrics.PromQL do
     :max_over_time
   ]
 
-  @transform_fns [:abs, :ceil, :floor, :round, :sqrt, :exp, :ln, :log2, :log10]
+  @transform_fns [
+    :abs,
+    :ceil,
+    :floor,
+    :round,
+    :sqrt,
+    :exp,
+    :ln,
+    :log2,
+    :log10,
+    :sgn,
+    :acos,
+    :acosh,
+    :asin,
+    :asinh,
+    :atan,
+    :atanh,
+    :cos,
+    :cosh,
+    :sin,
+    :sinh,
+    :tan,
+    :tanh,
+    :deg,
+    :rad
+  ]
 
   # Same policy for transforms: ceil/floor/round/clamp* keep the name in VM;
   # abs/sqrt/exp/log* drop it.
   @name_keeping_transforms [:ceil, :floor, :round]
 
-  @functions @rollup_fns ++ @transform_fns ++ [:clamp, :clamp_min, :clamp_max]
+  @functions @rollup_fns ++
+               @transform_fns ++
+               [:clamp, :clamp_min, :clamp_max, :pi, :predict_linear, :quantile_over_time]
 
   # Recognized PromQL functions we don't implement yet — named in the error
   # message so clients can tell "unsupported" from "typo".
-  @known_unsupported ~w(delta idelta deriv predict_linear histogram_quantile
+  @known_unsupported ~w(histogram_quantile
     histogram_fraction histogram_avg histogram_count histogram_sum
     histogram_stddev histogram_stdvar
     label_replace label_join sort sort_desc sort_by_label sort_by_label_desc
     scalar vector absent absent_over_time
-    changes resets time timestamp stddev_over_time stdvar_over_time
-    quantile_over_time present_over_time mad_over_time
+    time timestamp mad_over_time
     ceil_over_time floor_over_time
     double_exponential_smoothing holt_winters
     day_of_month day_of_week day_of_year days_in_month
     hour minute month year
-    sgn acos acosh asin asinh atan atanh cos cosh sin sinh tan tanh deg rad pi
     limitk limit_ratio info)
 
   # VictoriaMetrics MetricsQL extensions — distinct message so VM users know
@@ -778,7 +811,7 @@ defmodule TimelessMetrics.PromQL do
   # Instant selector: at each grid point, the most recent sample within the
   # lookback window (keeps __name__, like Prometheus).
   defp eval({:selector, sel}, ctx) do
-    with {:ok, series} <- eval_windowed(sel, ctx.lookback, true, ctx, &window_last/2) do
+    with {:ok, series} <- eval_windowed(sel, ctx.lookback, true, ctx, &window_last/3) do
       {:ok, {:vector, series}}
     end
   end
@@ -885,6 +918,55 @@ defmodule TimelessMetrics.PromQL do
     end
   end
 
+  defp eval_call(:pi, [], _ctx), do: {:ok, {:scalar, :math.pi()}}
+
+  defp eval_call(:quantile_over_time, [phi_node, {:range, {:selector, sel}, window}], ctx)
+       when window > 0 do
+    with {:ok, phi} <- eval_scalar(phi_node, ctx) do
+      fun =
+        stat_fun(fn vals ->
+          cond do
+            phi < 0 -> :neg_inf
+            phi > 1 -> :inf
+            true -> quantile(Enum.sort(vals), phi)
+          end
+        end)
+
+      with {:ok, series} <- eval_windowed(sel, window, true, ctx, fun) do
+        {:ok, {:vector, series}}
+      end
+    end
+  end
+
+  defp eval_call(:quantile_over_time, [_phi, _arg], _ctx),
+    do: {:error, "quantile_over_time() expects (scalar, metric[5m])"}
+
+  defp eval_call(:predict_linear, [{:range, {:selector, sel}, window}, t_node], ctx)
+       when window > 0 do
+    with {:ok, horizon} <- eval_scalar(t_node, ctx) do
+      fun = fn
+        slice, _prev, t when length(slice) >= 2 ->
+          case linear_regression(slice, t) do
+            {:nan, _} -> :nan
+            {slope, intercept} -> intercept + slope * horizon
+          end
+
+        [{_ts, v}], _prev, _t ->
+          v
+
+        [], _prev, _t ->
+          :skip
+      end
+
+      with {:ok, series} <- eval_windowed(sel, window, true, ctx, fun) do
+        {:ok, {:vector, series}}
+      end
+    end
+  end
+
+  defp eval_call(:predict_linear, [_arg, _t], _ctx),
+    do: {:error, "predict_linear() expects (metric[5m], scalar)"}
+
   defp eval_call(f, args, _ctx),
     do: {:error, "#{f}() called with #{length(args)} argument(s) — wrong arity"}
 
@@ -902,10 +984,25 @@ defmodule TimelessMetrics.PromQL do
       :ln -> if v <= 0, do: log_special(v), else: :math.log(v)
       :log2 -> if v <= 0, do: log_special(v), else: :math.log2(v)
       :log10 -> if v <= 0, do: log_special(v), else: :math.log10(v)
+      :sgn -> sgn(v)
+      :deg -> v * 180.0 / :math.pi()
+      :rad -> v * :math.pi() / 180.0
+      other -> safe_math(other, v)
     end
   end
 
   defp transform_value(_f, v), do: v
+
+  defp sgn(v) when v > 0, do: 1.0
+  defp sgn(v) when v < 0, do: -1.0
+  defp sgn(_v), do: 0.0
+
+  # Trig via :math; out-of-domain arguments become NaN instead of raising
+  defp safe_math(f, v) do
+    apply(:math, f, [v * 1.0])
+  rescue
+    ArithmeticError -> :nan
+  end
 
   defp log_special(v) when v == 0, do: :neg_inf
   defp log_special(_v), do: :nan
@@ -1500,7 +1597,7 @@ defmodule TimelessMetrics.PromQL do
     prev = if lo > 0, do: elem(arr, lo - 1), else: nil
 
     acc =
-      case fun.(slice, prev) do
+      case fun.(slice, prev, t) do
         :skip -> acc
         v -> [{t, v} | acc]
       end
@@ -1521,8 +1618,8 @@ defmodule TimelessMetrics.PromQL do
 
   # --- window functions ---
 
-  defp window_last([], _prev), do: :skip
-  defp window_last(slice, _prev), do: slice |> List.last() |> elem(1)
+  defp window_last([], _prev, _t), do: :skip
+  defp window_last(slice, _prev, _t), do: slice |> List.last() |> elem(1)
 
   defp rollup_window_fun(f, window) do
     case f do
@@ -1541,47 +1638,164 @@ defmodule TimelessMetrics.PromQL do
       :count_over_time ->
         stat_fun(fn vals -> length(vals) * 1.0 end)
 
+      :stddev_over_time ->
+        stat_fun(fn vals -> :math.sqrt(window_variance(vals)) end)
+
+      :stdvar_over_time ->
+        stat_fun(&window_variance/1)
+
+      :present_over_time ->
+        stat_fun(fn _vals -> 1.0 end)
+
       :last_over_time ->
-        &window_last/2
+        &window_last/3
 
       :first_over_time ->
         fn
-          [], _prev -> :skip
-          slice, _prev -> slice |> hd() |> elem(1)
+          [], _prev, _t -> :skip
+          slice, _prev, _t -> slice |> hd() |> elem(1)
         end
 
       :rate ->
-        fn slice, prev -> counter_rate(slice, prev, window) end
+        fn slice, prev, _t -> counter_rate(slice, prev, window) end
 
       :increase ->
-        fn slice, prev -> counter_increase_or_zero(slice, prev) end
+        fn slice, prev, _t -> counter_increase(slice, prev) end
 
       :irate ->
-        fn slice, prev -> instant_rate(slice, prev) end
+        fn slice, prev, _t -> instant_rate(slice, prev) end
+
+      :delta ->
+        fn slice, prev, _t -> gauge_delta(slice, prev) end
+
+      :idelta ->
+        fn slice, prev, _t -> gauge_idelta(slice, prev) end
+
+      :deriv ->
+        fn
+          slice, _prev, t when length(slice) >= 2 ->
+            {slope, _intercept} = linear_regression(slice, t)
+            slope
+
+          [_single], _prev, _t ->
+            0.0
+
+          [], _prev, _t ->
+            :skip
+        end
+
+      :changes ->
+        pairwise_count_fun(fn v1, v2 -> v2 != v1 end)
+
+      :resets ->
+        pairwise_count_fun(fn v1, v2 -> v2 < v1 end)
+    end
+  end
+
+  # Count qualifying adjacent pairs over [prev | slice] — VM includes the
+  # transition from the carry-in sample (implicit zero at a series head).
+  defp pairwise_count_fun(pred) do
+    fn
+      [], _prev, _t ->
+        :skip
+
+      slice, prev, _t ->
+        slice
+        |> seq_with_prev(prev)
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.count(fn [{_t1, v1}, {_t2, v2}] -> pred.(v1, v2) end)
+        |> Kernel.*(1.0)
+    end
+  end
+
+  defp window_variance(vals) do
+    n = length(vals)
+    mean = Enum.sum(vals) / n
+    Enum.reduce(vals, 0.0, fn v, acc -> acc + (v - mean) * (v - mean) end) / n
+  end
+
+  # Signed gauge difference over [carry-in | window]. At a series head VM
+  # (rollupDelta) counts from an implicit zero only when the first value is
+  # small relative to the first adjacent delta — a heuristic distinguishing
+  # "new counter born at ~0" from "gauge that was already large".
+  defp gauge_delta([], _prev), do: :skip
+
+  defp gauge_delta(slice, nil) do
+    {_t, v_first} = hd(slice)
+    {_t2, v_last} = List.last(slice)
+
+    d =
+      case slice do
+        [{_ta, va}, {_tb, vb} | _] -> vb - va
+        _ -> 0.0
+      end
+
+    if abs(v_first) <= 10 * (abs(d) + 1) do
+      v_last - 0.0
+    else
+      v_last - v_first
+    end
+  end
+
+  defp gauge_delta(slice, prev) do
+    {_t1, v_first} = prev
+    {_t2, v_last} = List.last(slice)
+    v_last - v_first
+  end
+
+  defp gauge_idelta(slice, prev) do
+    case Enum.take(seq_with_prev(slice, prev), -2) do
+      [{_t1, v1}, {_t2, v2}] -> v2 - v1
+      _ -> :skip
+    end
+  end
+
+  # Least-squares fit over the window slice with x = ts - t_ref.
+  # Returns {slope_per_second, intercept_at_t_ref}.
+  defp linear_regression(slice, t_ref) do
+    n = length(slice)
+
+    {sx, sy, sxy, sxx} =
+      Enum.reduce(slice, {0.0, 0.0, 0.0, 0.0}, fn {ts, v}, {sx, sy, sxy, sxx} ->
+        x = (ts - t_ref) * 1.0
+        {sx + x, sy + v, sxy + x * v, sxx + x * x}
+      end)
+
+    denom = n * sxx - sx * sx
+
+    if denom == 0 do
+      {:nan, :nan}
+    else
+      slope = (n * sxy - sx * sy) / denom
+      intercept = (sy - slope * sx) / n
+      {slope, intercept}
     end
   end
 
   defp stat_fun(fun) do
     fn
-      [], _prev -> :skip
-      slice, _prev -> slice |> Enum.map(&elem(&1, 1)) |> fun.()
+      [], _prev, _t -> :skip
+      slice, _prev, _t -> slice |> Enum.map(&elem(&1, 1)) |> fun.()
     end
   end
+
+  # VM treats a series head (no sample before the window) as growth from an
+  # implicit zero — the documented VM increase()-counts-the-first-value
+  # behavior, verified via scripts/vm_diff.exs. Applies to increase, delta,
+  # idelta, and changes; NOT to irate (which stays absent at a lone sample).
+  defp seq_with_prev([], _prev), do: []
+  defp seq_with_prev(slice, nil), do: [{elem(hd(slice), 0) - 1, 0.0} | slice]
+  defp seq_with_prev(slice, prev), do: [prev | slice]
 
   # Reset-adjusted increase over [prev | slice] (VM-style: the carry-in
   # sample makes the increase span the full window, without Prometheus'
   # extrapolation). On a counter reset the post-reset value is the delta.
   defp counter_increase(slice, prev) do
-    seq = if prev, do: [prev | slice], else: slice
-
-    case seq do
+    case seq_with_prev(slice, prev) do
       [] ->
         :skip
 
-      [_single] ->
-        :skip
-
-      _ ->
+      seq ->
         seq
         |> Enum.chunk_every(2, 1, :discard)
         |> Enum.reduce(0.0, fn [{_t1, v1}, {_t2, v2}], acc ->
@@ -1591,7 +1805,8 @@ defmodule TimelessMetrics.PromQL do
   end
 
   # With carry-in the increase spans the full window; without it (series
-  # head) VM divides by the actual data span inside the window.
+  # head) VM divides by the actual data span inside the window. A lone
+  # sample has zero span — no rate.
   defp counter_rate(slice, prev, window) do
     case counter_increase(slice, prev) do
       :skip ->
@@ -1604,14 +1819,6 @@ defmodule TimelessMetrics.PromQL do
         {t_first, _} = hd(slice)
         {t_last, _} = List.last(slice)
         if t_last > t_first, do: inc / (t_last - t_first), else: :skip
-    end
-  end
-
-  # VM emits increase = 0 for a single-sample window (no delta yet)
-  defp counter_increase_or_zero(slice, prev) do
-    case counter_increase(slice, prev) do
-      :skip when slice != [] -> 0.0
-      other -> other
     end
   end
 

@@ -220,7 +220,35 @@ defmodule VMDiff do
       "-g_ramp",
       "g_ramp >= 100",
       "g_ramp != 42",
-      ~s|g_ramp{host="a"} or g_ramp{host="b"}|
+      ~s|g_ramp{host="a"} or g_ramp{host="b"}|,
+      # Phase 2A: gauge rollups + over_time stats
+      "delta(g_ramp[5m])",
+      "idelta(g_ramp[1m])",
+      "deriv(g_ramp[5m])",
+      "predict_linear(g_ramp[5m], 600)",
+      "changes(g_ramp[5m])",
+      "resets(c_reqs[30m])",
+      "present_over_time(g_sparse[5m])",
+      "quantile_over_time(0.9, g_ramp[5m])",
+      "stddev_over_time(g_ramp[5m])",
+      "stdvar_over_time(g_ramp[5m])",
+      # Phase 2A: math batch
+      "sgn(g_ramp - 100)",
+      "sin(g_ramp)",
+      "cos(g_ramp)",
+      "tan(g_ramp)",
+      "atan(g_ramp)",
+      "asin(g_ramp / 1000)",
+      "acos(g_ramp / 1000)",
+      "sinh(g_ramp / 100)",
+      "cosh(g_ramp / 100)",
+      "tanh(g_ramp / 100)",
+      "asinh(g_ramp)",
+      "acosh(g_ramp)",
+      "atanh(g_ramp / 1000)",
+      "deg(g_ramp)",
+      "rad(g_ramp)",
+      "g_ramp + 0 * pi()"
     ]
   end
 
