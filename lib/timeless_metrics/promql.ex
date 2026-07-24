@@ -11,19 +11,26 @@ defmodule TimelessMetrics.PromQL do
 
   ## Supported
 
-    * Selectors: `m`, `m{a="x",b=~"y",c!="z",d!~"w"}`, `{__name__=~"cpu_.*"}`
-    * Range functions: `rate`, `irate`, `increase`, `avg/min/max/sum/count_over_time`,
-      `last_over_time`, `first_over_time`
-    * Aggregations: `sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`,
-      `group`, `quantile(q, ...)`, `topk(k, ...)`, `bottomk(k, ...)` — with
-      `by (...)` / `without (...)` in prefix or suffix position, or bare
-      (collapses to a single series, dropping `__name__`)
-    * Binary operators: `+ - * / % ^`, comparisons (`> < >= <= == !=`, with
-      `bool`), and set operators `and` / `or` / `unless`; scalar–vector and
-      1:1 vector–vector matching
-    * Value transforms: `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `ln`,
-      `log2`, `log10`, `clamp`, `clamp_min`, `clamp_max`
-    * `offset` modifier
+  Effectively the full PromQL surface plus the common MetricsQL tier —
+  every construct is verified against a live VictoriaMetrics instance by
+  `scripts/vm_diff.exs`:
+
+    * Selectors with all matcher types (duplicates AND together), `offset`,
+      the `@` modifier, subqueries `[W:R]`, and step-relative `[Ni]` windows
+    * Rollups: `rate irate increase delta idelta deriv predict_linear
+      changes resets` and the `*_over_time` family (incl. `quantile/stddev/
+      stdvar/present/last/first_over_time`), window-less MetricsQL forms
+    * Aggregations: `sum avg min max count group stddev stdvar topk bottomk
+      quantile count_values` with `by`/`without` in either position
+    * Binary operators with `bool` and full vector matching
+      (`on`/`ignoring`/`group_left`/`group_right`), set ops, and the
+      MetricsQL `default`/`if`/`ifnot` operators
+    * `histogram_quantile` over classic `le` buckets
+    * Transforms and math (`abs ceil floor round clamp* sqrt exp ln log2
+      log10 sgn` trig `deg rad pi`), `label_replace label_join label_set
+      label_del alias union sort sort_desc`, `absent absent_over_time`,
+      `time timestamp scalar vector` and the clock functions,
+      `keep_metric_names`, `range_*`/`running_*`
 
   Anything unsupported returns `{:error, reason}` — never a silent empty
   success — so API clients get a Prometheus-style error response.
@@ -1378,19 +1385,6 @@ defmodule TimelessMetrics.PromQL do
     end
   end
 
-  # VM rejects label transforms whose output contains colliding label sets
-  defp check_unique_output(series) do
-    dup =
-      series
-      |> Enum.frequencies_by(& &1.labels)
-      |> Enum.find(fn {_labels, n} -> n > 1 end)
-
-    case dup do
-      nil -> :ok
-      {labels, _n} -> {:error, "duplicate output timeseries: #{inspect(labels)}"}
-    end
-  end
-
   # default_rollup(m) — the last raw sample within the lookback window,
   # i.e. exactly our instant-selector semantics
   defp eval_call(:default_rollup, [{:selector, _} = sel_node], ctx), do: eval(sel_node, ctx)
@@ -1466,6 +1460,19 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval_call(f, args, _ctx),
     do: {:error, "#{f}() called with #{length(args)} argument(s) — wrong arity"}
+
+  # VM rejects label transforms whose output contains colliding label sets
+  defp check_unique_output(series) do
+    dup =
+      series
+      |> Enum.frequencies_by(& &1.labels)
+      |> Enum.find(fn {_labels, n} -> n > 1 end)
+
+    case dup do
+      nil -> :ok
+      {labels, _n} -> {:error, "duplicate output timeseries: #{inspect(labels)}"}
+    end
+  end
 
   defp resolve_window({:steps, n}, ctx), do: n * ctx.step
   defp resolve_window(seconds, _ctx) when is_integer(seconds), do: seconds

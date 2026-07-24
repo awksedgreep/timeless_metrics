@@ -952,6 +952,41 @@ defmodule TimelessMetrics.HTTPTest do
     assert resp.status == 400
   end
 
+  test "GET /api/v1/status/buildinfo identifies as Prometheus-compatible" do
+    for path <- ["/api/v1/status/buildinfo", "/prometheus/api/v1/status/buildinfo"] do
+      resp = TimelessMetrics.TestHTTP.get(@port, path)
+      assert resp.status == 200
+      body = :json.decode(resp.body)
+      assert body["status"] == "success"
+      assert is_binary(body["data"]["version"])
+      assert body["data"]["application"] == "timeless-metrics"
+    end
+  end
+
+  test "GET /api/v1/status/config returns an empty config" do
+    resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/status/config")
+    assert resp.status == 200
+    assert :json.decode(resp.body)["data"]["yaml"] == ""
+  end
+
+  test "series endpoint unions repeated match[] params" do
+    now = System.os_time(:second)
+    TimelessMetrics.write(:http_test, "m_one", %{"host" => "a"}, 1.0, timestamp: now)
+    TimelessMetrics.write(:http_test, "m_two", %{"host" => "b"}, 2.0, timestamp: now)
+    TimelessMetrics.flush(:http_test)
+
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
+        "/prometheus/api/v1/series?match[]=m_one&match[]=m_two"
+      )
+
+    assert resp.status == 200
+    data = :json.decode(resp.body)["data"]
+    names = data |> Enum.map(& &1["__name__"]) |> Enum.sort()
+    assert names == ["m_one", "m_two"]
+  end
+
   test "rejected PromQL queries land in the gap radar" do
     now = System.os_time(:second)
 

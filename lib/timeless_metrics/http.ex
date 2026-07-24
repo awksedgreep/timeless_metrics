@@ -269,6 +269,37 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
+  # Prometheus/Grafana flavor detection
+  get "/api/v1/status/buildinfo" do
+    buildinfo(req)
+  end
+
+  get "/prometheus/api/v1/status/buildinfo" do
+    buildinfo(req)
+  end
+
+  defp buildinfo(req) do
+    version = Application.spec(:timeless_metrics, :vsn) |> to_string()
+
+    json_resp(req, 200, %{
+      "status" => "success",
+      "data" => %{
+        # Prometheus-compatible API version Grafana keys on
+        "version" => "2.24.0",
+        "application" => "timeless-metrics",
+        "revision" => "timeless-metrics-#{version}",
+        "branch" => "",
+        "buildUser" => "",
+        "buildDate" => "",
+        "goVersion" => ""
+      }
+    })
+  end
+
+  get "/api/v1/status/config" do
+    json_resp(req, 200, %{"status" => "success", "data" => %{"yaml" => ""}})
+  end
+
   # Full diagnostic info — expensive, fans out to all series (auth required)
   get "/health/detailed" do
     case check_auth(req) do
@@ -1268,57 +1299,82 @@ defmodule TimelessMetrics.HTTP do
         store = store()
         {params, _} = Rocket.Request.query_params(req)
 
-        match_param =
-          case params["match[]"] || params["match"] do
-            [first | _] -> first
-            other -> other
+        # Map-based params keep only the last duplicate key — parse the raw
+        # query string to honor repeated match[] params (Prometheus API).
+        match_params =
+          case req.query_string do
+            qs when is_binary(qs) and qs != "" ->
+              for {k, v} <- URI.query_decoder(qs) |> Enum.to_list(),
+                  k in ["match[]", "match"],
+                  do: v
+
+            _ ->
+              List.wrap(params["match[]"] || params["match"])
           end
 
-        case match_param do
-          nil ->
+        case match_params do
+          [] ->
             json_error(req, 400, "missing required parameter: match[]")
 
-          match_query ->
-            case TimelessMetrics.PromQL.parse(match_query) do
-              {:ok, ast} ->
-                plan = TimelessMetrics.PromQL.selector_info(ast)
-
-                metric_names =
-                  case {plan.metric, plan.metric_pattern} do
-                    {name, nil} when is_binary(name) ->
-                      [name]
-
-                    {nil, pattern} when is_binary(pattern) ->
-                      {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
-                      {:ok, regex} = Regex.compile("^(?:" <> pattern <> ")$")
-                      Enum.filter(all_metrics, &Regex.match?(regex, &1))
-
-                    _ ->
-                      {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
-                      all_metrics
-                  end
-
-                series =
-                  Enum.flat_map(metric_names, fn metric ->
-                    case TimelessMetrics.list_series(store, metric) do
-                      {:ok, series_list} ->
-                        label_maps = Enum.map(series_list, fn %{labels: l} -> l end)
-
-                        label_maps
-                        |> filter_series_by_labels(plan.labels)
-                        |> Enum.map(&Map.put(&1, "__name__", metric))
-
-                      _ ->
-                        []
-                    end
-                  end)
-
-                json_resp(req, 200, %{"status" => "success", "data" => series})
+          match_queries ->
+            # Prometheus allows repeated match[] params; the result is the
+            # union of series matched by each selector.
+            match_queries
+            |> Enum.reduce_while({:ok, []}, fn match_query, {:ok, acc} ->
+              case series_for_match(store, match_query) do
+                {:ok, series} -> {:cont, {:ok, acc ++ series}}
+                {:error, _} = err -> {:halt, err}
+              end
+            end)
+            |> case do
+              {:ok, series} ->
+                json_resp(req, 200, %{"status" => "success", "data" => Enum.uniq(series)})
 
               {:error, reason} ->
                 json_error(req, 400, "PromQL parse error: #{reason}")
             end
         end
+    end
+  end
+
+  defp series_for_match(store, match_query) do
+    case TimelessMetrics.PromQL.parse(match_query) do
+      {:ok, ast} ->
+        plan = TimelessMetrics.PromQL.selector_info(ast)
+
+        metric_names =
+          case {plan.metric, plan.metric_pattern} do
+            {name, nil} when is_binary(name) ->
+              [name]
+
+            {nil, pattern} when is_binary(pattern) ->
+              {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
+              {:ok, regex} = Regex.compile("^(?:" <> pattern <> ")$")
+              Enum.filter(all_metrics, &Regex.match?(regex, &1))
+
+            _ ->
+              {:ok, all_metrics} = TimelessMetrics.list_metrics(store)
+              all_metrics
+          end
+
+        series =
+          Enum.flat_map(metric_names, fn metric ->
+            case TimelessMetrics.list_series(store, metric) do
+              {:ok, series_list} ->
+                series_list
+                |> Enum.map(fn %{labels: l} -> l end)
+                |> filter_series_by_labels(plan.labels)
+                |> Enum.map(&Map.put(&1, "__name__", metric))
+
+              _ ->
+                []
+            end
+          end)
+
+        {:ok, series}
+
+      {:error, _reason} = err ->
+        err
     end
   end
 
