@@ -146,6 +146,26 @@ defmodule TimelessMetrics.HTTP do
     json_resp(req, status, %{error: msg})
   end
 
+  # Prometheus API error shape — clients (Grafana etc.) surface these instead
+  # of rendering an empty chart.
+  defp prom_error(req, status, error_type, msg) do
+    json_resp(req, status, %{status: "error", errorType: error_type, error: msg})
+  end
+
+  # Prometheus API allows GET query params and POST form bodies interchangeably;
+  # merge both so each handler serves either method.
+  defp merged_params(req) do
+    {query_params, _} = Rocket.Request.query_params(req)
+
+    case Map.get(req, :body) do
+      body when is_binary(body) and body != "" ->
+        Map.merge(query_params, URI.decode_query(body))
+
+      _ ->
+        query_params
+    end
+  end
+
   defp html_resp(req, status, html) do
     Rocket.Response.send_iodata(req, status, [{"content-type", "text/html"}], html)
   end
@@ -332,6 +352,14 @@ defmodule TimelessMetrics.HTTP do
 
   # Latest value for matching series
   get "/api/v1/query" do
+    handle_api_query(req)
+  end
+
+  post "/api/v1/query" do
+    handle_api_query(req)
+  end
+
+  defp handle_api_query(req) do
     case check_auth(req) do
       :halt ->
         :ok
@@ -339,7 +367,7 @@ defmodule TimelessMetrics.HTTP do
       :ok ->
         store = store()
         TimelessMetrics.Stats.incr_http_queries(store)
-        {params, _} = Rocket.Request.query_params(req)
+        params = merged_params(req)
 
         if params["query"] do
           # PromQL instant query — evaluate at `time` (default: now)
@@ -349,21 +377,24 @@ defmodule TimelessMetrics.HTTP do
 
           case TimelessMetrics.PromQL.parse(params["query"]) do
             {:ok, plan} ->
-              {:ok, response} =
-                TimelessMetrics.PromQL.execute(
-                  plan,
-                  store,
-                  eval_time - lookback,
-                  eval_time,
-                  lookback
-                )
+              case TimelessMetrics.PromQL.execute(
+                     plan,
+                     store,
+                     eval_time - lookback,
+                     eval_time,
+                     lookback
+                   ) do
+                {:ok, response} ->
+                  # Convert range response to instant: keep only the last point per series
+                  instant_response = to_instant_response(response, eval_time)
+                  json_resp(req, 200, instant_response)
 
-              # Convert range response to instant: keep only the last point per series
-              instant_response = to_instant_response(response, eval_time)
-              json_resp(req, 200, instant_response)
+                {:error, reason} ->
+                  prom_error(req, 422, "execution", reason)
+              end
 
             {:error, reason} ->
-              json_error(req, 400, "PromQL parse error: #{reason}")
+              prom_error(req, 400, "bad_data", "PromQL parse error: #{reason}")
           end
         else
           case extract_metric_and_labels(params) do
@@ -398,6 +429,14 @@ defmodule TimelessMetrics.HTTP do
   # When query= param is present, routes through PromQL parser (TSBS/Grafana compatible).
   # Otherwise uses native params: metric=, metrics=, group_by=, cross_aggregate=, etc.
   get "/api/v1/query_range" do
+    handle_api_query_range(req)
+  end
+
+  post "/api/v1/query_range" do
+    handle_api_query_range(req)
+  end
+
+  defp handle_api_query_range(req) do
     case check_auth(req) do
       :halt ->
         :ok
@@ -405,7 +444,7 @@ defmodule TimelessMetrics.HTTP do
       :ok ->
         store = store()
         TimelessMetrics.Stats.incr_http_queries(store)
-        {params, _} = Rocket.Request.query_params(req)
+        params = merged_params(req)
 
         # If query= param is present, treat as PromQL (TSBS sends PromQL here)
         if params["query"] do
@@ -416,13 +455,16 @@ defmodule TimelessMetrics.HTTP do
 
           case TimelessMetrics.PromQL.parse(params["query"]) do
             {:ok, plan} ->
-              {:ok, response} =
-                TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
+              case TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step) do
+                {:ok, response} ->
+                  json_resp(req, 200, response)
 
-              json_resp(req, 200, response)
+                {:error, reason} ->
+                  prom_error(req, 422, "execution", reason)
+              end
 
             {:error, reason} ->
-              json_error(req, 400, "PromQL parse error: #{reason}")
+              prom_error(req, 400, "bad_data", "PromQL parse error: #{reason}")
           end
         else
           case extract_query_params_extended(params) do
@@ -1035,6 +1077,14 @@ defmodule TimelessMetrics.HTTP do
 
   # Prometheus-compatible query_range endpoint (for Grafana + TSBS)
   get "/prometheus/api/v1/query_range" do
+    handle_prom_query_range(req)
+  end
+
+  post "/prometheus/api/v1/query_range" do
+    handle_prom_query_range(req)
+  end
+
+  defp handle_prom_query_range(req) do
     case check_auth(req) do
       :halt ->
         :ok
@@ -1042,11 +1092,11 @@ defmodule TimelessMetrics.HTTP do
       :ok ->
         store = store()
         TimelessMetrics.Stats.incr_http_queries(store)
-        {params, _} = Rocket.Request.query_params(req)
+        params = merged_params(req)
 
         case params["query"] do
           nil ->
-            json_error(req, 400, "missing required parameter: query")
+            prom_error(req, 400, "bad_data", "missing required parameter: query")
 
           query ->
             now = System.os_time(:second)
@@ -1056,13 +1106,16 @@ defmodule TimelessMetrics.HTTP do
 
             case TimelessMetrics.PromQL.parse(query) do
               {:ok, plan} ->
-                {:ok, response} =
-                  TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
+                case TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step) do
+                  {:ok, response} ->
+                    json_resp(req, 200, response)
 
-                json_resp(req, 200, response)
+                  {:error, reason} ->
+                    prom_error(req, 422, "execution", reason)
+                end
 
               {:error, reason} ->
-                json_error(req, 400, "PromQL parse error: #{reason}")
+                prom_error(req, 400, "bad_data", "PromQL parse error: #{reason}")
             end
         end
     end
@@ -1070,6 +1123,14 @@ defmodule TimelessMetrics.HTTP do
 
   # Prometheus-compatible instant query endpoint (for Grafana health check + current-value panels)
   get "/prometheus/api/v1/query" do
+    handle_prom_query(req)
+  end
+
+  post "/prometheus/api/v1/query" do
+    handle_prom_query(req)
+  end
+
+  defp handle_prom_query(req) do
     case check_auth(req) do
       :halt ->
         :ok
@@ -1077,11 +1138,11 @@ defmodule TimelessMetrics.HTTP do
       :ok ->
         store = store()
         TimelessMetrics.Stats.incr_http_queries(store)
-        {params, _} = Rocket.Request.query_params(req)
+        params = merged_params(req)
 
         case params["query"] do
           nil ->
-            json_error(req, 400, "missing required parameter: query")
+            prom_error(req, 400, "bad_data", "missing required parameter: query")
 
           query ->
             now = System.os_time(:second)
@@ -1092,27 +1153,30 @@ defmodule TimelessMetrics.HTTP do
 
             case TimelessMetrics.PromQL.parse(query) do
               {:ok, plan} ->
-                {:ok, response} =
-                  TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step)
+                case TimelessMetrics.PromQL.execute(plan, store, start_ts, end_ts, step) do
+                  {:ok, response} ->
+                    # Convert matrix results to vector (take last value from each series)
+                    vector_results =
+                      Enum.map(response["data"]["result"], fn series ->
+                        case List.last(series["values"]) do
+                          [ts, val] -> %{"metric" => series["metric"], "value" => [ts, val]}
+                          _ -> %{"metric" => series["metric"], "value" => [end_ts, "0"]}
+                        end
+                      end)
 
-                # Convert matrix results to vector (take last value from each series)
-                vector_results =
-                  Enum.map(response["data"]["result"], fn series ->
-                    case List.last(series["values"]) do
-                      [ts, val] -> %{"metric" => series["metric"], "value" => [ts, val]}
-                      _ -> %{"metric" => series["metric"], "value" => [end_ts, "0"]}
-                    end
-                  end)
+                    vector_response = %{
+                      "status" => "success",
+                      "data" => %{"resultType" => "vector", "result" => vector_results}
+                    }
 
-                vector_response = %{
-                  "status" => "success",
-                  "data" => %{"resultType" => "vector", "result" => vector_results}
-                }
+                    json_resp(req, 200, vector_response)
 
-                json_resp(req, 200, vector_response)
+                  {:error, reason} ->
+                    prom_error(req, 422, "execution", reason)
+                end
 
               {:error, reason} ->
-                json_error(req, 400, "PromQL parse error: #{reason}")
+                prom_error(req, 400, "bad_data", "PromQL parse error: #{reason}")
             end
         end
     end
@@ -1199,7 +1263,9 @@ defmodule TimelessMetrics.HTTP do
 
           match_query ->
             case TimelessMetrics.PromQL.parse(match_query) do
-              {:ok, plan} ->
+              {:ok, ast} ->
+                plan = TimelessMetrics.PromQL.selector_info(ast)
+
                 metric_names =
                   case {plan.metric, plan.metric_pattern} do
                     {name, nil} when is_binary(name) ->
