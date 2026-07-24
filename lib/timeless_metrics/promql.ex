@@ -1496,10 +1496,16 @@ defmodule TimelessMetrics.PromQL do
 
       out =
         series
-        |> Enum.map(fn %{labels: labels, data: data} ->
-          labels = if keep_name, do: labels, else: Map.delete(labels, "__name__")
-          %{labels: labels, data: grid_eval(data, ctx.from, ctx.to, ctx.step, window, fun)}
-        end)
+        |> Task.async_stream(
+          fn %{labels: labels, data: data} ->
+            labels = if keep_name, do: labels, else: Map.delete(labels, "__name__")
+            %{labels: labels, data: grid_eval(data, ctx.from, ctx.to, ctx.step, window, fun)}
+          end,
+          max_concurrency: System.schedulers_online(),
+          ordered: false,
+          timeout: :infinity
+        )
+        |> Enum.flat_map(fn {:ok, s} -> [s] end)
         |> Enum.reject(&(&1.data == []))
 
       {:ok, {:vector, out}}
@@ -2569,22 +2575,39 @@ defmodule TimelessMetrics.PromQL do
       from = ctx.from - sel.offset
       to = ctx.to - sel.offset
 
+      # Per-series evaluation is independent — fan out across schedulers.
       series =
         raw
-        |> Enum.map(fn %{labels: labels, points: points} ->
-          data =
-            points
-            |> Enum.sort_by(&elem(&1, 0))
-            |> grid_eval(from, to, ctx.step, window, window_fun)
-            |> shift_data(sel.offset)
+        |> Task.async_stream(
+          fn %{labels: labels, points: points} ->
+            data =
+              points
+              |> ensure_sorted()
+              |> grid_eval(from, to, ctx.step, window, window_fun)
+              |> shift_data(sel.offset)
 
-          %{labels: labels, data: data}
-        end)
+            %{labels: labels, data: data}
+          end,
+          max_concurrency: System.schedulers_online(),
+          ordered: false,
+          timeout: :infinity
+        )
+        |> Enum.flat_map(fn {:ok, s} -> [s] end)
         |> Enum.reject(&(&1.data == []))
 
       {:ok, series}
     end
   end
+
+  # The engine returns chunk-merged points already sorted; verify with a
+  # cheap allocation-free pass instead of unconditionally re-sorting.
+  defp ensure_sorted(points) do
+    if sorted_asc?(points), do: points, else: Enum.sort_by(points, &elem(&1, 0))
+  end
+
+  defp sorted_asc?([{a, _} | [{b, _} | _] = rest]) when a <= b, do: sorted_asc?(rest)
+  defp sorted_asc?([_, _ | _]), do: false
+  defp sorted_asc?(_), do: true
 
   defp check_sample_budget(raw) do
     budget = Application.get_env(:timeless_metrics, :promql_max_samples, @default_max_samples)
@@ -2621,17 +2644,23 @@ defmodule TimelessMetrics.PromQL do
       results =
         all_metrics
         |> Enum.filter(&Regex.match?(regex, &1))
-        |> Enum.flat_map(fn metric ->
-          {:ok, results} =
-            TimelessMetrics.query_multi(ctx.store, metric, sel.labels,
-              from: ctx.from - sel.offset - window,
-              to: ctx.to - sel.offset
-            )
+        |> Task.async_stream(
+          fn metric ->
+            {:ok, results} =
+              TimelessMetrics.query_multi(ctx.store, metric, sel.labels,
+                from: ctx.from - sel.offset - window,
+                to: ctx.to - sel.offset
+              )
 
-          Enum.map(results, fn %{labels: l, points: pts} ->
-            %{labels: maybe_name(l, metric, keep_name), points: pts}
-          end)
-        end)
+            Enum.map(results, fn %{labels: l, points: pts} ->
+              %{labels: maybe_name(l, metric, keep_name), points: pts}
+            end)
+          end,
+          max_concurrency: System.schedulers_online(),
+          ordered: false,
+          timeout: :infinity
+        )
+        |> Enum.flat_map(fn {:ok, series} -> series end)
 
       {:ok, results}
     end
