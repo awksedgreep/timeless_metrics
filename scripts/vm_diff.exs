@@ -41,10 +41,33 @@ defmodule VMDiff do
       corpus = corpus(base)
       results = Enum.map(corpus, &compare(&1, q_start, q_end, step))
 
+      IO.puts("\n--- instant queries (/api/v1/query) ---")
+      instant_results = Enum.map(instant_corpus(base), &compare_instant(&1, q_end))
+      results = results ++ instant_results
+
+      IO.puts("\n--- metadata endpoints ---")
+
+      meta_paths = [
+        "/api/v1/labels",
+        "/api/v1/labels?match%5B%5D=g_ramp",
+        "/api/v1/labels?match%5B%5D=" <> URI.encode_www_form(~s|host_info{host="a"}|),
+        "/api/v1/label/host/values",
+        "/api/v1/label/host/values?match%5B%5D=g_sparse",
+        "/api/v1/label/le/values?match%5B%5D=lat_bucket",
+        "/api/v1/label/__name__/values?match%5B%5D=" <> URI.encode_www_form(~s|{host="a"}|),
+        "/api/v1/series?match%5B%5D=g_const&match%5B%5D=g_sparse"
+      ]
+
+      meta_results = Enum.map(meta_paths, &compare_meta/1)
+      results = results ++ meta_results
+
       diffs = Enum.reject(results, fn {_q, verdict} -> verdict == :ok end)
 
       IO.puts("\n=== VM differential summary ===")
-      IO.puts("#{length(corpus) - length(diffs)}/#{length(corpus)} queries match VictoriaMetrics")
+
+      IO.puts(
+        "#{length(results) - length(diffs)}/#{length(results)} queries match VictoriaMetrics"
+      )
 
       Enum.each(diffs, fn {q, verdict} ->
         IO.puts("\nDIFF  #{q}")
@@ -356,6 +379,137 @@ defmodule VMDiff do
       "g_ramp offset 5m @ #{base + 600}"
     ]
   end
+
+  # --- instant queries ---
+
+  defp instant_corpus(base) do
+    _ = base
+
+    [
+      "g_ramp",
+      ~s|g_ramp{host="a"}|,
+      "g_sparse",
+      "rate(c_reqs[5m])",
+      "sum(g_ramp)",
+      "avg by (host) (g_ramp)",
+      "g_ramp / 10",
+      "g_ramp > 100",
+      "histogram_quantile(0.9, lat_bucket)",
+      "topk(1, g_ramp)",
+      "time()",
+      "vector(1)",
+      "absent(no_such_metric)",
+      "g_ramp offset 5m",
+      "last_over_time(g_ramp[5m])",
+      "no_such_metric"
+    ]
+  end
+
+  defp compare_instant(query, eval_time) do
+    vm = query_instant("http://127.0.0.1:#{@vm_port}", query, eval_time)
+    tl = query_instant("http://127.0.0.1:#{@tl_port}", query, eval_time)
+
+    verdict =
+      case {vm, tl} do
+        {{:ok, vm_body}, {:ok, tl_body}} ->
+          diff_instant_bodies(vm_body, tl_body)
+
+        {{:error, {vm_code, _}}, {:error, {tl_code, _}}}
+        when vm_code in 400..499 and tl_code in 400..499 ->
+          :ok
+
+        {vm_err, tl_err} ->
+          {:transport, vm_err, tl_err}
+      end
+
+    tag = if verdict == :ok, do: "ok  ", else: "DIFF"
+    IO.puts("#{tag}  [instant] #{query}")
+    {"[instant] " <> query, verdict}
+  end
+
+  defp query_instant(base_url, query, time) do
+    http_get("#{base_url}/api/v1/query?query=#{URI.encode_www_form(query)}&time=#{time}")
+  end
+
+  defp diff_instant_bodies(vm_body, tl_body) do
+    vm_json = :json.decode(vm_body)
+    tl_json = :json.decode(tl_body)
+
+    cond do
+      vm_json["status"] != tl_json["status"] ->
+        {:status_mismatch, vm_json["status"], tl_json["status"]}
+
+      vm_json["status"] == "error" ->
+        :ok
+
+      vm_json["data"]["resultType"] != tl_json["data"]["resultType"] ->
+        {:result_type_mismatch, vm_json["data"]["resultType"], tl_json["data"]["resultType"]}
+
+      true ->
+        vm_map =
+          Map.new(vm_json["data"]["result"], fn s ->
+            {canon_labels(s["metric"]), s["value"]}
+          end)
+
+        tl_map =
+          Map.new(tl_json["data"]["result"], fn s ->
+            {canon_labels(s["metric"]), s["value"]}
+          end)
+
+        missing = Map.keys(vm_map) -- Map.keys(tl_map)
+        extra = Map.keys(tl_map) -- Map.keys(vm_map)
+
+        value_diffs =
+          for {labels, [vm_ts, vm_v]} <- vm_map,
+              [tl_ts, tl_v] = Map.get(tl_map, labels),
+              tl_ts != nil,
+              vm_ts != tl_ts or not same_value?(parse_val(vm_v), parse_val(tl_v)) do
+            {labels, {vm_ts, vm_v}, {tl_ts, tl_v}}
+          end
+
+        if missing == [] and extra == [] and value_diffs == [] do
+          :ok
+        else
+          {:mismatch, missing: missing, extra: extra, point_diffs: value_diffs}
+        end
+    end
+  end
+
+  # --- metadata endpoints (labels / label values / series) ---
+
+  defp compare_meta(path) do
+    vm = http_get("http://127.0.0.1:#{@vm_port}#{path}")
+    tl = http_get("http://127.0.0.1:#{@tl_port}#{path}")
+
+    verdict =
+      case {vm, tl} do
+        {{:ok, vm_body}, {:ok, tl_body}} ->
+          vm_data = :json.decode(vm_body)["data"] |> canon_meta()
+          tl_data = :json.decode(tl_body)["data"] |> canon_meta()
+          if vm_data == tl_data, do: :ok, else: {:meta_mismatch, vm_data, tl_data}
+
+        {vm_err, tl_err} ->
+          {:transport, vm_err, tl_err}
+      end
+
+    tag = if verdict == :ok, do: "ok  ", else: "DIFF"
+    IO.puts("#{tag}  [meta] #{path}")
+    {"[meta] " <> path, verdict}
+  end
+
+  defp canon_meta(data) when is_list(data) do
+    data
+    |> Enum.map(fn
+      m when is_map(m) ->
+        m |> Enum.sort() |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.join(",")
+
+      other ->
+        other
+    end)
+    |> Enum.sort()
+  end
+
+  defp canon_meta(other), do: other
 
   # --- comparison ---
 

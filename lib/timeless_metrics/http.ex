@@ -616,28 +616,47 @@ defmodule TimelessMetrics.HTTP do
 
   # List all label names (VictoriaMetrics native path)
   get "/api/v1/labels" do
+    handle_labels(req)
+  end
+
+  defp handle_labels(req) do
     case check_auth(req) do
       :halt ->
         :ok
 
       :ok ->
         store = store()
-        {:ok, metrics} = TimelessMetrics.list_metrics(store)
+        {params, _} = Rocket.Request.query_params(req)
 
-        label_names =
-          metrics
-          |> Enum.flat_map(fn metric ->
-            case TimelessMetrics.list_series(store, metric) do
-              {:ok, series} -> Enum.flat_map(series, fn %{labels: l} -> Map.keys(l) end)
-              _ -> []
+        case match_selector_params(req, params) do
+          [] ->
+            {:ok, metrics} = TimelessMetrics.list_metrics(store)
+
+            label_names =
+              metrics
+              |> Enum.flat_map(fn metric ->
+                case TimelessMetrics.list_series(store, metric) do
+                  {:ok, series} -> Enum.flat_map(series, fn %{labels: l} -> Map.keys(l) end)
+                  _ -> []
+                end
+              end)
+              |> MapSet.new()
+              |> MapSet.put("__name__")
+              |> MapSet.to_list()
+              |> Enum.sort()
+
+            json_resp(req, 200, %{"status" => "success", "data" => label_names})
+
+          matches ->
+            case matched_label_sets(store, matches) do
+              {:ok, label_sets} ->
+                names = label_sets |> Enum.flat_map(&Map.keys/1) |> Enum.uniq() |> Enum.sort()
+                json_resp(req, 200, %{"status" => "success", "data" => names})
+
+              {:error, reason} ->
+                json_error(req, 400, "PromQL parse error: #{reason}")
             end
-          end)
-          |> MapSet.new()
-          |> MapSet.put("__name__")
-          |> MapSet.to_list()
-          |> Enum.sort()
-
-        json_resp(req, 200, %{"status" => "success", "data" => label_names})
+        end
     end
   end
 
@@ -657,6 +676,10 @@ defmodule TimelessMetrics.HTTP do
   # List values for a specific label key
   # When metric= is provided, scopes to that metric. Otherwise queries all metrics (VM compat).
   get "/api/v1/label/:name/values" do
+    handle_label_values(req)
+  end
+
+  defp handle_label_values(req) do
     case check_auth(req) do
       :halt ->
         :ok
@@ -667,29 +690,58 @@ defmodule TimelessMetrics.HTTP do
         label_name = req.path_params["name"]
         metric = params["metric"]
 
-        values =
-          if metric do
-            {:ok, vals} = TimelessMetrics.label_values(store, metric, label_name)
-            vals
-          else
-            {:ok, metrics} = TimelessMetrics.list_metrics(store)
+        case match_selector_params(req, params) do
+          [] ->
+            values =
+              cond do
+                metric != nil ->
+                  {:ok, vals} = TimelessMetrics.label_values(store, metric, label_name)
+                  vals
 
-            metrics
-            |> Enum.flat_map(fn m ->
-              case TimelessMetrics.label_values(store, m, label_name) do
-                {:ok, vals} -> vals
-                _ -> []
+                label_name == "__name__" ->
+                  {:ok, metrics} = TimelessMetrics.list_metrics(store)
+                  metrics
+
+                true ->
+                  {:ok, metrics} = TimelessMetrics.list_metrics(store)
+
+                  metrics
+                  |> Enum.flat_map(fn m ->
+                    case TimelessMetrics.label_values(store, m, label_name) do
+                      {:ok, vals} -> vals
+                      _ -> []
+                    end
+                  end)
+                  |> Enum.uniq()
+                  |> Enum.sort()
               end
-            end)
-            |> Enum.uniq()
-            |> Enum.sort()
-          end
 
-        json_resp(req, 200, %{status: "success", data: values})
+            json_resp(req, 200, %{status: "success", data: values})
+
+          matches ->
+            case matched_label_sets(store, matches) do
+              {:ok, label_sets} ->
+                values =
+                  label_sets
+                  |> Enum.flat_map(fn labels ->
+                    case Map.fetch(labels, label_name) do
+                      {:ok, v} -> [v]
+                      :error -> []
+                    end
+                  end)
+                  |> Enum.uniq()
+                  |> Enum.sort()
+
+                json_resp(req, 200, %{status: "success", data: values})
+
+              {:error, reason} ->
+                json_error(req, 400, "PromQL parse error: #{reason}")
+            end
+        end
     end
   end
 
-  # List all series for a metric
+  # List series — native metric= form, or Prometheus match[] selectors
   get "/api/v1/series" do
     case check_auth(req) do
       :halt ->
@@ -699,11 +751,20 @@ defmodule TimelessMetrics.HTTP do
         store = store()
         {params, _} = Rocket.Request.query_params(req)
 
-        case params["metric"] do
-          nil ->
-            json_error(req, 400, "missing required parameter: metric")
+        case {params["metric"], match_selector_params(req, params)} do
+          {nil, []} ->
+            json_error(req, 400, "missing required parameter: metric or match[]")
 
-          metric ->
+          {nil, matches} ->
+            case matched_label_sets(store, matches) do
+              {:ok, series} ->
+                json_resp(req, 200, %{"status" => "success", "data" => Enum.uniq(series)})
+
+              {:error, reason} ->
+                json_error(req, 400, "PromQL parse error: #{reason}")
+            end
+
+          {metric, _} ->
             {:ok, series} = TimelessMetrics.list_series(store, metric)
             json_resp(req, 200, %{status: "success", data: series})
         end
@@ -1232,61 +1293,12 @@ defmodule TimelessMetrics.HTTP do
 
   # Prometheus-compatible labels endpoint (for Grafana label autocomplete)
   get "/prometheus/api/v1/labels" do
-    case check_auth(req) do
-      :halt ->
-        :ok
-
-      :ok ->
-        store = store()
-        {:ok, metrics} = TimelessMetrics.list_metrics(store)
-
-        label_names =
-          metrics
-          |> Enum.flat_map(fn metric ->
-            case TimelessMetrics.list_series(store, metric) do
-              {:ok, series} -> Enum.flat_map(series, fn %{labels: l} -> Map.keys(l) end)
-              _ -> []
-            end
-          end)
-          |> MapSet.new()
-          |> MapSet.put("__name__")
-          |> MapSet.to_list()
-          |> Enum.sort()
-
-        json_resp(req, 200, %{"status" => "success", "data" => label_names})
-    end
+    handle_labels(req)
   end
 
   # Prometheus-compatible label values endpoint (no metric= param required)
   get "/prometheus/api/v1/label/:name/values" do
-    case check_auth(req) do
-      :halt ->
-        :ok
-
-      :ok ->
-        store = store()
-        label_name = req.path_params["name"]
-
-        values =
-          if label_name == "__name__" do
-            {:ok, metrics} = TimelessMetrics.list_metrics(store)
-            metrics
-          else
-            {:ok, metrics} = TimelessMetrics.list_metrics(store)
-
-            metrics
-            |> Enum.flat_map(fn metric ->
-              case TimelessMetrics.label_values(store, metric, label_name) do
-                {:ok, vals} -> vals
-                _ -> []
-              end
-            end)
-            |> Enum.uniq()
-            |> Enum.sort()
-          end
-
-        json_resp(req, 200, %{"status" => "success", "data" => values})
-    end
+    handle_label_values(req)
   end
 
   # Prometheus-compatible series endpoint (accepts match[] param)
@@ -1335,6 +1347,32 @@ defmodule TimelessMetrics.HTTP do
             end
         end
     end
+  end
+
+  # Repeated match[]/match params from the raw query string (the parsed
+  # param map keeps only the last duplicate key).
+  defp match_selector_params(req, params) do
+    case req.query_string do
+      qs when is_binary(qs) and qs != "" ->
+        for {k, v} <- URI.query_decoder(qs) |> Enum.to_list(),
+            k in ["match[]", "match"],
+            do: v
+
+      _ ->
+        List.wrap(params["match[]"] || params["match"])
+    end
+  end
+
+  # Label maps (including __name__) for series matched by ANY selector.
+  # start/end time params are accepted by the API but not applied — the
+  # label index is not time-partitioned.
+  defp matched_label_sets(store, match_queries) do
+    Enum.reduce_while(match_queries, {:ok, []}, fn q, {:ok, acc} ->
+      case series_for_match(store, q) do
+        {:ok, series} -> {:cont, {:ok, acc ++ series}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
   end
 
   defp series_for_match(store, match_query) do

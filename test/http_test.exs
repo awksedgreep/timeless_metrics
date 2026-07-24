@@ -987,6 +987,37 @@ defmodule TimelessMetrics.HTTPTest do
     assert names == ["m_one", "m_two"]
   end
 
+  test "labels and label-values endpoints honor match[] selectors" do
+    now = System.os_time(:second)
+
+    TimelessMetrics.write(:http_test, "lm_a", %{"dc" => "east", "app" => "web"}, 1.0,
+      timestamp: now
+    )
+
+    TimelessMetrics.write(:http_test, "lm_b", %{"zone" => "z1"}, 2.0, timestamp: now)
+    TimelessMetrics.flush(:http_test)
+
+    resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/labels?match%5B%5D=lm_a")
+    assert resp.status == 200
+    names = :json.decode(resp.body)["data"]
+    assert "dc" in names and "app" in names
+    refute "zone" in names
+
+    resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/label/dc/values?match%5B%5D=lm_a")
+    assert :json.decode(resp.body)["data"] == ["east"]
+
+    resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/label/dc/values?match%5B%5D=lm_b")
+    assert :json.decode(resp.body)["data"] == []
+
+    # native series endpoint accepts match[] selectors too
+    resp = TimelessMetrics.TestHTTP.get(@port, "/api/v1/series?match%5B%5D=lm_a&match%5B%5D=lm_b")
+
+    names =
+      :json.decode(resp.body)["data"] |> Enum.map(& &1["__name__"]) |> Enum.sort()
+
+    assert names == ["lm_a", "lm_b"]
+  end
+
   test "rejected PromQL queries land in the gap radar" do
     now = System.os_time(:second)
 

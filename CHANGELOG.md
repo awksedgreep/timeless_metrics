@@ -1,5 +1,22 @@
 # Changelog
 
+## 6.2.1 (2026-07-24)
+
+Completes the Prometheus/VM API-compat surface started in 6.2.0. The
+differential referee now also covers instant queries and metadata
+endpoints — 182/182 corpus parity against live VictoriaMetrics across
+`query_range`, `query`, `labels`, `label values`, and `series`.
+
+- `/api/v1/labels` and `/api/v1/label/:name/values` (and `/prometheus`
+  mirrors) honor repeated `match[]` selectors, restricting results to
+  matching series. `start`/`end` are accepted (not applied — the label
+  index is not time-partitioned).
+- Native `/api/v1/series` accepts `match[]` selectors alongside its
+  `metric=` form and unions repeated matchers.
+- Instant-query (`/api/v1/query`) vector responses verified against VM
+  for selectors, rollups, aggregations, arithmetic, `time()`,
+  `vector()`, `absent()`, and empty results — no changes needed.
+
 ## 6.2.0 (2026-07-24)
 
 The VictoriaMetrics-parity release. The PromQL engine was rewritten from
