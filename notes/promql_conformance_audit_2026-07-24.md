@@ -113,6 +113,16 @@ of returning nothing.
 
 ## 2. Semantic divergences (work, but differ from Prometheus)
 
+> **STATUS UPDATE (2026-07-24, Phase 1):** all seven divergences below are
+> **fixed** by the windowed evaluator (see the parity plan, Phase 1, and the
+> PARITY tests in test/promql_conformance_test.exs). §2.1/§2.5: selectors now
+> evaluate last-sample-within-lookback with staleness fill; §2.2: range
+> windows are honored; §2.3/§2.4: rate/increase are reset-adjusted over the
+> window with carry-in, irate is last-two-samples; §2.6: matchers are ANDed
+> lists; §2.7: PromQL output timestamps are exactly `start + n*step` (the
+> engine-grid mismatch became moot when the legacy engine was deprecated).
+> The text below documents the pre-Phase-1 behavior for the record.
+
 These are the constructs a dashboard author would never notice from an error —
 each verified with a concrete experiment.
 

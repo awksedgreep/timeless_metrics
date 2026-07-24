@@ -1744,38 +1744,14 @@ defmodule TimelessMetrics.HTTP do
     end
   end
 
-  defp filter_series_by_labels(series_list, labels) when map_size(labels) == 0, do: series_list
-
+  # Accepts a matcher map (native params) or matcher list (PromQL selectors)
   defp filter_series_by_labels(series_list, labels) do
-    Enum.filter(series_list, fn series_labels ->
-      Enum.all?(labels, fn
-        {key, {:regex, pattern}} ->
-          case Map.get(series_labels, key) do
-            nil ->
-              false
-
-            val ->
-              {:ok, regex} = Regex.compile("^(?:" <> pattern <> ")$")
-              Regex.match?(regex, val)
-          end
-
-        {key, {:not_regex, pattern}} ->
-          case Map.get(series_labels, key) do
-            nil ->
-              true
-
-            val ->
-              {:ok, regex} = Regex.compile("^(?:" <> pattern <> ")$")
-              not Regex.match?(regex, val)
-          end
-
-        {key, {:not_equal, value}} ->
-          Map.get(series_labels, key) != value
-
-        {key, value} when is_binary(value) ->
-          Map.get(series_labels, key) == value
-      end)
-    end)
+    if Enum.empty?(labels) do
+      series_list
+    else
+      compiled = TimelessMetrics.LabelMatch.compile(labels)
+      Enum.filter(series_list, &TimelessMetrics.LabelMatch.match?(&1, compiled))
+    end
   end
 
   defp parse_aggregate(nil), do: :avg

@@ -29,46 +29,46 @@ defmodule TimelessMetrics.PromQLTest do
     test "plain metric name" do
       sel = sel!("cpu_usage_user")
       assert sel.metric == "cpu_usage_user"
-      assert sel.labels == %{}
+      assert sel.labels == []
       assert sel.pattern == nil
     end
 
     test "metric with exact label" do
       sel = sel!(~s|cpu_usage_user{hostname="host_0"}|)
       assert sel.metric == "cpu_usage_user"
-      assert sel.labels == %{"hostname" => "host_0"}
+      assert sel.labels == [{"hostname", "host_0"}]
     end
 
     test "metric with multiple exact labels" do
       sel = sel!(~s|cpu_usage_user{hostname="host_0",region="us-east"}|)
       assert sel.metric == "cpu_usage_user"
-      assert sel.labels == %{"hostname" => "host_0", "region" => "us-east"}
+      assert sel.labels == [{"hostname", "host_0"}, {"region", "us-east"}]
     end
 
     test "metric with regex label" do
       sel = sel!(~s|cpu_usage_user{hostname=~"host_0\|host_1"}|)
-      assert sel.labels == %{"hostname" => {:regex, "host_0|host_1"}}
+      assert sel.labels == [{"hostname", {:regex, "host_0|host_1"}}]
     end
 
     test "mixed exact and regex labels" do
       sel = sel!(~s|cpu_usage_user{hostname=~"host_0\|host_1",region="us-east"}|)
 
-      assert sel.labels == %{
-               "hostname" => {:regex, "host_0|host_1"},
-               "region" => "us-east"
-             }
+      assert sel.labels == [
+               {"hostname", {:regex, "host_0|host_1"}},
+               {"region", "us-east"}
+             ]
     end
 
     test "negative matchers" do
       sel = sel!(~s|cpu{host!="a",env!~"prod.*"}|)
-      assert sel.labels == %{"host" => {:not_equal, "a"}, "env" => {:not_regex, "prod.*"}}
+      assert sel.labels == [{"host", {:not_equal, "a"}}, {"env", {:not_regex, "prod.*"}}]
     end
 
     test "label-only selector matches all metrics" do
       sel = sel!(~s|{host="a"}|)
       assert sel.metric == nil
       assert sel.pattern == ".+"
-      assert sel.labels == %{"host" => "a"}
+      assert sel.labels == [{"host", "a"}]
     end
   end
 
@@ -77,7 +77,7 @@ defmodule TimelessMetrics.PromQLTest do
       {:ok, ast} = PromQL.parse("max_over_time(cpu_usage_user{hostname=\"host_0\"}[1h])")
       assert {:call, :max_over_time, [{:range, {:selector, sel}, 3600}]} = ast
       assert sel.metric == "cpu_usage_user"
-      assert sel.labels == %{"hostname" => "host_0"}
+      assert sel.labels == [{"hostname", "host_0"}]
     end
 
     test "avg_over_time with 5m range" do
@@ -206,38 +206,38 @@ defmodule TimelessMetrics.PromQLTest do
 
       assert sel.metric == nil
       assert sel.pattern == "cpu_.*"
-      assert sel.labels == %{"hostname" => {:regex, "host_0"}}
+      assert sel.labels == [{"hostname", {:regex, "host_0"}}]
     end
   end
 
   describe "parse/1 - quoting and whitespace" do
     test "exact match with single quotes" do
-      assert sel!("cpu_usage_user{hostname='host_0'}").labels == %{"hostname" => "host_0"}
+      assert sel!("cpu_usage_user{hostname='host_0'}").labels == [{"hostname", "host_0"}]
     end
 
     test "regex match with single quotes" do
       assert sel!("cpu_usage_user{hostname=~'host_0|host_1'}").labels ==
-               %{"hostname" => {:regex, "host_0|host_1"}}
+               [{"hostname", {:regex, "host_0|host_1"}}]
     end
 
     test "mixed single and double quotes" do
       assert sel!("cpu{hostname='host_0',region=\"us-east\"}").labels ==
-               %{"hostname" => "host_0", "region" => "us-east"}
+               [{"hostname", "host_0"}, {"region", "us-east"}]
     end
 
     test "empty label selector" do
       sel = sel!("cpu_usage_user{}")
       assert sel.metric == "cpu_usage_user"
-      assert sel.labels == %{}
+      assert sel.labels == []
     end
 
     test "spaces after commas in labels" do
       assert sel!("cpu{hostname='host_0', region='us-east'}").labels ==
-               %{"hostname" => "host_0", "region" => "us-east"}
+               [{"hostname", "host_0"}, {"region", "us-east"}]
     end
 
     test "trailing comma in matchers" do
-      assert sel!("cpu{hostname='host_0',}").labels == %{"hostname" => "host_0"}
+      assert sel!("cpu{hostname='host_0',}").labels == [{"hostname", "host_0"}]
     end
   end
 
@@ -261,7 +261,7 @@ defmodule TimelessMetrics.PromQLTest do
               {:call, :max_over_time, [{:range, {:selector, sel}, 3600}]}} = ast
 
       assert sel.metric == "cpu_usage_user"
-      assert sel.labels == %{"hostname" => {:regex, "host_0"}}
+      assert sel.labels == [{"hostname", {:regex, "host_0"}}]
     end
 
     test "SingleGroupby-5: TSBS actual format with single quotes and grouped regex" do
@@ -274,7 +274,7 @@ defmodule TimelessMetrics.PromQLTest do
               {:call, :max_over_time, [{:range, {:selector, sel}, 60}]}} = ast
 
       assert sel.pattern == "cpu_(usage_user|usage_system|usage_idle|usage_nice|usage_iowait)"
-      assert sel.labels == %{"hostname" => "host_35"}
+      assert sel.labels == [{"hostname", "host_35"}]
     end
 
     test "DoubleGroupby: 5-metrics-1-host-1-hr" do
@@ -374,7 +374,7 @@ defmodule TimelessMetrics.PromQLTest do
       info = PromQL.selector_info(ast)
       assert info.metric == "cpu"
       assert info.metric_pattern == nil
-      assert info.labels == %{"host" => "a"}
+      assert info.labels == [{"host", "a"}]
     end
 
     test "nested selector inside aggregation" do
@@ -413,7 +413,7 @@ defmodule TimelessMetrics.PromQLTest do
     test "bare avg() collapses to a single series and drops __name__ (bug report item 3)" do
       assert [%{"metric" => metric} = single] = run("avg(cpu_usage)")
       assert metric == %{}
-      assert values(single) == [20.0]
+      assert values(single) == [20.0, 20.0]
     end
 
     test "avg by (host) returns one series per host (bug report item 2)" do
@@ -429,7 +429,7 @@ defmodule TimelessMetrics.PromQLTest do
 
     test "sum(...) actually sums across series" do
       assert [single] = run("sum(cpu_usage)")
-      assert values(single) == [60.0]
+      assert values(single) == [60.0, 60.0]
     end
 
     test "last_over_time returns data and keeps __name__ (bug report item 5)" do
@@ -437,25 +437,25 @@ defmodule TimelessMetrics.PromQLTest do
       assert length(result) == 3
       assert Enum.all?(result, &(&1["metric"]["__name__"] == "cpu_usage"))
       a = Enum.find(result, &(&1["metric"]["host"] == "a"))
-      assert values(a) == [10.0]
+      assert values(a) == [10.0, 10.0]
     end
 
     test "scalar division scales values and drops __name__ (bug report item 4)" do
       result = run("cpu_usage / 10")
       assert length(result) == 3
       a = Enum.find(result, &(&1["metric"] == %{"host" => "a"}))
-      assert values(a) == [1.0]
+      assert values(a) == [1.0, 1.0]
     end
 
     test "(avg(cpu_usage)) / 10" do
       assert [single] = run("(avg(cpu_usage)) / 10")
-      assert values(single) == [2.0]
+      assert values(single) == [2.0, 2.0]
     end
 
     test "scalar on the left side" do
       result = run("100 - cpu_usage")
       a = Enum.find(result, &(&1["metric"] == %{"host" => "a"}))
-      assert values(a) == [90.0]
+      assert values(a) == [90.0, 90.0]
     end
 
     test "comparison filters samples" do
@@ -468,19 +468,19 @@ defmodule TimelessMetrics.PromQLTest do
       result = run("avg by (host) (cpu_usage) > bool 15")
       assert length(result) == 3
       by_host = Map.new(result, &{&1["metric"]["host"], values(&1)})
-      assert by_host == %{"a" => [0.0], "b" => [1.0], "c" => [1.0]}
+      assert by_host == %{"a" => [0.0, 0.0], "b" => [1.0, 1.0], "c" => [1.0, 1.0]}
     end
 
     test "vector-vector arithmetic joins on matching labels" do
       result = run("cpu_usage / mem_usage")
       assert length(result) == 3
       a = Enum.find(result, &(&1["metric"] == %{"host" => "a"}))
-      assert values(a) == [0.2]
+      assert values(a) == [0.2, 0.2]
     end
 
     test "division by zero yields +Inf, not a crash" do
       assert [single] = run("avg(cpu_usage) / 0")
-      assert [[_ts, "+Inf"]] = single["values"]
+      assert [[_ts1, "+Inf"], [_ts2, "+Inf"]] = single["values"]
     end
 
     test "topk selects the highest series" do
@@ -489,7 +489,7 @@ defmodule TimelessMetrics.PromQLTest do
 
     test "quantile aggregation" do
       assert [single] = run("quantile(0.5, avg by (host) (cpu_usage))")
-      assert values(single) == [20.0]
+      assert values(single) == [20.0, 20.0]
     end
 
     test "range vector without a function is an execution error" do
@@ -501,7 +501,7 @@ defmodule TimelessMetrics.PromQLTest do
     test "clamp_max caps values" do
       result = run("clamp_max(cpu_usage, 12)")
       c = Enum.find(result, &(&1["metric"] == %{"host" => "c"}))
-      assert values(c) == [12.0]
+      assert values(c) == [12.0, 12.0]
     end
 
     test "and/unless set operators" do

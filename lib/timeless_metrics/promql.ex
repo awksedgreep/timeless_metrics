@@ -2,9 +2,12 @@ defmodule TimelessMetrics.PromQL do
   @moduledoc """
   PromQL parser and evaluator for the Prometheus/VictoriaMetrics-compatible API.
 
-  A tokenizer + recursive-descent parser produces an AST; the evaluator pushes
-  per-series bucket aggregation down to the storage engine and computes
-  cross-series aggregation, binary operations, and value transforms in Elixir.
+  A tokenizer + recursive-descent parser produces an AST; the evaluator
+  fetches raw samples and evaluates Prometheus/VM semantics on an exact
+  `start + n*step` grid — instant selectors take the most recent sample
+  within the lookback window, range functions slide their `[window]` over
+  raw samples, and counter functions (`rate`/`increase`/`irate`) are
+  reset-adjusted with carry-in from before the window.
 
   ## Supported
 
@@ -30,24 +33,24 @@ defmodule TimelessMetrics.PromQL do
 
   @agg_ops ~w(sum min max avg count stddev stdvar topk bottomk quantile group count_values)
 
-  @rollup_fns %{
-    rate: :rate,
-    irate: :rate,
-    increase: :rate,
-    avg_over_time: :avg,
-    min_over_time: :min,
-    max_over_time: :max,
-    sum_over_time: :sum,
-    count_over_time: :count,
-    last_over_time: :last,
-    first_over_time: :first
-  }
+  @rollup_fns [
+    :rate,
+    :irate,
+    :increase,
+    :avg_over_time,
+    :min_over_time,
+    :max_over_time,
+    :sum_over_time,
+    :count_over_time,
+    :last_over_time,
+    :first_over_time
+  ]
   # These return raw sample values, so they keep the metric name (like a selector)
   @name_keeping_rollups [:last_over_time, :first_over_time]
 
   @transform_fns [:abs, :ceil, :floor, :round, :sqrt, :exp, :ln, :log2, :log10]
 
-  @functions Map.keys(@rollup_fns) ++ @transform_fns ++ [:clamp, :clamp_min, :clamp_max]
+  @functions @rollup_fns ++ @transform_fns ++ [:clamp, :clamp_min, :clamp_max]
 
   # Recognized PromQL functions we don't implement yet — named in the error
   # message so clients can tell "unsupported" from "typo".
@@ -107,24 +110,53 @@ defmodule TimelessMetrics.PromQL do
     end
   end
 
+  # Prometheus enforces the same cap; Grafana relies on the error to re-query
+  # at a coarser step.
+  @max_points_per_series 11_000
+
   @doc """
   Evaluate a parsed AST over a time range against a store.
+
+  Evaluation follows Prometheus/VM semantics: every series is evaluated at
+  the exact grid `start, start+step, ..., end`. Instant selectors take the
+  most recent sample within the lookback window (default 300s, configure
+  with `config :timeless_metrics, promql_lookback_seconds: n`); range
+  functions evaluate over their `[window]` of raw samples ending at each
+  grid point.
 
   Returns `{:ok, prometheus_matrix_response}` or `{:error, reason}`.
   """
   def execute(ast, store, start_ts, end_ts, step) do
-    ctx = %{store: store, from: start_ts, to: end_ts, step: step}
+    ctx = %{
+      store: store,
+      from: start_ts,
+      to: end_ts,
+      step: step,
+      lookback: Application.get_env(:timeless_metrics, :promql_lookback_seconds, 300)
+    }
 
-    case eval(ast, ctx) do
-      {:ok, {:vector, series}} ->
-        {:ok, wrap_prom_response(format_series(series))}
+    grid_points = div(end_ts - start_ts, step) + 1
 
-      {:ok, {:scalar, n}} ->
-        values = for ts <- start_ts..end_ts//step, do: [ts, format_value(n)]
-        {:ok, wrap_prom_response([%{"metric" => %{}, "values" => values}])}
+    cond do
+      end_ts < start_ts ->
+        {:error, "end timestamp must not be before start timestamp"}
 
-      {:error, msg} ->
-        {:error, msg}
+      grid_points > @max_points_per_series ->
+        {:error,
+         "exceeded maximum resolution of #{@max_points_per_series} points per timeseries — decrease the query resolution (increase step)"}
+
+      true ->
+        case eval(ast, ctx) do
+          {:ok, {:vector, series}} ->
+            {:ok, wrap_prom_response(format_series(series))}
+
+          {:ok, {:scalar, n}} ->
+            values = for ts <- start_ts..end_ts//step, do: [ts, format_value(n)]
+            {:ok, wrap_prom_response([%{"metric" => %{}, "values" => values}])}
+
+          {:error, msg} ->
+            {:error, msg}
+        end
     end
   end
 
@@ -607,28 +639,31 @@ defmodule TimelessMetrics.PromQL do
   end
 
   defp parse_selector(name, [:lbrace | rest]) do
-    with {:ok, labels, rest2} <- parse_matchers(rest, %{}),
-         {:ok, sel} <- build_selector(name, labels) do
+    with {:ok, matchers, rest2} <- parse_matchers(rest, []),
+         {:ok, sel} <- build_selector(name, matchers) do
       parse_selector_postfix({:selector, sel}, rest2)
     end
   end
 
   defp parse_selector(name, tokens) when is_binary(name) do
-    with {:ok, sel} <- build_selector(name, %{}) do
+    with {:ok, sel} <- build_selector(name, []) do
       parse_selector_postfix({:selector, sel}, tokens)
     end
   end
 
-  defp parse_matchers([:rbrace | rest], acc), do: {:ok, acc, rest}
+  # Matchers accumulate as a LIST — Prometheus ANDs duplicate labels
+  # ({job=~"a.*", job!~"a-dev"} is legal), so a map would silently drop
+  # matchers.
+  defp parse_matchers([:rbrace | rest], acc), do: {:ok, Enum.reverse(acc), rest}
 
   defp parse_matchers(tokens, acc) do
     with {:ok, {k, v}, rest} <- parse_matcher(tokens) do
-      acc = Map.put(acc, k, v)
+      acc = [{k, v} | acc]
 
       case rest do
-        [:comma, :rbrace | rest2] -> {:ok, acc, rest2}
+        [:comma, :rbrace | rest2] -> {:ok, Enum.reverse(acc), rest2}
         [:comma | rest2] -> parse_matchers(rest2, acc)
-        [:rbrace | rest2] -> {:ok, acc, rest2}
+        [:rbrace | rest2] -> {:ok, Enum.reverse(acc), rest2}
         [t | _] -> {:error, "expected , or } in label matchers, found #{describe_token(t)}"}
         [] -> {:error, "unterminated label matcher block"}
       end
@@ -656,27 +691,30 @@ defmodule TimelessMetrics.PromQL do
      ~s(invalid label matcher — expected label="value", label!="v", label=~"re", or label!~"re")}
   end
 
-  defp build_selector(name, labels) do
-    case Map.pop(labels, "__name__") do
-      {nil, _} ->
-        if name == nil and labels == %{} do
-          {:error, "selector must specify a metric name or at least one label matcher"}
-        else
-          pattern = if name == nil, do: ".+", else: nil
-          {:ok, %{metric: name, pattern: pattern, labels: labels, offset: 0}}
-        end
+  defp build_selector(name, matchers) do
+    {name_matchers, labels} = Enum.split_with(matchers, fn {k, _v} -> k == "__name__" end)
 
-      {_val, _} when is_binary(name) ->
+    case {name, name_matchers} do
+      {nil, []} when labels == [] ->
+        {:error, "selector must specify a metric name or at least one label matcher"}
+
+      {nil, []} ->
+        {:ok, %{metric: nil, pattern: ".+", labels: labels, offset: 0}}
+
+      {name, []} ->
+        {:ok, %{metric: name, pattern: nil, labels: labels, offset: 0}}
+
+      {nil, [{_, exact}]} when is_binary(exact) ->
+        {:ok, %{metric: exact, pattern: nil, labels: labels, offset: 0}}
+
+      {nil, [{_, {:regex, p}}]} ->
+        {:ok, %{metric: nil, pattern: p, labels: labels, offset: 0}}
+
+      {name, [_ | _]} when is_binary(name) ->
         {:error, "metric name specified twice (as name and __name__ matcher)"}
 
-      {exact, rest} when is_binary(exact) ->
-        {:ok, %{metric: exact, pattern: nil, labels: rest, offset: 0}}
-
-      {{:regex, p}, rest} ->
-        {:ok, %{metric: nil, pattern: p, labels: rest, offset: 0}}
-
-      {_negative, _} ->
-        {:error, "negative __name__ matchers are not supported"}
+      {nil, [_ | _]} ->
+        {:error, "unsupported __name__ matcher (negative or multiple __name__ matchers)"}
     end
   end
 
@@ -724,8 +762,10 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval({:number, n}, _ctx), do: {:ok, {:scalar, n}}
 
+  # Instant selector: at each grid point, the most recent sample within the
+  # lookback window (keeps __name__, like Prometheus).
   defp eval({:selector, sel}, ctx) do
-    with {:ok, series} <- query_selector(sel, :avg, true, ctx) do
+    with {:ok, series} <- eval_windowed(sel, ctx.lookback, true, ctx, &window_last/2) do
       {:ok, {:vector, series}}
     end
   end
@@ -757,19 +797,21 @@ defmodule TimelessMetrics.PromQL do
 
   # --- function calls ---
 
-  defp eval_call(f, [arg], ctx) when is_map_key(@rollup_fns, f) do
+  # Range-vector functions evaluate their window fn over the raw samples in
+  # (T - window, T] at each grid point T. Counter functions additionally see
+  # the sample just before the window (carry-in) for accurate increase math.
+  defp eval_call(f, [arg], ctx) when f in @rollup_fns do
     case arg do
-      {:range, {:selector, sel}, _dur} ->
+      {:range, {:selector, sel}, window} when window > 0 ->
         keep_name = f in @name_keeping_rollups
 
-        with {:ok, series} <- query_selector(sel, @rollup_fns[f], keep_name, ctx) do
-          series =
-            if f == :increase,
-              do: map_values(series, &arith(:mul, &1, ctx.step)),
-              else: series
-
+        with {:ok, series} <-
+               eval_windowed(sel, window, keep_name, ctx, rollup_window_fun(f, window)) do
           {:ok, {:vector, series}}
         end
+
+      {:range, {:selector, _sel}, _zero} ->
+        {:error, "#{f}() requires a non-zero range window"}
 
       _ ->
         {:error, "#{f}() expects a range vector argument like metric[5m]"}
@@ -1341,47 +1383,219 @@ defmodule TimelessMetrics.PromQL do
     Enum.map(series, fn %{labels: l} = s -> %{s | labels: Map.delete(l, "__name__")} end)
   end
 
-  # --- storage access ---
+  # --- windowed evaluation over raw samples ---
+  #
+  # Fetches raw samples for the selector over [from - window, to]
+  # (offset-shifted), then evaluates `window_fun` at each grid point T over
+  # the samples in (T - window, T]. window_fun receives (slice, prev) where
+  # prev is the newest sample at or before T - window — the carry-in that
+  # lets counter functions span the full window — and returns a value or
+  # :skip (no sample emitted at that grid point).
 
-  defp query_selector(sel, aggregate, keep_name, ctx) do
-    opts = [
-      from: ctx.from - sel.offset,
-      to: ctx.to - sel.offset,
-      bucket: {ctx.step, :seconds},
-      aggregate: aggregate
-    ]
+  @default_max_samples 10_000_000
 
-    with {:ok, series} <- run_selector_query(sel, opts, keep_name, ctx) do
+  defp eval_windowed(sel, window, keep_name, ctx, window_fun) do
+    with {:ok, raw} <- fetch_raw(sel, window, keep_name, ctx),
+         :ok <- check_sample_budget(raw) do
+      from = ctx.from - sel.offset
+      to = ctx.to - sel.offset
+
       series =
-        series
+        raw
+        |> Enum.map(fn %{labels: labels, points: points} ->
+          data =
+            points
+            |> Enum.sort_by(&elem(&1, 0))
+            |> grid_eval(from, to, ctx.step, window, window_fun)
+            |> shift_data(sel.offset)
+
+          %{labels: labels, data: data}
+        end)
         |> Enum.reject(&(&1.data == []))
-        |> shift_offset(sel.offset)
 
       {:ok, series}
     end
   end
 
-  defp run_selector_query(%{pattern: nil, metric: metric} = sel, opts, keep_name, ctx) do
-    {:ok, results} = TimelessMetrics.query_aggregate_multi(ctx.store, metric, sel.labels, opts)
+  defp check_sample_budget(raw) do
+    budget = Application.get_env(:timeless_metrics, :promql_max_samples, @default_max_samples)
+    total = Enum.reduce(raw, 0, fn %{points: pts}, acc -> acc + length(pts) end)
+
+    if total > budget do
+      {:error,
+       "query would process #{total} raw samples (limit #{budget}) — narrow the time range or label filters"}
+    else
+      :ok
+    end
+  end
+
+  defp shift_data(data, 0), do: data
+  defp shift_data(data, offset), do: Enum.map(data, fn {ts, v} -> {ts + offset, v} end)
+
+  defp fetch_raw(%{pattern: nil, metric: metric} = sel, window, keep_name, ctx) do
+    {:ok, results} =
+      TimelessMetrics.query_multi(ctx.store, metric, sel.labels,
+        from: ctx.from - sel.offset - window,
+        to: ctx.to - sel.offset
+      )
 
     {:ok,
-     Enum.map(results, fn %{labels: l, data: d} ->
-       %{labels: maybe_name(l, metric, keep_name), data: d}
+     Enum.map(results, fn %{labels: l, points: pts} ->
+       %{labels: maybe_name(l, metric, keep_name), points: pts}
      end)}
   end
 
-  defp run_selector_query(%{pattern: pattern} = sel, opts, keep_name, ctx) do
+  defp fetch_raw(%{pattern: pattern} = sel, window, keep_name, ctx) do
     with {:ok, regex} <- compile_anchored(pattern) do
       {:ok, all_metrics} = TimelessMetrics.list_metrics(ctx.store)
-      matching = Enum.filter(all_metrics, &Regex.match?(regex, &1))
 
-      {:ok, results} =
-        TimelessMetrics.query_aggregate_multi_metrics(ctx.store, matching, sel.labels, opts)
+      results =
+        all_metrics
+        |> Enum.filter(&Regex.match?(regex, &1))
+        |> Enum.flat_map(fn metric ->
+          {:ok, results} =
+            TimelessMetrics.query_multi(ctx.store, metric, sel.labels,
+              from: ctx.from - sel.offset - window,
+              to: ctx.to - sel.offset
+            )
 
-      {:ok,
-       Enum.map(results, fn %{metric: m, labels: l, data: d} ->
-         %{labels: maybe_name(l, m, keep_name), data: d}
-       end)}
+          Enum.map(results, fn %{labels: l, points: pts} ->
+            %{labels: maybe_name(l, metric, keep_name), points: pts}
+          end)
+        end)
+
+      {:ok, results}
+    end
+  end
+
+  # Two-pointer sweep over timestamp-sorted points: lo = first index with
+  # ts > T - window, hi = first index with ts > T; arr[lo..hi-1] is the
+  # window slice (T - window, T], arr[lo - 1] the carry-in. O(points + steps)
+  # pointer movement.
+  defp grid_eval(points, from, to, step, window, window_fun) do
+    arr = List.to_tuple(points)
+    n = tuple_size(arr)
+    do_grid_eval(Enum.to_list(from..to//step), arr, n, 0, 0, window, window_fun, [])
+  end
+
+  defp do_grid_eval([], _arr, _n, _lo, _hi, _window, _fun, acc), do: Enum.reverse(acc)
+
+  defp do_grid_eval([t | rest], arr, n, lo, hi, window, fun, acc) do
+    hi = advance_index(arr, n, hi, t)
+    lo = advance_index(arr, n, lo, t - window)
+
+    slice = slice_range(arr, lo, hi)
+    prev = if lo > 0, do: elem(arr, lo - 1), else: nil
+
+    acc =
+      case fun.(slice, prev) do
+        :skip -> acc
+        v -> [{t, v} | acc]
+      end
+
+    do_grid_eval(rest, arr, n, lo, hi, window, fun, acc)
+  end
+
+  defp advance_index(arr, n, idx, bound) do
+    cond do
+      idx >= n -> idx
+      elem(elem(arr, idx), 0) <= bound -> advance_index(arr, n, idx + 1, bound)
+      true -> idx
+    end
+  end
+
+  defp slice_range(_arr, lo, hi) when hi <= lo, do: []
+  defp slice_range(arr, lo, hi), do: for(i <- lo..(hi - 1), do: elem(arr, i))
+
+  # --- window functions ---
+
+  defp window_last([], _prev), do: :skip
+  defp window_last(slice, _prev), do: slice |> List.last() |> elem(1)
+
+  defp rollup_window_fun(f, window) do
+    case f do
+      :avg_over_time ->
+        stat_fun(fn vals -> Enum.sum(vals) / length(vals) end)
+
+      :min_over_time ->
+        stat_fun(&Enum.min/1)
+
+      :max_over_time ->
+        stat_fun(&Enum.max/1)
+
+      :sum_over_time ->
+        stat_fun(fn vals -> Enum.sum(vals) * 1.0 end)
+
+      :count_over_time ->
+        stat_fun(fn vals -> length(vals) * 1.0 end)
+
+      :last_over_time ->
+        &window_last/2
+
+      :first_over_time ->
+        fn
+          [], _prev -> :skip
+          slice, _prev -> slice |> hd() |> elem(1)
+        end
+
+      :rate ->
+        fn slice, prev -> counter_rate(slice, prev, window) end
+
+      :increase ->
+        fn slice, prev -> counter_increase(slice, prev) end
+
+      :irate ->
+        fn slice, prev -> instant_rate(slice, prev) end
+    end
+  end
+
+  defp stat_fun(fun) do
+    fn
+      [], _prev -> :skip
+      slice, _prev -> slice |> Enum.map(&elem(&1, 1)) |> fun.()
+    end
+  end
+
+  # Reset-adjusted increase over [prev | slice] (VM-style: the carry-in
+  # sample makes the increase span the full window, without Prometheus'
+  # extrapolation). On a counter reset the post-reset value is the delta.
+  defp counter_increase(slice, prev) do
+    seq = if prev, do: [prev | slice], else: slice
+
+    case seq do
+      [] ->
+        :skip
+
+      [_single] ->
+        :skip
+
+      _ ->
+        seq
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.reduce(0.0, fn [{_t1, v1}, {_t2, v2}], acc ->
+          acc + if v2 >= v1, do: v2 - v1, else: v2
+        end)
+    end
+  end
+
+  defp counter_rate(slice, prev, window) do
+    case counter_increase(slice, prev) do
+      :skip -> :skip
+      inc -> inc / window
+    end
+  end
+
+  # irate: slope of the last two samples in the window (reset-aware)
+  defp instant_rate(slice, prev) do
+    seq = if prev, do: [prev | slice], else: slice
+
+    case Enum.take(seq, -2) do
+      [{t1, v1}, {t2, v2}] when t2 > t1 ->
+        dv = if v2 >= v1, do: v2 - v1, else: v2
+        dv / (t2 - t1)
+
+      _ ->
+        :skip
     end
   end
 
@@ -1396,14 +1610,6 @@ defmodule TimelessMetrics.PromQL do
     do: Map.put(labels, "__name__", metric)
 
   defp maybe_name(labels, _metric, _keep), do: labels
-
-  defp shift_offset(series, 0), do: series
-
-  defp shift_offset(series, offset) do
-    Enum.map(series, fn %{data: data} = s ->
-      %{s | data: Enum.map(data, fn {ts, v} -> {ts + offset, v} end)}
-    end)
-  end
 
   # --- response formatting ---
 

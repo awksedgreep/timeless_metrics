@@ -57,7 +57,18 @@ defmodule TimelessMetrics.LabelMatch do
     {eq, complex} =
       Enum.split_with(label_filter, fn {_k, v} -> is_binary(v) and v != "" end)
 
-    {Map.new(eq), complex}
+    # A map can't hold duplicate keys, and Prometheus ANDs duplicate matchers
+    # ({host="a",host="b"} matches nothing) — keys appearing more than once
+    # must stay in the post-filter list.
+    dup_keys =
+      eq
+      |> Enum.frequencies_by(fn {k, _v} -> k end)
+      |> Enum.filter(fn {_k, n} -> n > 1 end)
+      |> MapSet.new(fn {k, _n} -> k end)
+
+    {eq_unique, eq_dup} = Enum.split_with(eq, fn {k, _v} -> k not in dup_keys end)
+
+    {Map.new(eq_unique), eq_dup ++ complex}
   end
 
   defp compile_anchored(pattern) do

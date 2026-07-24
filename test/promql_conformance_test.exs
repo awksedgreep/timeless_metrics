@@ -309,32 +309,78 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     end
   end
 
-  # --- Documented divergences (audit §2) pinned as current behavior. ---
-  # If one of these fails, behavior changed: update the audit doc (and
-  # probably celebrate — these are the P0/P1 items).
+  # --- Prometheus/VM parity semantics (formerly audit §2 divergences). ---
+  # These assert the Phase 1 windowed-evaluator behavior; if one fails, the
+  # semantics regressed toward the old bucketed evaluation.
 
-  test "DIVERGENCE §2.2: range window is ignored (bucket = step)" do
+  test "PARITY §2.2: range windows are honored" do
+    # cpu ramps 10..39 in 10s steps; a 1m window and a 30m window must
+    # produce different averages at the same grid points.
     {:ok, ast1} = PromQL.parse("avg_over_time(cpu[1m])")
     {:ok, ast2} = PromQL.parse("avg_over_time(cpu[30m])")
     {:ok, r1} = PromQL.execute(ast1, @store, @base_ts, @base_ts + 300, 60)
     {:ok, r2} = PromQL.execute(ast2, @store, @base_ts, @base_ts + 300, 60)
-    assert r1 == r2
+    refute r1 == r2
+
+    # Hand-computed: at T = base+300 the (T-60, T] window holds samples
+    # i=25..29 (values 35..39) → avg 37.0
+    a = Enum.find(r1["data"]["result"], &(&1["metric"] == %{"host" => "a"}))
+    [_, last_val] = List.last(a["values"])
+    assert String.to_float(last_val) == 37.0
   end
 
-  test "DIVERGENCE §2.3: irate is an alias of rate" do
+  test "PARITY §2.3: rate is windowed reset-adjusted increase; irate is last-two-samples" do
+    # reqs_total grows 100 per 10s (10/s). Data ends at base+290, so the
+    # (base+240, base+300] rate window only contains 50s of growth:
+    # rate = 500/60 ≈ 8.33/s, while irate (last two samples) stays 10/s.
     {:ok, ast1} = PromQL.parse("rate(reqs_total[1m])")
     {:ok, ast2} = PromQL.parse("irate(reqs_total[1m])")
     {:ok, r1} = PromQL.execute(ast1, @store, @base_ts, @base_ts + 300, 60)
     {:ok, r2} = PromQL.execute(ast2, @store, @base_ts, @base_ts + 300, 60)
-    assert r1 == r2
+    refute r1 == r2
+
+    rate_a = Enum.find(r1["data"]["result"], &(&1["metric"] == %{"host" => "a"}))
+    irate_a = Enum.find(r2["data"]["result"], &(&1["metric"] == %{"host" => "a"}))
+
+    [_, rate_last] = List.last(rate_a["values"])
+    [_, irate_last] = List.last(irate_a["values"])
+    assert_in_delta String.to_float(rate_last), 500.0 / 60, 1.0e-9
+    assert_in_delta String.to_float(irate_last), 10.0, 1.0e-9
+
+    # Full-window grid points see the true 10/s rate
+    [_, rate_mid] = Enum.at(rate_a["values"], 1)
+    assert_in_delta String.to_float(rate_mid), 10.0, 1.0e-9
   end
 
-  test "DIVERGENCE §2.6: duplicate matchers — last one wins" do
+  test "PARITY §2.6: duplicate matchers are ANDed" do
     {:ok, ast} = PromQL.parse(~s|cpu{host="nope",host="a"}|)
     {:ok, resp} = PromQL.execute(ast, @store, @base_ts, @base_ts + 300, 60)
-    # Prometheus would AND the matchers and return empty
-    assert [%{"metric" => %{"host" => "a"}}] =
-             Enum.map(resp["data"]["result"], &Map.take(&1, ["metric"]))
-             |> Enum.map(fn m -> update_in(m["metric"], &Map.delete(&1, "__name__")) end)
+    assert resp["data"]["result"] == []
+
+    {:ok, ast2} = PromQL.parse(~s|cpu{host=~"a\|b",host!="b"}|)
+    {:ok, resp2} = PromQL.execute(ast2, @store, @base_ts, @base_ts + 300, 60)
+
+    assert [%{"host" => "a"}] =
+             Enum.map(resp2["data"]["result"], &Map.delete(&1["metric"], "__name__"))
+  end
+
+  test "PARITY §2.5: lookback fills steps between sparse samples" do
+    # cpu has samples every 10s; a 5s step grid still gets a value at every
+    # grid point from the 5m lookback.
+    {:ok, ast} = PromQL.parse(~s|cpu{host="a"}|)
+    {:ok, resp} = PromQL.execute(ast, @store, @base_ts, @base_ts + 100, 5)
+    [%{"values" => values}] = resp["data"]["result"]
+    assert length(values) == 21
+  end
+
+  test "PARITY §2.7: output timestamps sit exactly on start + n*step" do
+    off_grid_start = @base_ts + 7
+    {:ok, ast} = PromQL.parse("cpu")
+    {:ok, resp} = PromQL.execute(ast, @store, off_grid_start, off_grid_start + 120, 60)
+
+    for %{"values" => values} <- resp["data"]["result"],
+        [ts, _v] <- values do
+      assert rem(ts - off_grid_start, 60) == 0
+    end
   end
 end
