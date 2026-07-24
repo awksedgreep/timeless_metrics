@@ -20,7 +20,7 @@ defmodule TimelessMetrics.AlertTest do
   setup do
     TestHelper.await_down(:alert_test_sup)
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:alert_test, nil})
-    start_supervised!({TimelessMetrics, name: :alert_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :alert_test, data_dir: @data_dir})
 
     on_exit(fn ->
       TestHelper.await_down(:alert_test_sup)

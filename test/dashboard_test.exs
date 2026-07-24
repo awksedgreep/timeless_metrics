@@ -20,7 +20,7 @@ defmodule TimelessMetrics.DashboardTest do
   setup do
     TestHelper.await_down(:dash_test_sup)
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:dash_test, nil})
-    start_supervised!({TimelessMetrics, name: :dash_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :dash_test, data_dir: @data_dir})
 
     on_exit(fn ->
       TestHelper.await_down(:dash_test_sup)

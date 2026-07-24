@@ -238,6 +238,19 @@ defmodule TimelessMetrics.Query do
     TimelessMetrics.SegmentBuilder.read_watermark(builder, tier_name)
   end
 
+  defp aggregate_from_raw(store, series_id, opts, bucket_seconds, :rate) do
+    {:ok, points} = raw(store, series_id, opts)
+
+    bucketed =
+      points
+      |> Enum.sort_by(&elem(&1, 0))
+      |> TimelessMetrics.Aggregation.bucket_rate(fn ts ->
+        div(ts, bucket_seconds) * bucket_seconds
+      end)
+
+    {:ok, bucketed}
+  end
+
   defp aggregate_from_raw(store, series_id, opts, bucket_seconds, agg_fn) do
     {:ok, points} = raw(store, series_id, opts)
 
@@ -426,33 +439,8 @@ defmodule TimelessMetrics.Query do
     val
   end
 
-  defp compute_aggregate(:rate, _values, points) do
-    sorted = Enum.sort_by(points, &elem(&1, 0))
-    compute_rate(sorted)
-  end
-
-  # Rate: average per-second rate across adjacent points.
-  # Skips negative deltas (counter resets).
-  defp compute_rate(sorted) when length(sorted) < 2, do: 0.0
-
-  defp compute_rate(sorted) do
-    {total_delta, total_dt} =
-      sorted
-      |> Enum.chunk_every(2, 1, :discard)
-      |> Enum.reduce({0.0, 0}, fn [{t1, v1}, {t2, v2}], {delta_acc, dt_acc} ->
-        dt = t2 - t1
-        dv = v2 - v1
-
-        if dv >= 0 and dt > 0 do
-          {delta_acc + dv, dt_acc + dt}
-        else
-          # Counter reset or same timestamp — skip
-          {delta_acc, dt_acc}
-        end
-      end)
-
-    if total_dt > 0, do: total_delta / total_dt, else: 0.0
-  end
+  # :rate is handled by TimelessMetrics.Aggregation.bucket_rate/2 before
+  # reaching compute_aggregate (it needs cross-bucket carry-in).
 
   # Text series marker: <<0xFE, text_codec_blob...>>
   @text_marker 0xFE

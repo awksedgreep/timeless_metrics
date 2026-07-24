@@ -4,6 +4,8 @@ defmodule TimelessMetrics.TextSeriesTest do
   @data_dir "/tmp/text_series_test_#{System.os_time(:millisecond)}"
 
   setup do
+    # Text series are a legacy-engine-only feature: the Rust engine's raw
+    # batch encoding is numeric-only. Port or retire before 7.0 removal.
     start_supervised!(
       {TimelessMetrics, name: :text_test_store, data_dir: @data_dir, engine: :actor}
     )

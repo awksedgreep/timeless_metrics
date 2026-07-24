@@ -301,9 +301,12 @@ defmodule TimelessMetrics.RustHTTPAPITest do
         aggregate: :rate
       )
 
-    assert length(rate_data) == 2
-    assert_in_delta elem(Enum.at(rate_data, 0), 1), 40.0 / 60, 0.0001
-    assert_in_delta elem(Enum.at(rate_data, 1), 1), 50.0 / 60, 0.0001
+    # Unified carry-in rate: the first bucket computes from its own samples
+    # (20/40s), later buckets carry the previous bucket's last sample in.
+    assert length(rate_data) == 3
+    assert_in_delta elem(Enum.at(rate_data, 0), 1), 20.0 / 40, 0.0001
+    assert_in_delta elem(Enum.at(rate_data, 1), 1), 40.0 / 60, 0.0001
+    assert_in_delta elem(Enum.at(rate_data, 2), 1), 50.0 / 60, 0.0001
   end
 
   test "GET /prometheus/api/v1/labels returns label names with rust engine" do

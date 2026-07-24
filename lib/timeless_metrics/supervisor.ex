@@ -14,6 +14,15 @@ defmodule TimelessMetrics.Supervisor do
     engine = Keyword.get(opts, :engine, :rust)
 
     if engine in [:legacy, :actor, :sharded] do
+      require Logger
+
+      Logger.warning(
+        "TimelessMetrics engine: #{inspect(engine)} is deprecated and will be removed in 7.0. " <>
+          "The Rust engine (the default) is the supported path. " <>
+          "Legacy-only features (rollup tiers/query_daily, mode: :memory) need porting or explicit " <>
+          "retirement before 7.0 — see notes/promql_vm_parity_plan_2026-07-24.md Phase 0."
+      )
+
       init_legacy(opts)
     else
       init_rust(opts)

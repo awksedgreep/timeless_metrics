@@ -387,7 +387,7 @@ defmodule TimelessMetrics.PromQLTest do
 
   describe "execute/5 - evaluation semantics" do
     setup do
-      start_supervised!({TimelessMetrics, name: @store, data_dir: @data_dir, engine: :actor})
+      start_supervised!({TimelessMetrics, name: @store, data_dir: @data_dir})
 
       # 3 hosts x 2 metrics; constant value per host, points every 10s
       entries =

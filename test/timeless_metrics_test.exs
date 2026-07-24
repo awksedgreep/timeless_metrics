@@ -4,7 +4,7 @@ defmodule TimelessMetricsTest do
   @data_dir "/tmp/timeless_test_#{System.os_time(:millisecond)}"
 
   setup do
-    start_supervised!({TimelessMetrics, name: :test_store, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :test_store, data_dir: @data_dir})
 
     on_exit(fn -> File.rm_rf!(@data_dir) end)
     :ok
@@ -146,7 +146,7 @@ defmodule TimelessMetricsTest do
     :persistent_term.erase({TimelessMetrics.Actor.SeriesManager, :test_store_actor_manager})
 
     # Restart the store with the same data_dir
-    start_supervised!({TimelessMetrics, name: :test_store, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :test_store, data_dir: @data_dir})
 
     # Give series processes a moment to recover from disk
     Process.sleep(500)

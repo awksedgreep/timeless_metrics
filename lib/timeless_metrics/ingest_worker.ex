@@ -174,7 +174,7 @@ defmodule TimelessMetrics.IngestWorker do
         # the Elixir-side series-id cache and raw batch NIF.
         entries =
           Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
-            Enum.map(batch, fn {ts, val} -> {metric_name, labels, ts, val} end)
+            Enum.map(batch, fn {ts, val} -> {metric_name, labels, val, ts} end)
           end)
 
         TimelessMetrics.RustEngine.write_batch(store, entries)
@@ -215,7 +215,7 @@ defmodule TimelessMetrics.IngestWorker do
       if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust do
         entries =
           Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
-            Enum.map(batch, fn {ts, val} -> {metric_name, labels, ts, val} end)
+            Enum.map(batch, fn {ts, val} -> {metric_name, labels, val, ts} end)
           end)
 
         TimelessMetrics.RustEngine.write_batch(store, entries)

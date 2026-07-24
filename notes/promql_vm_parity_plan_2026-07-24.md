@@ -45,9 +45,30 @@ Therefore the PromQL evaluator switches to **raw-sample windowed evaluation**:
 
 ## Phase 0 — hygiene + gap radar (prereqs, small)
 
-0.1 Unify native bucket grid: actor engine epoch-aligns, Rust engine
-    start-aligns (audit §2.7). Align actor to `from + n*step` so the two
-    engines agree even outside PromQL.
+0.1 ~~Unify native bucket grid~~ **Superseded (Mark, 2026-07-24): retire the
+    legacy engine instead of fixing it.** Done: `engine: :actor/:legacy/
+    :sharded` logs a deprecation warning (removal in 7.0); all tests except
+    text-series migrated to the Rust engine. The migration surfaced and fixed
+    five Rust-path production bugs CI had never covered (it tested actor):
+    - JSON `/api/v1/import` and the non-NIF Prometheus import path wrote
+      points with **value and timestamp swapped** (data corruption).
+    - Regex/negative label matchers crashed the NIF (`ArgumentError`) —
+      and negative matchers (`!=`, `!~`) never worked on either engine;
+      now a shared `TimelessMetrics.LabelMatch` with Prometheus
+      missing-label-as-empty semantics serves both.
+    - `latest`/`latest_multi`/`query_aggregate` routed to the legacy
+      registry on Rust stores (crash).
+    - No retention: nothing ever called `delete_before` on Rust stores —
+      they grew unbounded. RustEngine now enforces schema raw retention
+      hourly; `enforce_retention/1` works on both engines.
+    - `rate` diverged between engines; unified as carry-in bucket rate in
+      `Aggregation.bucket_rate/2` (one-sample-per-bucket data now yields
+      rates; undefined-rate buckets omitted, matching Prometheus/VM).
+    Also fixed: `transform=` was ignored on Rust query paths; points landing
+    exactly on the range end were dropped by Rust bucketing.
+    7.0 removal blockers: text series (Rust encode is numeric-only), rollup
+    tiers/`query_daily`, true `mode: :memory` (livebooks use it; Rust engine
+    silently writes to disk).
 0.2 Accept RFC3339 `start`/`end`/`time` params (Prometheus API allows both;
     we only parse unix today).
 0.3 **Gap radar:** count and sample rejected PromQL queries in Stats

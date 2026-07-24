@@ -20,7 +20,7 @@ defmodule TimelessMetrics.HTTPTest do
   setup do
     TestHelper.await_down(:http_test_sup)
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
-    start_supervised!({TimelessMetrics, name: :http_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :http_test, data_dir: @data_dir})
 
     on_exit(fn ->
       TestHelper.await_down(:http_test_sup)

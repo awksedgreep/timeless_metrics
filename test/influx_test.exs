@@ -24,7 +24,7 @@ defmodule TimelessMetrics.InfluxTest do
   setup do
     TestHelper.await_down(:influx_test_sup)
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:influx_test, nil})
-    start_supervised!({TimelessMetrics, name: :influx_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :influx_test, data_dir: @data_dir})
 
     on_exit(fn ->
       TestHelper.await_down(:influx_test_sup)

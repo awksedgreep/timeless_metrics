@@ -20,6 +20,7 @@ defmodule TimelessMetrics.RustEngine do
   @memory_budget_mb 0
   @flush_interval :timer.seconds(10)
   @cold_flush_interval :timer.minutes(5)
+  @retention_interval :timer.hours(1)
 
   # ── Public API (called by TimelessMetrics module) ───────────────────
 
@@ -196,9 +197,7 @@ defmodule TimelessMetrics.RustEngine do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
 
-    {:ok, results} =
-      Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
-      |> normalize_nif_result()
+    {:ok, results} = query_range_filtered(store, metric_name, label_filter, from, to)
 
     formatted =
       results
@@ -206,6 +205,53 @@ defmodule TimelessMetrics.RustEngine do
       |> Enum.reject(fn %{points: pts} -> pts == [] end)
 
     {:ok, formatted}
+  end
+
+  @doc """
+  Latest point per series matching a label filter, regardless of age.
+
+  The NIF has no dedicated latest-point query yet, so this reads the full
+  range and keeps the newest sample per series.
+  """
+  def latest_multi(store, metric_name, label_filter) do
+    now = System.os_time(:second)
+    {:ok, results} = query_range_filtered(store, metric_name, label_filter, 0, now)
+
+    latest =
+      Enum.flat_map(results, fn
+        {_labels, []} ->
+          []
+
+        {labels, points} ->
+          {ts, val} = Enum.max_by(points, &elem(&1, 0))
+          [%{labels: labels, timestamp: ts, value: val}]
+      end)
+
+    {:ok, latest}
+  end
+
+  # The NIF label filter only supports exact string equality. Push the exact
+  # matchers down and apply regex/negative/empty matchers on the returned
+  # series labels.
+  defp query_range_filtered(store, metric_name, label_filter, from, to) do
+    {eq, complex} = TimelessMetrics.LabelMatch.split_pushdown(label_filter)
+
+    {:ok, results} =
+      Nif.engine_query_range(ref(store), metric_name, eq, from, to)
+      |> normalize_nif_result()
+
+    case complex do
+      [] ->
+        {:ok, results}
+
+      _ ->
+        compiled = TimelessMetrics.LabelMatch.compile(complex)
+
+        {:ok,
+         Enum.filter(results, fn {labels, _pts} ->
+           TimelessMetrics.LabelMatch.match?(labels, compiled)
+         end)}
+    end
   end
 
   def query_aggregate(store, metric_name, labels, opts) do
@@ -256,26 +302,45 @@ defmodule TimelessMetrics.RustEngine do
     to = Keyword.get(opts, :to, System.os_time(:second))
     bucket = opts[:bucket]
     agg = Keyword.get(opts, :aggregate, :avg)
+    transform = Keyword.get(opts, :transform)
 
     bucket_seconds = bucket_to_seconds(bucket)
 
     if bucket_seconds do
-      {:ok, results} =
-        Nif.engine_query_range(ref(store), metric_name, label_filter, from, to)
-        |> normalize_nif_result()
+      {:ok, results} = query_range_filtered(store, metric_name, label_filter, from, to)
 
       formatted =
         results
         |> Enum.map(fn {labels, points} ->
-          %{labels: labels, data: bucket_points(points, from, to, bucket_seconds, agg)}
+          data =
+            points
+            |> bucket_points(from, to, bucket_seconds, agg)
+            |> TimelessMetrics.Transform.apply(transform)
+
+          %{labels: labels, data: data}
         end)
         |> Enum.reject(fn %{data: d} -> d == [] end)
 
       {:ok, formatted}
     else
+      {eq, complex} = TimelessMetrics.LabelMatch.split_pushdown(label_filter)
+
       {:ok, results} =
-        Nif.engine_query_aggregate(ref(store), metric_name, label_filter, from, to, agg)
+        Nif.engine_query_aggregate(ref(store), metric_name, eq, from, to, agg)
         |> normalize_nif_result()
+
+      results =
+        case complex do
+          [] ->
+            results
+
+          _ ->
+            compiled = TimelessMetrics.LabelMatch.compile(complex)
+
+            Enum.filter(results, fn {labels, _v} ->
+              TimelessMetrics.LabelMatch.match?(labels, compiled)
+            end)
+        end
 
       formatted =
         results
@@ -292,12 +357,12 @@ defmodule TimelessMetrics.RustEngine do
     now = System.os_time(:second)
 
     {:ok, results} =
-      Nif.engine_query_range(ref(store), metric_name, labels, now - 300, now)
+      Nif.engine_query_range(ref(store), metric_name, labels, 0, now)
       |> normalize_nif_result()
 
     case results do
       [{_labels, points}] when points != [] ->
-        {:ok, List.last(points)}
+        {:ok, Enum.max_by(points, &elem(&1, 0))}
 
       _ ->
         {:ok, nil}
@@ -416,6 +481,7 @@ defmodule TimelessMetrics.RustEngine do
     Process.flag(:trap_exit, true)
     schedule_flush()
     schedule_cold_flush()
+    schedule_retention()
 
     {:ok, %{store: store, engine: engine, cache: cache}}
   end
@@ -424,6 +490,23 @@ defmodule TimelessMetrics.RustEngine do
   def handle_info(:periodic_flush, state) do
     _ = Nif.engine_flush_pending(state.engine)
     schedule_flush()
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:retention, state) do
+    # The Rust tree has no Retention process — enforce raw retention from the
+    # schema here so Rust stores don't grow unbounded.
+    case :persistent_term.get({TimelessMetrics, state.store, :schema}, nil) do
+      %{raw_retention_seconds: seconds} when is_integer(seconds) ->
+        cutoff = System.os_time(:second) - seconds
+        _ = Nif.engine_delete_before(state.engine, cutoff)
+
+      _ ->
+        :ok
+    end
+
+    schedule_retention()
     {:noreply, state}
   end
 
@@ -445,6 +528,7 @@ defmodule TimelessMetrics.RustEngine do
 
   defp schedule_flush, do: Process.send_after(self(), :periodic_flush, @flush_interval)
   defp schedule_cold_flush, do: Process.send_after(self(), :cold_flush, @cold_flush_interval)
+  defp schedule_retention, do: Process.send_after(self(), :retention, @retention_interval)
 
   # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -507,90 +591,32 @@ defmodule TimelessMetrics.RustEngine do
   defp bucket_to_seconds({n, :hours}), do: n * 3600
   defp bucket_to_seconds(_), do: 60
 
+  # Buckets align to `from` and use the same per-bucket aggregate math as the
+  # legacy engine (TimelessMetrics.Aggregation), so both engines return
+  # identical results for identical data — including :rate (pairwise slopes
+  # within each bucket) and points landing exactly on the range end.
   defp bucket_points([], _from, _to, _step, _agg), do: []
 
-  defp bucket_points(points, from, to, step, :rate) do
-    buckets = Stream.iterate(from, &(&1 + step)) |> Enum.take_while(&(&1 < to))
-    point_map = Enum.group_by(points, fn {ts, _} -> from + div(ts - from, step) * step end)
-
-    last_per_bucket =
-      Enum.flat_map(buckets, fn bucket ->
-        case Map.get(point_map, bucket) do
-          nil ->
-            []
-
-          pts ->
-            [{bucket, aggregate_points(pts, :last)}]
-        end
-      end)
-
-    case last_per_bucket do
-      [] ->
-        []
-
-      [_single] ->
-        []
-
-      pairs ->
-        pairs
-        |> Enum.chunk_every(2, 1, :discard)
-        |> Enum.map(fn [{bucket, prev_last}, {_next_bucket, next_last}] ->
-          dv = next_last - prev_last
-
-          if dv >= 0 do
-            {bucket, dv / step}
-          else
-            {bucket, 0.0}
-          end
-        end)
-    end
+  defp bucket_points(points, from, _to, step, :rate) do
+    points
+    |> Enum.sort_by(&elem(&1, 0))
+    |> TimelessMetrics.Aggregation.bucket_rate(fn ts -> from + div(ts - from, step) * step end)
   end
 
-  defp bucket_points(points, from, to, step, agg) do
-    buckets = Stream.iterate(from, &(&1 + step)) |> Enum.take_while(&(&1 < to))
-    point_map = Enum.group_by(points, fn {ts, _} -> from + div(ts - from, step) * step end)
-
-    Enum.flat_map(buckets, fn b ->
-      case Map.get(point_map, b) do
-        nil ->
-          []
-
-        pts ->
-          [{b, aggregate_points(pts, agg)}]
-      end
+  defp bucket_points(points, from, _to, step, agg) do
+    points
+    |> Enum.group_by(fn {ts, _} -> from + div(ts - from, step) * step end)
+    |> Enum.map(fn {bucket, pts} ->
+      values = Enum.map(pts, &elem(&1, 1))
+      {bucket, TimelessMetrics.Aggregation.compute_aggregate(agg, values, pts)}
     end)
+    |> Enum.sort_by(&elem(&1, 0))
   end
-
-  defp aggregate_points(points, :last) do
-    points
-    |> Enum.max_by(&elem(&1, 0))
-    |> elem(1)
-  end
-
-  defp aggregate_points(points, :first) do
-    points
-    |> Enum.min_by(&elem(&1, 0))
-    |> elem(1)
-  end
-
-  defp aggregate_points(points, agg) do
-    points
-    |> Enum.map(&elem(&1, 1))
-    |> aggregate_values(agg)
-  end
-
-  defp aggregate_values(vals, :avg), do: Enum.sum(vals) / length(vals)
-  defp aggregate_values(vals, :min), do: Enum.min(vals)
-  defp aggregate_values(vals, :max), do: Enum.max(vals)
-  defp aggregate_values(vals, :sum), do: Enum.sum(vals)
-  defp aggregate_values(vals, :count), do: length(vals) * 1.0
-  defp aggregate_values(vals, _), do: Enum.sum(vals) / length(vals)
 
   defp filter_series(series, filter) when map_size(filter) == 0, do: series
 
   defp filter_series(series, filter) do
-    Enum.filter(series, fn labels ->
-      Enum.all?(filter, fn {k, v} -> Map.get(labels, k) == v end)
-    end)
+    compiled = TimelessMetrics.LabelMatch.compile(filter)
+    Enum.filter(series, &TimelessMetrics.LabelMatch.match?(&1, compiled))
   end
 end

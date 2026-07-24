@@ -20,7 +20,7 @@ defmodule TimelessMetrics.PrometheusTest do
   setup do
     TestHelper.await_down(:prom_test_sup)
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:prom_test, nil})
-    start_supervised!({TimelessMetrics, name: :prom_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :prom_test, data_dir: @data_dir})
 
     on_exit(fn ->
       TestHelper.await_down(:prom_test_sup)

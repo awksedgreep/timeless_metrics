@@ -33,7 +33,7 @@ defmodule TimelessMetrics.VMetricsCompatTest do
   setup do
     TestHelper.await_down(:vmc_sup)
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:vmc, nil})
-    start_supervised!({TimelessMetrics, name: :vmc, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :vmc, data_dir: @data_dir})
 
     on_exit(fn ->
       TestHelper.await_down(:vmc_sup)

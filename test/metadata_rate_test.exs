@@ -20,7 +20,7 @@ defmodule TimelessMetrics.MetadataRateTest do
   setup do
     TestHelper.await_down(:meta_test_sup)
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:meta_test, nil})
-    start_supervised!({TimelessMetrics, name: :meta_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :meta_test, data_dir: @data_dir})
 
     on_exit(fn ->
       TestHelper.await_down(:meta_test_sup)
@@ -205,7 +205,9 @@ defmodule TimelessMetrics.MetadataRateTest do
     assert_in_delta rate_val, 1000.0 / 60, 1.0
   end
 
-  test "rate with less than 2 points returns 0", %{store: store} do
+  test "rate with less than 2 points yields no buckets", %{store: store} do
+    # A single sample has no computable delta — Prometheus/VM return nothing
+    # for it rather than a filler zero.
     now = System.os_time(:second)
     base = div(now, 60) * 60
 
@@ -221,8 +223,6 @@ defmodule TimelessMetrics.MetadataRateTest do
         aggregate: :rate
       )
 
-    assert length(buckets) == 1
-    {_bucket, rate} = List.first(buckets)
-    assert rate == 0.0
+    assert buckets == []
   end
 end

@@ -20,7 +20,7 @@ defmodule TimelessMetrics.PromQLConformanceTest do
   setup_all do
     {:ok, sup} =
       Supervisor.start_link(
-        [{TimelessMetrics, name: @store, data_dir: @data_dir, engine: :actor}],
+        [{TimelessMetrics, name: @store, data_dir: @data_dir}],
         strategy: :one_for_one
       )
 
@@ -39,7 +39,12 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     TimelessMetrics.flush(@store)
 
     on_exit(fn ->
-      if Process.alive?(sup), do: Supervisor.stop(sup)
+      try do
+        Supervisor.stop(sup)
+      catch
+        :exit, _ -> :ok
+      end
+
       File.rm_rf!(@data_dir)
     end)
 

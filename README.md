@@ -208,5 +208,5 @@ The maintained benchmark set lives under [bench/](bench/README.md):
 
 ## Notes
 
-- The legacy Elixir engine still exists behind explicit `engine:` selection for compatibility and migration work, but the default path is Rust.
+- The legacy Elixir engine (`engine: :actor`/`:legacy`/`:sharded`) is **deprecated and will be removed in 7.0**. Starting a store with it logs a warning. Two features are still legacy-only and must be ported or retired before removal: text series and rollup tiers/`query_daily` (true in-memory `mode: :memory` is also only honored by the legacy engine).
 - The rust build may emit the upstream `rustler::resource!` `non_local_definitions` warning. That warning is currently expected.

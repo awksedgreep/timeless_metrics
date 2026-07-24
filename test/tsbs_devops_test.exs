@@ -37,7 +37,7 @@ defmodule TimelessMetrics.TSBSDevOpsTest do
   setup do
     TestHelper.await_down(:tsbs_test_sup)
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:tsbs_test, nil})
-    start_supervised!({TimelessMetrics, name: :tsbs_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :tsbs_test, data_dir: @data_dir})
 
     # Write TSBS-style data: 10 hosts x 10 CPU metrics x 100 points
     entries =

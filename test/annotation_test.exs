@@ -20,7 +20,7 @@ defmodule TimelessMetrics.AnnotationTest do
   setup do
     TestHelper.await_down(:annot_test_sup)
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:annot_test, nil})
-    start_supervised!({TimelessMetrics, name: :annot_test, data_dir: @data_dir, engine: :actor})
+    start_supervised!({TimelessMetrics, name: :annot_test, data_dir: @data_dir})
 
     on_exit(fn ->
       TestHelper.await_down(:annot_test_sup)

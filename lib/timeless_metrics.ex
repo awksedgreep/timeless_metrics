@@ -224,11 +224,22 @@ defmodule TimelessMetrics do
   Returns `{:ok, [{bucket_timestamp, aggregate_value}, ...]}`.
   """
   def query_aggregate(store, metric_name, labels, opts) do
-    registry = :"#{store}_registry"
-    schema = get_schema(store)
-    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    TimelessMetrics.Stats.incr_queries(store)
-    TimelessMetrics.Query.aggregate(store, series_id, Keyword.put(opts, :schema, schema))
+    if rust_engine?(store) do
+      # Exact-label single series: filter via multi, then match the label set
+      # exactly (the filter alone would also match series with extra labels).
+      {:ok, results} = query_aggregate_multi(store, metric_name, labels, opts)
+
+      case Enum.find(results, fn %{labels: l} -> l == labels end) do
+        %{data: data} -> {:ok, data}
+        nil -> {:ok, []}
+      end
+    else
+      registry = :"#{store}_registry"
+      schema = get_schema(store)
+      series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+      TimelessMetrics.Stats.incr_queries(store)
+      TimelessMetrics.Query.aggregate(store, series_id, Keyword.put(opts, :schema, schema))
+    end
   end
 
   @doc """
@@ -418,10 +429,14 @@ defmodule TimelessMetrics do
   Returns `{:ok, {timestamp, value}}` or `{:ok, nil}`.
   """
   def latest(store, metric_name, labels) do
-    registry = :"#{store}_registry"
-    schema = get_schema(store)
-    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    TimelessMetrics.Query.latest(store, series_id, schema: schema)
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.latest(store, metric_name, labels)
+    else
+      registry = :"#{store}_registry"
+      schema = get_schema(store)
+      series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+      TimelessMetrics.Query.latest(store, series_id, schema: schema)
+    end
   end
 
   @doc """
@@ -430,6 +445,14 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{labels: %{...}, timestamp: ts, value: val}, ...]}`.
   """
   def latest_multi(store, metric_name, label_filter \\ %{}) do
+    if rust_engine?(store) do
+      TimelessMetrics.RustEngine.latest_multi(store, metric_name, label_filter)
+    else
+      latest_multi_legacy(store, metric_name, label_filter)
+    end
+  end
+
+  defp latest_multi_legacy(store, metric_name, label_filter) do
     schema = get_schema(store)
     matching = find_matching_series(store, metric_name, label_filter)
 
@@ -756,14 +779,34 @@ defmodule TimelessMetrics do
 
   @doc "Force a daily rollup run."
   def rollup(store) do
-    GenServer.call(:"#{store}_rollup", {:run, :all}, :infinity)
+    if rust_engine?(store) do
+      # Rollup tiers are a legacy-engine feature; the Rust engine downsamples
+      # via raw-first compaction instead.
+      :ok
+    else
+      GenServer.call(:"#{store}_rollup", {:run, :all}, :infinity)
+    end
   end
 
   @doc """
   Force retention enforcement now.
   """
   def enforce_retention(store) do
-    GenServer.call(:"#{store}_retention", :enforce, :infinity)
+    if rust_engine?(store) do
+      schema = get_schema(store)
+
+      case schema.raw_retention_seconds do
+        :forever ->
+          :ok
+
+        seconds when is_integer(seconds) ->
+          cutoff = System.os_time(:second) - seconds
+          _ = TimelessMetrics.RustEngine.delete_before(store, cutoff)
+          :ok
+      end
+    else
+      GenServer.call(:"#{store}_retention", :enforce, :infinity)
+    end
   end
 
   @doc """
@@ -1160,18 +1203,11 @@ defmodule TimelessMetrics do
       published ++
         Enum.reject(overflow_entries, fn {id, _} -> MapSet.member?(published_ids, id) end)
 
-    # Apply label filter
-    Enum.filter(all_series, fn {_id, labels} ->
-      Enum.all?(label_filter, fn
-        {k, {:regex, pattern}} ->
-          case Map.get(labels, k) do
-            nil -> false
-            val -> Regex.match?(~r/^(?:#{pattern})$/, val)
-          end
+    # Apply label filter (shared matcher: exact, regex, and negative forms)
+    compiled = TimelessMetrics.LabelMatch.compile(label_filter)
 
-        {k, v} ->
-          Map.get(labels, k) == v
-      end)
+    Enum.filter(all_series, fn {_id, labels} ->
+      TimelessMetrics.LabelMatch.match?(labels, compiled)
     end)
   end
 
