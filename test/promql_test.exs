@@ -331,8 +331,8 @@ defmodule TimelessMetrics.PromQLTest do
     end
 
     test "recognized-but-unsupported functions name themselves" do
-      assert {:error, msg} = PromQL.parse("histogram_quantile(0.9, foo_bucket)")
-      assert msg =~ "histogram_quantile"
+      assert {:error, msg} = PromQL.parse("mad_over_time(foo[5m])")
+      assert msg =~ "mad_over_time"
       assert msg =~ "not supported"
     end
 

@@ -958,7 +958,7 @@ defmodule TimelessMetrics.HTTPTest do
     resp =
       TimelessMetrics.TestHTTP.get(
         @port,
-        "/api/v1/query_range?query=#{URI.encode_www_form("histogram_quantile(0.9, foo)")}&start=#{now - 60}&end=#{now}&step=60"
+        "/api/v1/query_range?query=#{URI.encode_www_form("mad_over_time(foo[5m])")}&start=#{now - 60}&end=#{now}&step=60"
       )
 
     assert resp.status == 400
@@ -971,7 +971,7 @@ defmodule TimelessMetrics.HTTPTest do
     assert detailed["promql_rejected"] >= 1
 
     assert Enum.any?(detailed["promql_rejections"], fn r ->
-             r["query"] =~ "histogram_quantile" and r["reason"] =~ "not supported"
+             r["query"] =~ "mad_over_time" and r["reason"] =~ "not supported"
            end)
   end
 end

@@ -106,13 +106,13 @@ defmodule TimelessMetrics.PromQL do
                  :predict_linear,
                  :quantile_over_time,
                  :label_replace,
-                 :label_join
+                 :label_join,
+                 :histogram_quantile
                ]
 
   # Recognized PromQL functions we don't implement yet — named in the error
   # message so clients can tell "unsupported" from "typo".
-  @known_unsupported ~w(histogram_quantile
-    histogram_fraction histogram_avg histogram_count histogram_sum
+  @known_unsupported ~w(histogram_fraction histogram_avg histogram_count histogram_sum
     histogram_stddev histogram_stdvar
     sort sort_desc sort_by_label sort_by_label_desc
     scalar vector absent absent_over_time
@@ -1063,8 +1063,127 @@ defmodule TimelessMetrics.PromQL do
   defp eval_call(:label_join, args, _ctx) when length(args) >= 3,
     do: {:error, "label_join() expects (vector, \"dst\", \"separator\", \"src\", ...)"}
 
+  defp eval_call(:histogram_quantile, [phi_node, arg], ctx) do
+    with {:ok, phi} <- eval_scalar(phi_node, ctx),
+         {:ok, series} <- eval_vector(arg, ctx) do
+      {:ok, {:vector, histogram_quantile_series(phi, series)}}
+    end
+  end
+
   defp eval_call(f, args, _ctx),
     do: {:error, "#{f}() called with #{length(args)} argument(s) — wrong arity"}
+
+  # Classic-histogram quantile over le-labeled cumulative buckets, following
+  # Prometheus' histogramQuantile: monotonic fixup, linear interpolation
+  # within the chosen bucket, largest finite le when the +Inf bucket wins.
+  defp histogram_quantile_series(phi, series) do
+    series
+    |> Enum.filter(fn %{labels: l} -> Map.has_key?(l, "le") end)
+    |> Enum.group_by(fn %{labels: l} -> l |> Map.delete("le") |> Map.delete("__name__") end)
+    |> Enum.flat_map(fn {group_labels, buckets} ->
+      parsed =
+        buckets
+        |> Enum.flat_map(fn %{labels: l, data: data} ->
+          case parse_le(Map.fetch!(l, "le")) do
+            nil -> []
+            le -> [{le, Map.new(data)}]
+          end
+        end)
+        |> Enum.sort_by(fn {le, _} -> le_rank(le) end)
+
+      ts_all =
+        parsed
+        |> Enum.flat_map(fn {_le, m} -> Map.keys(m) end)
+        |> Enum.uniq()
+        |> Enum.sort()
+
+      data =
+        Enum.flat_map(ts_all, fn ts ->
+          pairs =
+            Enum.flat_map(parsed, fn {le, m} ->
+              case Map.fetch(m, ts) do
+                {:ok, v} when is_number(v) -> [{le, v}]
+                _ -> []
+              end
+            end)
+
+          case bucket_quantile(phi, pairs) do
+            :skip -> []
+            v -> [{ts, v}]
+          end
+        end)
+
+      if data == [], do: [], else: [%{labels: group_labels, data: data}]
+    end)
+  end
+
+  defp parse_le("+Inf"), do: :inf
+  defp parse_le("Inf"), do: :inf
+
+  defp parse_le(str) do
+    case Float.parse(str) do
+      {f, ""} -> f
+      _ -> nil
+    end
+  end
+
+  defp le_rank(:inf), do: {1, 0.0}
+  defp le_rank(le), do: {0, le}
+
+  defp bucket_quantile(_phi, pairs) when length(pairs) < 2, do: :skip
+
+  defp bucket_quantile(phi, pairs) do
+    # monotonic fixup: cumulative counts may glitch downward across buckets
+    {fixed, _} =
+      Enum.map_reduce(pairs, 0.0, fn {le, v}, running_max ->
+        m = max(v, running_max)
+        {{le, m}, m}
+      end)
+
+    {last_le, total} = List.last(fixed)
+
+    cond do
+      last_le != :inf -> :skip
+      # VM omits the point entirely when the histogram has no observations
+      total == 0 -> :skip
+      phi < 0 -> :neg_inf
+      phi > 1 -> :inf
+      true -> interpolate_quantile(phi * total, fixed)
+    end
+  end
+
+  defp interpolate_quantile(rank, fixed) do
+    finite = Enum.reject(fixed, fn {le, _} -> le == :inf end)
+
+    case Enum.find_index(fixed, fn {_le, cum} -> cum >= rank end) do
+      nil ->
+        :nan
+
+      idx ->
+        {le, cum} = Enum.at(fixed, idx)
+
+        cond do
+          le == :inf ->
+            case List.last(finite) do
+              nil -> :nan
+              {max_le, _} -> max_le
+            end
+
+          idx == 0 ->
+            if le <= 0, do: le, else: le * min(rank / cum, 1.0)
+
+          true ->
+            {prev_le, prev_cum} = Enum.at(fixed, idx - 1)
+            count = cum - prev_cum
+
+            if count <= 0 do
+              le
+            else
+              prev_le + (le - prev_le) * ((rank - prev_cum) / count)
+            end
+        end
+    end
+  end
 
   defp validate_label_name(name) do
     if Regex.match?(@label_name_re, name) or name == "__name__" do

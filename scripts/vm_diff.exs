@@ -136,6 +136,25 @@ defmodule VMDiff do
         ~s|g_sparse{host="a"} #{5.0 + i} #{ts_ms}|
       end
 
+    # classic histogram: latencies drifting up over time
+    hist =
+      for host <- ["a", "b"], i <- 0..239 do
+        ts_ms = (base + i * 15) * 1000
+        # per-step observations: mostly fast, tail grows with i
+        c01 = i * 5
+        c05 = i * 8 + div(i * i, 500)
+        c1 = i * 9 + div(i * i, 300)
+        cinf = i * 10 + div(i * i, 200)
+
+        [
+          ~s|lat_bucket{host="#{host}",le="0.1"} #{c01} #{ts_ms}|,
+          ~s|lat_bucket{host="#{host}",le="0.5"} #{c05} #{ts_ms}|,
+          ~s|lat_bucket{host="#{host}",le="1"} #{c1} #{ts_ms}|,
+          ~s|lat_bucket{host="#{host}",le="+Inf"} #{cinf} #{ts_ms}|,
+          ~s|lat_count{host="#{host}"} #{cinf} #{ts_ms}|
+        ]
+      end
+
     # info-style metric (one per host, extra label) and a per-host+core
     # metric (many series per host) to exercise group_left
     extra =
@@ -149,7 +168,7 @@ defmodule VMDiff do
         ]
       end
 
-    Enum.join(List.flatten(lines) ++ sparse ++ List.flatten(extra), "\n")
+    Enum.join(List.flatten(lines) ++ sparse ++ List.flatten(extra) ++ List.flatten(hist), "\n")
   end
 
   defp import_both!(body) do
@@ -279,7 +298,14 @@ defmodule VMDiff do
       "g_ramp and on(host) g_const",
       "g_ramp or on(host) g_const",
       "g_ramp unless on(host) g_sparse",
-      "sum by (host) (core_load) / on(host) g_const"
+      "sum by (host) (core_load) / on(host) g_const",
+      # Phase 2D: histogram_quantile
+      "histogram_quantile(0.9, lat_bucket)",
+      "histogram_quantile(0.5, lat_bucket)",
+      "histogram_quantile(0.99, rate(lat_bucket[5m]))",
+      "histogram_quantile(0.5, sum by (le) (rate(lat_bucket[5m])))",
+      "histogram_quantile(1.5, lat_bucket)",
+      "histogram_quantile(-1, lat_bucket)"
     ]
   end
 

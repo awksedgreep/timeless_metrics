@@ -175,7 +175,9 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     "cpu / on(host) group_left mem",
     "cpu > on(host) mem",
     "cpu and on(host) mem",
-    "cpu or ignoring(host) mem"
+    "cpu or ignoring(host) mem",
+    # histogram_quantile (Phase 2D)
+    "histogram_quantile(0.9, rate(reqs_bucket[5m]))"
   ]
 
   # ❌ Rejected with a message naming the construct (not a generic parse error)
@@ -195,7 +197,6 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     ~s|sort_by_label_desc(cpu, "host")|,
     "absent(nonexistent)",
     "absent_over_time(nonexistent[5m])",
-    "histogram_quantile(0.9, rate(reqs_bucket[5m]))",
     "histogram_fraction(0, 100, reqs_total)",
     "histogram_avg(reqs_total)",
     "histogram_count(reqs_total)",
