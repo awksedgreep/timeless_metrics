@@ -308,16 +308,23 @@ defmodule TimelessMetrics do
     group_by = Keyword.fetch!(opts, :group_by)
     {:ok, results} = query_aggregate_multi(store, metric_name, label_filter, opts)
 
+    aggregate_fn = cross_series_aggregate_fn(opts)
+
     grouped =
       results
       |> Enum.group_by(fn %{labels: l} -> Map.take(l, List.wrap(group_by)) end)
       |> Enum.map(fn {group, series_results} ->
-        aggregate_fn = Keyword.get(opts, :aggregate, :avg)
         data = cross_aggregate(series_results, aggregate_fn)
         %{group: group, data: data}
       end)
 
     {:ok, grouped}
+  end
+
+  # Cross-series merge honors the explicit :cross_series_aggregate option and
+  # falls back to the per-bucket :aggregate (historical behavior).
+  defp cross_series_aggregate_fn(opts) do
+    Keyword.get(opts, :cross_series_aggregate) || Keyword.get(opts, :aggregate, :avg)
   end
 
   @doc """
@@ -336,7 +343,7 @@ defmodule TimelessMetrics do
       |> Enum.flat_map(fn {:ok, results} -> results end)
 
     group_by = Keyword.fetch!(opts, :group_by)
-    aggregate_fn = Keyword.get(opts, :aggregate, :avg)
+    aggregate_fn = cross_series_aggregate_fn(opts)
 
     grouped =
       all_results
@@ -1158,6 +1165,8 @@ defmodule TimelessMetrics do
   defp apply_cross_aggregate(vals, :sum), do: Enum.sum(vals)
   defp apply_cross_aggregate(vals, :count), do: length(vals) / 1
   defp apply_cross_aggregate(vals, :avg), do: Enum.sum(vals) / length(vals)
+  # Bucket-only aggregates (:last, :first, :rate) have no cross-series meaning
+  defp apply_cross_aggregate(vals, _other), do: Enum.sum(vals) / length(vals)
 
   # --- Sharded engine helpers ---
 

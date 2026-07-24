@@ -152,6 +152,18 @@ defmodule TimelessMetrics.HTTP do
     json_resp(req, status, %{status: "error", errorType: error_type, error: msg})
   end
 
+  # Rejected PromQL goes through the gap radar (Stats) so real traffic tells
+  # us which unsupported constructs to implement next.
+  defp promql_error(req, store, query, :parse, reason) do
+    TimelessMetrics.Stats.record_promql_rejection(store, query, reason)
+    prom_error(req, 400, "bad_data", "PromQL parse error: #{reason}")
+  end
+
+  defp promql_error(req, store, query, :execution, reason) do
+    TimelessMetrics.Stats.record_promql_rejection(store, query, reason)
+    prom_error(req, 422, "execution", reason)
+  end
+
   # Prometheus API allows GET query params and POST form bodies interchangeably;
   # merge both so each handler serves either method.
   defp merged_params(req) do
@@ -266,6 +278,7 @@ defmodule TimelessMetrics.HTTP do
       :ok ->
         store = store()
         info = TimelessMetrics.info(store)
+        stats = TimelessMetrics.Stats.snapshot(store)
 
         json_resp(req, 200, %{
           status: "ok",
@@ -273,7 +286,9 @@ defmodule TimelessMetrics.HTTP do
           points: info.total_points,
           storage_bytes: info.storage_bytes,
           buffer_points: info.raw_buffer_points,
-          bytes_per_point: info.bytes_per_point
+          bytes_per_point: info.bytes_per_point,
+          promql_rejected: stats.promql_rejected,
+          promql_rejections: TimelessMetrics.Stats.promql_rejections(store)
         })
     end
   end
@@ -390,11 +405,11 @@ defmodule TimelessMetrics.HTTP do
                   json_resp(req, 200, instant_response)
 
                 {:error, reason} ->
-                  prom_error(req, 422, "execution", reason)
+                  promql_error(req, store, params["query"], :execution, reason)
               end
 
             {:error, reason} ->
-              prom_error(req, 400, "bad_data", "PromQL parse error: #{reason}")
+              promql_error(req, store, params["query"], :parse, reason)
           end
         else
           case extract_metric_and_labels(params) do
@@ -460,11 +475,11 @@ defmodule TimelessMetrics.HTTP do
                   json_resp(req, 200, response)
 
                 {:error, reason} ->
-                  prom_error(req, 422, "execution", reason)
+                  promql_error(req, store, params["query"], :execution, reason)
               end
 
             {:error, reason} ->
-              prom_error(req, 400, "bad_data", "PromQL parse error: #{reason}")
+              promql_error(req, store, params["query"], :parse, reason)
           end
         else
           case extract_query_params_extended(params) do
@@ -496,9 +511,10 @@ defmodule TimelessMetrics.HTTP do
                         store,
                         metrics,
                         query_spec.labels,
-                        Keyword.merge(base_opts,
-                          group_by: group_keys,
-                          cross_series_aggregate: cross_agg || :max
+                        Keyword.merge(
+                          base_opts,
+                          [group_by: group_keys] ++
+                            if(cross_agg, do: [cross_series_aggregate: cross_agg], else: [])
                         )
                       )
 
@@ -524,9 +540,10 @@ defmodule TimelessMetrics.HTTP do
                         store,
                         query_spec.metric,
                         query_spec.labels,
-                        Keyword.merge(base_opts,
-                          group_by: group_keys,
-                          cross_series_aggregate: cross_agg || :max
+                        Keyword.merge(
+                          base_opts,
+                          [group_by: group_keys] ++
+                            if(cross_agg, do: [cross_series_aggregate: cross_agg], else: [])
                         )
                       )
 
@@ -1111,11 +1128,11 @@ defmodule TimelessMetrics.HTTP do
                     json_resp(req, 200, response)
 
                   {:error, reason} ->
-                    prom_error(req, 422, "execution", reason)
+                    promql_error(req, store, params["query"], :execution, reason)
                 end
 
               {:error, reason} ->
-                prom_error(req, 400, "bad_data", "PromQL parse error: #{reason}")
+                promql_error(req, store, params["query"], :parse, reason)
             end
         end
     end
@@ -1172,11 +1189,11 @@ defmodule TimelessMetrics.HTTP do
                     json_resp(req, 200, vector_response)
 
                   {:error, reason} ->
-                    prom_error(req, 422, "execution", reason)
+                    promql_error(req, store, params["query"], :execution, reason)
                 end
 
               {:error, reason} ->
-                prom_error(req, 400, "bad_data", "PromQL parse error: #{reason}")
+                promql_error(req, store, params["query"], :parse, reason)
             end
         end
     end
@@ -2083,26 +2100,49 @@ defmodule TimelessMetrics.HTTP do
     }
   end
 
-  # Parse Prometheus time params — can be unix timestamps (float or int)
+  # Parse Prometheus time params — unix timestamps (float or int) or RFC3339.
+  # RFC3339 must be tried first: Float.parse("2026-07-24T00:00:00Z") happily
+  # returns {2026.0, "-07-..."} and would silently become year-as-seconds.
   defp parse_prom_time(nil, default), do: default
 
   defp parse_prom_time(val, default) when is_binary(val) do
-    case Float.parse(val) do
-      {ts, _} -> trunc(ts)
-      :error -> default
+    case DateTime.from_iso8601(val) do
+      {:ok, dt, _offset} ->
+        DateTime.to_unix(dt)
+
+      _ ->
+        case Float.parse(val) do
+          {ts, ""} -> trunc(ts)
+          _ -> default
+        end
     end
   end
 
-  # Parse Prometheus step — can be integer seconds or duration string like "60s"
+  # Parse Prometheus step — duration string like "60s"/"5m", or seconds (int or float)
   defp parse_prom_step(nil, default), do: default
 
   defp parse_prom_step(val, default) when is_binary(val) do
     case Integer.parse(val) do
-      {n, "s"} -> n
-      {n, "m"} -> n * 60
-      {n, "h"} -> n * 3600
-      {n, ""} -> n
-      _ -> default
+      {n, "s"} when n > 0 ->
+        n
+
+      {n, "m"} when n > 0 ->
+        n * 60
+
+      {n, "h"} when n > 0 ->
+        n * 3600
+
+      {n, "d"} when n > 0 ->
+        n * 86_400
+
+      {n, ""} when n > 0 ->
+        n
+
+      _ ->
+        case Float.parse(val) do
+          {f, ""} when f > 0 -> max(trunc(f), 1)
+          _ -> default
+        end
     end
   end
 end

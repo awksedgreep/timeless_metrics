@@ -951,4 +951,27 @@ defmodule TimelessMetrics.HTTPTest do
 
     assert resp.status == 400
   end
+
+  test "rejected PromQL queries land in the gap radar" do
+    now = System.os_time(:second)
+
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
+        "/api/v1/query_range?query=#{URI.encode_www_form("histogram_quantile(0.9, foo)")}&start=#{now - 60}&end=#{now}&step=60"
+      )
+
+    assert resp.status == 400
+    assert :json.decode(resp.body)["status"] == "error"
+
+    health = TimelessMetrics.TestHTTP.get(@port, "/health/detailed")
+    assert health.status == 200
+    detailed = :json.decode(health.body)
+
+    assert detailed["promql_rejected"] >= 1
+
+    assert Enum.any?(detailed["promql_rejections"], fn r ->
+             r["query"] =~ "histogram_quantile" and r["reason"] =~ "not supported"
+           end)
+  end
 end

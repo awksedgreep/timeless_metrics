@@ -13,13 +13,26 @@ defmodule TimelessMetrics.Stats do
   @queries 9
   @query_fast_path 10
   @query_slow_path 11
+  @promql_rejected 12
 
-  @counter_size 11
+  @counter_size 12
+
+  # Bounded sample of recently rejected PromQL queries (the "gap radar"):
+  # real traffic tells us which unsupported constructs to implement next.
+  @max_rejection_samples 100
 
   @doc "Initialize counters for a store. Call once before children start."
   def init(store) do
     ref = :counters.new(@counter_size, [:write_concurrency])
     :persistent_term.put({__MODULE__, store}, ref)
+
+    rejections = rejection_table_name(store)
+
+    if :ets.whereis(rejections) == :undefined do
+      :ets.new(rejections, [:named_table, :set, :public, write_concurrency: :auto])
+    end
+
+    :ok
   end
 
   # --- Increment by 1 ---
@@ -40,6 +53,57 @@ defmodule TimelessMetrics.Stats do
   def add_http_import_errors(store, n), do: add(store, @http_import_errors, n)
   def add_points_merged(store, n), do: add(store, @points_merged, n)
 
+  # --- PromQL gap radar ---
+
+  @doc """
+  Record a rejected PromQL query: bumps the counter and keeps a bounded
+  sample of distinct query strings with their rejection reason.
+  """
+  def record_promql_rejection(store, query, reason) when is_binary(query) do
+    add(store, @promql_rejected, 1)
+    table = rejection_table_name(store)
+
+    if :ets.whereis(table) != :undefined do
+      now = System.os_time(:second)
+
+      case :ets.lookup(table, query) do
+        [{^query, _reason, count, _last_ts}] ->
+          :ets.insert(table, {query, reason, count + 1, now})
+
+        [] ->
+          if :ets.info(table, :size) < @max_rejection_samples do
+            :ets.insert(table, {query, reason, 1, now})
+          end
+      end
+    end
+
+    :ok
+  end
+
+  def record_promql_rejection(_store, _query, _reason), do: :ok
+
+  @doc """
+  Recently rejected PromQL queries, most recent first:
+  `[%{query, reason, count, last_seen}]`.
+  """
+  def promql_rejections(store, limit \\ 50) do
+    table = rejection_table_name(store)
+
+    if :ets.whereis(table) == :undefined do
+      []
+    else
+      table
+      |> :ets.tab2list()
+      |> Enum.sort_by(fn {_q, _r, _c, last_ts} -> -last_ts end)
+      |> Enum.take(limit)
+      |> Enum.map(fn {query, reason, count, last_ts} ->
+        %{query: query, reason: reason, count: count, last_seen: last_ts}
+      end)
+    end
+  end
+
+  defp rejection_table_name(store), do: :"#{store}_promql_rejections"
+
   # --- Snapshot ---
 
   @doc "Read all 8 counters as a map."
@@ -58,7 +122,8 @@ defmodule TimelessMetrics.Stats do
             :points_merged,
             :queries,
             :query_fast_path,
-            :query_slow_path
+            :query_slow_path,
+            :promql_rejected
           ],
           &{&1, 0}
         )
@@ -75,7 +140,8 @@ defmodule TimelessMetrics.Stats do
           points_merged: :counters.get(ref, @points_merged),
           queries: :counters.get(ref, @queries),
           query_fast_path: :counters.get(ref, @query_fast_path),
-          query_slow_path: :counters.get(ref, @query_slow_path)
+          query_slow_path: :counters.get(ref, @query_slow_path),
+          promql_rejected: :counters.get(ref, @promql_rejected)
         }
     end
   end

@@ -172,6 +172,34 @@ defmodule TimelessMetrics.PrometheusTest do
     assert val >= 50.0
   end
 
+  test "prometheus query_range accepts RFC3339 start/end", %{store: store} do
+    now = System.os_time(:second)
+    base = div(now, 60) * 60
+
+    for i <- 0..9 do
+      TimelessMetrics.write(store, "rfc_metric", %{"host" => "web-1"}, 10.0 + i,
+        timestamp: base + i * 60
+      )
+    end
+
+    TimelessMetrics.flush(store)
+
+    start_iso = base |> DateTime.from_unix!() |> DateTime.to_iso8601()
+    end_iso = (base + 600) |> DateTime.from_unix!() |> DateTime.to_iso8601()
+
+    resp =
+      TimelessMetrics.TestHTTP.get(
+        @port,
+        "/prometheus/api/v1/query_range?query=rfc_metric&start=#{URI.encode_www_form(start_iso)}&end=#{URI.encode_www_form(end_iso)}&step=60"
+      )
+
+    assert resp.status == 200
+    result = :json.decode(resp.body)
+    assert result["status"] == "success"
+    assert [%{"values" => values} | _] = result["data"]["result"]
+    assert length(values) > 0
+  end
+
   test "prometheus query_range with label filter", %{store: store} do
     now = System.os_time(:second)
     base = div(now, 60) * 60
