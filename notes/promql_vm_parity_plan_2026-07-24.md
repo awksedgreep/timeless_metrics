@@ -109,6 +109,10 @@ Therefore the PromQL evaluator switches to **raw-sample windowed evaluation**:
 
 ## Phase 2 — PromQL breadth, by importance
 
+> **DONE 2026-07-24** — all items below implemented and referee-verified
+> (137/137 corpus parity vs a live VM container). See audit doc §1 status
+> update for the VM behaviors the referee corrected along the way.
+
 Ranked by real-world Grafana/alerting usage; each is small once Phase 1's
 windowed evaluator exists.
 

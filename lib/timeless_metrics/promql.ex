@@ -96,6 +96,17 @@ defmodule TimelessMetrics.PromQL do
   # abs/sqrt/exp/log* drop it.
   @name_keeping_transforms [:ceil, :floor, :round]
 
+  @clock_fns [
+    :minute,
+    :hour,
+    :day_of_week,
+    :day_of_month,
+    :day_of_year,
+    :days_in_month,
+    :month,
+    :year
+  ]
+
   @functions @rollup_fns ++
                @transform_fns ++
                [
@@ -107,20 +118,32 @@ defmodule TimelessMetrics.PromQL do
                  :quantile_over_time,
                  :label_replace,
                  :label_join,
-                 :histogram_quantile
+                 :histogram_quantile,
+                 :sort,
+                 :sort_desc,
+                 :absent,
+                 :absent_over_time,
+                 :time,
+                 :timestamp,
+                 :scalar,
+                 :vector,
+                 :minute,
+                 :hour,
+                 :day_of_week,
+                 :day_of_month,
+                 :day_of_year,
+                 :days_in_month,
+                 :month,
+                 :year
                ]
 
   # Recognized PromQL functions we don't implement yet — named in the error
   # message so clients can tell "unsupported" from "typo".
   @known_unsupported ~w(histogram_fraction histogram_avg histogram_count histogram_sum
     histogram_stddev histogram_stdvar
-    sort sort_desc sort_by_label sort_by_label_desc
-    scalar vector absent absent_over_time
-    time timestamp mad_over_time
-    ceil_over_time floor_over_time
+    sort_by_label sort_by_label_desc
+    mad_over_time ceil_over_time floor_over_time
     double_exponential_smoothing holt_winters
-    day_of_month day_of_week day_of_year days_in_month
-    hour minute month year
     limitk limit_ratio info)
 
   # VictoriaMetrics MetricsQL extensions — distinct message so VM users know
@@ -208,6 +231,13 @@ defmodule TimelessMetrics.PromQL do
           {:ok, {:scalar, n}} ->
             values = for ts <- start_ts..end_ts//step, do: [ts, format_value(n)]
             {:ok, wrap_prom_response([%{"metric" => %{}, "values" => values}])}
+
+          {:ok, {:scalar_fn, f}} ->
+            values =
+              for ts <- start_ts..end_ts//step, (v = f.(ts)) != :nan, do: [ts, format_value(v)]
+
+            result = if values == [], do: [], else: [%{"metric" => %{}, "values" => values}]
+            {:ok, wrap_prom_response(result)}
 
           {:error, msg} ->
             {:error, msg}
@@ -872,6 +902,7 @@ defmodule TimelessMetrics.PromQL do
     case eval(node, ctx) do
       {:ok, {:vector, series}} -> {:ok, series}
       {:ok, {:scalar, _}} -> {:error, "expected an instant vector, got a scalar"}
+      {:ok, {:scalar_fn, _}} -> {:error, "expected an instant vector, got a scalar"}
       {:error, _} = err -> err
     end
   end
@@ -879,6 +910,7 @@ defmodule TimelessMetrics.PromQL do
   defp eval_scalar(node, ctx) do
     case eval(node, ctx) do
       {:ok, {:scalar, n}} -> {:ok, n}
+      {:ok, {:scalar_fn, _}} -> {:error, "a time-dependent scalar is not allowed here"}
       {:ok, {:vector, _}} -> {:error, "expected a scalar (number), got an instant vector"}
       {:error, _} = err -> err
     end
@@ -1063,6 +1095,99 @@ defmodule TimelessMetrics.PromQL do
   defp eval_call(:label_join, args, _ctx) when length(args) >= 3,
     do: {:error, "label_join() expects (vector, \"dst\", \"separator\", \"src\", ...)"}
 
+  # sort/sort_desc order instant vectors; on range (matrix) results they are
+  # a pass-through, as in Prometheus/VM.
+  defp eval_call(f, [arg], ctx) when f in [:sort, :sort_desc] do
+    with {:ok, series} <- eval_vector(arg, ctx) do
+      {:ok, {:vector, series}}
+    end
+  end
+
+  # time() is a per-step scalar
+  defp eval_call(:time, [], _ctx), do: {:ok, {:scalar_fn, fn ts -> ts * 1.0 end}}
+
+  # scalar(v): the single series' value at each step, NaN when 0 or >1 series
+  defp eval_call(:scalar, [arg], ctx) do
+    with {:ok, series} <- eval_vector(arg, ctx) do
+      case series do
+        [%{data: data}] ->
+          m = Map.new(data)
+          {:ok, {:scalar_fn, fn ts -> Map.get(m, ts, :nan) end}}
+
+        _ ->
+          {:ok, {:scalar_fn, fn _ts -> :nan end}}
+      end
+    end
+  end
+
+  # vector(s): scalar as a single labelless series over the grid
+  defp eval_call(:vector, [arg], ctx) do
+    case eval(arg, ctx) do
+      {:ok, {:scalar, n}} ->
+        {:ok, {:vector, [%{labels: %{}, data: for(ts <- grid(ctx), do: {ts, n})}]}}
+
+      {:ok, {:scalar_fn, f}} ->
+        {:ok, {:vector, [%{labels: %{}, data: for(ts <- grid(ctx), do: {ts, f.(ts)})}]}}
+
+      {:ok, {:vector, _}} ->
+        {:error, "vector() expects a scalar argument"}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # timestamp(selector): the raw-sample timestamp behind each step's value
+  defp eval_call(:timestamp, [{:selector, sel}], ctx) do
+    fun = fn
+      [], _prev, _t -> :skip
+      slice, _prev, _t -> slice |> List.last() |> elem(0) |> Kernel.*(1.0)
+    end
+
+    with {:ok, series} <- eval_windowed(sel, ctx.lookback, false, ctx, fun) do
+      {:ok, {:vector, series}}
+    end
+  end
+
+  defp eval_call(:timestamp, [_arg], _ctx),
+    do: {:error, "timestamp() expects an instant vector selector"}
+
+  # absent(v): 1 at steps where the vector has no samples at all; labels are
+  # derived from the selector's equality matchers
+  defp eval_call(:absent, [arg], ctx) do
+    with {:ok, series} <- eval_vector(arg, ctx) do
+      {:ok, {:vector, absent_series(series, absent_labels(arg), ctx)}}
+    end
+  end
+
+  defp eval_call(:absent_over_time, [{:range, {:selector, sel}, window} = _arg], ctx)
+       when window > 0 do
+    fun = fn
+      [], _prev, _t -> :skip
+      _slice, _prev, _t -> 1.0
+    end
+
+    with {:ok, series} <- eval_windowed(sel, window, false, ctx, fun) do
+      {:ok, {:vector, absent_series(series, absent_labels({:selector, sel}), ctx)}}
+    end
+  end
+
+  defp eval_call(:absent_over_time, [_arg], _ctx),
+    do: {:error, "absent_over_time() expects a range vector like metric[5m]"}
+
+  # clock functions: zero-arg form applies to the evaluation time
+  defp eval_call(f, [], ctx) when f in @clock_fns do
+    data = for ts <- grid(ctx), do: {ts, clock_part(f, ts * 1.0)}
+    {:ok, {:vector, [%{labels: %{}, data: data}]}}
+  end
+
+  defp eval_call(f, [arg], ctx) when f in @clock_fns do
+    with {:ok, series} <- eval_vector(arg, ctx) do
+      series = series |> map_values(&clock_part(f, &1)) |> drop_names()
+      {:ok, {:vector, series}}
+    end
+  end
+
   defp eval_call(:histogram_quantile, [phi_node, arg], ctx) do
     with {:ok, phi} <- eval_scalar(phi_node, ctx),
          {:ok, series} <- eval_vector(arg, ctx) do
@@ -1072,6 +1197,49 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval_call(f, args, _ctx),
     do: {:error, "#{f}() called with #{length(args)} argument(s) — wrong arity"}
+
+  defp grid(ctx), do: Enum.to_list(ctx.from..ctx.to//ctx.step)
+
+  # equality matchers of the selector become the absent() labels
+  defp absent_labels({:selector, %{labels: matchers, metric: _m}}) do
+    Enum.reduce(matchers, %{}, fn
+      {k, v}, acc when is_binary(v) and v != "" -> Map.put(acc, k, v)
+      _other, acc -> acc
+    end)
+  end
+
+  defp absent_labels(_other), do: %{}
+
+  defp absent_series(series, labels, ctx) do
+    covered =
+      series
+      |> Enum.flat_map(fn %{data: data} -> Enum.map(data, &elem(&1, 0)) end)
+      |> MapSet.new()
+
+    data = for ts <- grid(ctx), not MapSet.member?(covered, ts), do: {ts, 1.0}
+
+    if data == [], do: [], else: [%{labels: labels, data: data}]
+  end
+
+  @clock_epoch ~U[1970-01-01 00:00:00Z]
+
+  defp clock_part(_f, v) when not is_number(v), do: v
+
+  defp clock_part(f, v) do
+    dt = DateTime.add(@clock_epoch, trunc(v), :second)
+
+    case f do
+      :minute -> dt.minute * 1.0
+      :hour -> dt.hour * 1.0
+      # Prometheus: 0 = Sunday
+      :day_of_week -> rem(Date.day_of_week(DateTime.to_date(dt)), 7) * 1.0
+      :day_of_month -> dt.day * 1.0
+      :day_of_year -> Date.day_of_year(DateTime.to_date(dt)) * 1.0
+      :days_in_month -> Date.days_in_month(DateTime.to_date(dt)) * 1.0
+      :month -> dt.month * 1.0
+      :year -> dt.year * 1.0
+    end
+  end
 
   # Classic-histogram quantile over le-labeled cumulative buckets, following
   # Prometheus' histogramQuantile: monotonic fixup, linear interpolation
@@ -1464,9 +1632,26 @@ defmodule TimelessMetrics.PromQL do
 
   # vector ∘ scalar / scalar ∘ vector — matching modifiers don't apply
   defp apply_binop(_op, %{matching: matching}, l, r)
-       when matching != nil and (elem(l, 0) == :scalar or elem(r, 0) == :scalar) do
+       when matching != nil and
+              (elem(l, 0) in [:scalar, :scalar_fn] or elem(r, 0) in [:scalar, :scalar_fn]) do
     {:error, "vector matching (on/ignoring) is only allowed between two instant vectors"}
   end
+
+  # time-dependent scalars (time(), scalar(v)) — compose per timestep
+  defp apply_binop(op, opts, {:scalar_fn, f}, {:scalar, n}),
+    do: scalar_fn_binop(op, opts, f, fn _ts -> n end)
+
+  defp apply_binop(op, opts, {:scalar, n}, {:scalar_fn, f}),
+    do: scalar_fn_binop(op, opts, fn _ts -> n end, f)
+
+  defp apply_binop(op, opts, {:scalar_fn, f}, {:scalar_fn, g}),
+    do: scalar_fn_binop(op, opts, f, g)
+
+  defp apply_binop(op, opts, {:vector, series}, {:scalar_fn, f}),
+    do: vector_scalar_fn(op, opts.bool, series, f, :scalar_right)
+
+  defp apply_binop(op, opts, {:scalar_fn, f}, {:vector, series}),
+    do: vector_scalar_fn(op, opts.bool, series, f, :scalar_left)
 
   defp apply_binop(op, opts, {:vector, series}, {:scalar, n}),
     do: vector_scalar(op, opts.bool, series, n, :scalar_right)
@@ -1519,6 +1704,78 @@ defmodule TimelessMetrics.PromQL do
                   Enum.filter(data, fn {_ts, v} ->
                     {o, a, b} = apply_op.(v)
                     cmp(o, a, b)
+                  end)
+            }
+          end)
+          |> Enum.reject(&(&1.data == []))
+      end
+
+    {:ok, {:vector, result}}
+  end
+
+  defp scalar_fn_binop(op, opts, f, g) do
+    cond do
+      op not in @comparison_ops ->
+        {:ok, {:scalar_fn, fn ts -> arith(op, f.(ts), g.(ts)) end}}
+
+      opts.bool ->
+        {:ok, {:scalar_fn, fn ts -> if cmp(op, f.(ts), g.(ts)), do: 1.0, else: 0.0 end}}
+
+      true ->
+        {:error, "comparisons between scalars must use the bool modifier (e.g. 1 > bool 2)"}
+    end
+  end
+
+  defp vector_scalar_fn(op, bool?, series, f, orient) do
+    per_point = fn ts, v ->
+      n = f.(ts)
+
+      {a, b} =
+        case orient do
+          :scalar_right -> {v, n}
+          :scalar_left -> {n, v}
+        end
+
+      {a, b}
+    end
+
+    result =
+      cond do
+        op not in @comparison_ops ->
+          series
+          |> Enum.map(fn %{data: data} = s ->
+            %{
+              s
+              | data:
+                  Enum.map(data, fn {ts, v} ->
+                    {ts, (fn {a, b} -> arith(op, a, b) end).(per_point.(ts, v))}
+                  end)
+            }
+          end)
+          |> drop_names()
+
+        bool? ->
+          series
+          |> Enum.map(fn %{data: data} = s ->
+            %{
+              s
+              | data:
+                  Enum.map(data, fn {ts, v} ->
+                    {ts,
+                     (fn {a, b} -> if(cmp(op, a, b), do: 1.0, else: 0.0) end).(per_point.(ts, v))}
+                  end)
+            }
+          end)
+          |> drop_names()
+
+        true ->
+          series
+          |> Enum.map(fn %{data: data} = s ->
+            %{
+              s
+              | data:
+                  Enum.filter(data, fn {ts, v} ->
+                    (fn {a, b} -> cmp(op, a, b) end).(per_point.(ts, v))
                   end)
             }
           end)
@@ -2245,14 +2502,20 @@ defmodule TimelessMetrics.PromQL do
 
   # --- response formatting ---
 
+  # VM omits NaN samples from query output (they render as gaps); series
+  # left with no samples disappear entirely.
   defp format_series(series) do
     series
     |> Enum.sort_by(& &1.labels)
-    |> Enum.map(fn %{labels: l, data: data} ->
-      %{
-        "metric" => l,
-        "values" => Enum.map(data, fn {ts, val} -> [ts, format_value(val)] end)
-      }
+    |> Enum.flat_map(fn %{labels: l, data: data} ->
+      values =
+        for {ts, val} <- data, val != :nan, do: [ts, format_value(val)]
+
+      if values == [] do
+        []
+      else
+        [%{"metric" => l, "values" => values}]
+      end
     end)
   end
 

@@ -177,7 +177,27 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     "cpu and on(host) mem",
     "cpu or ignoring(host) mem",
     # histogram_quantile (Phase 2D)
-    "histogram_quantile(0.9, rate(reqs_bucket[5m]))"
+    "histogram_quantile(0.9, rate(reqs_bucket[5m]))",
+    # Phase 2E/F
+    "sort(cpu)",
+    "sort_desc(cpu)",
+    "absent(nonexistent)",
+    "absent_over_time(nonexistent[5m])",
+    "scalar(avg(cpu))",
+    "vector(1)",
+    "time()",
+    "time() - cpu",
+    "timestamp(cpu)",
+    "minute()",
+    "hour()",
+    "day_of_week()",
+    "day_of_month()",
+    "day_of_year()",
+    "days_in_month()",
+    "month()",
+    "year()",
+    "hour(cpu * 0)",
+    "vector(scalar(sum(cpu)))"
   ]
 
   # ❌ Rejected with a message naming the construct (not a generic parse error)
@@ -191,29 +211,13 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     "mad_over_time(cpu[1m])",
     "double_exponential_smoothing(cpu[1m], 0.5, 0.5)",
     "holt_winters(cpu[1m], 0.5, 0.5)",
-    "sort(cpu)",
-    "sort_desc(cpu)",
     ~s|sort_by_label(cpu, "host")|,
     ~s|sort_by_label_desc(cpu, "host")|,
-    "absent(nonexistent)",
-    "absent_over_time(nonexistent[5m])",
     "histogram_fraction(0, 100, reqs_total)",
     "histogram_avg(reqs_total)",
     "histogram_count(reqs_total)",
     "histogram_sum(reqs_total)",
     "histogram_stddev(reqs_total)",
-    "scalar(avg(cpu))",
-    "vector(1)",
-    "time()",
-    "timestamp(cpu)",
-    "minute()",
-    "hour()",
-    "day_of_week()",
-    "day_of_month()",
-    "day_of_year()",
-    "days_in_month()",
-    "month()",
-    "year()",
     "info(cpu)"
   ]
 

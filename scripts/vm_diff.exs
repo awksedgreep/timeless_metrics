@@ -305,7 +305,30 @@ defmodule VMDiff do
       "histogram_quantile(0.99, rate(lat_bucket[5m]))",
       "histogram_quantile(0.5, sum by (le) (rate(lat_bucket[5m])))",
       "histogram_quantile(1.5, lat_bucket)",
-      "histogram_quantile(-1, lat_bucket)"
+      "histogram_quantile(-1, lat_bucket)",
+      # Phase 2E/F
+      "sort(g_ramp)",
+      "sort_desc(g_ramp)",
+      "absent(g_ramp)",
+      ~s|absent(no_such_metric{host="a"})|,
+      "absent_over_time(no_such_metric[5m])",
+      "absent_over_time(g_sparse[5m])",
+      "time()",
+      "time() - g_ramp",
+      "timestamp(g_ramp)",
+      "scalar(sum(g_ramp))",
+      "g_ramp / scalar(g_const)",
+      "vector(1)",
+      "vector(scalar(avg(g_const)))",
+      "minute()",
+      "hour()",
+      "day_of_week()",
+      "day_of_month()",
+      "day_of_year()",
+      "days_in_month()",
+      "month()",
+      "year()",
+      "hour(g_ramp * 0 + 1700000000)"
     ]
   end
 

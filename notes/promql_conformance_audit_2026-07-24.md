@@ -19,6 +19,22 @@ Classes:
 
 ## 1. Language surface
 
+> **STATUS UPDATE (2026-07-24, Phase 2):** the rejection tables below have
+> shrunk dramatically — Phase 2 implemented vector matching (on/ignoring/
+> group_left/group_right), histogram_quantile, label_replace/label_join,
+> count_values, gauge rollups (delta idelta deriv predict_linear changes
+> resets), quantile/stddev/stdvar/present_over_time, absent/absent_over_time,
+> time/timestamp/scalar/vector, clock functions, sort/sort_desc, and the
+> full math batch (sgn, trig, deg/rad/pi) — each verified against a live
+> VictoriaMetrics container (scripts/vm_diff.exs, 137/137 corpus parity).
+> Notable referee-verified VM behaviors adopted: per-function __name__
+> retention, implicit-zero series heads for counter/delta functions with the
+> rollupDelta magnitude heuristic, NaN samples stripped from output, and
+> __name__ dropped on filtering comparisons that use a matching modifier.
+> Still rejected: sort_by_label*, histogram_fraction/avg/count/sum/stddev,
+> mad_over_time, smoothing functions, limitk/limit_ratio, info, subqueries,
+> @ modifier, MetricsQL extensions (Phase 3).
+
 ### Selectors and matchers
 
 | Construct | Status |
