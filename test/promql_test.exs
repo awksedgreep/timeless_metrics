@@ -500,7 +500,9 @@ defmodule TimelessMetrics.PromQLTest do
 
     test "clamp_max caps values" do
       result = run("clamp_max(cpu_usage, 12)")
-      c = Enum.find(result, &(&1["metric"] == %{"host" => "c"}))
+      # clamp_* keeps __name__ (VM name policy, verified via scripts/vm_diff.exs)
+      c = Enum.find(result, &(&1["metric"]["host"] == "c"))
+      assert c["metric"]["__name__"] == "cpu_usage"
       assert values(c) == [12.0, 12.0]
     end
 

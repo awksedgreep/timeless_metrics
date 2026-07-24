@@ -122,6 +122,16 @@ of returning nothing.
 > lists; §2.7: PromQL output timestamps are exactly `start + n*step` (the
 > engine-grid mismatch became moot when the legacy engine was deprecated).
 > The text below documents the pre-Phase-1 behavior for the record.
+>
+> **Referee finding (scripts/vm_diff.exs, 67/67 corpus parity against a real
+> VM container):** VictoriaMetrics *keeps* `__name__` on `avg/min/max/last/
+> first_over_time`, `ceil`, `floor`, `round`, and `clamp*` — strict
+> Prometheus drops it there. We follow VM (the compatibility target). VM
+> drops the name on `abs`, `sqrt`, `exp`, `ln`, `log*`, `sum/count_over_time`
+> and all counter functions. VM also emits `increase = 0` for single-sample
+> windows and, at a series head with no carry-in sample, divides `rate` by
+> the actual data span inside the window rather than the window length —
+> both matched.
 
 These are the constructs a dashboard author would never notice from an error —
 each verified with a concrete experiment.

@@ -323,8 +323,11 @@ defmodule TimelessMetrics.PromQLConformanceTest do
     refute r1 == r2
 
     # Hand-computed: at T = base+300 the (T-60, T] window holds samples
-    # i=25..29 (values 35..39) → avg 37.0
-    a = Enum.find(r1["data"]["result"], &(&1["metric"] == %{"host" => "a"}))
+    # i=25..29 (values 35..39) → avg 37.0. avg_over_time keeps __name__
+    # (VM name policy).
+    a =
+      Enum.find(r1["data"]["result"], &(&1["metric"] == %{"__name__" => "cpu", "host" => "a"}))
+
     [_, last_val] = List.last(a["values"])
     assert String.to_float(last_val) == 37.0
   end

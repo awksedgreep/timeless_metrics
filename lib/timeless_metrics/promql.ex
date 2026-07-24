@@ -45,10 +45,23 @@ defmodule TimelessMetrics.PromQL do
     :last_over_time,
     :first_over_time
   ]
-  # These return raw sample values, so they keep the metric name (like a selector)
-  @name_keeping_rollups [:last_over_time, :first_over_time]
+  # VM name policy (verified against a real VM instance via scripts/vm_diff.exs):
+  # rollups whose result is "the same quantity" keep the metric name; rate-like
+  # and sum/count rollups drop it. Note this differs from strict Prometheus,
+  # which drops the name on all of these — VM is our compatibility target.
+  @name_keeping_rollups [
+    :last_over_time,
+    :first_over_time,
+    :avg_over_time,
+    :min_over_time,
+    :max_over_time
+  ]
 
   @transform_fns [:abs, :ceil, :floor, :round, :sqrt, :exp, :ln, :log2, :log10]
+
+  # Same policy for transforms: ceil/floor/round/clamp* keep the name in VM;
+  # abs/sqrt/exp/log* drop it.
+  @name_keeping_transforms [:ceil, :floor, :round]
 
   @functions @rollup_fns ++ @transform_fns ++ [:clamp, :clamp_min, :clamp_max]
 
@@ -820,7 +833,7 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval_call(f, [arg], ctx) when f in @transform_fns do
     with {:ok, series} <- eval_vector(arg, ctx) do
-      series = series |> map_values(&transform_value(f, &1)) |> drop_names()
+      series = series |> map_values(&transform_value(f, &1)) |> apply_name_policy(f)
       {:ok, {:vector, series}}
     end
   end
@@ -833,7 +846,6 @@ defmodule TimelessMetrics.PromQL do
         |> map_values(fn v ->
           if is_number(v) and n != 0, do: Float.round(v / n) * n, else: v
         end)
-        |> drop_names()
 
       {:ok, {:vector, series}}
     end
@@ -846,7 +858,6 @@ defmodule TimelessMetrics.PromQL do
       series =
         series
         |> map_values(fn v -> if is_number(v), do: v |> max(mn) |> min(mx), else: v end)
-        |> drop_names()
 
       {:ok, {:vector, series}}
     end
@@ -858,7 +869,6 @@ defmodule TimelessMetrics.PromQL do
       series =
         series
         |> map_values(fn v -> if is_number(v), do: max(v, mn), else: v end)
-        |> drop_names()
 
       {:ok, {:vector, series}}
     end
@@ -870,7 +880,6 @@ defmodule TimelessMetrics.PromQL do
       series =
         series
         |> map_values(fn v -> if is_number(v), do: min(v, mx), else: v end)
-        |> drop_names()
 
       {:ok, {:vector, series}}
     end
@@ -878,6 +887,9 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval_call(f, args, _ctx),
     do: {:error, "#{f}() called with #{length(args)} argument(s) — wrong arity"}
+
+  defp apply_name_policy(series, f) when f in @name_keeping_transforms, do: series
+  defp apply_name_policy(series, _f), do: drop_names(series)
 
   defp transform_value(f, v) when is_number(v) do
     case f do
@@ -1542,7 +1554,7 @@ defmodule TimelessMetrics.PromQL do
         fn slice, prev -> counter_rate(slice, prev, window) end
 
       :increase ->
-        fn slice, prev -> counter_increase(slice, prev) end
+        fn slice, prev -> counter_increase_or_zero(slice, prev) end
 
       :irate ->
         fn slice, prev -> instant_rate(slice, prev) end
@@ -1578,10 +1590,28 @@ defmodule TimelessMetrics.PromQL do
     end
   end
 
+  # With carry-in the increase spans the full window; without it (series
+  # head) VM divides by the actual data span inside the window.
   defp counter_rate(slice, prev, window) do
     case counter_increase(slice, prev) do
-      :skip -> :skip
-      inc -> inc / window
+      :skip ->
+        :skip
+
+      inc when prev != nil ->
+        inc / window
+
+      inc ->
+        {t_first, _} = hd(slice)
+        {t_last, _} = List.last(slice)
+        if t_last > t_first, do: inc / (t_last - t_first), else: :skip
+    end
+  end
+
+  # VM emits increase = 0 for a single-sample window (no delta yet)
+  defp counter_increase_or_zero(slice, prev) do
+    case counter_increase(slice, prev) do
+      :skip when slice != [] -> 0.0
+      other -> other
     end
   end
 
