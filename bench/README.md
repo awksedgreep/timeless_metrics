@@ -16,6 +16,7 @@ This directory contains the current benchmark set for `timeless_metrics`.
 - [write_bench.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/write_bench.exs)
   Embedded API benchmark for write throughput, flush/compression cost, query latency, and storage footprint.
   Use this for quick local regression checks on the core engine.
+  Pass `--libsql` to run the same workload against the opt-in libSQL engine.
 
 - [rust_engine_baseline.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/rust_engine_baseline.exs)
   Focused Rust-engine benchmark for labeled writes, new-series creation, raw binary writes, flush cost, and targeted query latency.
@@ -24,6 +25,28 @@ This directory contains the current benchmark set for `timeless_metrics`.
 - [rust_query_bench.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/rust_query_bench.exs)
   Focused Rust-engine query benchmark for high-fanout multi-series range and aggregate queries over flushed batch files.
   Use this when changing Rust query internals, file reuse, or decode behavior.
+
+- [engine_query_bench.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/engine_query_bench.exs)
+  Reproducible public-API comparison for the Rust and libSQL engines, covering first-read publication cost, exact/narrow/wide raw reads, scalar and bucketed aggregation, latest queries, and libSQL boundary attribution.
+  The wide query also samples its worker-process peak (including referenced
+  binaries) and enforces a 10x bound relative to the serialized result size.
+  Run each engine in a separate process with `MIX_ENV=test mix run bench/engine_query_bench.exs --engine rust|libsql`.
+
+- [engine_query_distribution.sh](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/engine_query_distribution.sh)
+  Runs the public Rust/libSQL query workload in five fresh processes per
+  engine by default and emits one CSV row per process and query shape. Use this
+  for release decisions so BEAM-process variance is not hidden.
+
+- [libsql_soak.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/libsql_soak.exs)
+  Mixed libSQL release soak with live writes, multiple oracle readers,
+  compaction, rollup, retention, online backup, a forced writer restart,
+  backup restore, and primary-store reopen. Run with
+  `MIX_ENV=test mix run bench/libsql_soak.exs --seconds 30 --readers 8`.
+
+- [rollup_query_bench.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/rollup_query_bench.exs)
+  Focused comparison of the former six-row-query rollup adapter and the packed
+  `timeless_rollup_batches` path over at least 1,000 settled buckets.
+  Run with `MIX_ENV=test mix run bench/rollup_query_bench.exs --runs 30 --buckets 1200`.
 
 - [rust_series_bench.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/rust_series_bench.exs)
   Focused Rust-engine benchmark for new-series resolution, cached series lookup, and first-write cost for unseen series.
@@ -51,12 +74,45 @@ This directory contains the current benchmark set for `timeless_metrics`.
 - Prefer `write_bench.exs` for engine-only regressions.
 - Prefer `rust_engine_baseline.exs` when changing Rust NIF write/query internals.
 - Prefer `rust_query_bench.exs` when changing multi-series Rust query internals.
+- Prefer `rollup_query_bench.exs` when changing stored-tier query transport or decoding.
 - Prefer `rust_series_bench.exs` when changing new-series resolution or series registry persistence.
 - Prefer `http_concurrency.exs` or `realistic_workload.exs` for HTTP path changes.
 - Prefer `tsbs_bench.exs` when you want an external, standardized workload.
 - Prefer `vs_victoriametrics.exs` only when you specifically need a product-to-product comparison.
 
 ## Historical Results
+
+- [results/2026-07-31_integration_release_gate.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-07-31_integration_release_gate.md)
+  Five-process Rust/libSQL query distributions, the large write/storage gate,
+  packed-rollup distribution, mixed soak, and the default-engine decision.
+
+- [results/2026-07-31_matcher_discovery_pushdown.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-07-31_matcher_discovery_pushdown.md)
+  Hybrid matcher planning, filtered public discovery, semantic fallbacks, and
+  the selective-query Rust/libSQL comparison.
+
+- [results/2026-07-31_catalog_publication.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-07-31_catalog_publication.md)
+  Transaction-safe catalog-generation publication and the first-query latency
+  result through the public TimelessMetrics API.
+
+- [results/2026-07-31_raw_frame.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-07-31_raw_frame.md)
+  One-row raw-frame transport, native final-map decoding, stage attribution,
+  and the enforced public-query memory bound.
+
+- [results/2026-07-31_packed_rollups.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-07-31_packed_rollups.md)
+  One-call packed rollup adapter implementation, parity coverage, and the
+  1,200-bucket six-query comparison.
+
+- [results/2026-07-31_native_bucketed.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-07-31_native_bucketed.md)
+  Native complete-bucket adoption, packed-window boundary attribution, and the
+  final Rust/libSQL comparison.
+
+- [results/2026-07-31_native_aggregate.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-07-31_native_aggregate.md)
+  Native scalar aggregate implementation result and extension/adapter
+  attribution.
+
+- [results/2026-07-31_libsql_query_baseline.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-07-31_libsql_query_baseline.md)
+  First extension-first Rust/libSQL public-query baseline, including direct
+  read-boundary attribution and fresh-process variance.
 
 - [results/2026-03-12_ets_optimizations.md](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-03-12_ets_optimizations.md)
   Archived benchmark notes from an earlier optimization pass.

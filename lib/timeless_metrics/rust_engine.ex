@@ -392,7 +392,7 @@ defmodule TimelessMetrics.RustEngine do
       Nif.engine_list_series(ref(store), metric_name)
       |> normalize_nif_result()
 
-    filter_series(series, label_filter)
+    {:ok, filter_series(series, label_filter)}
   end
 
   def delete_before(store, before_ts) do

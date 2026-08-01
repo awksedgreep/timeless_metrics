@@ -27,7 +27,7 @@ defmodule TimelessMetrics do
   @parallel_batch_threshold 1_000
 
   defp rust_engine?(store) do
-    :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust
+    :persistent_term.get({TimelessMetrics, store, :engine}, nil) in [:rust, :libsql]
   end
 
   @doc "Start a TimelessMetrics instance as part of a supervision tree."
@@ -59,7 +59,7 @@ defmodule TimelessMetrics do
     TimelessMetrics.Stats.add_points(store, 1)
 
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.write(store, metric_name, labels, value, timestamp)
+      TimelessMetrics.StorageEngine.write(store, metric_name, labels, value, timestamp)
     else
       registry = :"#{store}_registry"
       series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
@@ -80,7 +80,7 @@ defmodule TimelessMetrics do
     TimelessMetrics.Stats.add_points(store, length(entries))
 
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.write_batch(store, entries)
+      TimelessMetrics.StorageEngine.write_batch(store, entries)
     else
       write_batch_legacy(store, entries)
     end
@@ -130,7 +130,7 @@ defmodule TimelessMetrics do
   """
   def resolve_series(store, metric_name, labels) do
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.resolve_series(store, metric_name, labels)
+      TimelessMetrics.StorageEngine.resolve_series(store, metric_name, labels)
     else
       registry = :"#{store}_registry"
       TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
@@ -147,7 +147,7 @@ defmodule TimelessMetrics do
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
 
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.write_resolved(store, series_id, value, timestamp)
+      TimelessMetrics.StorageEngine.write_resolved(store, series_id, value, timestamp)
     else
       shard_count = buffer_shard_count(store)
       shard_idx = rem(abs(series_id), shard_count)
@@ -169,7 +169,7 @@ defmodule TimelessMetrics do
     TimelessMetrics.Stats.incr_queries(store)
 
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.query_raw(store, metric_name, labels, opts)
+      TimelessMetrics.StorageEngine.query_raw(store, metric_name, labels, opts)
     else
       registry = :"#{store}_registry"
       series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
@@ -181,12 +181,15 @@ defmodule TimelessMetrics do
   Query raw points across multiple series matching a label filter.
 
   Returns `{:ok, [%{labels: %{...}, points: [{ts, val}, ...]}, ...]}`.
+  Point order is stable within each series. As with the legacy/Rust parallel
+  query paths, the outer series list is unordered; sort it in the caller when
+  presentation order matters.
   """
   def query_multi(store, metric_name, label_filter \\ %{}, opts \\ []) do
     TimelessMetrics.Stats.incr_queries(store)
 
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.query_multi(store, metric_name, label_filter, opts)
+      TimelessMetrics.StorageEngine.query_multi(store, metric_name, label_filter, opts)
     else
       query_multi_legacy(store, metric_name, label_filter, opts)
     end
@@ -251,7 +254,7 @@ defmodule TimelessMetrics do
     TimelessMetrics.Stats.incr_queries(store)
 
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.query_aggregate_multi(store, metric_name, label_filter, opts)
+      TimelessMetrics.StorageEngine.query_aggregate_multi(store, metric_name, label_filter, opts)
     else
       query_aggregate_multi_legacy(store, metric_name, label_filter, opts)
     end
@@ -425,9 +428,13 @@ defmodule TimelessMetrics do
   Returns `{:ok, [%{bucket: ts, avg: v, min: v, max: v, count: n, sum: v, last: v}, ...]}`.
   """
   def query_daily(store, metric_name, labels, from, to) do
-    registry = :"#{store}_registry"
-    series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-    TimelessMetrics.Query.read_tier(store, :daily, series_id, from: from, to: to)
+    if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :libsql do
+      TimelessMetrics.LibsqlEngine.query_rollup(store, metric_name, labels, 86_400, from, to)
+    else
+      registry = :"#{store}_registry"
+      series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+      TimelessMetrics.Query.read_tier(store, :daily, series_id, from: from, to: to)
+    end
   end
 
   @doc """
@@ -437,7 +444,7 @@ defmodule TimelessMetrics do
   """
   def latest(store, metric_name, labels) do
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.latest(store, metric_name, labels)
+      TimelessMetrics.StorageEngine.latest(store, metric_name, labels)
     else
       registry = :"#{store}_registry"
       schema = get_schema(store)
@@ -453,7 +460,7 @@ defmodule TimelessMetrics do
   """
   def latest_multi(store, metric_name, label_filter \\ %{}) do
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.latest_multi(store, metric_name, label_filter)
+      TimelessMetrics.StorageEngine.latest_multi(store, metric_name, label_filter)
     else
       latest_multi_legacy(store, metric_name, label_filter)
     end
@@ -518,7 +525,7 @@ defmodule TimelessMetrics do
   @doc "Force flush all buffered data to disk."
   def flush(store) do
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.flush(store)
+      TimelessMetrics.StorageEngine.flush(store)
     else
       flush_legacy(store)
     end
@@ -543,11 +550,27 @@ defmodule TimelessMetrics do
 
   @doc "Create a consistent online backup."
   def backup(store, target_dir) do
-    if rust_engine?(store) do
-      backup_rust(store, target_dir)
-    else
-      backup_legacy(store, target_dir)
+    case :persistent_term.get({TimelessMetrics, store, :engine}, nil) do
+      :libsql -> backup_libsql(store, target_dir)
+      :rust -> backup_rust(store, target_dir)
+      _ -> backup_legacy(store, target_dir)
     end
+  end
+
+  defp backup_libsql(store, target_dir) do
+    flush(store)
+    db = :"#{store}_db"
+    File.mkdir_p!(target_dir)
+    db_target = Path.join(target_dir, "metrics.db")
+    {:ok, _} = TimelessMetrics.DB.backup(db, db_target)
+
+    db_size =
+      case File.stat(db_target) do
+        {:ok, %{size: size}} -> size
+        _ -> 0
+      end
+
+    {:ok, %{path: target_dir, files: ["metrics.db"], total_bytes: db_size}}
   end
 
   defp backup_rust(store, target_dir) do
@@ -653,7 +676,7 @@ defmodule TimelessMetrics do
   @doc "Get store info and statistics."
   def info(store) do
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.info(store)
+      TimelessMetrics.StorageEngine.info(store)
     else
       info_legacy(store)
     end
@@ -786,12 +809,10 @@ defmodule TimelessMetrics do
 
   @doc "Force a daily rollup run."
   def rollup(store) do
-    if rust_engine?(store) do
-      # Rollup tiers are a legacy-engine feature; the Rust engine downsamples
-      # via raw-first compaction instead.
-      :ok
-    else
-      GenServer.call(:"#{store}_rollup", {:run, :all}, :infinity)
+    case :persistent_term.get({TimelessMetrics, store, :engine}, nil) do
+      :libsql -> TimelessMetrics.LibsqlEngine.rollup(store)
+      :rust -> :ok
+      _ -> GenServer.call(:"#{store}_rollup", {:run, :all}, :infinity)
     end
   end
 
@@ -808,7 +829,7 @@ defmodule TimelessMetrics do
 
         seconds when is_integer(seconds) ->
           cutoff = System.os_time(:second) - seconds
-          _ = TimelessMetrics.RustEngine.delete_before(store, cutoff)
+          _ = TimelessMetrics.StorageEngine.delete_before(store, cutoff)
           :ok
       end
     else
@@ -823,7 +844,7 @@ defmodule TimelessMetrics do
   """
   def list_metrics(store) do
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.list_metrics(store)
+      TimelessMetrics.StorageEngine.list_metrics(store)
     else
       list_metrics_legacy(store)
     end
@@ -854,7 +875,7 @@ defmodule TimelessMetrics do
   """
   def list_series(store, metric_name) do
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.list_series(store, metric_name)
+      TimelessMetrics.StorageEngine.list_series(store, metric_name)
     else
       list_series_legacy(store, metric_name)
     end
@@ -881,7 +902,7 @@ defmodule TimelessMetrics do
   """
   def label_values(store, metric_name, label_key) do
     if rust_engine?(store) do
-      TimelessMetrics.RustEngine.label_values(store, metric_name, label_key)
+      TimelessMetrics.StorageEngine.label_values(store, metric_name, label_key)
     else
       label_values_legacy(store, metric_name, label_key)
     end

@@ -7,7 +7,9 @@ defmodule WriteBench do
 
   Usage:
     mix run bench/write_bench.exs
+    mix run bench/write_bench.exs --libsql
     mix run bench/write_bench.exs --memory
+    mix run bench/write_bench.exs --libsql --scale large
   """
 
   @steady_state_seconds 10
@@ -15,8 +17,13 @@ defmodule WriteBench do
 
   def run(args) do
     memory_only = "--memory" in args
+    engine = if "--libsql" in args, do: :libsql, else: :rust
 
-    mode_label = if memory_only, do: "MEMORY-ONLY", else: "DISK"
+    if memory_only and engine == :libsql do
+      raise "--memory and --libsql cannot be combined; libSQL is a disk-backed preview"
+    end
+
+    mode_label = if memory_only, do: "MEMORY-ONLY", else: "DISK / #{engine}"
 
     IO.puts("\n=============================================")
     IO.puts("  TimelessMetrics Embedded Benchmark (#{mode_label})")
@@ -24,19 +31,24 @@ defmodule WriteBench do
     IO.puts("  Steady-state window: #{@steady_state_seconds}s")
     IO.puts("=============================================\n")
 
-    for {label, series_count, pts_per_series} <- [
-          {"Small (1K series x 100 pts)", 1_000, 100},
-          {"Medium (10K series x 100 pts)", 10_000, 100},
-          {"Large (10K series x 1K pts)", 10_000, 1_000}
-        ] do
-      run_scale(label, series_count, pts_per_series, memory_only)
+    scales = [
+      {"small", "Small (1K series x 100 pts)", 1_000, 100},
+      {"medium", "Medium (10K series x 100 pts)", 10_000, 100},
+      {"large", "Large (10K series x 1K pts)", 10_000, 1_000}
+    ]
+
+    selected_scale = option_value(args, "--scale")
+
+    for {name, label, series_count, pts_per_series} <- scales,
+        selected_scale in [nil, name] do
+      run_scale(label, series_count, pts_per_series, memory_only, engine)
     end
 
     IO.puts("--- Compression by Data Pattern ---\n")
-    run_compression_analysis(memory_only)
+    run_compression_analysis(memory_only, engine)
   end
 
-  defp run_scale(label, series_count, pts_per_series, memory_only) do
+  defp run_scale(label, series_count, pts_per_series, memory_only, engine) do
     total = series_count * pts_per_series
     data_dir = "/tmp/timeless_bench_#{System.os_time(:millisecond)}"
     store = :"bench_#{System.unique_integer([:positive])}"
@@ -45,7 +57,7 @@ defmodule WriteBench do
       if memory_only do
         [name: store, mode: :memory, self_monitor: false]
       else
-        [name: store, data_dir: data_dir, self_monitor: false]
+        [name: store, data_dir: data_dir, engine: engine, self_monitor: false, scraping: false]
       end
 
     {:ok, sup} =
@@ -119,6 +131,21 @@ defmodule WriteBench do
       IO.puts(
         "  Query (compressed): #{length(compressed_points)} pts in #{div(q_compressed_us, 1000)}ms"
       )
+
+      query_latencies =
+        for _ <- 1..100 do
+          {elapsed, {:ok, _points}} =
+            :timer.tc(fn ->
+              TimelessMetrics.query(store, sample_metric, sample_labels,
+                from: population_start - 1,
+                to: steady_start + @steady_state_seconds + 1
+              )
+            end)
+
+          elapsed
+        end
+
+      IO.puts("  Query p95 (warm):   #{percentile(query_latencies, 0.95)}µs (100 runs)")
 
       info = TimelessMetrics.info(store)
       points_ingested = Map.get(info, :points_ingested, info.total_points)
@@ -226,7 +253,7 @@ defmodule WriteBench do
     {count, @steady_state_seconds * 1_000_000}
   end
 
-  defp run_compression_analysis(memory_only) do
+  defp run_compression_analysis(memory_only, engine) do
     now = System.os_time(:second)
     n = 10_000
 
@@ -265,7 +292,7 @@ defmodule WriteBench do
         if memory_only do
           [name: store, mode: :memory, self_monitor: false]
         else
-          [name: store, data_dir: data_dir, self_monitor: false]
+          [name: store, data_dir: data_dir, engine: engine, self_monitor: false, scraping: false]
         end
 
       {:ok, sup} =
@@ -307,6 +334,18 @@ defmodule WriteBench do
   end
 
   defp rate(count, microseconds), do: trunc(count / (microseconds / 1_000_000))
+
+  defp percentile(values, quantile) do
+    sorted = Enum.sort(values)
+    Enum.at(sorted, max(ceil(length(sorted) * quantile) - 1, 0))
+  end
+
+  defp option_value(args, option) do
+    case Enum.find_index(args, &(&1 == option)) do
+      nil -> nil
+      index -> Enum.at(args, index + 1)
+    end
+  end
 
   defp format_number(n) when n >= 1_000_000, do: "#{Float.round(n / 1_000_000, 2)}M"
   defp format_number(n) when n >= 1_000, do: "#{Float.round(n / 1_000, 1)}K"

@@ -29,6 +29,27 @@ It runs:
 
 The default engine is the Rust engine.
 
+The next storage engine is available as an opt-in preview with `engine: :libsql`.
+It embeds the `timeless-libsql` SQLite extension so time-series blocks, the
+series catalog, rollups, and TimelessMetrics admin data all live in one
+`metrics.db` file. The public Elixir and HTTP APIs remain the same. Existing
+Rust-engine stores must use the verified offline migration described in
+[Operations](docs/operations.md#rust-to-libsql-migration); libSQL startup
+intentionally refuses to silently ignore a non-empty `rust_engine/` directory.
+
+For the preview engine, supported scalar `avg`/`sum`/`min`/`max`/`count`
+queries run in the extension's chunk-aware `timeless_aggregate` kernel, while
+`latest` and `latest_multi` use its newest-first `timeless_latest` kernel.
+Complete, `from`-aligned buckets for those same five aggregates use its packed
+`timeless_window_batches` kernel. Partial terminal buckets, `first`, `last`,
+`rate`, and other semantic mismatches retain the existing raw fallback. Stored
+rollup reads use one prepared `timeless_rollup_batches` call and decode all six
+aggregates from one versioned blob instead of scanning the tier six times.
+Wide eager raw reads use one `timeless_raw_frame` row for the complete result
+and construct final BEAM series maps in the native decoder; exact reads keep
+the selective per-series path. Multi-series outer order is unspecified across
+all engines, while points remain timestamp-ordered within each series.
+
 Hot-path responsibilities live in the Rust NIF:
 - labeled writes and batched writes
 - raw and aggregate range queries
@@ -63,6 +84,7 @@ If you need the detailed design, start with [docs/architecture.md](docs/architec
 ## Highlights
 
 - Rust-native storage engine enabled by default
+- Opt-in SQLite/libSQL block-store engine with a single-file backup
 - Embedded Elixir API plus optional HTTP API
 - Prometheus text ingest, VictoriaMetrics JSON-line ingest, and Influx line protocol ingest
 - Prometheus-compatible query endpoints for Grafana
@@ -106,6 +128,17 @@ Memory-only mode:
 children = [
   {TimelessMetrics, name: :metrics, mode: :memory},
   {TimelessMetrics.HTTP, store: :metrics, port: 8428}
+]
+```
+
+Opt-in libSQL storage engine:
+
+```elixir
+children = [
+  {TimelessMetrics,
+   name: :metrics,
+   data_dir: "/var/lib/metrics",
+   engine: :libsql}
 ]
 ```
 
@@ -208,5 +241,5 @@ The maintained benchmark set lives under [bench/](bench/README.md):
 
 ## Notes
 
-- The legacy Elixir engine (`engine: :actor`/`:legacy`/`:sharded`) is **deprecated and will be removed in 7.0**. Starting a store with it logs a warning. Two features are still legacy-only and must be ported or retired before removal: text series and rollup tiers/`query_daily` (true in-memory `mode: :memory` is also only honored by the legacy engine).
+- The legacy Elixir engine (`engine: :actor`/`:legacy`/`:sharded`) is **deprecated and will be removed in 7.0**. Starting a store with it logs a warning. Text series must still be ported or retired before removal; true in-memory `mode: :memory` is also only honored by the legacy engine.
 - The rust build may emit the upstream `rustler::resource!` `non_local_definitions` warning. That warning is currently expected.

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod atoms {
     rustler::atoms! {
-        ok, error, avg, sum, min, max, count,
+        ok, error, avg, sum, min, max, count, labels, points,
     }
 }
 
@@ -2517,6 +2517,240 @@ fn parse_prometheus<'a>(
     });
 
     Ok((list.list_reverse()?, errors))
+}
+
+/// Decode timeless_raw_batches point blobs directly into BEAM terms. This is
+/// storage-independent boundary work shared by the libSQL adapter: the public
+/// blob remains u32 LE count, i64 LE timestamps, then f64-bit LE values.
+/// Building the final lists in the NIF avoids an intermediate reversed Elixir
+/// list and the nonlinear GC cost of retaining 720K decoded tuples beside it.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_raw_batches<'a>(
+    env: Env<'a>,
+    batches: Vec<(i64, Binary<'a>)>,
+) -> Result<Term<'a>, String> {
+    let mut series = Vec::with_capacity(batches.len());
+
+    for (series_id, blob) in &batches {
+        let bytes = blob.as_slice();
+        if bytes.len() < 4 {
+            return Err(format!(
+                "timeless_raw_batches returned a truncated {}-byte point blob",
+                bytes.len()
+            ));
+        }
+        let count = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let columns = count
+            .checked_mul(16)
+            .ok_or_else(|| "timeless_raw_batches point blob size overflow".to_string())?;
+        let expected = 4usize
+            .checked_add(columns)
+            .ok_or_else(|| "timeless_raw_batches point blob size overflow".to_string())?;
+        if bytes.len() != expected {
+            return Err(format!(
+                "timeless_raw_batches returned a malformed {}-byte point blob; {count} points require {expected}",
+                bytes.len()
+            ));
+        }
+
+        let values_start = 4 + count * 8;
+        let mut point_terms = Vec::with_capacity(count);
+        for index in 0..count {
+            let timestamp_offset = 4 + index * 8;
+            let value_offset = values_start + index * 8;
+            let timestamp = i64::from_le_bytes(
+                bytes[timestamp_offset..timestamp_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let value = f64::from_bits(u64::from_le_bytes(
+                bytes[value_offset..value_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            ));
+            point_terms.push(make_tuple(
+                env,
+                &[timestamp.encode(env), value.encode(env)],
+            ));
+        }
+
+        series.push(make_tuple(
+            env,
+            &[series_id.encode(env), point_terms.encode(env)],
+        ));
+    }
+
+    Ok(series.encode(env))
+}
+
+struct RawFrameLayout {
+    series_count: usize,
+    timestamps_start: usize,
+    values_start: usize,
+    point_offsets: Vec<usize>,
+}
+
+fn parse_raw_frame(bytes: &[u8]) -> Result<RawFrameLayout, String> {
+    if bytes.len() < 16 {
+        return Err(format!(
+            "timeless_raw_frame returned a truncated {}-byte frame",
+            bytes.len()
+        ));
+    }
+    if &bytes[..4] != b"TRF1" {
+        return Err(format!(
+            "timeless_raw_frame returned unknown frame version {:?}",
+            &bytes[..4]
+        ));
+    }
+
+    let series_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let total_points_u64 = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let total_points: usize = total_points_u64
+        .try_into()
+        .map_err(|_| "timeless_raw_frame point count overflows this host".to_string())?;
+    let ids_bytes = series_count
+        .checked_mul(8)
+        .ok_or_else(|| "timeless_raw_frame series-id column size overflow".to_string())?;
+    let counts_bytes = series_count
+        .checked_mul(4)
+        .ok_or_else(|| "timeless_raw_frame point-count column size overflow".to_string())?;
+    let point_column_bytes = total_points
+        .checked_mul(8)
+        .ok_or_else(|| "timeless_raw_frame point column size overflow".to_string())?;
+    let counts_start = 16usize
+        .checked_add(ids_bytes)
+        .ok_or_else(|| "timeless_raw_frame header size overflow".to_string())?;
+    let timestamps_start = counts_start
+        .checked_add(counts_bytes)
+        .ok_or_else(|| "timeless_raw_frame header size overflow".to_string())?;
+    let values_start = timestamps_start
+        .checked_add(point_column_bytes)
+        .ok_or_else(|| "timeless_raw_frame timestamp column size overflow".to_string())?;
+    let expected = values_start
+        .checked_add(point_column_bytes)
+        .ok_or_else(|| "timeless_raw_frame value column size overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "timeless_raw_frame returned a malformed {}-byte frame; {series_count} series and {total_points} points require {expected}",
+            bytes.len()
+        ));
+    }
+
+    let mut point_offsets = Vec::with_capacity(series_count + 1);
+    point_offsets.push(0usize);
+    for index in 0..series_count {
+        let offset = counts_start + index * 4;
+        let count = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let end = point_offsets[index]
+            .checked_add(count)
+            .ok_or_else(|| "timeless_raw_frame per-series point counts overflow".to_string())?;
+        point_offsets.push(end);
+    }
+    if point_offsets[series_count] != total_points {
+        return Err(format!(
+            "timeless_raw_frame point counts sum to {}, not header total {total_points}",
+            point_offsets[series_count]
+        ));
+    }
+
+    Ok(RawFrameLayout {
+        series_count,
+        timestamps_start,
+        values_start,
+        point_offsets,
+    })
+}
+
+fn decode_raw_frame_points<'a>(
+    env: Env<'a>,
+    bytes: &[u8],
+    layout: &RawFrameLayout,
+    series_index: usize,
+) -> Term<'a> {
+    let point_start = layout.point_offsets[series_index];
+    let point_stop = layout.point_offsets[series_index + 1];
+    let mut point_terms = Vec::with_capacity(point_stop - point_start);
+    for point_index in point_start..point_stop {
+        let timestamp_offset = layout.timestamps_start + point_index * 8;
+        let value_offset = layout.values_start + point_index * 8;
+        let timestamp = i64::from_le_bytes(
+            bytes[timestamp_offset..timestamp_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let value = f64::from_bits(u64::from_le_bytes(
+            bytes[value_offset..value_offset + 8]
+                .try_into()
+                .unwrap(),
+        ));
+        point_terms.push(make_tuple(
+            env,
+            &[timestamp.encode(env), value.encode(env)],
+        ));
+    }
+    point_terms.encode(env)
+}
+
+/// Decode the one-row timeless_raw_frame transport directly into the same
+/// `[{series_id, [{timestamp, value}]}]` BEAM shape as decode_raw_batches.
+/// TRF1 is fully columnar across the result set, eliminating one SQLite row
+/// and one binary allocation per series for wide fanout queries.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_raw_frame<'a>(env: Env<'a>, frame: Binary<'a>) -> Result<Term<'a>, String> {
+    let bytes = frame.as_slice();
+    let layout = parse_raw_frame(bytes)?;
+    let mut series = Vec::with_capacity(layout.series_count);
+    for series_index in 0..layout.series_count {
+        let id_offset = 16 + series_index * 8;
+        let series_id = i64::from_le_bytes(
+            bytes[id_offset..id_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        series.push(make_tuple(
+            env,
+            &[
+                series_id.encode(env),
+                decode_raw_frame_points(env, bytes, &layout, series_index),
+            ],
+        ));
+    }
+
+    Ok(series.encode(env))
+}
+
+/// TimelessMetrics fast path: attach already-cached label-map terms while the
+/// point lists are being built, so the NIF returns the final public series
+/// maps rather than a second intermediate series list for Elixir to reshape.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_raw_frame_series<'a>(
+    env: Env<'a>,
+    frame: Binary<'a>,
+    label_maps: Vec<Term<'a>>,
+) -> Result<Term<'a>, String> {
+    let bytes = frame.as_slice();
+    let layout = parse_raw_frame(bytes)?;
+    if label_maps.len() != layout.series_count {
+        return Err(format!(
+            "timeless_raw_frame has {} series but received {} label maps",
+            layout.series_count,
+            label_maps.len()
+        ));
+    }
+
+    let keys = [atoms::labels().encode(env), atoms::points().encode(env)];
+    let mut series = Vec::with_capacity(layout.series_count);
+    for (series_index, labels) in label_maps.into_iter().enumerate() {
+        let values = [
+            labels,
+            decode_raw_frame_points(env, bytes, &layout, series_index),
+        ];
+        let map = Term::map_from_term_arrays(env, &keys, &values)
+            .map_err(|error| format!("timeless_raw_frame map construction failed: {error:?}"))?;
+        series.push(map);
+    }
+    Ok(series.encode(env))
 }
 
 // ═══════════════════════════════════════════════════════════════════════

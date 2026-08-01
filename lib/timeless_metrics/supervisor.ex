@@ -13,23 +13,28 @@ defmodule TimelessMetrics.Supervisor do
   def init(opts) do
     engine = Keyword.get(opts, :engine, :rust)
 
-    if engine in [:legacy, :actor, :sharded] do
-      require Logger
+    case engine do
+      engine when engine in [:legacy, :actor, :sharded] ->
+        require Logger
 
-      Logger.warning(
-        "TimelessMetrics engine: #{inspect(engine)} is deprecated and will be removed in 7.0. " <>
-          "The Rust engine (the default) is the supported path. " <>
-          "Legacy-only features (rollup tiers/query_daily, mode: :memory) need porting or explicit " <>
-          "retirement before 7.0 — see notes/promql_vm_parity_plan_2026-07-24.md Phase 0."
-      )
+        Logger.warning(
+          "TimelessMetrics engine: #{inspect(engine)} is deprecated and will be removed in 7.0. " <>
+            "The Rust engine (the default) is the supported path. " <>
+            "Legacy-only features (rollup tiers/query_daily, mode: :memory) need porting or explicit " <>
+            "retirement before 7.0 — see notes/promql_vm_parity_plan_2026-07-24.md Phase 0."
+        )
 
-      init_legacy(opts)
-    else
-      init_rust(opts)
+        init_legacy(opts)
+
+      :libsql ->
+        init_hot(opts, :libsql)
+
+      _ ->
+        init_hot(opts, :rust)
     end
   end
 
-  defp init_rust(opts) do
+  defp init_hot(opts, engine) do
     name = Keyword.fetch!(opts, :name)
     data_dir = Keyword.get(opts, :data_dir, "data")
     memory_only = Keyword.get(opts, :mode) == :memory
@@ -44,7 +49,7 @@ defmodule TimelessMetrics.Supervisor do
     # Same persistent_term setup as legacy — HTTP, stats, retention all need these
     :persistent_term.put({TimelessMetrics, name, :schema}, schema)
     :persistent_term.put({TimelessMetrics, name, :data_dir}, data_dir)
-    :persistent_term.put({TimelessMetrics, name, :engine}, :rust)
+    :persistent_term.put({TimelessMetrics, name, :engine}, engine)
     :persistent_term.put({TimelessMetrics, name, :shard_count}, 1)
 
     TimelessMetrics.Stats.init(name)
@@ -122,16 +127,47 @@ defmodule TimelessMetrics.Supervisor do
         []
       end
 
+    storage_children =
+      case engine do
+        :libsql ->
+          reader_count =
+            opts
+            |> Keyword.get(:reader_pool_size, max(div(System.schedulers_online(), 2), 2))
+            |> max(1)
+
+          reader_names =
+            for i <- 0..(reader_count - 1),
+                do: TimelessMetrics.LibsqlEngine.reader_name(name, i)
+
+          :persistent_term.put({TimelessMetrics.LibsqlEngine, name, :readers}, reader_names)
+
+          readers =
+            Enum.map(reader_names, fn reader_name ->
+              %{
+                id: reader_name,
+                start:
+                  {TimelessMetrics.LibsqlEngine.Reader, :start_link,
+                   [[name: reader_name, data_dir: data_dir]]}
+              }
+            end)
+
+          [
+            {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
+            {TimelessMetrics.LibsqlEngine, store: name, data_dir: data_dir, schema: schema}
+          ] ++ readers
+
+        :rust ->
+          [
+            {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
+            {TimelessMetrics.RustEngine,
+             store: name,
+             data_dir: data_dir,
+             defer_compression: Keyword.get(opts, :defer_compression, false)}
+          ]
+      end
+
     children =
-      [
-        # SQLite for admin (alerts, annotations, metadata, scrape targets, rollups)
-        {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
-        # Rust engine for hot data path
-        {TimelessMetrics.RustEngine,
-         store: name,
-         data_dir: data_dir,
-         defer_compression: Keyword.get(opts, :defer_compression, false)}
-      ] ++
+      storage_children ++
         if(memory_only, do: [], else: ingest_workers) ++
         alert_children ++
         self_monitor_children ++

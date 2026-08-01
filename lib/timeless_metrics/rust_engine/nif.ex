@@ -45,4 +45,7 @@ defmodule TimelessMetrics.RustEngine.Nif do
 
   # Bench-only: parse without term materialization (bench/ingest_segments_bench.exs)
   def parse_prometheus_count(_body), do: :erlang.nif_error(:nif_not_loaded)
+  def decode_raw_batches(_batches), do: :erlang.nif_error(:nif_not_loaded)
+  def decode_raw_frame(_frame), do: :erlang.nif_error(:nif_not_loaded)
+  def decode_raw_frame_series(_frame, _labels), do: :erlang.nif_error(:nif_not_loaded)
 end

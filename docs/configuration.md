@@ -23,7 +23,7 @@ All options are passed to the `TimelessMetrics` child spec:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | `atom` | **(required)** | Store name used to reference this instance in all API calls |
-| `data_dir` | `String.t()` | `"data"` | Directory for the store's SQLite admin data and Rust engine data files |
+| `data_dir` | `String.t()` | `"data"` | Directory for store data. The libSQL engine keeps all durable state in `metrics.db` |
 | `mode` | `:disk \| :memory` | `:disk` | `:disk` persists data under `data_dir`; `:memory` keeps the store ephemeral |
 | `schema` | module or `%TimelessMetrics.Schema{}` | `TimelessMetrics.Schema.default()` | Rollup tier configuration |
 | `raw_retention_seconds` | `pos_integer()` | `604_800` | How long raw point data is retained (7 days by default) |
@@ -33,7 +33,24 @@ All options are passed to the `TimelessMetrics` child spec:
 | `self_monitor` | `boolean()` | `true` | Enable internal self-monitoring metrics |
 | `self_monitor_labels` | `map()` | `%{}` | Labels applied to self-monitoring metrics |
 | `scraping` | `boolean()` | `true` | Enable the Prometheus scraping subsystem |
-| `engine` | `:rust \| :legacy` | `:rust` | Engine selection. `:rust` is the default and maintained path; `:legacy` exists only for compatibility and migration work |
+| `engine` | `:rust \| :libsql \| :legacy` | `:rust` | Engine selection. `:libsql` is the opt-in single-database preview; `:legacy` exists only for compatibility and migration work |
+| `reader_pool_size` | `pos_integer()` | `max(div(schedulers, 2), 2)` | Number of read-only SQLite connections used by `engine: :libsql` |
+
+### libSQL engine preview
+
+`engine: :libsql` loads the `timeless-libsql` extension into SQLite and stores
+raw blocks, rollups, the durable series registry, and application metadata in
+the existing `data_dir/metrics.db`. It uses one serialized writer connection
+and a configurable reader pool. Reader selection is caller-sticky so repeated
+queries reuse prepared SQLite statements while independent caller processes
+still spread across the pool. Supported scalar aggregates execute in the
+extension; unsupported or bucketed shapes retain the raw fallback.
+
+New or empty data directories can opt in directly. For a data directory that
+already contains Rust-engine chunks, run the verified offline migration before
+starting with `engine: :libsql`; see [Operations](operations.md#rust-to-libsql-migration).
+The engine will fail startup if it finds an unmigrated, non-empty
+`rust_engine/` directory.
 
 ### Legacy-only options
 
@@ -127,6 +144,12 @@ These workers drain the HTTP import queue. They matter only for the HTTP ingest 
 - Default: good for most deployments
 - Increase: when HTTP import is saturated and CPU is available
 - Decrease: for small embedded deployments where background concurrency is unnecessary
+
+### `reader_pool_size`
+
+This applies only to `engine: :libsql`. Increase it when independent range
+queries are queuing behind the reader pool. It does not increase write
+parallelism: libSQL deliberately uses one writer connection.
 
 ### `raw_retention_seconds` and `daily_retention_seconds`
 

@@ -69,10 +69,14 @@ Returns:
 ```elixir
 {:ok, %{
   path: "/tmp/metrics_backup",
-  files: ["metrics.db", "shard_0/raw/current.wal", ...],
+  files: ["metrics.db"],
   total_bytes: 24000000
 }}
 ```
+
+With `engine: :libsql`, the backup is a consistent SQLite snapshot containing
+both time-series blocks and admin data, so `files` contains only `metrics.db`.
+The Rust and legacy engines can return additional engine data files.
 
 ### HTTP API
 
@@ -92,7 +96,7 @@ Response:
 {
   "status": "ok",
   "path": "/tmp/metrics_backup",
-  "files": ["metrics.db", "shard_0/raw/current.wal"],
+  "files": ["metrics.db"],
   "total_bytes": 24000000
 }
 ```
@@ -101,7 +105,7 @@ Response:
 
 1. Flush buffered data: `TimelessMetrics.flush(:metrics)`
 2. Create backup: `TimelessMetrics.backup(:metrics, target_dir)`
-3. The backup creates a consistent snapshot of all SQLite databases and data files
+3. The backup creates a consistent snapshot of the active engine's databases and data files
 4. Copy the backup directory to offsite storage
 
 ### Restore procedure
@@ -110,9 +114,40 @@ Response:
 2. Replace the data directory contents with the backup files
 3. Start the instance -- it will load from the restored data
 
+## Rust-to-libSQL migration
+
+Migration is explicit, offline, staged, and verified. Stop every process using
+the store, keep enough free space for another copy of the data, then run:
+
+```bash
+mix timeless_metrics.migrate_libsql /var/lib/metrics
+```
+
+This creates `/var/lib/metrics/.libsql-migration/metrics.db`, imports every
+Rust series (including empty catalog entries), verifies each point bit-for-bit,
+and runs SQLite's integrity check. It does not change the active store.
+
+Inspect the result, retain a separate backup, then activate it:
+
+```bash
+mix timeless_metrics.migrate_libsql /var/lib/metrics --activate
+```
+
+Activation moves the former admin database to `metrics.db.pre-libsql` and
+installs the verified staged database as `metrics.db`. It deliberately leaves
+`rust_engine/` in place for rollback. Configure `engine: :libsql` only after
+activation. To roll back while no store process is running, move the current
+`metrics.db` aside, restore `metrics.db.pre-libsql` as `metrics.db`, and switch
+the configuration back to `engine: :rust`.
+
+Never bypass the migration by merely changing the engine option: libSQL startup
+refuses a non-empty Rust store unless `metrics.db` contains the migration marker.
+
 ## Merge compaction
 
-Each SegmentBuilder periodically seals completed time windows into immutable `.seg` files for better compression and faster large-range queries. This runs automatically (every 10 seconds for completed windows, every 60 seconds for pending data).
+On the legacy engine, each SegmentBuilder periodically seals completed time
+windows into immutable `.seg` files. The Rust engine compacts its own chunk
+files. The libSQL engine compacts shadow-table blocks inside `metrics.db`.
 
 ### Manual trigger
 
@@ -125,9 +160,9 @@ TimelessMetrics.merge_now(:metrics)
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `segment_duration` | 14,400 (4 hours) | Time window per segment file |
-| `flush_threshold` | 10,000 | Points per shard before immediate buffer flush |
-| `flush_interval` | 5,000 (5 sec) | Buffer flush interval |
+| `segment_duration` | 14,400 (4 hours) | Legacy-engine time window per segment file |
+| `flush_threshold` | 10,000 | Legacy-engine points per shard before immediate flush |
+| `flush_interval` | 5,000 (5 sec) | Legacy-engine buffer flush interval |
 
 See [Configuration Reference](configuration.md) for tuning guidance.
 

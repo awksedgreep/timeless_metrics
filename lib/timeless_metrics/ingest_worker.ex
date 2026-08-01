@@ -137,13 +137,13 @@ defmodule TimelessMetrics.IngestWorker do
   end
 
   defp process_prometheus(body, store, registry, shard_count) do
-    rust? = :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust
+    rust? = :persistent_term.get({TimelessMetrics, store, :engine}, nil) in [:rust, :libsql]
 
     if rust? and TimelessMetrics.PrometheusNif.available?() do
       # Fused ingest: parse -> resolve -> write inside the engine in one
       # NIF call, no per-sample terms. This path has no relabeling,
       # matching the previous parse+write_batch behavior.
-      case TimelessMetrics.RustEngine.ingest_prometheus(store, body) do
+      case TimelessMetrics.StorageEngine.ingest_prometheus(store, body) do
         {:ok, count, _errors} when count > 0 ->
           TimelessMetrics.Stats.incr_writes(store)
           TimelessMetrics.Stats.add_points(store, count)
@@ -169,7 +169,7 @@ defmodule TimelessMetrics.IngestWorker do
       TimelessMetrics.Stats.incr_writes(store)
       TimelessMetrics.Stats.add_points(store, count)
 
-      if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust do
+      if :persistent_term.get({TimelessMetrics, store, :engine}, nil) in [:rust, :libsql] do
         # Rust engine without the parser NIF: optimized write path using
         # the Elixir-side series-id cache and raw batch NIF.
         entries =
@@ -177,7 +177,7 @@ defmodule TimelessMetrics.IngestWorker do
             Enum.map(batch, fn {ts, val} -> {metric_name, labels, val, ts} end)
           end)
 
-        TimelessMetrics.RustEngine.write_batch(store, entries)
+        TimelessMetrics.StorageEngine.write_batch(store, entries)
       else
         Enum.each(groups, fn {{metric_name, labels}, batch} ->
           series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
@@ -212,13 +212,13 @@ defmodule TimelessMetrics.IngestWorker do
       TimelessMetrics.Stats.incr_writes(store)
       TimelessMetrics.Stats.add_points(store, count)
 
-      if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust do
+      if :persistent_term.get({TimelessMetrics, store, :engine}, nil) in [:rust, :libsql] do
         entries =
           Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
             Enum.map(batch, fn {ts, val} -> {metric_name, labels, val, ts} end)
           end)
 
-        TimelessMetrics.RustEngine.write_batch(store, entries)
+        TimelessMetrics.StorageEngine.write_batch(store, entries)
       else
         Enum.each(groups, fn {{metric_name, labels}, batch} ->
           series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)

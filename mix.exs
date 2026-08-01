@@ -16,8 +16,12 @@ defmodule TimelessMetrics.MixProject do
       make_precompiler_url:
         "https://github.com/awksedgreep/timeless_metrics/releases/download/v#{@version}/@{artefact_filename}",
       make_precompiler_filename: "tms_engine",
-      make_precompiler_priv_paths: ["native/tms_engine.*"],
+      make_precompiler_priv_paths: ["native/tms_engine.*", "native/timeless_sqlite_ext.*"],
       make_precompiler_nif_versions: [versions: ["2.16", "2.17", "2.18"]],
+      # A source checkout must not silently restore a released NIF whose
+      # exports predate the Rust sources being tested. Hex installs still use
+      # the published precompiled artefact.
+      make_force_build: File.exists?(Path.join(__DIR__, ".git")),
       description: "Embedded time series database for Elixir with a Rust-native hot path.",
       source_url: "https://github.com/awksedgreep/timeless_metrics",
       homepage_url: "https://github.com/awksedgreep/timeless_metrics",
@@ -35,6 +39,9 @@ defmodule TimelessMetrics.MixProject do
         native/tms_engine/Cargo.toml
         native/tms_engine/Cargo.lock
         native/tms_engine/src
+        native/timeless_sqlite_ext/Cargo.toml
+        native/timeless_sqlite_ext/Cargo.lock
+        native/timeless_sqlite_ext/src
         Makefile
         mix.exs
         checksum.exs
@@ -58,7 +65,7 @@ defmodule TimelessMetrics.MixProject do
   def application do
     [
       mod: {TimelessMetrics.Application, []},
-      extra_applications: [:logger]
+      extra_applications: [:logger, :inets]
     ]
   end
 

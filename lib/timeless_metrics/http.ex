@@ -260,7 +260,7 @@ defmodule TimelessMetrics.HTTP do
   end
 
   defp health_counts(store, stats) do
-    if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :rust do
+    if :persistent_term.get({TimelessMetrics, store, :engine}, nil) in [:rust, :libsql] do
       info = TimelessMetrics.info(store)
       {info.series_count, info.total_points, info.raw_buffer_points}
     else
@@ -1397,12 +1397,9 @@ defmodule TimelessMetrics.HTTP do
 
         series =
           Enum.flat_map(metric_names, fn metric ->
-            case TimelessMetrics.list_series(store, metric) do
-              {:ok, series_list} ->
-                series_list
-                |> Enum.map(fn %{labels: l} -> l end)
-                |> filter_series_by_labels(plan.labels)
-                |> Enum.map(&Map.put(&1, "__name__", metric))
+            case TimelessMetrics.StorageEngine.find_series(store, metric, plan.labels) do
+              {:ok, labels} ->
+                Enum.map(labels, &Map.put(&1, "__name__", metric))
 
               _ ->
                 []
@@ -1835,16 +1832,6 @@ defmodule TimelessMetrics.HTTP do
       {n, "d"} -> n * 86400
       {n, ""} -> n
       _ -> default
-    end
-  end
-
-  # Accepts a matcher map (native params) or matcher list (PromQL selectors)
-  defp filter_series_by_labels(series_list, labels) do
-    if Enum.empty?(labels) do
-      series_list
-    else
-      compiled = TimelessMetrics.LabelMatch.compile(labels)
-      Enum.filter(series_list, &TimelessMetrics.LabelMatch.match?(&1, compiled))
     end
   end
 

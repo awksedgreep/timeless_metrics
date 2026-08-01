@@ -4,6 +4,7 @@ This document describes the current default architecture of TimelessMetrics.
 
 The important versioned truth is:
 - the default engine is the Rust engine
+- the SQLite/libSQL block-store engine is available as an opt-in preview
 - the legacy Elixir engine still exists, but it is no longer the primary design target
 
 If you are reading older notes that describe ETS shard buffers, SegmentBuilder, ALP, or SQLite-backed raw storage as the hot path, those describe the legacy engine, not the default runtime on `main`.
@@ -69,6 +70,17 @@ The legacy engine is still available through explicit configuration:
 ```elixir
 {TimelessMetrics, name: :metrics, data_dir: "/tmp/metrics", engine: :legacy}
 ```
+
+The single-database libSQL preview is also explicit:
+
+```elixir
+{TimelessMetrics, name: :metrics, data_dir: "/tmp/metrics", engine: :libsql}
+```
+
+Its supervision tree replaces `TimelessMetrics.RustEngine` with one
+`TimelessMetrics.LibsqlEngine` writer and a pool of reader connections. Every
+connection loads a small native SQLite extension that registers the
+`timeless-libsql` virtual tables and query functions.
 
 Current docs in this file describe the rust path unless stated otherwise.
 
@@ -156,6 +168,43 @@ Important behavior:
 - restart recovery rebuilds the in-memory index from disk
 - chunk naming is designed to avoid restart-time overwrite collisions
 - out-of-order points are normalized before chunk metadata is written
+
+### libSQL preview storage model
+
+The libSQL engine uses the same `data_dir/metrics.db` that already holds admin
+state. `timeless-libsql` shadow tables in that database hold the series
+registry, compressed raw blocks, rollups, retention metadata, and engine
+statistics. Inserts go through the `timeless_metrics` virtual table; wide
+range queries use the one-row, multi-series `timeless_raw_frame` table-valued
+function and decode its versioned `TRF1` columns directly into final BEAM
+series maps (selective exact reads retain the per-series batch path); scalar
+aggregates use the chunk-aware `timeless_aggregate` kernel;
+latest-point reads use the newest-first `timeless_latest` kernel; rollup
+queries use one prepared `timeless_rollup_batches` call and decode the complete
+stored bucket record once per series. Complete `from`-aligned
+`avg`/`sum`/`min`/`max`/`count` buckets map to `timeless_window_batches`, which
+returns one versioned timestamp/value blob per series. Partial terminal buckets
+and counter/ordering operations remain raw because their semantics differ from
+the native half-open window. The scalar/latest/window/rollup adapters select
+series ids plus numeric data from SQLite and resolve immutable labels through
+the ETS catalog cache, avoiding repeated JSON transport and decoding. The raw
+frame is bounded to 10x the returned external-term size in the 12K-series
+benchmark; the measured peak increment was 120,596,408 bytes for a 12,959,022
+byte result (9.306x).
+
+The boundary is intentionally narrow:
+
+```text
+TimelessMetrics public API
+  -> Elixir matcher/query semantics
+  -> one SQLite writer or pooled SQLite reader
+  -> timeless-libsql virtual table
+  -> shadow tables and compressed blocks in metrics.db
+```
+
+This design makes a SQLite snapshot of `metrics.db` a complete backup. The
+Rust-to-libSQL converter stages and verifies a replacement database before an
+explicit activation; there is no implicit dual-read or dual-write mode.
 
 ## Memory-Only Mode
 

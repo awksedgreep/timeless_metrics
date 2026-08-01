@@ -76,8 +76,10 @@ defmodule TimelessMetrics.Schema do
         %TimelessMetrics.Schema{
           raw_retention_seconds:
             TimelessMetrics.Schema.duration_to_seconds(unquote(Macro.escape(raw_ret))),
-          rollup_interval: unquote(rollup_int),
-          retention_interval: unquote(retention_int),
+          rollup_interval:
+            TimelessMetrics.Schema.interval_to_milliseconds(unquote(Macro.escape(rollup_int))),
+          retention_interval:
+            TimelessMetrics.Schema.interval_to_milliseconds(unquote(Macro.escape(retention_int))),
           tiers:
             unquote(
               Macro.escape(
@@ -133,6 +135,19 @@ defmodule TimelessMetrics.Schema do
   def duration_to_seconds({n, :hours}), do: n * 3_600
   def duration_to_seconds({n, :days}), do: n * 86_400
   def duration_to_seconds({n, :weeks}), do: n * 604_800
+
+  @doc false
+  def interval_to_milliseconds(:infinity), do: :infinity
+
+  def interval_to_milliseconds(milliseconds)
+      when is_integer(milliseconds) and milliseconds >= 0,
+      do: milliseconds
+
+  def interval_to_milliseconds(duration) do
+    duration
+    |> duration_to_seconds()
+    |> :timer.seconds()
+  end
 
   def resolution_to_seconds(:minute), do: 60
   def resolution_to_seconds(:hour), do: 3_600

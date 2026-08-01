@@ -8,6 +8,7 @@
 #
 # Usage:
 #     mix run --no-start scripts/vm_diff.exs
+#     TIMELESS_VM_DIFF_ENGINE=libsql mix run --no-start scripts/vm_diff.exs
 #
 # Exit code 0 = full parity on the corpus; 1 = diffs found (printed).
 
@@ -31,7 +32,7 @@ defmodule VMDiff do
     step = 60
 
     start_vm!()
-    {:ok, _} = start_timeless()
+    {:ok, timeless_sup, data_dir} = start_timeless()
 
     try do
       await_vm!()
@@ -76,6 +77,8 @@ defmodule VMDiff do
 
       if diffs == [], do: :ok, else: :diffs
     after
+      Supervisor.stop(timeless_sup)
+      File.rm_rf!(data_dir)
       System.cmd("podman", ["stop", "-t", "2", @container], stderr_to_stdout: true)
     end
   end
@@ -108,14 +111,32 @@ defmodule VMDiff do
 
   defp start_timeless do
     data_dir = "/tmp/timeless_vm_diff_#{System.os_time(:millisecond)}"
+    engine = timeless_engine()
+    IO.puts("starting TimelessMetrics engine=#{inspect(engine)} on :#{@tl_port}")
 
-    Supervisor.start_link(
-      [
-        {TimelessMetrics, name: :vm_diff, data_dir: data_dir},
-        {TimelessMetrics.HTTP, store: :vm_diff, port: @tl_port}
-      ],
-      strategy: :one_for_one
-    )
+    case Supervisor.start_link(
+           [
+             {TimelessMetrics,
+              name: :vm_diff,
+              data_dir: data_dir,
+              engine: engine,
+              self_monitor: false,
+              scraping: false},
+             {TimelessMetrics.HTTP, store: :vm_diff, port: @tl_port}
+           ],
+           strategy: :one_for_one
+         ) do
+      {:ok, supervisor} -> {:ok, supervisor, data_dir}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp timeless_engine do
+    case System.get_env("TIMELESS_VM_DIFF_ENGINE", "rust") do
+      "rust" -> :rust
+      "libsql" -> :libsql
+      other -> raise "TIMELESS_VM_DIFF_ENGINE must be rust or libsql, got: #{inspect(other)}"
+    end
   end
 
   defp await_vm!(tries \\ 60) do

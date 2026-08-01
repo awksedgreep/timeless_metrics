@@ -14,7 +14,19 @@ defmodule TimelessMetrics.Application do
           store_opts =
             config
             |> Keyword.take([
+              :engine,
+              :mode,
+              :schema,
+              :reader_pool_size,
+              :ingest_workers,
+              :alert_interval,
+              :self_monitor,
+              :self_monitor_labels,
+              :scraping,
               :compression,
+              :compression_level,
+              :buffer_shards,
+              :segment_duration,
               :max_blocks,
               :block_size,
               :flush_interval,
