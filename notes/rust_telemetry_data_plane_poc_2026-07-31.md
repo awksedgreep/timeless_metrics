@@ -1,9 +1,10 @@
 # Deferred Rust telemetry data-plane POC
 
-Status: captured for a fresh branch after the libSQL storage migration and its
-query-performance gates are complete. This proposal is deliberately out of
-scope for `feat/libsql-storage-engine`; the work on this branch remains useful
-to it unchanged.
+Status: captured for a fresh branch after the libSQL storage migration, its
+query-performance gates, and the standalone SQLite query API completion plan
+in `timeless-libsql` are complete. This proposal is deliberately out of scope
+for `feat/libsql-storage-engine`; the completed storage and extension work
+remains useful to it unchanged.
 
 ## Motivation
 

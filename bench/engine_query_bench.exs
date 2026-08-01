@@ -169,8 +169,12 @@ defmodule TimelessMetrics.EngineQueryBench do
     ensure!(length(latest_warm) == config.series, "unexpected latest count")
     ensure!(latest_exact_warm != nil, "unexpected empty exact latest")
 
-    wide_memory = measure_process_peak_memory(wide)
+    wide_memory = measure_process_peak_memory(wide, &series_result_signature/1)
+    scalar_memory = measure_process_peak_memory(scalar_aggregate, &aggregate_result_signature/1)
+    latest_memory = measure_process_peak_memory(latest, &latest_result_signature/1)
     wide_external_bytes = :erlang.external_size(wide_warm)
+    scalar_external_bytes = :erlang.external_size(scalar_warm)
+    latest_external_bytes = :erlang.external_size(latest_warm)
 
     ensure!(
       wide_memory.peak - wide_memory.baseline <= wide_external_bytes * 10,
@@ -238,16 +242,11 @@ defmodule TimelessMetrics.EngineQueryBench do
     IO.puts("# flush_us=#{flush_us}")
     IO.puts("# database_bytes=#{directory_bytes(data_dir)}")
     IO.puts("# wide_result_external_bytes=#{wide_external_bytes}")
-    IO.puts("# wide_query_process_baseline_bytes=#{wide_memory.baseline}")
-    IO.puts("# wide_query_process_peak_bytes=#{wide_memory.peak}")
-
-    IO.puts(
-      "# wide_query_process_peak_increment_bytes=#{wide_memory.peak - wide_memory.baseline}"
-    )
-
-    IO.puts(
-      "# wide_query_process_peak_multiple=#{Float.round((wide_memory.peak - wide_memory.baseline) / wide_external_bytes, 3)}"
-    )
+    print_memory("wide_query", wide_memory, wide_external_bytes)
+    IO.puts("# scalar_result_external_bytes=#{scalar_external_bytes}")
+    print_memory("scalar_query", scalar_memory, scalar_external_bytes)
+    IO.puts("# latest_result_external_bytes=#{latest_external_bytes}")
+    print_memory("latest_query", latest_memory, latest_external_bytes)
 
     IO.puts("metric,median_us,p95_us,min_us,max_us,runs,result_a,result_b")
     print_stats("first_exact_after_flush", first_exact)
@@ -262,6 +261,15 @@ defmodule TimelessMetrics.EngineQueryBench do
     print_stats("latest_exact", latest_exact_stats)
     print_stats("latest_multi", latest_stats)
     Enum.each(profile, fn {name, stats} -> print_stats(name, stats) end)
+  end
+
+  defp print_memory(prefix, memory, external_bytes) do
+    increment = memory.peak - memory.baseline
+
+    IO.puts("# #{prefix}_process_baseline_bytes=#{memory.baseline}")
+    IO.puts("# #{prefix}_process_peak_bytes=#{memory.peak}")
+    IO.puts("# #{prefix}_process_peak_increment_bytes=#{increment}")
+    IO.puts("# #{prefix}_process_peak_multiple=#{Float.round(increment / external_bytes, 3)}")
   end
 
   defp profile_libsql(store, config, stop_timestamp, wide_filter) do
@@ -764,7 +772,7 @@ defmodule TimelessMetrics.EngineQueryBench do
     }
   end
 
-  defp measure_process_peak_memory(operation) do
+  defp measure_process_peak_memory(operation, signature_function) do
     parent = self()
 
     {pid, monitor} =
@@ -777,8 +785,8 @@ defmodule TimelessMetrics.EngineQueryBench do
           :run_peak_query -> :ok
         end
 
-        {:ok, series} = operation.()
-        signature = {length(series), total_series_points(series)}
+        result = operation.()
+        signature = signature_function.(result)
         finished = process_memory_with_binaries(self())
         send(parent, {:peak_done, self(), finished, signature})
 

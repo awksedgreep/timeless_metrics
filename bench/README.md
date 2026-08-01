@@ -28,8 +28,9 @@ This directory contains the current benchmark set for `timeless_metrics`.
 
 - [engine_query_bench.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/engine_query_bench.exs)
   Reproducible public-API comparison for the Rust and libSQL engines, covering first-read publication cost, exact/narrow/wide raw reads, scalar and bucketed aggregation, latest queries, and libSQL boundary attribution.
-  The wide query also samples its worker-process peak (including referenced
-  binaries) and enforces a 10x bound relative to the serialized result size.
+  Wide raw, scalar aggregate, and wide latest queries also sample their
+  worker-process peaks, including referenced binaries. The wide raw path
+  enforces a 10x bound relative to the serialized result size.
   Run each engine in a separate process with `MIX_ENV=test mix run bench/engine_query_bench.exs --engine rust|libsql`.
 
 - [engine_query_distribution.sh](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/engine_query_distribution.sh)
@@ -81,6 +82,10 @@ This directory contains the current benchmark set for `timeless_metrics`.
 - Prefer `vs_victoriametrics.exs` only when you specifically need a product-to-product comparison.
 
 ## Historical Results
+
+- [results/2026-08-01_standalone_query_adoption.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_standalone_query_adoption.md)
+  Session 6 adoption of selected-ID reads and the TAF1/TLF1 aggregate/latest
+  transports, including controlled row fallback latency and peak memory.
 
 - [results/2026-07-31_integration_release_gate.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-07-31_integration_release_gate.md)
   Five-process Rust/libSQL query distributions, the large write/storage gate,

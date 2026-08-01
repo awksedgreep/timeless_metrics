@@ -487,7 +487,7 @@ dependencies = [
 [[package]]
 name = "timeless-codec"
 version = "0.3.0"
-source = "git+https://github.com/awksedgreep/timeless-libsql.git?rev=09aa46e94185c8380d5a16a6efda353b62e0083a#09aa46e94185c8380d5a16a6efda353b62e0083a"
+source = "git+https://github.com/awksedgreep/timeless-libsql.git?rev=6fc33006c1f3d6605b4feb76018ef6b21d17383b#6fc33006c1f3d6605b4feb76018ef6b21d17383b"
 dependencies = [
  "pco",
  "zstd",
@@ -496,7 +496,7 @@ dependencies = [
 [[package]]
 name = "timeless-core"
 version = "0.3.0"
-source = "git+https://github.com/awksedgreep/timeless-libsql.git?rev=09aa46e94185c8380d5a16a6efda353b62e0083a#09aa46e94185c8380d5a16a6efda353b62e0083a"
+source = "git+https://github.com/awksedgreep/timeless-libsql.git?rev=6fc33006c1f3d6605b4feb76018ef6b21d17383b#6fc33006c1f3d6605b4feb76018ef6b21d17383b"
 dependencies = [
  "dashmap",
  "pco",
@@ -508,7 +508,7 @@ dependencies = [
 [[package]]
 name = "timeless-ext"
 version = "0.3.0"
-source = "git+https://github.com/awksedgreep/timeless-libsql.git?rev=09aa46e94185c8380d5a16a6efda353b62e0083a#09aa46e94185c8380d5a16a6efda353b62e0083a"
+source = "git+https://github.com/awksedgreep/timeless-libsql.git?rev=6fc33006c1f3d6605b4feb76018ef6b21d17383b#6fc33006c1f3d6605b4feb76018ef6b21d17383b"
 dependencies = [
  "regex",
  "rusqlite",

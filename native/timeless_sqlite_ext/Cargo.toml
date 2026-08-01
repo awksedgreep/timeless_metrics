@@ -8,4 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 rusqlite = { version = "0.40.1", features = ["vtab", "loadable_extension"] }
-timeless-ext = { git = "https://github.com/awksedgreep/timeless-libsql.git", rev = "09aa46e94185c8380d5a16a6efda353b62e0083a", default-features = false }
+timeless-ext = { git = "https://github.com/awksedgreep/timeless-libsql.git", rev = "6fc33006c1f3d6605b4feb76018ef6b21d17383b", default-features = false }

@@ -34,11 +34,11 @@ This branch replaces the filesystem-backed Rust metrics store with the
    `:rust` as the default for the next release or two while `:libsql` ships as
    the fully supported forward path.
 
-## Implementation status (2026-07-31)
+## Implementation status (updated 2026-08-01)
 
 Completed validation:
 
-- `mix test`: all 477 tests pass, including dedicated libSQL engine,
+- `mix test`: all 479 tests pass, including dedicated libSQL engine,
   migration, backup, rollup, retention, and HTTP coverage.
 - `cargo test --workspace`: all codec, core, extension, recovery, retention,
   rollup, query-kernel, and publication tests pass.
@@ -93,15 +93,22 @@ Completed validation:
   one-series regex read fell from 116.944ms to 3.083ms (37.93x), and filtered
   discovery fell from 52.427ms to 2.431ms (21.57x). Direct SQLite users gain
   matcher-aware `timeless_series` and `timeless_label_values` forms as well.
+- The standalone query API adoption is complete. Cached exact raw, aggregate,
+  and latest reads use selected-ID plans; 12K-series scalar aggregate and
+  latest reads use TAF1/TLF1 with automatic row fallbacks. In a controlled
+  same-code comparison, scalar fell from 38.833ms to 12.695ms median and
+  latest from 37.488ms to 12.332ms. Full latency, memory, and compatibility
+  results are recorded in
+  [`bench/results/2026-08-01_standalone_query_adoption.md`](../bench/results/2026-08-01_standalone_query_adoption.md).
 - A mixed 30-second run with eight readers completed 392,512 writes, 23,496
   oracle reads, 411 maintenance operations, 35 online backups, a forced writer
   restart, reopen, and backup verification with zero escaped read transients.
   Extension read permits plus adapter retries close the transaction-private
   chunk visibility failure found by the earlier soak.
-- The packaged native wrapper is pinned to merged `timeless-libsql` revision
-  `09aa46e94185c8380d5a16a6efda353b62e0083a`. A clean Hex package unpack and
-  `cargo check --locked` compile without the sibling checkout, and all 477
-  Elixir tests pass against that Git dependency.
+- The packaged native wrapper is pinned to `timeless-libsql` revision
+  `6fc33006c1f3d6605b4feb76018ef6b21d17383b`. `cargo check --locked` resolves
+  and compiles that immutable Git dependency, and all 479 Elixir tests pass
+  against it.
 
 Release follow-up:
 

@@ -617,6 +617,125 @@ defmodule TimelessMetrics.LibsqlEngineTest do
     assert message =~ "point counts sum"
   end
 
+  test "native aggregate and latest frame decoders preserve types and reject malformed frames" do
+    aggregate_frame =
+      <<"TAF1", 0, 0, 0::unsigned-little-16, 3::unsigned-little-32, 7::signed-little-64,
+        8::signed-little-64, 9::signed-little-64, 0b101, 1.25::float-little-64,
+        0::unsigned-little-64, -2.5::float-little-64>>
+
+    assert {:ok, {:avg, [{7, 1.25}, {8, nil}, {9, -2.5}]}} =
+             TimelessMetrics.RustEngine.Nif.decode_aggregate_frame(aggregate_frame)
+
+    count_frame =
+      <<"TAF1", 4, 0, 0::unsigned-little-16, 2::unsigned-little-32, 7::signed-little-64,
+        8::signed-little-64, 0b11, 3::unsigned-little-64, 5::unsigned-little-64>>
+
+    assert {:ok, {:count, [{7, 3}, {8, 5}]}} =
+             TimelessMetrics.RustEngine.Nif.decode_aggregate_frame(count_frame)
+
+    latest_frame =
+      <<"TLF1", 2::unsigned-little-32, 7::signed-little-64, 8::signed-little-64,
+        10::signed-little-64, 20::signed-little-64, 0b01, 1.25::float-little-64,
+        0::unsigned-little-64>>
+
+    assert {:ok, [{7, 10, 1.25}, {8, 20, nil}]} =
+             TimelessMetrics.RustEngine.Nif.decode_latest_frame(latest_frame)
+
+    assert {:error, "TAF1: unknown magic/version"} =
+             TimelessMetrics.RustEngine.Nif.decode_aggregate_frame(
+               "TAF2" <> binary_part(aggregate_frame, 4, byte_size(aggregate_frame) - 4)
+             )
+
+    assert {:error, message} =
+             TimelessMetrics.RustEngine.Nif.decode_aggregate_frame(
+               <<"TAF1", 0, 0, 0::unsigned-little-16, 1::unsigned-little-32, 7::signed-little-64,
+                 0b10, 0::unsigned-little-64>>
+             )
+
+    assert message =~ "bitmap padding"
+
+    nan_bits = 0x7FF8_0000_0000_0042
+
+    assert {:error, message} =
+             TimelessMetrics.RustEngine.Nif.decode_aggregate_frame(
+               <<"TAF1", 0, 0, 0::unsigned-little-16, 1::unsigned-little-32, 7::signed-little-64,
+                 0b1, nan_bits::unsigned-little-64>>
+             )
+
+    assert message =~ "must not be NaN"
+
+    assert {:error, message} =
+             TimelessMetrics.RustEngine.Nif.decode_latest_frame(
+               <<"TLF1", 1::unsigned-little-32, 7::signed-little-64, 10::signed-little-64, 0b0,
+                 1::unsigned-little-64>>
+             )
+
+    assert message =~ "nonzero word"
+  end
+
+  test "packed aggregate/latest adoption retains row fallbacks and exact series-id reads" do
+    exact_labels = %{"env" => "prod", "host" => "a"}
+
+    assert :ok =
+             TimelessMetrics.write_batch(@store, [
+               {"frames", exact_labels, 1.0, 10},
+               {"frames", exact_labels, 3.0, 20},
+               {"frames", Map.put(exact_labels, "rack", "r1"), 100.0, 30},
+               {"frames", %{"env" => "prod", "host" => "b"}, 5.0, 15}
+             ])
+
+    assert TimelessMetrics.LibsqlEngine.query_frame_features(@store) ==
+             MapSet.new(["timeless_aggregate_frame", "timeless_latest_frame"])
+
+    # A cached exact selector must not also read a series whose labels are a
+    # strict superset. These calls exercise all three selected-ID statements.
+    assert {:ok, [{10, 1.0}, {20, 3.0}]} =
+             TimelessMetrics.query(@store, "frames", exact_labels, from: 0, to: 40)
+
+    assert {:ok, [{0, 2.0}]} =
+             TimelessMetrics.LibsqlEngine.query_aggregate(
+               @store,
+               "frames",
+               exact_labels,
+               from: 0,
+               to: 40,
+               aggregate: :avg
+             )
+
+    assert {:ok, {20, 3.0}} = TimelessMetrics.latest(@store, "frames", exact_labels)
+
+    filter = %{"env" => "prod"}
+
+    assert {:ok, framed_aggregate} =
+             TimelessMetrics.query_aggregate_multi(@store, "frames", filter,
+               from: 0,
+               to: 40,
+               aggregate: :avg
+             )
+
+    assert {:ok, framed_latest} = TimelessMetrics.latest_multi(@store, "frames", filter)
+
+    feature_key = {TimelessMetrics.LibsqlEngine, @store, :query_frame_features}
+    features = TimelessMetrics.LibsqlEngine.query_frame_features(@store)
+
+    try do
+      :persistent_term.put(feature_key, MapSet.new())
+
+      assert {:ok, row_aggregate} =
+               TimelessMetrics.query_aggregate_multi(@store, "frames", filter,
+                 from: 0,
+                 to: 40,
+                 aggregate: :avg
+               )
+
+      assert {:ok, row_latest} = TimelessMetrics.latest_multi(@store, "frames", filter)
+      assert sort_series(framed_aggregate) == sort_series(row_aggregate)
+      assert sort_series(framed_latest) == sort_series(row_latest)
+    after
+      :persistent_term.put(feature_key, features)
+    end
+  end
+
   test "writer crash loses only unflushed work and resumes from durable blocks" do
     assert :ok = TimelessMetrics.write(@store, "crash", %{}, 1.0, timestamp: 10)
     assert :ok = TimelessMetrics.flush(@store)
@@ -732,6 +851,8 @@ defmodule TimelessMetrics.LibsqlEngineTest do
   defp series_data_map(series) do
     Map.new(series, fn %{labels: labels, data: data} -> {labels, data} end)
   end
+
+  defp sort_series(series), do: Enum.sort_by(series, & &1.labels)
 
   defp await_restarted_writer(old_writer, attempts \\ 100)
 

@@ -2753,6 +2753,177 @@ fn decode_raw_frame_series<'a>(
     Ok(series.encode(env))
 }
 
+fn packed_frame_bitmap_len(count: usize) -> Result<usize, String> {
+    count
+        .checked_add(7)
+        .map(|value| value / 8)
+        .ok_or_else(|| "packed query frame bitmap size overflow".to_string())
+}
+
+fn packed_frame_bit(bitmap: &[u8], index: usize) -> bool {
+    bitmap[index / 8] & (1 << (index % 8)) != 0
+}
+
+fn validate_packed_frame_bitmap(bitmap: &[u8], count: usize, name: &str) -> Result<(), String> {
+    let used_bits = count & 7;
+    if used_bits != 0 && bitmap.last().copied().unwrap_or(0) & !((1 << used_bits) - 1) != 0 {
+        return Err(format!("{name}: nonzero bitmap padding bits"));
+    }
+    Ok(())
+}
+
+fn packed_i64_at(bytes: &[u8], offset: usize) -> i64 {
+    i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn packed_u64_at(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+/// Decode the public TAF1 aggregate frame into
+/// `{aggregate_kind, [{series_id, value}]}`. `count` values remain integers;
+/// invalid floating-point values become `nil`, matching the row TVF.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_aggregate_frame<'a>(env: Env<'a>, frame: Binary<'a>) -> Result<Term<'a>, String> {
+    let bytes = frame.as_slice();
+    if bytes.len() < 12 {
+        return Err("TAF1: truncated header".to_string());
+    }
+    if &bytes[..4] != b"TAF1" {
+        return Err("TAF1: unknown magic/version".to_string());
+    }
+
+    let kind = match bytes[4] {
+        0 => atoms::avg(),
+        1 => atoms::sum(),
+        2 => atoms::min(),
+        3 => atoms::max(),
+        4 => atoms::count(),
+        other => return Err(format!("TAF1: unknown aggregate kind {other}")),
+    };
+    let count_kind = bytes[4] == 4;
+    if bytes[5] != 0 {
+        return Err(format!("TAF1: unknown flags 0x{:02x}", bytes[5]));
+    }
+    if bytes[6..8] != [0, 0] {
+        return Err("TAF1: reserved bits must be zero".to_string());
+    }
+
+    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let bitmap_len = packed_frame_bitmap_len(count)?;
+    let columns_len = count
+        .checked_mul(16)
+        .ok_or_else(|| "TAF1: column size overflow".to_string())?;
+    let expected = 12usize
+        .checked_add(columns_len)
+        .and_then(|size| size.checked_add(bitmap_len))
+        .ok_or_else(|| "TAF1: frame size overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "TAF1: {} bytes, expected {expected} for {count} series",
+            bytes.len()
+        ));
+    }
+
+    let ids_start = 12;
+    let bitmap_start = ids_start + count * 8;
+    let words_start = bitmap_start + bitmap_len;
+    let bitmap = &bytes[bitmap_start..words_start];
+    validate_packed_frame_bitmap(bitmap, count, "TAF1")?;
+
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let series_id = packed_i64_at(bytes, ids_start + index * 8);
+        let valid = packed_frame_bit(bitmap, index);
+        let word = packed_u64_at(bytes, words_start + index * 8);
+        let value = if !valid {
+            if word != 0 {
+                return Err(format!("TAF1: invalid value {index} has a nonzero word"));
+            }
+            if count_kind {
+                return Err(format!("TAF1: count value {index} must not be NULL"));
+            }
+            Option::<f64>::None.encode(env)
+        } else if count_kind {
+            if word > i64::MAX as u64 {
+                return Err(format!("TAF1: count value {index} exceeds SQLite INTEGER"));
+            }
+            (word as i64).encode(env)
+        } else {
+            let value = f64::from_bits(word);
+            if value.is_nan() {
+                return Err(format!("TAF1: valid value {index} must not be NaN"));
+            }
+            value.encode(env)
+        };
+        rows.push(make_tuple(env, &[series_id.encode(env), value]));
+    }
+
+    Ok(make_tuple(env, &[kind.encode(env), rows.encode(env)]))
+}
+
+/// Decode the public TLF1 latest frame into
+/// `[{series_id, timestamp, value}]`, preserving SQL NULL as `nil`.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn decode_latest_frame<'a>(env: Env<'a>, frame: Binary<'a>) -> Result<Term<'a>, String> {
+    let bytes = frame.as_slice();
+    if bytes.len() < 8 {
+        return Err("TLF1: truncated header".to_string());
+    }
+    if &bytes[..4] != b"TLF1" {
+        return Err("TLF1: unknown magic/version".to_string());
+    }
+
+    let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let bitmap_len = packed_frame_bitmap_len(count)?;
+    let columns_len = count
+        .checked_mul(24)
+        .ok_or_else(|| "TLF1: column size overflow".to_string())?;
+    let expected = 8usize
+        .checked_add(columns_len)
+        .and_then(|size| size.checked_add(bitmap_len))
+        .ok_or_else(|| "TLF1: frame size overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "TLF1: {} bytes, expected {expected} for {count} series",
+            bytes.len()
+        ));
+    }
+
+    let ids_start = 8;
+    let timestamps_start = ids_start + count * 8;
+    let bitmap_start = timestamps_start + count * 8;
+    let words_start = bitmap_start + bitmap_len;
+    let bitmap = &bytes[bitmap_start..words_start];
+    validate_packed_frame_bitmap(bitmap, count, "TLF1")?;
+
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let series_id = packed_i64_at(bytes, ids_start + index * 8);
+        let timestamp = packed_i64_at(bytes, timestamps_start + index * 8);
+        let valid = packed_frame_bit(bitmap, index);
+        let word = packed_u64_at(bytes, words_start + index * 8);
+        let value = if valid {
+            let value = f64::from_bits(word);
+            if value.is_nan() {
+                return Err(format!("TLF1: valid value {index} must not be NaN"));
+            }
+            value.encode(env)
+        } else {
+            if word != 0 {
+                return Err(format!("TLF1: invalid value {index} has a nonzero word"));
+            }
+            Option::<f64>::None.encode(env)
+        };
+        rows.push(make_tuple(
+            env,
+            &[series_id.encode(env), timestamp.encode(env), value],
+        ));
+    }
+
+    Ok(rows.encode(env))
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // NIF interface
 // ═══════════════════════════════════════════════════════════════════════

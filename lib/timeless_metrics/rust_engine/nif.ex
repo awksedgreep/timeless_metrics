@@ -48,4 +48,6 @@ defmodule TimelessMetrics.RustEngine.Nif do
   def decode_raw_batches(_batches), do: :erlang.nif_error(:nif_not_loaded)
   def decode_raw_frame(_frame), do: :erlang.nif_error(:nif_not_loaded)
   def decode_raw_frame_series(_frame, _labels), do: :erlang.nif_error(:nif_not_loaded)
+  def decode_aggregate_frame(_frame), do: :erlang.nif_error(:nif_not_loaded)
+  def decode_latest_frame(_frame), do: :erlang.nif_error(:nif_not_loaded)
 end

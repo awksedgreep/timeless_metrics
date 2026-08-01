@@ -17,6 +17,8 @@ defmodule TimelessMetrics.LibsqlEngine do
   @native_scalar_aggregates [:avg, :sum, :min, :max, :count]
   @native_bucket_aggregates [:avg, :sum, :min, :max, :count]
   @native_window_max_points 1_000_000
+  @aggregate_frame_module "timeless_aggregate_frame"
+  @latest_frame_module "timeless_latest_frame"
 
   # -- Public storage API ---------------------------------------------------
 
@@ -40,8 +42,44 @@ defmodule TimelessMetrics.LibsqlEngine do
   end
 
   @doc false
+  def raw_points_by_id_sql do
+    "SELECT series_id, points " <>
+      "FROM timeless_raw_batches('#{@table}', ?1, NULL, ?2, ?3) " <>
+      "WHERE series_id = ?4"
+  end
+
+  @doc false
   def raw_frame_sql do
     "SELECT frame FROM timeless_raw_frame('#{@table}', ?1, ?2, ?3, ?4)"
+  end
+
+  @doc false
+  def aggregate_frame_sql do
+    "SELECT frame " <>
+      "FROM timeless_aggregate_frame('#{@table}', ?1, ?2, ?3, ?4, ?5)"
+  end
+
+  @doc false
+  def latest_frame_sql do
+    "SELECT frame FROM timeless_latest_frame('#{@table}', ?1, ?2, ?3, ?4)"
+  end
+
+  @doc false
+  def detect_query_frame_features(conn) do
+    case TimelessMetrics.DB.execute(
+           conn,
+           "SELECT name FROM pragma_module_list " <>
+             "WHERE name IN ('#{@aggregate_frame_module}', '#{@latest_frame_module}')",
+           []
+         ) do
+      {:ok, rows} -> MapSet.new(rows, fn [name] -> name end)
+      {:error, _reason} -> MapSet.new()
+    end
+  end
+
+  @doc false
+  def query_frame_features(store) do
+    :persistent_term.get({__MODULE__, store, :query_frame_features}, MapSet.new())
   end
 
   @doc false
@@ -51,9 +89,23 @@ defmodule TimelessMetrics.LibsqlEngine do
   end
 
   @doc false
+  def aggregate_by_id_sql do
+    "SELECT series_id, value " <>
+      "FROM timeless_aggregate('#{@table}', ?1, NULL, ?2, ?3, ?4) " <>
+      "WHERE series_id = ?5"
+  end
+
+  @doc false
   def latest_sql do
     "SELECT series_id, ts, value " <>
       "FROM timeless_latest('#{@table}', ?1, ?2, ?3, ?4)"
+  end
+
+  @doc false
+  def latest_by_id_sql do
+    "SELECT series_id, ts, value " <>
+      "FROM timeless_latest('#{@table}', ?1, NULL, ?2, ?3) " <>
+      "WHERE series_id = ?4"
   end
 
   @doc false
@@ -185,7 +237,7 @@ defmodule TimelessMetrics.LibsqlEngine do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
 
-    with {:ok, rows} <- raw_point_rows(store, metric, labels, from, to) do
+    with {:ok, rows} <- raw_point_rows_exact(store, metric, labels, from, to) do
       point_blobs = Enum.map(rows, fn [_sid, point_blob] -> point_blob end)
 
       points =
@@ -221,7 +273,7 @@ defmodule TimelessMetrics.LibsqlEngine do
 
     cond do
       bucket_seconds == nil and agg in @native_scalar_aggregates ->
-        with {:ok, rows} <- aggregate_rows(store, metric, labels, from, to, agg) do
+        with {:ok, rows} <- aggregate_rows_exact(store, metric, labels, from, to, agg) do
           case rows do
             [] ->
               {:ok, []}
@@ -261,12 +313,13 @@ defmodule TimelessMetrics.LibsqlEngine do
 
     cond do
       bucket_seconds == nil and agg in @native_scalar_aggregates ->
-        with {:ok, rows} <- aggregate_rows(store, metric, label_filter, from, to, agg) do
+        with {:ok, rows} <- aggregate_multi_rows(store, metric, label_filter, from, to, agg) do
           cache = cache_ref(store)
 
           result =
             rows
-            |> Enum.map(fn [sid, value] ->
+            |> Enum.map(fn row ->
+              {sid, value} = aggregate_row(row)
               data = TimelessMetrics.Transform.apply([{from, value}], transform)
               %{labels: cached_labels_by_sid(cache, sid), data: data}
             end)
@@ -347,7 +400,7 @@ defmodule TimelessMetrics.LibsqlEngine do
   end
 
   def latest(store, metric, labels) do
-    with {:ok, rows} <- latest_rows(store, metric, labels, 0, System.os_time(:second)) do
+    with {:ok, rows} <- latest_rows_exact(store, metric, labels, 0, System.os_time(:second)) do
       case rows do
         [[_sid, timestamp, value]] -> {:ok, {timestamp, value}}
         _ -> {:ok, nil}
@@ -356,11 +409,13 @@ defmodule TimelessMetrics.LibsqlEngine do
   end
 
   def latest_multi(store, metric, filter) do
-    with {:ok, rows} <- latest_rows(store, metric, filter, 0, System.os_time(:second)) do
+    with {:ok, rows} <- latest_multi_rows(store, metric, filter, 0, System.os_time(:second)) do
       cache = cache_ref(store)
 
       {:ok,
-       Enum.map(rows, fn [sid, timestamp, value] ->
+       Enum.map(rows, fn row ->
+         {sid, timestamp, value} = latest_row(row)
+
          %{
            labels: cached_labels_by_sid(cache, sid),
            timestamp: timestamp,
@@ -483,6 +538,7 @@ defmodule TimelessMetrics.LibsqlEngine do
     conn = open_connection(Path.join(data_dir, "metrics.db"))
     create_table(conn, schema)
     {:ok, insert_stmt} = Exqlite.Sqlite3.prepare(conn, insert_command_sql())
+    query_frame_features = detect_query_frame_features(conn)
 
     cache =
       :ets.new(__MODULE__, [
@@ -493,6 +549,7 @@ defmodule TimelessMetrics.LibsqlEngine do
       ])
 
     :persistent_term.put({__MODULE__, store, :series_cache}, cache)
+    :persistent_term.put({__MODULE__, store, :query_frame_features}, query_frame_features)
     schedule_flush()
     rollup_timer = schedule_compact(schema.rollup_interval)
     retention_timer = schedule_retention(schema.retention_interval)
@@ -504,6 +561,7 @@ defmodule TimelessMetrics.LibsqlEngine do
        conn: conn,
        insert_stmt: insert_stmt,
        cache: cache,
+       query_frame_features: query_frame_features,
        ingest_count: 0,
        ingest_timer: nil,
        ingest_token: nil,
@@ -623,6 +681,7 @@ defmodule TimelessMetrics.LibsqlEngine do
     Exqlite.Sqlite3.release(state.conn, state.insert_stmt)
     Exqlite.Sqlite3.close(state.conn)
     :persistent_term.erase({__MODULE__, state.store, :series_cache})
+    :persistent_term.erase({__MODULE__, state.store, :query_frame_features})
     :ets.delete(state.cache)
     :ok
   end
@@ -686,6 +745,17 @@ defmodule TimelessMetrics.LibsqlEngine do
              TimelessMetrics.LabelMatch.match?(cached_labels_by_sid(cache, sid), compiled)
            end)}
       end
+    end
+  end
+
+  defp raw_point_rows_exact(store, metric, labels, from, to) do
+    if series_id_pushdown?(store) do
+      case cached_series_id(store, metric, labels) do
+        {:ok, sid} -> read_raw_points_by_id(store, [metric, from, to, sid])
+        :miss -> raw_point_rows(store, metric, labels, from, to)
+      end
+    else
+      raw_point_rows(store, metric, labels, from, to)
     end
   end
 
@@ -783,6 +853,84 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
   end
 
+  defp aggregate_multi_rows(store, metric, filter, from, to, agg) do
+    if frame_feature?(store, @aggregate_frame_module) do
+      case aggregate_frame_rows(store, metric, filter, from, to, agg) do
+        {:error, :query_frame_unavailable} -> aggregate_rows(store, metric, filter, from, to, agg)
+        result -> result
+      end
+    else
+      aggregate_rows(store, metric, filter, from, to, agg)
+    end
+  end
+
+  defp aggregate_frame_rows(store, metric, filter, from, to, agg) do
+    case TimelessMetrics.LabelMatch.split_libsql_pushdown(filter) do
+      :none ->
+        {:ok, []}
+
+      {pushdown, residual} ->
+        with {:ok, frame_rows} <-
+               read_aggregate_frame(store, [
+                 metric,
+                 encode_json(pushdown),
+                 from,
+                 to,
+                 Atom.to_string(agg)
+               ]),
+             {:ok, rows} <- decode_aggregate_frame_rows(frame_rows, agg),
+             :ok <- ensure_cached_labels(store, metric, rows) do
+          {:ok, filter_aggregate_rows(store, rows, residual)}
+        end
+    end
+  end
+
+  defp decode_aggregate_frame_rows([], _expected_aggregate), do: {:ok, []}
+
+  defp decode_aggregate_frame_rows([[frame]], expected_aggregate) when is_binary(frame) do
+    case TimelessMetrics.RustEngine.Nif.decode_aggregate_frame(frame) do
+      {:ok, {^expected_aggregate, rows}} ->
+        {:ok, rows}
+
+      {:ok, {actual_aggregate, _rows}} ->
+        {:error,
+         "timeless_aggregate_frame returned #{actual_aggregate} for #{expected_aggregate} query"}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp decode_aggregate_frame_rows(rows, _expected_aggregate) do
+    {:error, "timeless_aggregate_frame returned #{length(rows)} malformed rows"}
+  end
+
+  defp filter_aggregate_rows(_store, rows, []), do: rows
+
+  defp filter_aggregate_rows(store, rows, residual) do
+    compiled = TimelessMetrics.LabelMatch.compile(residual)
+    cache = cache_ref(store)
+
+    Enum.filter(rows, fn row ->
+      {sid, _value} = aggregate_row(row)
+      TimelessMetrics.LabelMatch.match?(cached_labels_by_sid(cache, sid), compiled)
+    end)
+  end
+
+  defp aggregate_rows_exact(store, metric, labels, from, to, agg) do
+    if series_id_pushdown?(store) do
+      case cached_series_id(store, metric, labels) do
+        {:ok, sid} ->
+          read_aggregate_by_id(store, [metric, from, to, Atom.to_string(agg), sid])
+
+        :miss ->
+          aggregate_rows(store, metric, labels, from, to, agg)
+      end
+    else
+      aggregate_rows(store, metric, labels, from, to, agg)
+    end
+  end
+
   defp latest_rows(store, metric, filter, from, to) do
     case TimelessMetrics.LabelMatch.split_libsql_pushdown(filter) do
       :none ->
@@ -805,6 +953,71 @@ defmodule TimelessMetrics.LibsqlEngine do
                end)}
           end
         end
+    end
+  end
+
+  defp latest_multi_rows(store, metric, filter, from, to) do
+    if frame_feature?(store, @latest_frame_module) do
+      case latest_frame_rows(store, metric, filter, from, to) do
+        {:error, :query_frame_unavailable} -> latest_rows(store, metric, filter, from, to)
+        result -> result
+      end
+    else
+      latest_rows(store, metric, filter, from, to)
+    end
+  end
+
+  defp latest_frame_rows(store, metric, filter, from, to) do
+    case TimelessMetrics.LabelMatch.split_libsql_pushdown(filter) do
+      :none ->
+        {:ok, []}
+
+      {pushdown, residual} ->
+        with {:ok, frame_rows} <-
+               read_latest_frame(store, [metric, encode_json(pushdown), from, to]),
+             {:ok, rows} <- decode_latest_frame_rows(frame_rows),
+             :ok <- ensure_cached_labels(store, metric, rows) do
+          {:ok, filter_latest_rows(store, rows, residual)}
+        end
+    end
+  end
+
+  defp decode_latest_frame_rows([]), do: {:ok, []}
+
+  defp decode_latest_frame_rows([[frame]]) when is_binary(frame) do
+    TimelessMetrics.RustEngine.Nif.decode_latest_frame(frame)
+  end
+
+  defp decode_latest_frame_rows(rows) do
+    {:error, "timeless_latest_frame returned #{length(rows)} malformed rows"}
+  end
+
+  defp filter_latest_rows(_store, rows, []), do: rows
+
+  defp filter_latest_rows(store, rows, residual) do
+    compiled = TimelessMetrics.LabelMatch.compile(residual)
+    cache = cache_ref(store)
+
+    Enum.filter(rows, fn row ->
+      {sid, _timestamp, _value} = latest_row(row)
+      TimelessMetrics.LabelMatch.match?(cached_labels_by_sid(cache, sid), compiled)
+    end)
+  end
+
+  defp aggregate_row([sid, value]), do: {sid, value}
+  defp aggregate_row({sid, value}), do: {sid, value}
+
+  defp latest_row([sid, timestamp, value]), do: {sid, timestamp, value}
+  defp latest_row({sid, timestamp, value}), do: {sid, timestamp, value}
+
+  defp latest_rows_exact(store, metric, labels, from, to) do
+    if series_id_pushdown?(store) do
+      case cached_series_id(store, metric, labels) do
+        {:ok, sid} -> read_latest_by_id(store, [metric, from, to, sid])
+        :miss -> latest_rows(store, metric, labels, from, to)
+      end
+    else
+      latest_rows(store, metric, labels, from, to)
     end
   end
 
@@ -883,12 +1096,42 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
   end
 
+  defp read_raw_points_by_id(store, params) do
+    with :ok <- read_barrier(store) do
+      if target = select_reader(store) do
+        GenServer.call(target, {:raw_points_by_id, params}, :infinity)
+      else
+        write_sql(store, raw_points_by_id_sql(), params)
+      end
+    end
+  end
+
   defp read_raw_frame(store, params) do
     with :ok <- read_barrier(store) do
       if target = select_reader(store) do
         GenServer.call(target, {:raw_frame, params}, :infinity)
       else
         write_sql(store, raw_frame_sql(), params)
+      end
+    end
+  end
+
+  defp read_aggregate_frame(store, params) do
+    with :ok <- read_barrier(store) do
+      if target = select_reader(store) do
+        GenServer.call(target, {:aggregate_frame, params}, :infinity)
+      else
+        write_sql(store, aggregate_frame_sql(), params)
+      end
+    end
+  end
+
+  defp read_latest_frame(store, params) do
+    with :ok <- read_barrier(store) do
+      if target = select_reader(store) do
+        GenServer.call(target, {:latest_frame, params}, :infinity)
+      else
+        write_sql(store, latest_frame_sql(), params)
       end
     end
   end
@@ -903,12 +1146,32 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
   end
 
+  defp read_aggregate_by_id(store, params) do
+    with :ok <- read_barrier(store) do
+      if target = select_reader(store) do
+        GenServer.call(target, {:aggregate_by_id, params}, :infinity)
+      else
+        write_sql(store, aggregate_by_id_sql(), params)
+      end
+    end
+  end
+
   defp read_latest(store, params) do
     with :ok <- read_barrier(store) do
       if target = select_reader(store) do
         GenServer.call(target, {:latest, params}, :infinity)
       else
         write_sql(store, latest_sql(), params)
+      end
+    end
+  end
+
+  defp read_latest_by_id(store, params) do
+    with :ok <- read_barrier(store) do
+      if target = select_reader(store) do
+        GenServer.call(target, {:latest_by_id, params}, :infinity)
+      else
+        write_sql(store, latest_by_id_sql(), params)
       end
     end
   end
@@ -1061,6 +1324,30 @@ defmodule TimelessMetrics.LibsqlEngine do
         end
     end
   end
+
+  defp frame_feature?(store, module) do
+    MapSet.member?(query_frame_features(store), module)
+  end
+
+  # The first extension revision with packed query frames is also the first
+  # with output-column series_id constraint pushdown. Older extensions accept
+  # the WHERE clause but apply it only after scanning every candidate series,
+  # so keep their selective label-filter plans as the compatibility route.
+  defp series_id_pushdown?(store) do
+    frame_feature?(store, @aggregate_frame_module) and
+      frame_feature?(store, @latest_frame_module)
+  end
+
+  defp cached_series_id(store, metric, labels) when is_map(labels) do
+    key = {metric, labels}
+
+    case :ets.lookup(cache_ref(store), key) do
+      [{^key, sid}] -> {:ok, sid}
+      [] -> :miss
+    end
+  end
+
+  defp cached_series_id(_store, _metric, _labels), do: :miss
 
   defp cached_resolved_entries(cache, entries) do
     entries
@@ -1433,6 +1720,7 @@ defmodule TimelessMetrics.LibsqlEngine.Reader do
   def init(opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
     conn = TimelessMetrics.LibsqlEngine.open_connection(Path.join(data_dir, "metrics.db"))
+    query_frame_features = TimelessMetrics.LibsqlEngine.detect_query_frame_features(conn)
 
     {:ok, raw_stmt} =
       Exqlite.Sqlite3.prepare(conn, TimelessMetrics.LibsqlEngine.raw_batches_sql())
@@ -1440,14 +1728,39 @@ defmodule TimelessMetrics.LibsqlEngine.Reader do
     {:ok, raw_points_stmt} =
       Exqlite.Sqlite3.prepare(conn, TimelessMetrics.LibsqlEngine.raw_points_sql())
 
+    {:ok, raw_points_by_id_stmt} =
+      Exqlite.Sqlite3.prepare(conn, TimelessMetrics.LibsqlEngine.raw_points_by_id_sql())
+
     {:ok, raw_frame_stmt} =
       Exqlite.Sqlite3.prepare(conn, TimelessMetrics.LibsqlEngine.raw_frame_sql())
+
+    aggregate_frame_stmt =
+      prepare_optional(
+        conn,
+        query_frame_features,
+        "timeless_aggregate_frame",
+        TimelessMetrics.LibsqlEngine.aggregate_frame_sql()
+      )
+
+    latest_frame_stmt =
+      prepare_optional(
+        conn,
+        query_frame_features,
+        "timeless_latest_frame",
+        TimelessMetrics.LibsqlEngine.latest_frame_sql()
+      )
 
     {:ok, aggregate_stmt} =
       Exqlite.Sqlite3.prepare(conn, TimelessMetrics.LibsqlEngine.aggregate_sql())
 
+    {:ok, aggregate_by_id_stmt} =
+      Exqlite.Sqlite3.prepare(conn, TimelessMetrics.LibsqlEngine.aggregate_by_id_sql())
+
     {:ok, latest_stmt} =
       Exqlite.Sqlite3.prepare(conn, TimelessMetrics.LibsqlEngine.latest_sql())
+
+    {:ok, latest_by_id_stmt} =
+      Exqlite.Sqlite3.prepare(conn, TimelessMetrics.LibsqlEngine.latest_by_id_sql())
 
     {:ok, window_stmt} =
       Exqlite.Sqlite3.prepare(conn, TimelessMetrics.LibsqlEngine.window_sql())
@@ -1463,9 +1776,14 @@ defmodule TimelessMetrics.LibsqlEngine.Reader do
        conn: conn,
        raw_stmt: raw_stmt,
        raw_points_stmt: raw_points_stmt,
+       raw_points_by_id_stmt: raw_points_by_id_stmt,
        raw_frame_stmt: raw_frame_stmt,
+       aggregate_frame_stmt: aggregate_frame_stmt,
+       latest_frame_stmt: latest_frame_stmt,
        aggregate_stmt: aggregate_stmt,
+       aggregate_by_id_stmt: aggregate_by_id_stmt,
        latest_stmt: latest_stmt,
+       latest_by_id_stmt: latest_by_id_stmt,
        window_stmt: window_stmt,
        window_batches_stmt: window_batches_stmt,
        rollup_batches_stmt: rollup_batches_stmt
@@ -1494,16 +1812,44 @@ defmodule TimelessMetrics.LibsqlEngine.Reader do
     {:reply, execute_prepared_query(state.conn, state.raw_points_stmt, params), state}
   end
 
+  def handle_call({:raw_points_by_id, params}, _from, state) do
+    {:reply, execute_prepared_query(state.conn, state.raw_points_by_id_stmt, params), state}
+  end
+
   def handle_call({:raw_frame, params}, _from, state) do
     {:reply, execute_prepared_query(state.conn, state.raw_frame_stmt, params), state}
+  end
+
+  def handle_call({:aggregate_frame, _params}, _from, %{aggregate_frame_stmt: nil} = state) do
+    {:reply, {:error, :query_frame_unavailable}, state}
+  end
+
+  def handle_call({:aggregate_frame, params}, _from, state) do
+    {:reply, execute_prepared_query(state.conn, state.aggregate_frame_stmt, params), state}
+  end
+
+  def handle_call({:latest_frame, _params}, _from, %{latest_frame_stmt: nil} = state) do
+    {:reply, {:error, :query_frame_unavailable}, state}
+  end
+
+  def handle_call({:latest_frame, params}, _from, state) do
+    {:reply, execute_prepared_query(state.conn, state.latest_frame_stmt, params), state}
   end
 
   def handle_call({:aggregate, params}, _from, state) do
     {:reply, execute_prepared_query(state.conn, state.aggregate_stmt, params), state}
   end
 
+  def handle_call({:aggregate_by_id, params}, _from, state) do
+    {:reply, execute_prepared_query(state.conn, state.aggregate_by_id_stmt, params), state}
+  end
+
   def handle_call({:latest, params}, _from, state) do
     {:reply, execute_prepared_query(state.conn, state.latest_stmt, params), state}
+  end
+
+  def handle_call({:latest_by_id, params}, _from, state) do
+    {:reply, execute_prepared_query(state.conn, state.latest_by_id_stmt, params), state}
   end
 
   def handle_call({:window, params}, _from, state) do
@@ -1522,14 +1868,29 @@ defmodule TimelessMetrics.LibsqlEngine.Reader do
   def terminate(_reason, state) do
     Exqlite.Sqlite3.release(state.conn, state.raw_stmt)
     Exqlite.Sqlite3.release(state.conn, state.raw_points_stmt)
+    Exqlite.Sqlite3.release(state.conn, state.raw_points_by_id_stmt)
     Exqlite.Sqlite3.release(state.conn, state.raw_frame_stmt)
+    release_optional(state.conn, state.aggregate_frame_stmt)
+    release_optional(state.conn, state.latest_frame_stmt)
     Exqlite.Sqlite3.release(state.conn, state.aggregate_stmt)
+    Exqlite.Sqlite3.release(state.conn, state.aggregate_by_id_stmt)
     Exqlite.Sqlite3.release(state.conn, state.latest_stmt)
+    Exqlite.Sqlite3.release(state.conn, state.latest_by_id_stmt)
     Exqlite.Sqlite3.release(state.conn, state.window_stmt)
     Exqlite.Sqlite3.release(state.conn, state.window_batches_stmt)
     Exqlite.Sqlite3.release(state.conn, state.rollup_batches_stmt)
     Exqlite.Sqlite3.close(state.conn)
   end
+
+  defp prepare_optional(conn, features, module, sql) do
+    if MapSet.member?(features, module) do
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, sql)
+      stmt
+    end
+  end
+
+  defp release_optional(_conn, nil), do: :ok
+  defp release_optional(conn, stmt), do: Exqlite.Sqlite3.release(conn, stmt)
 
   defp execute_prepared_query(conn, stmt, params) do
     retry_read_conflict(fn -> execute_prepared_query_once(conn, stmt, params) end)
