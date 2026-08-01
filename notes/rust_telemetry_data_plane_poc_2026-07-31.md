@@ -1,10 +1,10 @@
-# Deferred Rust telemetry data-plane POC
+# Rust telemetry data-plane POC
 
-Status: captured for a fresh branch after the libSQL storage migration, its
-query-performance gates, and the standalone SQLite query API completion plan
-in `timeless-libsql` are complete. This proposal is deliberately out of scope
-for `feat/libsql-storage-engine`; the completed storage and extension work
-remains useful to it unchanged.
+Status: active on `poc/rust-telemetry-data-plane` as of 2026-08-01. The libSQL
+storage migration, standalone query API, and Rust logs API POC are complete and
+merged. The metrics slice is next. Its implementation plan lives in
+`timeless-libsql/METRICS_API_POC_PLAN.md`; this note records the product and
+process boundary.
 
 ## Motivation
 
@@ -101,6 +101,44 @@ product state may use a separate small database. If a single artifact for both
 telemetry and product state becomes a requirement, product tables should be
 accessed through a Rust control API rather than opened by two owners.
 
+## What the logs POC taught us
+
+The logs POC validated this process boundary, but only after rejecting two
+false starts that reimplemented storage behavior. The metrics work carries
+these lessons as hard constraints:
+
+- The POC is an API experiment. It loads the existing extension and uses the
+  established metrics virtual table, batch formats, automatic flush,
+  compaction, rollups, retention, and query TVFs unchanged.
+- The primary control is the current Elixir HTTP API using `engine: :libsql`,
+  because that isolates the API/runtime boundary. The Rust block engine remains
+  a secondary product comparison.
+- HTTP admission and SQLite completion are measured separately, with queue
+  depth/age and a final ordered drain. Storage throughput is never inferred
+  from `204` response rate.
+- Request bodies are parsed once into the native columnar batch. There is no
+  arbitrary point threshold, per-request compression layer, request-boundary
+  flush, or benchmark-only block writer.
+- Useful query and maintenance work belongs in `timeless-libsql` when direct
+  SQLite users can consume it. The server composes public surfaces rather than
+  hiding API-only storage shortcuts.
+- Peak memory, maintenance amplification, logical compressed bytes, and
+  physical SQLite file high-water are first-class results. Faster latency does
+  not excuse database-sized retained payloads or imply that optimize vacuums.
+- Reader count, admission fairness, and host transaction grouping are chosen
+  from queue/completion evidence. The logs POC selected two readers and
+  rejected the other mechanisms; metrics must run its own sweep.
+- Auth, cluster administration, product routes, and a generic three-signal
+  framework are not POC milestones. The logs POC proved that spending effort
+  there before the data path only obscures the question being tested.
+
+The logs result was strong: under two query workers the Rust/libSQL API matched
+completed ingest, improved query p99 from 1.61s to 261ms, and reduced process
+HWM from 1.66GiB to 62MiB. Its remaining operational tradeoff is equally
+important: SQLite's live compressed payload was smaller, but without vacuum the
+post-compaction file retained its high-water allocation. Metrics must report
+that behavior rather than hiding it behind logical codec bytes.
+
 ## Candidate Rust layout
 
 Build on the existing `timeless-codec`, `timeless-core`, and `timeless-ext`
@@ -110,10 +148,12 @@ crates:
   planning/evaluation over explicit storage traits
 - `timeless-protocol`: Prometheus, VictoriaMetrics, VictoriaLogs, OTLP, and
   Jaeger request/response models and codecs
-- `timeless-api`: route handlers, authentication hooks, limits, cancellation,
-  streaming, and response construction
+- `timeless-metrics-api` (POC): metrics route handlers, limits, cancellation,
+  and response construction. Keep the descriptive signal name until a second
+  implementation proves which machinery is actually generic.
 - `timelessd`: standalone server binary which loads or embeds the existing
-  extension and owns the database connections
+  extension and owns the database connections; this is a post-POC product
+  candidate, not the first metrics binary name
 - `TimelessStack.DataClient`: a thin Elixir client used by Canvas and Stack
 
 The loadable extension remains a first-class product for direct SQLite/libSQL
@@ -127,17 +167,19 @@ Rust query crates, and a standalone server without requiring the BEAM.
 Create the POC on a fresh branch from the completed storage/query migration,
 not on `feat/libsql-storage-engine`.
 
-The first vertical slice should use metrics only:
+The first vertical slice uses metrics only:
 
-1. Start `timelessd` as a separately supervised OS child.
-2. Load the same `timeless-libsql` extension and own one metrics database.
-3. Implement health, Prometheus text ingest, exact/raw range query, labels, and
+1. Pin the current Elixir+libSQL HTTP behavior and performance before writing
+   server code.
+2. Start `timeless-metrics-api` as a separately supervised OS child.
+3. Load the same `timeless-libsql` extension and own one metrics database.
+4. Implement health, Prometheus text ingest, exact/raw range query, labels, and
    one aggregate query through the existing public storage interfaces.
-4. Return final wire-format responses from Rust without materializing points in
+5. Return final wire-format responses from Rust without materializing points in
    the BEAM.
-5. Add an Elixir client adapter and switch one Canvas query path without
+6. Add an Elixir client adapter and switch one Canvas query path without
    changing its public result.
-6. Run byte/semantic differential tests against the current Elixir HTTP API and
+7. Run byte/semantic differential tests against the current Elixir HTTP API and
    compare throughput, latency, peak memory, cancellation, and crash isolation.
 
 POC success means:
@@ -162,7 +204,10 @@ If the metrics POC succeeds:
 6. Move storage operations and remove Rocket from the three telemetry apps.
 7. Decide separately whether any remaining product routes belong in Rust.
 
-A useful metrics vertical slice is expected to take several weeks. Full
-three-signal API, PromQL, packaging, and production hardening is a multi-month
-project; compatibility and operational correctness are the larger risks than
-route translation.
+The detailed work is split into seven independently measurable sessions in
+`timeless-libsql/METRICS_API_POC_PLAN.md`: baseline, server/storage contract,
+native ingest, mechanical reads/discovery, one PromQL vertical, Elixir client
+and crash isolation, then scheduling/maintenance/final verdict. Full
+three-signal API, PromQL, packaging, and production hardening remains a
+multi-month project; compatibility and operational correctness are the larger
+risks than route translation.
