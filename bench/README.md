@@ -59,8 +59,16 @@ This directory contains the current benchmark set for `timeless_metrics`.
   Note: the current read side uses `/health/detailed` as the stable GET path while rust HTTP query benchmarks are still being hardened.
 
 - [realistic_workload.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/realistic_workload.exs)
-  End-to-end HTTP workload generator with ramp-up behavior.
-  Use this to find saturation points and observe throughput/latency tradeoffs under a more production-like traffic mix.
+  Deterministic end-to-end HTTP workload generator with ramp-up behavior,
+  separate offered/admitted/completed throughput, queue age/depth, and an
+  explicit final drain barrier. Use this to find saturation points and observe
+  throughput/latency tradeoffs under a more production-like traffic mix.
+
+- [http_baseline_server.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/http_baseline_server.exs)
+  Starts one isolated Elixir HTTP control over either libSQL or the Rust block
+  engine, with configurable readers/workers and optional deferred scheduled
+  maintenance. Use it with `realistic_workload.exs` for fresh-process API
+  comparisons; compile once, then run both processes with `--no-compile`.
 
 - [tsbs_bench.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/tsbs_bench.exs)
   TSBS harness that starts a local TimelessMetrics HTTP endpoint and prints the commands needed to run the external TSBS tools.
@@ -82,6 +90,10 @@ This directory contains the current benchmark set for `timeless_metrics`.
 - Prefer `vs_victoriametrics.exs` only when you specifically need a product-to-product comparison.
 
 ## Historical Results
+
+- [results/2026-08-01_metrics_api_session0.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session0.md)
+  Rust metrics API POC Session 0 compatibility contract and completion-aware
+  fresh-process Elixir+libSQL/Rust-block baseline.
 
 - [results/2026-08-01_standalone_query_adoption.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_standalone_query_adoption.md)
   Session 6 adoption of selected-ID reads and the TAF1/TLF1 aggregate/latest

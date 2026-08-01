@@ -211,3 +211,9 @@ and crash isolation, then scheduling/maintenance/final verdict. Full
 three-signal API, PromQL, packaging, and production hardening remains a
 multi-month project; compatibility and operational correctness are the larger
 risks than route translation.
+
+Session 0 completed on 2026-08-01. Its executable compatibility contract,
+completion-aware harness, six fresh-process control runs, HWM/storage data, and
+boundary verdict are recorded in
+`bench/results/2026-08-01_metrics_api_session0.md`. Session 1 can begin without
+conflating HTTP admission, Elixir/libSQL behavior, and the Rust block engine.

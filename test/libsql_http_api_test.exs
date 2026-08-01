@@ -57,14 +57,29 @@ defmodule TimelessMetrics.LibsqlHTTPAPITest do
 
     assert %{status: 204} = TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", json)
 
-    prometheus = "http_prom{host=\"web-2\"} 8.5 #{now_ms}\n"
+    prometheus = "http_prom{host=\"web-2\"} 8.5 #{now_ms}\nmalformed line\n"
 
     assert %{status: 204} =
              TimelessMetrics.TestHTTP.post(@port, "/api/v1/import/prometheus", prometheus,
                content_type: "text/plain"
              )
 
-    assert :ok = TimelessMetrics.flush(@store)
+    flush = TimelessMetrics.TestHTTP.post(@port, "/api/v1/flush", "")
+    assert flush.status == 200
+
+    assert %{
+             "status" => "ok",
+             "admitted_batches" => 2,
+             "completed_batches" => 2,
+             "completed_points" => 2
+           } = :json.decode(flush.body)
+
+    health = TimelessMetrics.TestHTTP.get(@port, "/health")
+    health_body = :json.decode(health.body)
+    assert health_body["queued_batches"] == 0
+    assert health_body["in_flight_batches"] == 0
+    assert health_body["oldest_queued_ms"] == 0
+    assert health_body["import_errors"] == 1
 
     assert {:ok, [{^now_s, 7.5}]} =
              TimelessMetrics.query(@store, "http_json", %{"host" => "web-1"},
@@ -94,6 +109,13 @@ defmodule TimelessMetrics.LibsqlHTTPAPITest do
     assert health_body["status"] == "ok"
     assert health_body["series"] == 1
     assert health_body["points"] == 1
+    assert is_integer(health_body["completed_points"])
+    assert is_integer(health_body["admitted_batches"])
+    assert is_integer(health_body["completed_batches"])
+    assert is_integer(health_body["queued_batches"])
+    assert is_integer(health_body["in_flight_batches"])
+    assert is_integer(health_body["oldest_queued_ms"])
+    assert is_integer(health_body["import_errors"])
 
     query =
       URI.encode_query(%{
