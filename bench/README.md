@@ -62,7 +62,19 @@ This directory contains the current benchmark set for `timeless_metrics`.
   Deterministic end-to-end HTTP workload generator with ramp-up behavior,
   separate offered/admitted/completed throughput, queue age/depth, and an
   explicit final drain barrier. Use this to find saturation points and observe
-  throughput/latency tradeoffs under a more production-like traffic mix.
+  throughput/latency tradeoffs under a more production-like traffic mix. Its
+  query default remains `promql`; pass `--query-format native` only for the
+  metrics API POC's pre-PromQL exact latest/range comparison.
+
+- [metrics_api_seed.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/metrics_api_seed.exs)
+  Seeds separate API processes with an identical fixed Prometheus fixture and
+  flushes it. Pair it with `metrics_api_reads.exs`; do not compare read paths
+  over saturation runs that completed different point counts.
+
+- [metrics_api_reads.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/metrics_api_reads.exs)
+  Sequential socket-to-body benchmark for Session 3 latest, native range,
+  export, label, and series shapes. It anchors bounds to exact latest and
+  reports response bytes so empty or differently phased controls are rejected.
 
 - [http_baseline_server.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/http_baseline_server.exs)
   Starts one isolated Elixir HTTP control over either libSQL or the Rust block
@@ -90,6 +102,11 @@ This directory contains the current benchmark set for `timeless_metrics`.
 - Prefer `vs_victoriametrics.exs` only when you specifically need a product-to-product comparison.
 
 ## Historical Results
+
+- [results/2026-08-01_metrics_api_session3.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session3.md)
+  Rust metrics API POC Session 3 mechanical read/discovery implementation,
+  fixed-fixture route comparison, mixed native read/write result, packed-frame
+  accounting, memory, and control label-cache observation.
 
 - [results/2026-08-01_metrics_api_session2.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session2.md)
   Rust metrics API POC Session 2 native Prometheus/VictoriaMetrics ingest,

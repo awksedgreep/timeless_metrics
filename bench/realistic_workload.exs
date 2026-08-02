@@ -105,7 +105,8 @@ defmodule RealisticWorkload do
           warmup: :integer,
           batch: :integer,
           seed: :integer,
-          write_format: :string
+          write_format: :string,
+          query_format: :string
         ]
       )
 
@@ -124,6 +125,7 @@ defmodule RealisticWorkload do
     batch_size = opts[:batch] || 1
     seed = opts[:seed] || 42
     write_format = parse_write_format(opts[:write_format] || "prometheus")
+    query_format = parse_query_format(opts[:query_format] || "promql")
 
     fixed_steps =
       case opts[:steps] do
@@ -155,7 +157,8 @@ defmodule RealisticWorkload do
       ramp_factor: ramp_factor,
       batch_size: batch_size,
       seed: seed,
-      write_format: write_format
+      write_format: write_format,
+      query_format: query_format
     }
 
     # --- Header ---
@@ -179,7 +182,7 @@ defmodule RealisticWorkload do
     IO.puts("  Step dur:    #{step_dur}s (#{settle_s}s settle, #{warmup_s}s warmup)")
     IO.puts("  Batch:       #{batch_size} device#{if batch_size > 1, do: "s", else: ""}/POST")
     IO.puts("  Write format: #{write_format}")
-    IO.puts("  Queries:     #{query_workers} workers (ramped with writes)")
+    IO.puts("  Queries:     #{query_workers} workers, #{query_format} (ramped with writes)")
     IO.puts("  Seed:        #{seed}")
     IO.puts("  Mode:        sequential (full client capacity per target)")
     IO.puts("  TM:          #{tm_url}")
@@ -295,7 +298,16 @@ defmodule RealisticWorkload do
           Task.async(fn ->
             seed_rng(cfg.seed, :query, i)
 
-            query_loop(device_structs, client, stop, interval_ms, query_ets, query_id, query_ctr)
+            query_loop(
+              device_structs,
+              client,
+              stop,
+              interval_ms,
+              query_ets,
+              query_id,
+              query_ctr,
+              cfg.query_format
+            )
           end)
         end
       else
@@ -560,11 +572,11 @@ defmodule RealisticWorkload do
 
   # --- Query loop (aggressive ramp, paced to write interval / 5) ---
 
-  defp query_loop(devices, client, stop, interval_ms, ets, qid, ctr) do
-    do_query(devices, client, stop, interval_ms, ets, qid, ctr)
+  defp query_loop(devices, client, stop, interval_ms, ets, qid, ctr, query_format) do
+    do_query(devices, client, stop, interval_ms, ets, qid, ctr, query_format)
   end
 
-  defp do_query(devices, client, stop, interval_ms, ets, qid, ctr) do
+  defp do_query(devices, client, stop, interval_ms, ets, qid, ctr, query_format) do
     if :atomics.get(stop, 1) == 1 do
       :ok
     else
@@ -572,31 +584,53 @@ defmodule RealisticWorkload do
       dev = Enum.random(devices)
       now = System.os_time(:second)
 
-      run_query(type, metric, dev, now, range_s, step, client, ets, qid, ctr)
+      run_query(type, metric, dev, now, range_s, step, client, ets, qid, ctr, query_format)
 
       # Aggressive pacing: write_interval / 5, floor 5ms
       write_int = :atomics.get(interval_ms, 1)
       q_sleep = max(div(write_int, 5), 5) + :rand.uniform(5)
       Process.sleep(q_sleep)
 
-      do_query(devices, client, stop, interval_ms, ets, qid, ctr)
+      do_query(devices, client, stop, interval_ms, ets, qid, ctr, query_format)
     end
   end
 
-  defp run_query(type, metric, dev, now, range_s, step, client, ets, qid, ctr) do
+  defp run_query(type, metric, dev, now, range_s, step, client, ets, qid, ctr, query_format) do
     query = ~s(#{metric}{host="#{dev.host}"})
 
     {us, result} =
       try do
         case type do
           :instant ->
-            :timer.tc(fn -> Req.get(client, url: "/api/v1/query", params: [query: query]) end)
+            params =
+              case query_format do
+                :promql -> [query: query]
+                :native -> [metric: metric, host: dev.host]
+              end
+
+            :timer.tc(fn -> Req.get(client, url: "/api/v1/query", params: params) end)
 
           :range ->
+            params =
+              case query_format do
+                :promql ->
+                  [query: query, start: now - range_s, end: now, step: step]
+
+                :native ->
+                  [
+                    metric: metric,
+                    host: dev.host,
+                    start: now - range_s,
+                    end: now,
+                    step: step,
+                    aggregate: "avg"
+                  ]
+              end
+
             :timer.tc(fn ->
               Req.get(client,
                 url: "/api/v1/query_range",
-                params: [query: query, start: now - range_s, end: now, step: step]
+                params: params
               )
             end)
         end
@@ -612,6 +646,13 @@ defmodule RealisticWorkload do
       {:ok, %{status: s}} when s in 200..299 -> :ok
       _ -> :counters.add(ctr, 2, 1)
     end
+  end
+
+  defp parse_query_format("promql"), do: :promql
+  defp parse_query_format("native"), do: :native
+
+  defp parse_query_format(other) do
+    raise ArgumentError, "--query-format must be promql or native, got: #{inspect(other)}"
   end
 
   # --- Data generation ---
