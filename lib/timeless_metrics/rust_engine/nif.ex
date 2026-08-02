@@ -37,6 +37,16 @@ defmodule TimelessMetrics.RustEngine.Nif do
   def engine_list_series(_engine, _metric), do: :erlang.nif_error(:nif_not_loaded)
   def engine_info(_engine), do: :erlang.nif_error(:nif_not_loaded)
 
+  # Strict read-only migration surface. These functions use a separate
+  # resource type that cannot be passed to any mutation NIF.
+  def engine_legacy_open(_data_dir), do: :erlang.nif_error(:nif_not_loaded)
+  def engine_legacy_list_series(_reader), do: :erlang.nif_error(:nif_not_loaded)
+
+  def engine_legacy_query_page(_reader, _metric, _labels, _after, _limit),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def engine_legacy_info(_reader), do: :erlang.nif_error(:nif_not_loaded)
+
   # Prometheus text parser (production; wrapped by TimelessMetrics.PrometheusNif)
   def parse_prometheus(_body), do: :erlang.nif_error(:nif_not_loaded)
   # Fused parse -> resolve -> write ingest; returns {:ok, {count, errors}}

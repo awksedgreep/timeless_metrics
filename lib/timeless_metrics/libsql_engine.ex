@@ -205,6 +205,25 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
   end
 
+  @doc false
+  def migration_checkpoint(store, {metric, labels}, points, journal, opts \\ []) do
+    failpoint = Keyword.get(opts, :failpoint)
+    final_page? = Keyword.get(opts, :final_page, false)
+    labels = Map.new(labels)
+
+    blob =
+      points
+      |> Enum.map(fn {timestamp, value} -> {metric, labels, timestamp, value} end)
+      |> encode_named_batch()
+
+    GenServer.call(
+      writer_name(store),
+      {:migration_checkpoint, metric, encode_json(labels), blob, points == [], final_page?,
+       journal, failpoint},
+      :infinity
+    )
+  end
+
   def ingest_prometheus(store, body, default_ts \\ nil) do
     now = default_ts || System.os_time(:second)
     {entries, errors} = TimelessMetrics.PrometheusNif.parse(body)
@@ -587,6 +606,96 @@ defmodule TimelessMetrics.LibsqlEngine do
   end
 
   def handle_call(:cache_ref, _from, state), do: {:reply, state.cache, state}
+
+  def handle_call(
+        {:migration_checkpoint, metric, labels_json, blob, empty?, final_page?, journal,
+         failpoint},
+        _from,
+        state
+      ) do
+    with {:ok, state} <- finish_ingest_transaction(state) do
+      {:ok, _} = TimelessMetrics.DB.execute(state.conn, "BEGIN IMMEDIATE", [])
+
+      try do
+        if empty? do
+          {:ok, _} =
+            TimelessMetrics.DB.execute(
+              state.conn,
+              "INSERT INTO #{@table}(#{@table}, name, labels) VALUES ('resolve', ?1, ?2)",
+              [metric, labels_json]
+            )
+        else
+          {:ok, _} =
+            TimelessMetrics.DB.execute(
+              state.conn,
+              "INSERT INTO #{@table}(#{@table}) VALUES (?1)",
+              [{:blob, blob}]
+            )
+        end
+
+        if final_page? and not empty? do
+          {:ok, _} =
+            TimelessMetrics.DB.execute(
+              state.conn,
+              "INSERT INTO #{@table}(#{@table}) VALUES ('flush')",
+              []
+            )
+        end
+
+        migration_failpoint!(failpoint, :disk_full)
+        migration_failpoint!(failpoint, :after_batch_before_journal)
+
+        {:ok, _} =
+          TimelessMetrics.DB.execute(
+            state.conn,
+            """
+            UPDATE _timeless_migration
+            SET phase = ?1, series_index = ?2, cursor_json = ?3,
+                records_completed = ?4, series_completed = ?5,
+                identity_digest = ?6, updated_at_ns = ?7,
+                checkpoints = checkpoints + 1
+            WHERE singleton = 1
+            """,
+            [
+              journal.phase,
+              journal.series_index,
+              journal.cursor_json,
+              journal.records_completed,
+              journal.series_completed,
+              journal.identity_digest,
+              journal.updated_at_ns
+            ]
+          )
+
+        {:ok, _} =
+          TimelessMetrics.DB.execute(
+            state.conn,
+            """
+            INSERT INTO _timeless_migration_events
+              (phase, series_index, cursor_json, records_completed, at_ns)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            """,
+            [
+              journal.phase,
+              journal.series_index,
+              journal.cursor_json,
+              journal.records_completed,
+              journal.updated_at_ns
+            ]
+          )
+
+        migration_failpoint!(failpoint, :after_journal_before_commit)
+        {:ok, _} = TimelessMetrics.DB.execute(state.conn, "COMMIT", [])
+        {:reply, :ok, state}
+      rescue
+        error ->
+          _ = TimelessMetrics.DB.execute(state.conn, "ROLLBACK", [])
+          {:reply, {:error, Exception.message(error)}, state}
+      end
+    else
+      {{:error, _} = error, state} -> {:reply, error, state}
+    end
+  end
 
   def handle_call({:insert, value}, _from, state) do
     case ensure_ingest_transaction(state) do
@@ -1308,7 +1417,12 @@ defmodule TimelessMetrics.LibsqlEngine do
   end
 
   defp extension_path do
-    Application.app_dir(:timeless_metrics, "priv/native/timeless_sqlite_ext.so")
+    System.get_env("TIMELESS_EXT_PATH") ||
+      Application.get_env(
+        :timeless_metrics,
+        :extension_path,
+        Application.app_dir(:timeless_metrics, "priv/native/timeless_sqlite_ext.so")
+      )
   end
 
   defp cache_ref(store) do
@@ -1447,7 +1561,8 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
   end
 
-  defp encode_named_batch(entries) do
+  @doc false
+  def encode_named_batch(entries) do
     {series, index_by_key} =
       entries
       |> Enum.map(fn {metric, labels, _ts, _value} -> {metric, Map.new(labels)} end)
@@ -1522,7 +1637,8 @@ defmodule TimelessMetrics.LibsqlEngine do
   defp encode_json(value), do: value |> :json.encode() |> IO.iodata_to_binary()
   defp decode_json(value), do: :json.decode(value)
 
-  defp decode_point_batch(<<n::unsigned-little-32, rest::binary>>) do
+  @doc false
+  def decode_point_batch(<<n::unsigned-little-32, rest::binary>>) do
     column_bytes = n * 8
 
     case rest do
@@ -1534,9 +1650,15 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
   end
 
-  defp decode_point_batch(blob) do
+  def decode_point_batch(blob) do
     raise "timeless_raw_batches returned a truncated #{byte_size(blob)}-byte point blob"
   end
+
+  defp migration_failpoint!(configured, configured) do
+    raise "injected migration failure at #{configured}"
+  end
+
+  defp migration_failpoint!(_configured, _point), do: :ok
 
   defp decode_point_columns(<<>>, <<>>, acc), do: Enum.reverse(acc)
 

@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use rayon::prelude::*;
 use rustler::types::tuple::make_tuple;
 use rustler::{Atom, Binary, Encoder, Env, ResourceArc, Term};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -478,11 +478,57 @@ struct EngineResource {
     engine: Engine,
 }
 
+/// A deliberately separate resource type for release migration.  It exposes
+/// no mutation NIFs, so a caller cannot accidentally flush, compact, recover,
+/// or otherwise alter the rollback source through this handle.
+struct LegacyReaderResource {
+    engine: Engine,
+}
+
 unsafe impl Send for EngineResource {}
 unsafe impl Sync for EngineResource {}
 impl std::panic::RefUnwindSafe for EngineResource {}
 impl std::panic::UnwindSafe for EngineResource {}
 impl rustler::Resource for EngineResource {}
+
+unsafe impl Send for LegacyReaderResource {}
+unsafe impl Sync for LegacyReaderResource {}
+impl std::panic::RefUnwindSafe for LegacyReaderResource {}
+impl std::panic::UnwindSafe for LegacyReaderResource {}
+impl rustler::Resource for LegacyReaderResource {}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LegacyPointKey {
+    timestamp: i64,
+    value_bits: u64,
+    relative_path: String,
+    data_offset: u64,
+    ordinal: u64,
+}
+
+type LegacyCursor = (i64, u64, String, u64, u64);
+
+impl LegacyPointKey {
+    fn from_cursor(cursor: LegacyCursor) -> Self {
+        Self {
+            timestamp: cursor.0,
+            value_bits: cursor.1,
+            relative_path: cursor.2,
+            data_offset: cursor.3,
+            ordinal: cursor.4,
+        }
+    }
+
+    fn cursor(&self) -> LegacyCursor {
+        (
+            self.timestamp,
+            self.value_bits,
+            self.relative_path.clone(),
+            self.data_offset,
+            self.ordinal,
+        )
+    }
+}
 
 struct CompressedPartition {
     key: PartitionKey,
@@ -588,6 +634,151 @@ impl Engine {
         Self::recover_compaction_manifest(&engine.data_dir);
         engine.rebuild_index();
         engine
+    }
+
+    /// Open a stopped legacy store without executing any recovery or cleanup.
+    /// Unlike the normal engine constructor this fails on a corrupt registry,
+    /// an interrupted compaction, an orphan temporary file, or an unreadable
+    /// chunk.  Those states need the previous release's recovery path; a
+    /// migration is never allowed to repair its immutable rollback source.
+    fn new_read_only(data_dir: PathBuf) -> EngineResult<Self> {
+        let registry = SeriesRegistry::load(&Self::series_path(&data_dir))
+            .map_err(|error| format!("cannot read legacy series registry: {error}"))?;
+        let instance_id = 0;
+        let engine = Engine {
+            data_dir,
+            flush_threshold: 4096,
+            min_flush_size: 64,
+            compression_level: 8,
+            memory_budget: usize::MAX,
+            defer_compression: false,
+            partitions: DashMap::new(),
+            index: RwLock::new(BTreeMap::new()),
+            series: RwLock::new(registry),
+            created_dirs: Mutex::new(HashSet::new()),
+            flush_queue: Mutex::new(Vec::new()),
+            buffer_memory: AtomicUsize::new(0),
+            batch_counter: AtomicUsize::new(0),
+            chunk_seq: AtomicU64::new(0),
+            instance_id,
+            cold_flush_running: AtomicBool::new(false),
+            compaction_running: AtomicBool::new(false),
+            resolve_cache: DashMap::new(),
+            file_cache: DashMap::new(),
+        };
+
+        for artifact in [
+            Self::manifest_path(&engine.data_dir),
+            engine.data_dir.join("compaction.manifest.tmp"),
+        ] {
+            if artifact.exists() {
+                return Err(format!(
+                    "legacy source has interrupted compaction artifact {}; reopen it with the previous release before migration",
+                    artifact.display()
+                ));
+            }
+        }
+        engine.rebuild_index_read_only()?;
+        Ok(engine)
+    }
+
+    fn legacy_series(&self) -> Vec<(String, HashMap<String, String>)> {
+        let registry = self.series_read();
+        let mut series = registry
+            .series_info
+            .values()
+            .map(|info| {
+                (
+                    info.metric_name.clone(),
+                    info.labels
+                        .clone()
+                        .into_iter()
+                        .collect::<HashMap<String, String>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        series.sort_by(|left, right| {
+            let left_labels = left.1.iter().collect::<BTreeMap<_, _>>();
+            let right_labels = right.1.iter().collect::<BTreeMap<_, _>>();
+            (left.0.as_str(), left_labels).cmp(&(right.0.as_str(), right_labels))
+        });
+        series
+    }
+
+    fn legacy_query_page(
+        &self,
+        metric: &str,
+        labels: &Labels,
+        after: Option<LegacyCursor>,
+        limit: usize,
+    ) -> EngineResult<(Vec<(i64, f64)>, Option<LegacyCursor>, bool)> {
+        if !(1..=4096).contains(&limit) {
+            return Err("legacy migration page limit must be between 1 and 4096".into());
+        }
+        let series_id = self
+            .series_read()
+            .series_map
+            .get(&(metric.to_owned(), labels.clone()))
+            .copied()
+            .ok_or_else(|| format!("legacy series not found: {metric} {labels:?}"))?;
+        let partition = PartitionKey { series_id };
+        let mut metas = self
+            .index_read()
+            .iter()
+            .filter(|((key, _, _), _)| *key == partition)
+            .map(|(_, meta)| meta.clone())
+            .collect::<Vec<_>>();
+        metas.sort_by(|left, right| {
+            (left.path.as_os_str(), left.data_offset)
+                .cmp(&(right.path.as_os_str(), right.data_offset))
+        });
+
+        let after = after.map(LegacyPointKey::from_cursor);
+        // This max heap retains only the smallest `limit` points after the
+        // cursor.  Each legacy chunk is decoded independently and released
+        // before the next, bounding memory by one chunk plus one public batch.
+        let retained = limit + 1;
+        let mut page = BinaryHeap::<LegacyPointKey>::with_capacity(retained);
+        for meta in metas {
+            let mut one_file_cache = HashMap::new();
+            let points =
+                self.read_chunk_data_cached(&meta, i64::MIN, i64::MAX, &mut one_file_cache)?;
+            let relative_path = meta
+                .path
+                .strip_prefix(&self.data_dir)
+                .map_err(|_| format!("legacy chunk escaped source root: {}", meta.path.display()))?
+                .to_str()
+                .ok_or_else(|| format!("legacy chunk path is not UTF-8: {}", meta.path.display()))?
+                .to_owned();
+            for (ordinal, (timestamp, value)) in points.into_iter().enumerate() {
+                let key = LegacyPointKey {
+                    timestamp,
+                    value_bits: value.to_bits(),
+                    relative_path: relative_path.clone(),
+                    data_offset: meta.data_offset,
+                    ordinal: ordinal as u64,
+                };
+                if after.as_ref().is_some_and(|cursor| key <= *cursor) {
+                    continue;
+                }
+                if page.len() < retained {
+                    page.push(key);
+                } else if page.peek().is_some_and(|largest| key < *largest) {
+                    page.pop();
+                    page.push(key);
+                }
+            }
+        }
+
+        let mut ordered = page.into_sorted_vec();
+        let has_more = ordered.len() > limit;
+        ordered.truncate(limit);
+        let next = ordered.last().map(LegacyPointKey::cursor);
+        let points = ordered
+            .into_iter()
+            .map(|key| (key.timestamp, f64::from_bits(key.value_bits)))
+            .collect();
+        Ok((points, next, has_more))
     }
 
     // ── Series resolution ────────────────────────────────────────────
@@ -1176,15 +1367,15 @@ impl Engine {
             (ts_raw, val_raw)
         } else {
             let config = pco::ChunkConfig::default().with_compression_level(level);
-            let ts_compressed = pco::standalone::simple_compress(ts_slice, &config)
-                .map_err(|err| {
+            let ts_compressed =
+                pco::standalone::simple_compress(ts_slice, &config).map_err(|err| {
                     format!(
                         "failed to compress timestamps for series {}: {err}",
                         key.series_id
                     )
                 })?;
-            let val_compressed = pco::standalone::simple_compress(val_slice, &config)
-                .map_err(|err| {
+            let val_compressed =
+                pco::standalone::simple_compress(val_slice, &config).map_err(|err| {
                     format!(
                         "failed to compress values for series {}: {err}",
                         key.series_id
@@ -2065,6 +2256,84 @@ impl Engine {
         }
     }
 
+    fn rebuild_index_read_only(&self) -> EngineResult<()> {
+        let mut paths = Vec::new();
+        for dir_name in &["chunks", "batches"] {
+            let dir = self.data_dir.join(dir_name);
+            if dir.exists() {
+                self.collect_legacy_paths(&dir, &mut paths)?;
+            }
+        }
+        paths.sort();
+
+        let mut index = self.index_write();
+        for path in paths {
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("pco1") => {
+                    let entries = Self::read_pco1_header(&path).map_err(|error| {
+                        format!("invalid legacy chunk {}: {error}", path.display())
+                    })?;
+                    for (partition, meta) in entries {
+                        index.insert((partition, meta.min_ts, self.next_chunk_seq()), meta);
+                    }
+                }
+                Some("pcb1") => {
+                    let entries = Self::read_pcb1_headers(&path).map_err(|error| {
+                        format!("invalid legacy batch {}: {error}", path.display())
+                    })?;
+                    for (partition, meta) in entries {
+                        index.insert((partition, meta.min_ts, self.next_chunk_seq()), meta);
+                    }
+                }
+                Some("tmp" | "pending") => {
+                    return Err(format!(
+                        "legacy source contains unfinished write {}; reopen it with the previous release before migration",
+                        path.display()
+                    ));
+                }
+                extension => {
+                    return Err(format!(
+                        "legacy source contains unsupported chunk file {} ({extension:?})",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_legacy_paths(
+        &self,
+        dir: &std::path::Path,
+        paths: &mut Vec<PathBuf>,
+    ) -> EngineResult<()> {
+        let mut entries = fs::read_dir(dir)
+            .map_err(|error| format!("cannot scan legacy directory {}: {error}", dir.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot scan legacy directory {}: {error}", dir.display()))?;
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|error| {
+                format!("cannot inspect legacy path {}: {error}", path.display())
+            })?;
+            if file_type.is_symlink() {
+                return Err(format!("legacy source contains symlink {}", path.display()));
+            }
+            if file_type.is_dir() {
+                self.collect_legacy_paths(&path, paths)?;
+            } else if file_type.is_file() {
+                paths.push(path);
+            } else {
+                return Err(format!(
+                    "legacy source contains non-regular path {}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn scan_dir_recursive(&self, dir: &PathBuf, index: &mut BTreeMap<ChunkKey, ChunkMeta>) {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
@@ -2408,9 +2677,7 @@ fn parse_prom_line_into<'a>(
     let name = &line[..name_end];
 
     let rest = if line[name_end] == b'{' {
-        let close = name_end
-            + 1
-            + line[name_end + 1..].iter().position(|&b| b == b'}')?;
+        let close = name_end + 1 + line[name_end + 1..].iter().position(|&b| b == b'}')?;
         parse_prom_labels_into(&line[name_end + 1..close], labels);
         &line[close + 1..]
     } else {
@@ -2489,10 +2756,7 @@ fn slice_term<'a>(env: Env<'a>, body: &Binary<'a>, slice: &[u8]) -> Term<'a> {
 /// that stores these binaries long-term must :binary.copy/1 them first
 /// (see cache_series_id in TimelessMetrics.RustEngine).
 #[rustler::nif(schedule = "DirtyCpu")]
-fn parse_prometheus<'a>(
-    env: Env<'a>,
-    body: Binary<'a>,
-) -> rustler::NifResult<(Term<'a>, usize)> {
+fn parse_prometheus<'a>(env: Env<'a>, body: Binary<'a>) -> rustler::NifResult<(Term<'a>, usize)> {
     let mut list = Term::list_new_empty(env);
     let mut pair_scratch: Vec<Term<'a>> = Vec::with_capacity(16);
 
@@ -2564,14 +2828,9 @@ fn decode_raw_batches<'a>(
                     .unwrap(),
             );
             let value = f64::from_bits(u64::from_le_bytes(
-                bytes[value_offset..value_offset + 8]
-                    .try_into()
-                    .unwrap(),
+                bytes[value_offset..value_offset + 8].try_into().unwrap(),
             ));
-            point_terms.push(make_tuple(
-                env,
-                &[timestamp.encode(env), value.encode(env)],
-            ));
+            point_terms.push(make_tuple(env, &[timestamp.encode(env), value.encode(env)]));
         }
 
         series.push(make_tuple(
@@ -2680,14 +2939,9 @@ fn decode_raw_frame_points<'a>(
                 .unwrap(),
         );
         let value = f64::from_bits(u64::from_le_bytes(
-            bytes[value_offset..value_offset + 8]
-                .try_into()
-                .unwrap(),
+            bytes[value_offset..value_offset + 8].try_into().unwrap(),
         ));
-        point_terms.push(make_tuple(
-            env,
-            &[timestamp.encode(env), value.encode(env)],
-        ));
+        point_terms.push(make_tuple(env, &[timestamp.encode(env), value.encode(env)]));
     }
     point_terms.encode(env)
 }
@@ -2703,11 +2957,7 @@ fn decode_raw_frame<'a>(env: Env<'a>, frame: Binary<'a>) -> Result<Term<'a>, Str
     let mut series = Vec::with_capacity(layout.series_count);
     for series_index in 0..layout.series_count {
         let id_offset = 16 + series_index * 8;
-        let series_id = i64::from_le_bytes(
-            bytes[id_offset..id_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let series_id = i64::from_le_bytes(bytes[id_offset..id_offset + 8].try_into().unwrap());
         series.push(make_tuple(
             env,
             &[
@@ -3235,6 +3485,51 @@ fn engine_info<'a>(
     Ok(map)
 }
 
+/// Strict, immutable migration reader.  Opening does not run the normal
+/// engine's compaction recovery or temporary-file cleanup.
+#[rustler::nif(schedule = "DirtyIo")]
+fn engine_legacy_open(data_dir: String) -> Result<ResourceArc<LegacyReaderResource>, String> {
+    let engine = Engine::new_read_only(PathBuf::from(data_dir))?;
+    Ok(ResourceArc::new(LegacyReaderResource { engine }))
+}
+
+#[rustler::nif]
+fn engine_legacy_list_series(
+    resource: ResourceArc<LegacyReaderResource>,
+) -> (Atom, Vec<(String, HashMap<String, String>)>) {
+    (atoms::ok(), resource.deref().engine.legacy_series())
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn engine_legacy_query_page(
+    resource: ResourceArc<LegacyReaderResource>,
+    metric: String,
+    labels: HashMap<String, String>,
+    after: Option<LegacyCursor>,
+    limit: usize,
+) -> Result<(Vec<(i64, f64)>, Option<LegacyCursor>, bool), String> {
+    let labels = labels.into_iter().collect::<BTreeMap<_, _>>();
+    let (points, next, has_more) = resource
+        .deref()
+        .engine
+        .legacy_query_page(&metric, &labels, after, limit)?;
+    Ok((points, next, has_more))
+}
+
+#[rustler::nif]
+fn engine_legacy_info<'a>(
+    env: rustler::Env<'a>,
+    resource: ResourceArc<LegacyReaderResource>,
+) -> Result<Term<'a>, String> {
+    let info = resource.deref().engine.info();
+    let map = rustler::types::map::map_new(env);
+    let map = map.map_put("series", info.series_count as i64).unwrap();
+    let map = map.map_put("points", info.disk_points as i64).unwrap();
+    let map = map.map_put("chunks", info.chunk_count as i64).unwrap();
+    let map = map.map_put("bytes", info.total_bytes as i64).unwrap();
+    Ok(map)
+}
+
 fn match_agg(atom: Atom) -> Result<AggFn, String> {
     if atom == atoms::avg() {
         Ok(AggFn::Avg)
@@ -3252,7 +3547,7 @@ fn match_agg(atom: Atom) -> Result<AggFn, String> {
 }
 
 fn load(env: rustler::Env, _info: rustler::Term) -> bool {
-    env.register::<EngineResource>().is_ok()
+    env.register::<EngineResource>().is_ok() && env.register::<LegacyReaderResource>().is_ok()
 }
 
 rustler::init!("Elixir.TimelessMetrics.RustEngine.Nif", load = load);
@@ -3301,9 +3596,7 @@ mod tests {
         assert_eq!((count, errors), (2, 0));
 
         assert_eq!(engine.series_read().series_count(), 1);
-        let points = engine
-            .query_range_by_id(labeled_id, 0, i64::MAX)
-            .unwrap();
+        let points = engine.query_range_by_id(labeled_id, 0, i64::MAX).unwrap();
         // ms timestamp normalized to seconds; missing timestamp -> default
         assert_eq!(points, vec![(1_700_000_000, 1.5), (1_700_000_100, 2.5)]);
     }
@@ -3338,7 +3631,10 @@ mod tests {
         // Restart: rebuild_index must recover the raw encoding from the
         // version byte and still serve the data
         let restarted = Engine::new(dir, 100, 1, 8, usize::MAX, true);
-        assert!(restarted.index_read().values().all(|m| m.encoding == ENC_RAW));
+        assert!(restarted
+            .index_read()
+            .values()
+            .all(|m| m.encoding == ENC_RAW));
         let points = restarted.query_range_by_id(1, 0, 100).unwrap();
         assert_eq!(points.len(), 10);
         assert_eq!(points[3], (3, 4.5));
@@ -3388,8 +3684,11 @@ mod tests {
             }
             engine.flush_all().unwrap();
         }
-        let old_paths: Vec<PathBuf> =
-            engine.index_read().values().map(|m| m.path.clone()).collect();
+        let old_paths: Vec<PathBuf> = engine
+            .index_read()
+            .values()
+            .map(|m| m.path.clone())
+            .collect();
         assert_eq!(old_paths.len(), 2);
 
         // Simulate a crash mid-compaction, right after the manifest is
@@ -3398,7 +3697,9 @@ mod tests {
         let points = engine.query_range_by_id(1, 0, 1000).unwrap();
         let (ts, vals): (Vec<i64>, Vec<f64>) = points.iter().copied().unzip();
         let key = PartitionKey { series_id: 1 };
-        let cp = engine.encode_partition(&key, &ts, &vals, ENC_PCO, 12).unwrap();
+        let cp = engine
+            .encode_partition(&key, &ts, &vals, ENC_PCO, 12)
+            .unwrap();
         let (meta, written) = engine.write_individual_chunk_at(&cp, true).unwrap();
         let deletable: HashSet<PathBuf> = old_paths.iter().cloned().collect();
         engine
@@ -3432,7 +3733,9 @@ mod tests {
         let points = engine.query_range_by_id(1, 0, 1000).unwrap();
         let (ts, vals): (Vec<i64>, Vec<f64>) = points.iter().copied().unzip();
         let key = PartitionKey { series_id: 1 };
-        let cp = engine.encode_partition(&key, &ts, &vals, ENC_PCO, 12).unwrap();
+        let cp = engine
+            .encode_partition(&key, &ts, &vals, ENC_PCO, 12)
+            .unwrap();
         let (_meta, written) = engine.write_individual_chunk_at(&cp, true).unwrap();
         assert!(written.exists());
         drop(engine); // "crash"
@@ -3658,7 +3961,7 @@ mod tests {
 
     #[test]
     fn flush_sorts_out_of_order_points() {
-        let dir = test_dir("sorts");
+        let _dir = test_dir("sorts");
         let engine = Engine::new(test_dir("fused"), 100, 64, 8, usize::MAX, false);
         let key = PartitionKey { series_id: 1 };
 
@@ -3971,5 +4274,98 @@ mod tests {
 
         assert!(chunk_dir.exists());
         assert_eq!(engine.query_range_by_id(1, 0, 10).unwrap(), vec![(3, 3.0)]);
+    }
+
+    #[test]
+    fn legacy_reader_pages_exact_series_without_mutating_source() {
+        let dir = test_dir("legacy_reader_pages");
+        let engine = Engine::new(dir.clone(), 2, 1, 8, usize::MAX, false);
+        let mut base = BTreeMap::new();
+        base.insert("host".to_owned(), "a".to_owned());
+        let mut superset = base.clone();
+        superset.insert("region".to_owned(), "west".to_owned());
+        let base_id = engine.resolve_series("cpu", &base).unwrap();
+        let superset_id = engine.resolve_series("cpu", &superset).unwrap();
+
+        engine.write_point(base_id, 10, 1.0);
+        engine.write_point(base_id, 10, -0.0);
+        engine.flush_all().unwrap();
+        engine.write_point(base_id, 10, 1.0);
+        engine.write_point(base_id, 20, 2.0);
+        engine.write_point(superset_id, 15, 99.0);
+        engine.shutdown().unwrap();
+        drop(engine);
+
+        let before = source_bytes(&dir);
+        let reader = Engine::new_read_only(dir.clone()).unwrap();
+        assert_eq!(
+            reader
+                .legacy_series()
+                .into_iter()
+                .map(|(name, labels)| (name, labels.len()))
+                .collect::<Vec<_>>(),
+            vec![("cpu".to_owned(), 1), ("cpu".to_owned(), 2)]
+        );
+
+        let (first, cursor, more) = reader.legacy_query_page("cpu", &base, None, 2).unwrap();
+        assert!(more);
+        let (second, cursor, more) = reader.legacy_query_page("cpu", &base, cursor, 2).unwrap();
+        assert!(!more);
+        let (empty, _, more) = reader.legacy_query_page("cpu", &base, cursor, 2).unwrap();
+        assert!(!more);
+        let actual = first.into_iter().chain(second).collect::<Vec<_>>();
+        assert_eq!(actual.len(), 4);
+        assert_eq!(
+            actual.iter().map(|point| point.0).collect::<Vec<_>>(),
+            [10, 10, 10, 20]
+        );
+        assert!(!actual.iter().any(|point| point.1 == 99.0));
+        assert!(empty.is_empty());
+        drop(reader);
+        assert_eq!(source_bytes(&dir), before);
+    }
+
+    #[test]
+    fn legacy_reader_refuses_recovery_artifacts_without_removing_them() {
+        let dir = test_dir("legacy_reader_recovery_artifact");
+        let engine = Engine::new(dir.clone(), 2, 1, 8, usize::MAX, false);
+        engine.resolve_series("cpu", &BTreeMap::new()).unwrap();
+        engine.shutdown().unwrap();
+        drop(engine);
+        let pending = dir.join("chunks").join("unfinished.pending");
+        fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        fs::write(&pending, b"unfinished").unwrap();
+
+        let error = match Engine::new_read_only(dir) {
+            Ok(_) => panic!("read-only legacy open unexpectedly accepted a pending chunk"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unfinished write"));
+        assert_eq!(fs::read(pending).unwrap(), b"unfinished");
+    }
+
+    fn source_bytes(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let mut entries = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.path());
+            for entry in entries {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    out.push((
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out
     }
 }
