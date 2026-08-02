@@ -27,9 +27,15 @@ It runs:
 
 ## Current Architecture
 
-The default engine is the Rust engine.
+The default Timeless Stack installation now uses the external
+`timeless-metrics-api` Rust owner backed by `timeless-libsql`; Phoenix remains
+the control plane and this OTP application is loaded for compatibility and
+automatic migration without starting a second storage owner. The standalone
+embedded-library API described below is a separate compatibility surface and
+continues to default to its original Rust engine in this release.
 
-The next storage engine is available as an opt-in preview with `engine: :libsql`.
+For standalone embedded-library users, the libSQL engine is available with
+`engine: :libsql`.
 It embeds the `timeless-libsql` SQLite extension so time-series blocks, the
 series catalog, rollups, and TimelessMetrics admin data all live in one
 `metrics.db` file. The public Elixir and HTTP APIs remain the same. Existing
@@ -37,7 +43,7 @@ Rust-engine stores must use the verified offline migration described in
 [Operations](docs/operations.md#rust-to-libsql-migration); libSQL startup
 intentionally refuses to silently ignore a non-empty `rust_engine/` directory.
 
-For the preview engine, supported scalar `avg`/`sum`/`min`/`max`/`count`
+For the embedded libSQL engine, supported scalar `avg`/`sum`/`min`/`max`/`count`
 queries run in the extension's chunk-aware `timeless_aggregate` kernel, while
 `latest` and `latest_multi` use its newest-first `timeless_latest` kernel.
 Complete, `from`-aligned buckets for those same five aggregates use its packed

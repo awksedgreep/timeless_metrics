@@ -116,8 +116,15 @@ Response:
 
 ## Rust-to-libSQL migration
 
-Migration is explicit, offline, staged, and verified. Stop every process using
-the store, keep enough free space for another copy of the data, then run:
+This section applies only to the standalone embedded-library engine selector.
+The default Timeless Stack release detects legacy storage at startup and runs
+its versioned, restartable side-by-side conversion automatically before the
+external Rust/libSQL owner becomes ready; use the Stack operator runbook for
+that production path.
+
+For a standalone embedded store, migration is explicit, offline, staged, and
+verified. Stop every process using the store, keep enough free space for
+another copy of the data, then run:
 
 ```bash
 mix timeless_metrics.migrate_libsql /var/lib/metrics
