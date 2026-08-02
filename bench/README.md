@@ -76,6 +76,11 @@ This directory contains the current benchmark set for `timeless_metrics`.
   export, label, and series shapes. It anchors bounds to exact latest and
   reports response bytes so empty or differently phased controls are rejected.
 
+- [metrics_api_promql.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/metrics_api_promql.exs)
+  Session 4 socket-to-body selector/`avg_over_time` benchmark. With
+  `--reference-url`, it first requires all six decoded Prometheus responses to
+  match an independently seeded Elixir+libSQL control.
+
 - [http_baseline_server.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/http_baseline_server.exs)
   Starts one isolated Elixir HTTP control over either libSQL or the Rust block
   engine, with configurable readers/workers and optional deferred scheduled
@@ -102,6 +107,10 @@ This directory contains the current benchmark set for `timeless_metrics`.
 - Prefer `vs_victoriametrics.exs` only when you specifically need a product-to-product comparison.
 
 ## Historical Results
+
+- [results/2026-08-01_metrics_api_session4.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session4.md)
+  Rust PromQL selector/`avg_over_time` vertical slice, cancellation regression,
+  six-shape Elixir+libSQL differential, latency, and memory result.
 
 - [results/2026-08-01_metrics_api_session3.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session3.md)
   Rust metrics API POC Session 3 mechanical read/discovery implementation,

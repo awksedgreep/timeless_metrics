@@ -38,7 +38,13 @@ defmodule MetricsAPISeed do
 
     {opts, _, _} =
       OptionParser.parse(argv,
-        strict: [url: :string, devices: :integer, metrics: :integer, samples: :integer]
+        strict: [
+          url: :string,
+          devices: :integer,
+          metrics: :integer,
+          samples: :integer,
+          first_timestamp: :integer
+        ]
       )
 
     url = opts[:url] || "http://127.0.0.1:8428"
@@ -46,7 +52,7 @@ defmodule MetricsAPISeed do
     metrics = Enum.take(@metrics, max(opts[:metrics] || 20, 1))
     samples = max(opts[:samples] || 100, 1)
     client = Req.new(base_url: url, retry: false, receive_timeout: 60_000)
-    first_ms = (System.os_time(:second) - samples) * 1_000
+    first_ms = (opts[:first_timestamp] || System.os_time(:second) - samples) * 1_000
 
     labels =
       for device <- 0..(devices - 1), metric <- metrics do
