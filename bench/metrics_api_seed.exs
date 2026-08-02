@@ -1,7 +1,9 @@
 defmodule MetricsAPISeed do
   @moduledoc """
   Creates a fixed-cardinality, fixed-point-count Prometheus fixture for
-  socket-level mechanical read comparisons.
+  socket-level mechanical read comparisons. `--expected-existing-points`
+  keeps the exact final-point assertion available for page-reuse runs against
+  a pre-populated database.
   """
 
   @metrics [
@@ -43,7 +45,8 @@ defmodule MetricsAPISeed do
           devices: :integer,
           metrics: :integer,
           samples: :integer,
-          first_timestamp: :integer
+          first_timestamp: :integer,
+          expected_existing_points: :integer
         ]
       )
 
@@ -51,6 +54,7 @@ defmodule MetricsAPISeed do
     devices = max(opts[:devices] || 200, 1)
     metrics = Enum.take(@metrics, max(opts[:metrics] || 20, 1))
     samples = max(opts[:samples] || 100, 1)
+    expected_existing_points = max(opts[:expected_existing_points] || 0, 0)
     client = Req.new(base_url: url, retry: false, receive_timeout: 60_000)
     first_ms = (opts[:first_timestamp] || System.os_time(:second) - samples) * 1_000
 
@@ -64,6 +68,7 @@ defmodule MetricsAPISeed do
 
     expected_series = devices * length(metrics)
     expected_points = expected_series * samples
+    expected_total_points = expected_existing_points + expected_points
     started = System.monotonic_time(:microsecond)
 
     for sample <- 0..(samples - 1) do
@@ -102,7 +107,7 @@ defmodule MetricsAPISeed do
       {:ok,
        %{
          status: 200,
-         body: %{"series" => ^expected_series, "points" => ^expected_points}
+         body: %{"series" => ^expected_series, "points" => ^expected_total_points}
        }} ->
         :ok
 
@@ -113,6 +118,7 @@ defmodule MetricsAPISeed do
     elapsed = System.monotonic_time(:microsecond) - started
     IO.puts("seeded_series=#{expected_series}")
     IO.puts("seeded_points=#{expected_points}")
+    IO.puts("total_points=#{expected_total_points}")
     IO.puts("elapsed_us=#{elapsed}")
   end
 end
