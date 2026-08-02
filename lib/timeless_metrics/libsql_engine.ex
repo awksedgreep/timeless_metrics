@@ -554,7 +554,7 @@ defmodule TimelessMetrics.LibsqlEngine do
     data_dir = Keyword.fetch!(opts, :data_dir)
     schema = Keyword.fetch!(opts, :schema)
     reject_unmigrated_rust_store!(store, data_dir)
-    conn = open_connection(Path.join(data_dir, "metrics.db"))
+    conn = open_connection(Path.join(data_dir, "metrics.db"), Keyword.get(opts, :extension_path))
     create_table(conn, schema)
     {:ok, insert_stmt} = Exqlite.Sqlite3.prepare(conn, insert_command_sql())
     query_frame_features = detect_query_frame_features(conn)
@@ -797,7 +797,10 @@ defmodule TimelessMetrics.LibsqlEngine do
 
   # -- Connection helpers --------------------------------------------------
 
-  def open_connection(db_path) do
+  def open_connection(db_path), do: open_connection(db_path, extension_path())
+  def open_connection(db_path, nil), do: open_connection(db_path)
+
+  def open_connection(db_path, extension_path) do
     {:ok, conn} = Exqlite.Sqlite3.open(db_path)
 
     for sql <- [
@@ -810,9 +813,37 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
 
     :ok = Exqlite.Sqlite3.enable_load_extension(conn, true)
-    {:ok, _} = TimelessMetrics.DB.execute(conn, "SELECT load_extension(?1)", [extension_path()])
+    {:ok, _} = TimelessMetrics.DB.execute(conn, "SELECT load_extension(?1)", [extension_path])
     :ok = Exqlite.Sqlite3.enable_load_extension(conn, false)
     conn
+  end
+
+  @doc false
+  def open_readonly_connection(db_path), do: open_readonly_connection(db_path, extension_path())
+  def open_readonly_connection(db_path, nil), do: open_readonly_connection(db_path)
+
+  def open_readonly_connection(db_path, extension_path) do
+    {:ok, conn} = Exqlite.Sqlite3.open(db_path, mode: :readonly)
+
+    {:ok, _} = TimelessMetrics.DB.execute(conn, "PRAGMA busy_timeout = 5000", [])
+    :ok = Exqlite.Sqlite3.enable_load_extension(conn, true)
+    {:ok, _} = TimelessMetrics.DB.execute(conn, "SELECT load_extension(?1)", [extension_path])
+    :ok = Exqlite.Sqlite3.enable_load_extension(conn, false)
+    conn
+  end
+
+  @doc false
+  def initialize_release_database(db_path, schema, extension_path) do
+    conn = open_connection(db_path, extension_path)
+
+    try do
+      with {:ok, _} <- create_table(conn, schema),
+           {:ok, _} <- TimelessMetrics.DB.execute(conn, "PRAGMA wal_checkpoint(TRUNCATE)", []) do
+        :ok
+      end
+    after
+      Exqlite.Sqlite3.close(conn)
+    end
   end
 
   defp create_table(conn, schema) do
@@ -1841,7 +1872,13 @@ defmodule TimelessMetrics.LibsqlEngine.Reader do
   @impl true
   def init(opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
-    conn = TimelessMetrics.LibsqlEngine.open_connection(Path.join(data_dir, "metrics.db"))
+
+    conn =
+      TimelessMetrics.LibsqlEngine.open_connection(
+        Path.join(data_dir, "metrics.db"),
+        Keyword.get(opts, :extension_path)
+      )
+
     query_frame_features = TimelessMetrics.LibsqlEngine.detect_query_frame_features(conn)
 
     {:ok, raw_stmt} =

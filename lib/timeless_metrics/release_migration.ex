@@ -26,7 +26,7 @@ defmodule TimelessMetrics.ReleaseMigration do
     # mutation race without preserving any user data.
     source_paths =
       [source_db, source_db <> "-wal", source_engine]
-      |> Enum.filter(&File.exists?/1)
+      |> Enum.filter(&durable_source_path?/1)
 
     with :ok <- require_source(source_db, source_engine),
          {:ok, manifest} <- source_manifest(data_dir, source_paths),
@@ -49,10 +49,19 @@ defmodule TimelessMetrics.ReleaseMigration do
                  candidate_db,
                  series,
                  copied.records_completed,
-                 copied.identity_digest
+                 copied.identity_digest,
+                 opts
                ),
              {:ok, report} <-
-               finish_report(candidate_db, manifest, copied, validation, maintenance, started) do
+               finish_report(
+                 candidate_db,
+                 manifest,
+                 copied,
+                 validation,
+                 maintenance,
+                 started,
+                 opts
+               ) do
           {:ok, report}
         end
       rescue
@@ -70,12 +79,61 @@ defmodule TimelessMetrics.ReleaseMigration do
     Path.join([Path.expand(data_dir), ".timeless-migration", @signal, "metrics.db"])
   end
 
+  @doc false
+  def legacy_manifest(data_dir) do
+    data_dir = Path.expand(data_dir)
+    source_db = Path.join(data_dir, "metrics.db")
+    source_engine = Path.join(data_dir, "rust_engine")
+
+    source_paths =
+      [source_db, source_db <> "-wal", source_engine]
+      |> Enum.filter(&durable_source_path?/1)
+
+    with :ok <- require_source(source_db, source_engine) do
+      source_manifest(data_dir, source_paths)
+    end
+  end
+
+  @doc false
+  def validate_checkpoint(path, series, opts \\ []) when is_list(series) do
+    with {:ok, conn} <- Exqlite.Sqlite3.open(path, mode: :readonly) do
+      result =
+        case DB.execute(
+               conn,
+               "SELECT series_index,cursor_json,records_completed,identity_digest FROM _timeless_migration WHERE singleton=1",
+               []
+             ) do
+          {:ok, [[series_index, cursor, completed, digest]]} ->
+            migrated_series = Enum.take(series, series_index + if(is_nil(cursor), do: 0, else: 1))
+            {:ok, migrated_series, completed, digest}
+
+          other ->
+            {:error, "invalid metrics checkpoint journal: #{inspect(other)}"}
+        end
+
+      Exqlite.Sqlite3.close(conn)
+
+      with {:ok, migrated_series, completed, digest} <- result,
+           {:ok, _} <- cold_validate(path, migrated_series, completed, digest, opts) do
+        :ok
+      end
+    end
+  end
+
   defp require_source(source_db, source_engine) do
     cond do
       not File.regular?(source_db) -> {:error, "missing legacy metrics database #{source_db}"}
       not File.dir?(source_engine) -> {:error, "missing legacy Rust store #{source_engine}"}
       File.ls!(source_engine) == [] -> {:error, "legacy Rust store is empty: #{source_engine}"}
       true -> :ok
+    end
+  end
+
+  defp durable_source_path?(path) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: 0}} -> not String.ends_with?(path, ".db-wal")
+      {:ok, _} -> true
+      {:error, _} -> false
     end
   end
 
@@ -87,6 +145,7 @@ defmodule TimelessMetrics.ReleaseMigration do
        name: @migration_store,
        engine: :libsql,
        data_dir: candidate_dir,
+       extension_path: Keyword.get(opts, :extension_path),
        mode: :memory,
        schema: schema,
        scraping: false,
@@ -471,8 +530,12 @@ defmodule TimelessMetrics.ReleaseMigration do
     :ok
   end
 
-  defp cold_validate(candidate_db, series, expected_points, expected_digest) do
-    conn = LibsqlEngine.open_connection(candidate_db)
+  defp cold_validate(candidate_db, series, expected_points, expected_digest, opts) do
+    conn =
+      LibsqlEngine.open_readonly_connection(
+        candidate_db,
+        Keyword.get(opts, :extension_path)
+      )
 
     try do
       with {:ok, [["ok"]]} <- DB.execute(conn, "PRAGMA integrity_check", []),
@@ -483,8 +546,13 @@ defmodule TimelessMetrics.ReleaseMigration do
                "SELECT CAST(value AS INTEGER) FROM timeless_stats('metric_samples') WHERE key='rollup_chunks'",
                []
              ) do
+        # A valid non-empty source can contain no completed rollup bucket (for
+        # example, seventeen seconds inside the first hourly bucket). Exact
+        # rollup aggregates are pinned by the threshold-crossing fixture; do
+        # not invent a chunk requirement for a range the public rollup command
+        # correctly leaves unsettled.
         if actual.points == expected_points and actual.series == length(series) and
-             actual.digest == expected_digest and (expected_points == 0 or rollup_chunks > 0) do
+             actual.digest == expected_digest do
           {:ok, Map.put(actual, :rollup_chunks, rollup_chunks)}
         else
           {:error,
@@ -574,10 +642,10 @@ defmodule TimelessMetrics.ReleaseMigration do
     end
   end
 
-  defp finish_report(candidate_db, manifest, state, validation, maintenance, started) do
+  defp finish_report(candidate_db, manifest, state, validation, maintenance, started, opts) do
     observe_hwm(candidate_db)
     observed = :persistent_term.get({__MODULE__, :observed})
-    conn = LibsqlEngine.open_connection(candidate_db)
+    conn = LibsqlEngine.open_connection(candidate_db, Keyword.get(opts, :extension_path))
     now = System.system_time(:nanosecond)
 
     try do

@@ -147,13 +147,23 @@ defmodule TimelessMetrics.Supervisor do
                 id: reader_name,
                 start:
                   {TimelessMetrics.LibsqlEngine.Reader, :start_link,
-                   [[name: reader_name, data_dir: data_dir]]}
+                   [
+                     [
+                       name: reader_name,
+                       data_dir: data_dir,
+                       extension_path: Keyword.get(opts, :extension_path)
+                     ]
+                   ]}
               }
             end)
 
           [
             {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
-            {TimelessMetrics.LibsqlEngine, store: name, data_dir: data_dir, schema: schema}
+            {TimelessMetrics.LibsqlEngine,
+             store: name,
+             data_dir: data_dir,
+             schema: schema,
+             extension_path: Keyword.get(opts, :extension_path)}
           ] ++ readers
 
         :rust ->
