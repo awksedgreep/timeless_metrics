@@ -108,6 +108,11 @@ This directory contains the current benchmark set for `timeless_metrics`.
 
 ## Historical Results
 
+- [results/2026-08-01_metrics_api_session5.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session5.md)
+  Opt-in Phoenix control-plane client, real Canvas graph-history switch,
+  complete-response enforcement, sole ownership, supervised SIGKILL/restart,
+  exact reopen result, and loopback boundary overhead.
+
 - [results/2026-08-01_metrics_api_session4.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session4.md)
   Rust PromQL selector/`avg_over_time` vertical slice, cancellation regression,
   six-shape Elixir+libSQL differential, latency, and memory result.
