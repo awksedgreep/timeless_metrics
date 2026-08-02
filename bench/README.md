@@ -91,6 +91,15 @@ This directory contains the current benchmark set for `timeless_metrics`.
 
 ## Historical Results
 
+- [results/2026-08-01_metrics_api_session2.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session2.md)
+  Rust metrics API POC Session 2 native Prometheus/VictoriaMetrics ingest,
+  partial-success contract, phase attribution, fresh-process throughput, and
+  memory comparison with the Session 0 Elixir+libSQL control.
+
+- [results/2026-08-01_metrics_api_session1.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session1.md)
+  Rust metrics API POC Session 1 server/storage lifecycle, sole ownership,
+  automatic flush threshold fix, and control-route shell smoke result.
+
 - [results/2026-08-01_metrics_api_session0.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session0.md)
   Rust metrics API POC Session 0 compatibility contract and completion-aware
   fresh-process Elixir+libSQL/Rust-block baseline.

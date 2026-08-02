@@ -22,6 +22,7 @@
 # All flags optional. --vm-url "" to skip VictoriaMetrics.
 # --steps "5,2,1,0.5" overrides auto-ramp with fixed steps.
 # --batch N groups N devices per HTTP POST (reduces client overhead at high cardinality)
+# --write-format prometheus|victoria selects the native import payload (default: prometheus)
 # --start-interval S start at S seconds instead of 4s (default)
 # --ramp-factor N divide interval by N each step instead of 2 (default)
 # --seed N fixes writer jitter and query selection (default: 42)
@@ -103,7 +104,8 @@ defmodule RealisticWorkload do
           ramp_factor: :integer,
           warmup: :integer,
           batch: :integer,
-          seed: :integer
+          seed: :integer,
+          write_format: :string
         ]
       )
 
@@ -121,6 +123,7 @@ defmodule RealisticWorkload do
     ramp_factor = opts[:ramp_factor] || 2
     batch_size = opts[:batch] || 1
     seed = opts[:seed] || 42
+    write_format = parse_write_format(opts[:write_format] || "prometheus")
 
     fixed_steps =
       case opts[:steps] do
@@ -151,7 +154,8 @@ defmodule RealisticWorkload do
       start_interval: start_interval,
       ramp_factor: ramp_factor,
       batch_size: batch_size,
-      seed: seed
+      seed: seed,
+      write_format: write_format
     }
 
     # --- Header ---
@@ -174,6 +178,7 @@ defmodule RealisticWorkload do
 
     IO.puts("  Step dur:    #{step_dur}s (#{settle_s}s settle, #{warmup_s}s warmup)")
     IO.puts("  Batch:       #{batch_size} device#{if batch_size > 1, do: "s", else: ""}/POST")
+    IO.puts("  Write format: #{write_format}")
     IO.puts("  Queries:     #{query_workers} workers (ramped with writes)")
     IO.puts("  Seed:        #{seed}")
     IO.puts("  Mode:        sequential (full client capacity per target)")
@@ -277,7 +282,8 @@ defmodule RealisticWorkload do
             interval_ms,
             write_ets,
             write_id,
-            write_ctr
+            write_ctr,
+            cfg.write_format
           )
         end)
       end
@@ -448,18 +454,31 @@ defmodule RealisticWorkload do
       env = Enum.at(["prod", "staging"], rem(dev_id, 2))
       label_str = ~s(host="#{host}",region="#{region}",env="#{env}")
       metric_lines = for m <- metrics, do: {m, "#{m}{#{label_str}}"}
-      %{id: dev_id, host: host, metric_lines: metric_lines}
+
+      victoria_metrics =
+        for metric <- metrics do
+          labels = %{
+            "__name__" => metric,
+            "host" => host,
+            "region" => region,
+            "env" => env
+          }
+
+          {metric, Jason.encode!(labels)}
+        end
+
+      %{id: dev_id, host: host, metric_lines: metric_lines, victoria_metrics: victoria_metrics}
     end
   end
 
   # --- Writer loop (batched — one task handles N devices) ---
 
-  defp batch_writer_loop(devs, mc, client, stop, int_ms, ets, wid, ctr) do
+  defp batch_writer_loop(devs, mc, client, stop, int_ms, ets, wid, ctr, write_format) do
     Process.sleep(:rand.uniform(:atomics.get(int_ms, 1)))
-    do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr)
+    do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr, write_format)
   end
 
-  defp do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr) do
+  defp do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr, write_format) do
     if :atomics.get(stop, 1) == 1 do
       :ok
     else
@@ -468,35 +487,57 @@ defmodule RealisticWorkload do
 
       payload =
         devs
-        |> Enum.map(&build_payload(&1, ts_ms))
+        |> Enum.map(&build_payload(&1, ts_ms, write_format))
         |> IO.iodata_to_binary()
 
-      post_write(client, payload, ets, wid, ctr, total_mc)
+      post_write(client, payload, ets, wid, ctr, total_mc, write_format)
 
       base = :atomics.get(int_ms, 1)
       jitter = max(trunc(base * 0.2), 1)
       sleep = max(base - jitter + :rand.uniform(jitter * 2), 1)
       Process.sleep(sleep)
 
-      do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr)
+      do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr, write_format)
     end
   end
 
-  defp build_payload(dev, ts_ms) do
+  defp build_payload(dev, ts_ms, :prometheus) do
     for {metric, labeled} <- dev.metric_lines do
       val = gen_value(metric, ts_ms, dev.id)
       [labeled, ?\s, Float.to_string(val), ?\s, Integer.to_string(ts_ms), ?\n]
     end
   end
 
-  defp post_write(client, payload, ets, wid, ctr, mc) do
+  defp build_payload(dev, ts_ms, :victoria) do
+    for {metric, metric_json} <- dev.victoria_metrics do
+      val = gen_value(metric, ts_ms, dev.id)
+
+      [
+        ~s({"metric":),
+        metric_json,
+        ~s(,"values":[),
+        Float.to_string(val),
+        ~s(],"timestamps":[),
+        Integer.to_string(ts_ms),
+        "]}\n"
+      ]
+    end
+  end
+
+  defp post_write(client, payload, ets, wid, ctr, mc, write_format) do
+    {path, content_type} =
+      case write_format do
+        :prometheus -> {"/api/v1/import/prometheus", "text/plain"}
+        :victoria -> {"/api/v1/import", "application/x-ndjson"}
+      end
+
     {us, result} =
       :timer.tc(fn ->
         try do
           Req.post(client,
-            url: "/api/v1/import/prometheus",
+            url: path,
             body: payload,
-            headers: [{"content-type", "text/plain"}]
+            headers: [{"content-type", content_type}]
           )
         rescue
           e -> {:error, e}
@@ -685,6 +726,14 @@ defmodule RealisticWorkload do
       receive_timeout: 30_000,
       finch: finch_name
     )
+  end
+
+  defp parse_write_format("prometheus"), do: :prometheus
+  defp parse_write_format("victoria"), do: :victoria
+
+  defp parse_write_format(other) do
+    raise ArgumentError,
+          "--write-format must be prometheus or victoria, got: #{inspect(other)}"
   end
 
   defp seed_rng(seed, role, index) do
