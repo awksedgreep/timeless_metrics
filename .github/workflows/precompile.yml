@@ -75,6 +75,14 @@ jobs:
       - name: Fetch dependencies
         run: mix deps.get
 
+      - name: Configure arm64 macOS C toolchain
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          echo "CC_aarch64_apple_darwin=clang" >> "$GITHUB_ENV"
+          echo "CFLAGS_aarch64_apple_darwin=-arch arm64" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_apple_darwin=clang++" >> "$GITHUB_ENV"
+          echo "CXXFLAGS_aarch64_apple_darwin=-arch arm64" >> "$GITHUB_ENV"
+
       - name: Precompile
         run: mix elixir_make.precompile
         env:
