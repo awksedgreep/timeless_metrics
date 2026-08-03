@@ -38,7 +38,7 @@ jobs:
           cargo build --locked --release -p timeless-ext
           mkdir -p ../../timeless-libsql/target/release
           cp target/release/libtimeless_ext.so ../../timeless-libsql/target/release/libtimeless_ext.so
-          echo "TIMELESS_EXT_PATH=$(dirname \"$GITHUB_WORKSPACE\")/timeless-libsql/target/release/libtimeless_ext.so" >> "$GITHUB_ENV"
+          echo "TIMELESS_EXT_PATH=$(dirname "$GITHUB_WORKSPACE")/timeless-libsql/target/release/libtimeless_ext.so" >> "$GITHUB_ENV"
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
