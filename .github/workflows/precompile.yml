@@ -63,6 +63,7 @@ jobs:
       - name: Install Erlang & Elixir (macOS)
         if: runner.os == 'macOS'
         run: |
+          brew trust aws/tap || true
           brew install erlang elixir
           mix local.hex --force
           mix local.rebar --force
