@@ -237,6 +237,7 @@ defmodule TimelessMetrics.HTTP do
         body = req.body
 
         queue = :persistent_term.get({TimelessMetrics, store, :ingest_queue})
+        TimelessMetrics.Stats.incr_http_batches_admitted(store)
         TimelessMetrics.IngestWorker.enqueue(queue, body, :json)
         send_resp(req, 204)
     end
@@ -247,16 +248,80 @@ defmodule TimelessMetrics.HTTP do
     store = store()
     stats = TimelessMetrics.Stats.snapshot(store)
     {series_count, points, buffer_points} = health_counts(store, stats)
+    queue = :persistent_term.get({TimelessMetrics, store, :ingest_queue})
+    queue_stats = TimelessMetrics.IngestWorker.queue_stats(queue)
+
+    in_flight_batches =
+      max(
+        stats.http_batches_admitted - stats.http_batches_completed - queue_stats.queued_batches,
+        0
+      )
 
     json_resp(req, 200, %{
       status: "ok",
       series: series_count,
       points: points,
       buffer_points: buffer_points,
+      completed_points: stats.points_ingested,
+      admitted_batches: stats.http_batches_admitted,
+      completed_batches: stats.http_batches_completed,
+      queued_batches: queue_stats.queued_batches,
+      in_flight_batches: in_flight_batches,
+      oldest_queued_ms: queue_stats.oldest_queued_ms,
+      import_errors: stats.http_import_errors,
       queries: stats.queries,
       query_fast_path: stats.query_fast_path,
       query_slow_path: stats.query_slow_path
     })
+  end
+
+  post "/api/v1/flush" do
+    case check_auth(req) do
+      :halt ->
+        :ok
+
+      :ok ->
+        store = store()
+
+        case await_ingest_drain(store, System.monotonic_time(:millisecond) + 60_000) do
+          :ok ->
+            case TimelessMetrics.flush(store) do
+              :ok ->
+                stats = TimelessMetrics.Stats.snapshot(store)
+
+                json_resp(req, 200, %{
+                  status: "ok",
+                  admitted_batches: stats.http_batches_admitted,
+                  completed_batches: stats.http_batches_completed,
+                  completed_points: stats.points_ingested
+                })
+
+              {:error, reason} ->
+                json_error(req, 500, "flush failed: #{inspect(reason)}")
+            end
+
+          {:error, :timeout} ->
+            json_error(req, 503, "ingest queue did not drain before flush timeout")
+        end
+    end
+  end
+
+  defp await_ingest_drain(store, deadline_ms) do
+    stats = TimelessMetrics.Stats.snapshot(store)
+    queue = :persistent_term.get({TimelessMetrics, store, :ingest_queue})
+    queue_stats = TimelessMetrics.IngestWorker.queue_stats(queue)
+
+    if stats.http_batches_completed >= stats.http_batches_admitted and
+         queue_stats.queued_batches == 0 do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline_ms do
+        {:error, :timeout}
+      else
+        Process.sleep(5)
+        await_ingest_drain(store, deadline_ms)
+      end
+    end
   end
 
   defp health_counts(store, stats) do
@@ -1179,6 +1244,7 @@ defmodule TimelessMetrics.HTTP do
 
         # Queue for background processing — return 204 immediately
         queue = :persistent_term.get({TimelessMetrics, store, :ingest_queue})
+        TimelessMetrics.Stats.incr_http_batches_admitted(store)
         TimelessMetrics.IngestWorker.enqueue(queue, body, :prometheus)
         send_resp(req, 204)
     end

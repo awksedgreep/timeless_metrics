@@ -30,8 +30,35 @@ defmodule TimelessMetrics.IngestWorker do
   """
   def enqueue(queue_table, body, format) do
     key = :erlang.unique_integer([:positive, :monotonic])
-    :ets.insert(queue_table, {key, :ezstd.compress(body, 2), format})
+    enqueued_at = System.monotonic_time(:millisecond)
+    :ets.insert(queue_table, {key, enqueued_at, :ezstd.compress(body, 2), format})
     :ok
+  end
+
+  @doc false
+  def queue_stats(queue_table) do
+    queued_batches =
+      case :ets.info(queue_table, :size) do
+        :undefined -> 0
+        size -> size
+      end
+
+    oldest_queued_ms =
+      case :ets.first(queue_table) do
+        :"$end_of_table" ->
+          0
+
+        key ->
+          case :ets.lookup(queue_table, key) do
+            [{^key, enqueued_at, _body, _format}] ->
+              max(System.monotonic_time(:millisecond) - enqueued_at, 0)
+
+            [] ->
+              0
+          end
+      end
+
+    %{queued_batches: queued_batches, oldest_queued_ms: oldest_queued_ms}
   end
 
   # --- Server ---
@@ -107,8 +134,8 @@ defmodule TimelessMetrics.IngestWorker do
     next = :ets.next(queue, key)
 
     case :ets.take(queue, key) do
-      [{^key, body, format}] ->
-        take_loop(queue, next, remaining - 1, [{key, body, format} | acc])
+      [{^key, enqueued_at, body, format}] ->
+        take_loop(queue, next, remaining - 1, [{key, enqueued_at, body, format} | acc])
 
       [] ->
         # Another worker took it
@@ -120,7 +147,7 @@ defmodule TimelessMetrics.IngestWorker do
     registry = :"#{state.store}_registry"
     shard_count = :persistent_term.get({TimelessMetrics, state.store, :shard_count})
 
-    Enum.each(entries, fn {_key, compressed_body, format} ->
+    Enum.each(entries, fn {_key, _enqueued_at, compressed_body, format} ->
       try do
         body = :ezstd.decompress(compressed_body)
 
@@ -129,9 +156,11 @@ defmodule TimelessMetrics.IngestWorker do
           :json -> process_json(body, state.store, registry, shard_count)
         end
       rescue
-        _ -> :ok
+        _ -> TimelessMetrics.Stats.add_http_import_errors(state.store, 1)
       catch
-        _, _ -> :ok
+        _, _ -> TimelessMetrics.Stats.add_http_import_errors(state.store, 1)
+      after
+        TimelessMetrics.Stats.incr_http_batches_completed(state.store)
       end
     end)
   end
@@ -144,12 +173,16 @@ defmodule TimelessMetrics.IngestWorker do
       # NIF call, no per-sample terms. This path has no relabeling,
       # matching the previous parse+write_batch behavior.
       case TimelessMetrics.StorageEngine.ingest_prometheus(store, body) do
-        {:ok, count, _errors} when count > 0 ->
-          TimelessMetrics.Stats.incr_writes(store)
-          TimelessMetrics.Stats.add_points(store, count)
-          :ok
+        {:ok, count, errors} ->
+          TimelessMetrics.Stats.add_http_import_errors(store, errors)
+
+          if count > 0 do
+            TimelessMetrics.Stats.incr_writes(store)
+            TimelessMetrics.Stats.add_points(store, count)
+          end
 
         _ ->
+          TimelessMetrics.Stats.add_http_import_errors(store, 1)
           :ok
       end
     else
@@ -158,42 +191,27 @@ defmodule TimelessMetrics.IngestWorker do
   end
 
   defp process_prometheus_grouped(body, store, registry, shard_count) do
-    {groups, count, _errors, _samples} =
+    {groups, count, errors, _samples} =
       if TimelessMetrics.PrometheusNif.available?() do
         parse_prometheus_nif(body)
       else
         parse_prometheus_elixir(body)
       end
 
+    TimelessMetrics.Stats.add_http_import_errors(store, errors)
+
     if count > 0 do
-      TimelessMetrics.Stats.incr_writes(store)
-      TimelessMetrics.Stats.add_points(store, count)
-
-      if :persistent_term.get({TimelessMetrics, store, :engine}, nil) in [:rust, :libsql] do
-        # Rust engine without the parser NIF: optimized write path using
-        # the Elixir-side series-id cache and raw batch NIF.
-        entries =
-          Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
-            Enum.map(batch, fn {ts, val} -> {metric_name, labels, val, ts} end)
-          end)
-
-        TimelessMetrics.StorageEngine.write_batch(store, entries)
-      else
-        Enum.each(groups, fn {{metric_name, labels}, batch} ->
-          series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-          shard_idx = rem(abs(series_id), shard_count)
-          points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
-          TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
-        end)
-      end
+      groups
+      |> write_groups(store, registry, shard_count)
+      |> record_write_result(store, count)
     end
   end
 
   defp process_json(body, store, registry, shard_count) do
     lines = :binary.split(body, <<"\n">>, [:global, :trim_all])
 
-    {groups, count} =
-      Enum.reduce(lines, {%{}, 0}, fn line, {groups, count} ->
+    {groups, count, errors} =
+      Enum.reduce(lines, {%{}, 0, 0}, fn line, {groups, count, errors} ->
         case parse_json_line(line) do
           {:ok, line_groups, line_count} ->
             merged =
@@ -201,33 +219,57 @@ defmodule TimelessMetrics.IngestWorker do
                 Map.update(acc, key, points, &(points ++ &1))
               end)
 
-            {merged, count + line_count}
+            {merged, count + line_count, errors}
 
           :error ->
-            {groups, count}
+            {groups, count, errors + 1}
         end
       end)
 
+    TimelessMetrics.Stats.add_http_import_errors(store, errors)
+
     if count > 0 do
-      TimelessMetrics.Stats.incr_writes(store)
-      TimelessMetrics.Stats.add_points(store, count)
-
-      if :persistent_term.get({TimelessMetrics, store, :engine}, nil) in [:rust, :libsql] do
-        entries =
-          Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
-            Enum.map(batch, fn {ts, val} -> {metric_name, labels, val, ts} end)
-          end)
-
-        TimelessMetrics.StorageEngine.write_batch(store, entries)
-      else
-        Enum.each(groups, fn {{metric_name, labels}, batch} ->
-          series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
-          shard_idx = rem(abs(series_id), shard_count)
-          points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
-          TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
-        end)
-      end
+      groups
+      |> write_groups(store, registry, shard_count)
+      |> record_write_result(store, count)
     end
+  end
+
+  defp write_groups(groups, store, registry, shard_count) do
+    if :persistent_term.get({TimelessMetrics, store, :engine}, nil) in [:rust, :libsql] do
+      # Hot engine without fused ingest: use one optimized raw batch call.
+      entries =
+        Enum.flat_map(groups, fn {{metric_name, labels}, batch} ->
+          Enum.map(batch, fn {ts, val} -> {metric_name, labels, val, ts} end)
+        end)
+
+      TimelessMetrics.StorageEngine.write_batch(store, entries)
+    else
+      Enum.each(groups, fn {{metric_name, labels}, batch} ->
+        series_id = TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+        shard_idx = rem(abs(series_id), shard_count)
+        points = Enum.map(batch, fn {ts, val} -> {series_id, ts, val} end)
+        :ok = TimelessMetrics.Buffer.write_bulk(:"#{store}_shard_#{shard_idx}", points)
+      end)
+
+      :ok
+    end
+  end
+
+  defp record_write_result(:ok, store, count) do
+    TimelessMetrics.Stats.incr_writes(store)
+    TimelessMetrics.Stats.add_points(store, count)
+    :ok
+  end
+
+  defp record_write_result({:error, _reason}, store, count) do
+    TimelessMetrics.Stats.add_http_import_errors(store, count)
+    :error
+  end
+
+  defp record_write_result(_unexpected, store, count) do
+    TimelessMetrics.Stats.add_http_import_errors(store, count)
+    :error
   end
 
   # --- Parsers (extracted from HTTP module) ---

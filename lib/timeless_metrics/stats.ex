@@ -14,8 +14,10 @@ defmodule TimelessMetrics.Stats do
   @query_fast_path 10
   @query_slow_path 11
   @promql_rejected 12
+  @http_batches_admitted 13
+  @http_batches_completed 14
 
-  @counter_size 12
+  @counter_size 14
 
   # Bounded sample of recently rejected PromQL queries (the "gap radar"):
   # real traffic tells us which unsupported constructs to implement next.
@@ -45,6 +47,8 @@ defmodule TimelessMetrics.Stats do
   def incr_queries(store), do: add(store, @queries, 1)
   def incr_query_fast_path(store), do: add(store, @query_fast_path, 1)
   def incr_query_slow_path(store), do: add(store, @query_slow_path, 1)
+  def incr_http_batches_admitted(store), do: add(store, @http_batches_admitted, 1)
+  def incr_http_batches_completed(store), do: add(store, @http_batches_completed, 1)
 
   # --- Add N ---
 
@@ -106,7 +110,7 @@ defmodule TimelessMetrics.Stats do
 
   # --- Snapshot ---
 
-  @doc "Read all 8 counters as a map."
+  @doc "Read all counters as a map."
   def snapshot(store) do
     case ref(store) do
       nil ->
@@ -123,7 +127,9 @@ defmodule TimelessMetrics.Stats do
             :queries,
             :query_fast_path,
             :query_slow_path,
-            :promql_rejected
+            :promql_rejected,
+            :http_batches_admitted,
+            :http_batches_completed
           ],
           &{&1, 0}
         )
@@ -141,7 +147,9 @@ defmodule TimelessMetrics.Stats do
           queries: :counters.get(ref, @queries),
           query_fast_path: :counters.get(ref, @query_fast_path),
           query_slow_path: :counters.get(ref, @query_slow_path),
-          promql_rejected: :counters.get(ref, @promql_rejected)
+          promql_rejected: :counters.get(ref, @promql_rejected),
+          http_batches_admitted: :counters.get(ref, @http_batches_admitted),
+          http_batches_completed: :counters.get(ref, @http_batches_completed)
         }
     end
   end

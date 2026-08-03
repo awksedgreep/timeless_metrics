@@ -59,8 +59,33 @@ This directory contains the current benchmark set for `timeless_metrics`.
   Note: the current read side uses `/health/detailed` as the stable GET path while rust HTTP query benchmarks are still being hardened.
 
 - [realistic_workload.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/realistic_workload.exs)
-  End-to-end HTTP workload generator with ramp-up behavior.
-  Use this to find saturation points and observe throughput/latency tradeoffs under a more production-like traffic mix.
+  Deterministic end-to-end HTTP workload generator with ramp-up behavior,
+  separate offered/admitted/completed throughput, queue age/depth, and an
+  explicit final drain barrier. Use this to find saturation points and observe
+  throughput/latency tradeoffs under a more production-like traffic mix. Its
+  query default remains `promql`; pass `--query-format native` only for the
+  metrics API POC's pre-PromQL exact latest/range comparison.
+
+- [metrics_api_seed.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/metrics_api_seed.exs)
+  Seeds separate API processes with an identical fixed Prometheus fixture and
+  flushes it. Pair it with `metrics_api_reads.exs`; do not compare read paths
+  over saturation runs that completed different point counts.
+
+- [metrics_api_reads.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/metrics_api_reads.exs)
+  Sequential socket-to-body benchmark for Session 3 latest, native range,
+  export, label, and series shapes. It anchors bounds to exact latest and
+  reports response bytes so empty or differently phased controls are rejected.
+
+- [metrics_api_promql.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/metrics_api_promql.exs)
+  Session 4 socket-to-body selector/`avg_over_time` benchmark. With
+  `--reference-url`, it first requires all six decoded Prometheus responses to
+  match an independently seeded Elixir+libSQL control.
+
+- [http_baseline_server.exs](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/http_baseline_server.exs)
+  Starts one isolated Elixir HTTP control over either libSQL or the Rust block
+  engine, with configurable readers/workers and optional deferred scheduled
+  maintenance. Use it with `realistic_workload.exs` for fresh-process API
+  comparisons; compile once, then run both processes with `--no-compile`.
 
 - [tsbs_bench.exs](/Users/mcotner/Documents/elixir/timeless/timeless_metrics/bench/tsbs_bench.exs)
   TSBS harness that starts a local TimelessMetrics HTTP endpoint and prints the commands needed to run the external TSBS tools.
@@ -82,6 +107,33 @@ This directory contains the current benchmark set for `timeless_metrics`.
 - Prefer `vs_victoriametrics.exs` only when you specifically need a product-to-product comparison.
 
 ## Historical Results
+
+- [results/2026-08-01_metrics_api_session5.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session5.md)
+  Opt-in Phoenix control-plane client, real Canvas graph-history switch,
+  complete-response enforcement, sole ownership, supervised SIGKILL/restart,
+  exact reopen result, and loopback boundary overhead.
+
+- [results/2026-08-01_metrics_api_session4.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session4.md)
+  Rust PromQL selector/`avg_over_time` vertical slice, cancellation regression,
+  six-shape Elixir+libSQL differential, latency, and memory result.
+
+- [results/2026-08-01_metrics_api_session3.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session3.md)
+  Rust metrics API POC Session 3 mechanical read/discovery implementation,
+  fixed-fixture route comparison, mixed native read/write result, packed-frame
+  accounting, memory, and control label-cache observation.
+
+- [results/2026-08-01_metrics_api_session2.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session2.md)
+  Rust metrics API POC Session 2 native Prometheus/VictoriaMetrics ingest,
+  partial-success contract, phase attribution, fresh-process throughput, and
+  memory comparison with the Session 0 Elixir+libSQL control.
+
+- [results/2026-08-01_metrics_api_session1.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session1.md)
+  Rust metrics API POC Session 1 server/storage lifecycle, sole ownership,
+  automatic flush threshold fix, and control-route shell smoke result.
+
+- [results/2026-08-01_metrics_api_session0.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_metrics_api_session0.md)
+  Rust metrics API POC Session 0 compatibility contract and completion-aware
+  fresh-process Elixir+libSQL/Rust-block baseline.
 
 - [results/2026-08-01_standalone_query_adoption.md](/home/mcotner/Documents/elixir/timeless/timeless_metrics/bench/results/2026-08-01_standalone_query_adoption.md)
   Session 6 adoption of selected-ID reads and the TAF1/TLF1 aggregate/latest

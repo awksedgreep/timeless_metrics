@@ -729,14 +729,51 @@ defmodule TimelessMetrics.OpenAPI do
                       "status" => %{"type" => "string", "example" => "ok"},
                       "series" => %{"type" => "integer"},
                       "points" => %{"type" => "integer"},
-                      "storage_bytes" => %{"type" => "integer"},
                       "buffer_points" => %{"type" => "integer"},
-                      "bytes_per_point" => %{"type" => "number"}
+                      "completed_points" => %{"type" => "integer"},
+                      "admitted_batches" => %{"type" => "integer"},
+                      "completed_batches" => %{"type" => "integer"},
+                      "queued_batches" => %{"type" => "integer"},
+                      "in_flight_batches" => %{"type" => "integer"},
+                      "oldest_queued_ms" => %{"type" => "integer"},
+                      "import_errors" => %{"type" => "integer"},
+                      "queries" => %{"type" => "integer"},
+                      "query_fast_path" => %{"type" => "integer"},
+                      "query_slow_path" => %{"type" => "integer"}
                     }
                   }
                 }
               }
             }
+          }
+        }
+      },
+      "/api/v1/flush" => %{
+        "post" => %{
+          "tags" => ["Operational"],
+          "summary" => "Drain and flush ingested metrics",
+          "description" =>
+            "Wait for every HTTP-admitted import batch to finish, then synchronously flush the storage engine.",
+          "operationId" => "flushMetrics",
+          "responses" => %{
+            "200" => %{
+              "description" => "Ingest queue drained and storage flushed",
+              "content" => %{
+                "application/json" => %{
+                  "schema" => %{
+                    "type" => "object",
+                    "properties" => %{
+                      "status" => %{"type" => "string", "example" => "ok"},
+                      "admitted_batches" => %{"type" => "integer"},
+                      "completed_batches" => %{"type" => "integer"},
+                      "completed_points" => %{"type" => "integer"}
+                    }
+                  }
+                }
+              }
+            },
+            "500" => json_error_response("Storage flush failed"),
+            "503" => json_error_response("Ingest drain timed out")
           }
         }
       },

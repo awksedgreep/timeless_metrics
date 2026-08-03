@@ -22,8 +22,10 @@
 # All flags optional. --vm-url "" to skip VictoriaMetrics.
 # --steps "5,2,1,0.5" overrides auto-ramp with fixed steps.
 # --batch N groups N devices per HTTP POST (reduces client overhead at high cardinality)
+# --write-format prometheus|victoria selects the native import payload (default: prometheus)
 # --start-interval S start at S seconds instead of 4s (default)
 # --ramp-factor N divide interval by N each step instead of 2 (default)
+# --seed N fixes writer jitter and query selection (default: 42)
 
 defmodule RealisticWorkload do
   @metric_pool ~w(
@@ -79,20 +81,32 @@ defmodule RealisticWorkload do
   @min_interval_ms 1
 
   def run do
+    {:ok, _started_apps} = Application.ensure_all_started(:req)
+
+    argv =
+      case System.argv() do
+        ["--" | rest] -> rest
+        rest -> rest
+      end
+
     {opts, _, _} =
-      OptionParser.parse(System.argv(),
+      OptionParser.parse(argv,
         switches: [
           tm_url: :string,
           vm_url: :string,
           devices: :integer,
           metrics: :integer,
           step_seconds: :integer,
+          settle_seconds: :integer,
           steps: :string,
           query_workers: :integer,
           start_interval: :float,
           ramp_factor: :integer,
           warmup: :integer,
-          batch: :integer
+          batch: :integer,
+          seed: :integer,
+          write_format: :string,
+          query_format: :string
         ]
       )
 
@@ -104,17 +118,24 @@ defmodule RealisticWorkload do
     metrics_count = opts[:metrics] || 20
     step_dur = opts[:step_seconds] || 20
     query_workers = opts[:query_workers] || 20
-    settle_s = 5
+    settle_s = opts[:settle_seconds] || 5
     warmup_s = opts[:warmup] || 10
     start_interval = opts[:start_interval] || 4.0
     ramp_factor = opts[:ramp_factor] || 2
     batch_size = opts[:batch] || 1
+    seed = opts[:seed] || 42
+    write_format = parse_write_format(opts[:write_format] || "prometheus")
+    query_format = parse_query_format(opts[:query_format] || "promql")
 
     fixed_steps =
       case opts[:steps] do
-        nil -> nil
+        nil ->
+          nil
+
         s ->
-          s |> String.split(",") |> Enum.map(fn p ->
+          s
+          |> String.split(",")
+          |> Enum.map(fn p ->
             {f, ""} = Float.parse(String.trim(p))
             f
           end)
@@ -134,7 +155,10 @@ defmodule RealisticWorkload do
       fixed_steps: fixed_steps,
       start_interval: start_interval,
       ramp_factor: ramp_factor,
-      batch_size: batch_size
+      batch_size: batch_size,
+      seed: seed,
+      write_format: write_format,
+      query_format: query_format
     }
 
     # --- Header ---
@@ -146,14 +170,20 @@ defmodule RealisticWorkload do
     IO.puts("  Metrics:     #{metrics_count} per device (#{fmt_int(series_count)} series)")
 
     if fixed_steps do
-      IO.puts("  Steps:       #{fixed_steps |> Enum.map(&format_interval/1) |> Enum.join(" -> ")} (fixed)")
+      IO.puts(
+        "  Steps:       #{fixed_steps |> Enum.map(&format_interval/1) |> Enum.join(" -> ")} (fixed)"
+      )
     else
-      IO.puts("  Ramp:        auto (÷#{ramp_factor} from #{format_interval(start_interval)} until saturation)")
+      IO.puts(
+        "  Ramp:        auto (÷#{ramp_factor} from #{format_interval(start_interval)} until saturation)"
+      )
     end
 
     IO.puts("  Step dur:    #{step_dur}s (#{settle_s}s settle, #{warmup_s}s warmup)")
     IO.puts("  Batch:       #{batch_size} device#{if batch_size > 1, do: "s", else: ""}/POST")
-    IO.puts("  Queries:     #{query_workers} workers (ramped with writes)")
+    IO.puts("  Write format: #{write_format}")
+    IO.puts("  Queries:     #{query_workers} workers, #{query_format} (ramped with writes)")
+    IO.puts("  Seed:        #{seed}")
     IO.puts("  Mode:        sequential (full client capacity per target)")
     IO.puts("  TM:          #{tm_url}")
     IO.puts("  VM:          #{if skip_vm, do: "(skipped)", else: vm_url}")
@@ -165,46 +195,52 @@ defmodule RealisticWorkload do
 
     # --- Run targets sequentially ---
     IO.puts("\n  === TimelessMetrics ===")
-    tm_results = run_target(tm_url, device_structs, cfg)
+    tm_run = run_target(:tm, tm_url, device_structs, cfg)
 
-    vm_results =
+    vm_run =
       if skip_vm do
         nil
       else
         IO.puts("\n  === VictoriaMetrics ===")
-        run_target(vm_url, device_structs, cfg)
+        run_target(:vm, vm_url, device_structs, cfg)
       end
 
     # --- Print comparison ---
     IO.puts("")
-    print_comparison(tm_results, vm_results, skip_vm)
-    print_summary(tm_url, series_count, tm_results, vm_results, skip_vm)
+    print_comparison(tm_run.steps, vm_run && vm_run.steps, skip_vm)
+    print_summary(tm_url, series_count, tm_run, vm_run, skip_vm)
   end
 
   # --- Run one target to saturation ---
 
-  defp run_target(url, device_structs, cfg) do
+  defp run_target(target, url, device_structs, cfg) do
     pool_size = ceil(length(device_structs) / cfg.batch_size) + cfg.query_workers + 10
     finch_name = :"BenchFinch_#{System.unique_integer([:positive])}"
 
     Finch.start_link(
       name: finch_name,
-      pools: %{default: [size: pool_size, count: 1, conn_opts: [transport_opts: [timeout: 10_000]]]}
+      pools: %{
+        default: [size: pool_size, count: 1, conn_opts: [transport_opts: [timeout: 10_000]]]
+      }
     )
 
     client = build_client(url, finch_name)
 
     write_ets = :ets.new(:write, [:ordered_set, :public, {:write_concurrency, true}])
     query_ets = :ets.new(:query, [:ordered_set, :public, {:write_concurrency, true}])
-    write_ctr = :counters.new(3, [:atomics])   # [1]=reqs [2]=errs [3]=pts
-    query_ctr = :counters.new(2, [:atomics])   # [1]=queries [2]=errs
+    # [1]=requests [2]=errors [3]=offered points [4]=HTTP-admitted points
+    write_ctr = :counters.new(4, [:atomics])
+    # [1]=queries [2]=errs
+    query_ctr = :counters.new(2, [:atomics])
     write_id = :atomics.new(1, [])
     query_id = :atomics.new(1, [])
     stop = :atomics.new(1, [])
     interval_ms = :atomics.new(1, [])
 
     initial_ms =
-      if cfg.fixed_steps, do: trunc(hd(cfg.fixed_steps) * 1000), else: trunc(cfg.start_interval * 1000)
+      if cfg.fixed_steps,
+        do: trunc(hd(cfg.fixed_steps) * 1000),
+        else: trunc(cfg.start_interval * 1000)
 
     :atomics.put(interval_ms, 1, initial_ms)
 
@@ -223,7 +259,8 @@ defmodule RealisticWorkload do
       step_dur: cfg.step_dur,
       settle_s: cfg.settle_s,
       ramp_factor: cfg.ramp_factor,
-      batch_size: cfg.batch_size
+      batch_size: cfg.batch_size,
+      target: target
     }
 
     # Spawn writers — batch devices into writer groups for high cardinality
@@ -238,18 +275,43 @@ defmodule RealisticWorkload do
 
         Task.async(fn ->
           Process.sleep(delay)
-          batch_writer_loop(group, cfg.metrics_count, client, stop, interval_ms,
-            write_ets, write_id, write_ctr)
+          seed_rng(cfg.seed, :writer, idx)
+
+          batch_writer_loop(
+            group,
+            cfg.metrics_count,
+            client,
+            stop,
+            interval_ms,
+            write_ets,
+            write_id,
+            write_ctr,
+            cfg.write_format
+          )
         end)
       end
 
     # Spawn query workers
     q_tasks =
-      for _i <- 1..cfg.query_workers do
-        Task.async(fn ->
-          query_loop(device_structs, client, stop, interval_ms,
-            query_ets, query_id, query_ctr)
-        end)
+      if cfg.query_workers > 0 do
+        for i <- 1..cfg.query_workers do
+          Task.async(fn ->
+            seed_rng(cfg.seed, :query, i)
+
+            query_loop(
+              device_structs,
+              client,
+              stop,
+              interval_ms,
+              query_ets,
+              query_id,
+              query_ctr,
+              cfg.query_format
+            )
+          end)
+        end
+      else
+        []
       end
 
     # Warmup
@@ -269,10 +331,12 @@ defmodule RealisticWorkload do
     IO.puts("  Stopping...")
     Task.await_many(writer_tasks ++ q_tasks, 30_000)
 
+    drain = drain_target(target, client)
+
     :ets.delete(write_ets)
     :ets.delete(query_ets)
 
-    step_results
+    %{steps: step_results, drain: drain}
   end
 
   defp run_fixed(steps, ctx) do
@@ -306,9 +370,7 @@ defmodule RealisticWorkload do
 
   defp run_one_step(int_ms, ctx) do
     int_s = int_ms / 1000
-    writer_count = ceil(ctx.devices / ctx.batch_size)
-    target_rps = trunc(writer_count / int_s)
-    target_pts = target_rps * ctx.metrics_count * ctx.batch_size
+    target_pts = trunc(ctx.devices * ctx.metrics_count / int_s)
 
     IO.write("#{format_interval(int_s)} (~#{fmt_int(target_pts)} pts/s) ...")
 
@@ -320,16 +382,20 @@ defmodule RealisticWorkload do
     :ets.delete_all_objects(ctx.query_ets)
     :atomics.put(ctx.write_id, 1, 0)
     :atomics.put(ctx.query_id, 1, 0)
-    reset_counters(ctx.write_ctr, 3)
+    reset_counters(ctx.write_ctr, 4)
     reset_counters(ctx.query_ctr, 2)
 
+    health_before = health_snapshot(ctx.target, ctx.client)
     t0 = System.monotonic_time(:microsecond)
     Process.sleep(ctx.step_dur * 1_000)
     elapsed_s = (System.monotonic_time(:microsecond) - t0) / 1_000_000
+    health_after = health_snapshot(ctx.target, ctx.client)
 
     w_reqs = :counters.get(ctx.write_ctr, 1)
     w_errs = :counters.get(ctx.write_ctr, 2)
-    w_pts = :counters.get(ctx.write_ctr, 3)
+    w_offered = :counters.get(ctx.write_ctr, 3)
+    w_admitted = :counters.get(ctx.write_ctr, 4)
+    w_completed = completed_delta(health_before, health_after, w_admitted)
     q_count = :counters.get(ctx.query_ctr, 1)
     q_errs = :counters.get(ctx.query_ctr, 2)
 
@@ -339,8 +405,14 @@ defmodule RealisticWorkload do
       elapsed_s: elapsed_s,
       w_reqs: w_reqs,
       w_errs: w_errs,
-      w_pts: w_pts,
+      w_offered: w_offered,
+      w_admitted: w_admitted,
+      w_completed: w_completed,
       w_pts_target: target_pts,
+      queued_batches: health_after.queued_batches,
+      in_flight_batches: health_after.in_flight_batches,
+      oldest_queued_ms: health_after.oldest_queued_ms,
+      completion_source: health_after.completion_source,
       w_lats: ets_values(ctx.write_ets),
       q_count: q_count,
       q_errs: q_errs,
@@ -348,16 +420,22 @@ defmodule RealisticWorkload do
     }
 
     actual_rps = trunc(w_reqs / elapsed_s)
-    actual_pts = trunc(w_pts / elapsed_s)
+    admitted_pts = trunc(w_admitted / elapsed_s)
+    completed_pts = trunc(w_completed / elapsed_s)
     actual_qps = trunc(q_count / elapsed_s)
-    IO.puts(" #{fmt_int(actual_rps)} req/s, #{fmt_int(actual_pts)} pts/s, #{fmt_int(actual_qps)} qps")
+
+    IO.puts(
+      " #{fmt_int(actual_rps)} req/s, #{fmt_int(admitted_pts)} admitted/s, " <>
+        "#{fmt_int(completed_pts)} completed/s, q=#{health_after.queued_batches}, " <>
+        "oldest=#{health_after.oldest_queued_ms}ms, #{fmt_int(actual_qps)} qps"
+    )
 
     result
   end
 
   defp check_saturation(r, _devices) do
     target_pts = r.w_pts_target
-    actual_pts = r.w_pts / r.elapsed_s
+    actual_pts = r.w_completed / r.elapsed_s
     ratio = actual_pts / max(target_pts, 1)
 
     w_p99 = percentile(r.w_lats, 99)
@@ -371,7 +449,8 @@ defmodule RealisticWorkload do
         {:saturated, "error rate #{Float.round(err_rate * 100, 1)}%"}
 
       ratio < @throughput_floor ->
-        {:saturated, "throughput #{trunc(ratio * 100)}% of target (#{fmt_int(actual_pts)} vs #{fmt_int(target_pts)} pts/s)"}
+        {:saturated,
+         "throughput #{trunc(ratio * 100)}% of target (#{fmt_int(actual_pts)} vs #{fmt_int(target_pts)} pts/s)"}
 
       true ->
         :ok
@@ -387,18 +466,31 @@ defmodule RealisticWorkload do
       env = Enum.at(["prod", "staging"], rem(dev_id, 2))
       label_str = ~s(host="#{host}",region="#{region}",env="#{env}")
       metric_lines = for m <- metrics, do: {m, "#{m}{#{label_str}}"}
-      %{id: dev_id, host: host, metric_lines: metric_lines}
+
+      victoria_metrics =
+        for metric <- metrics do
+          labels = %{
+            "__name__" => metric,
+            "host" => host,
+            "region" => region,
+            "env" => env
+          }
+
+          {metric, Jason.encode!(labels)}
+        end
+
+      %{id: dev_id, host: host, metric_lines: metric_lines, victoria_metrics: victoria_metrics}
     end
   end
 
   # --- Writer loop (batched — one task handles N devices) ---
 
-  defp batch_writer_loop(devs, mc, client, stop, int_ms, ets, wid, ctr) do
+  defp batch_writer_loop(devs, mc, client, stop, int_ms, ets, wid, ctr, write_format) do
     Process.sleep(:rand.uniform(:atomics.get(int_ms, 1)))
-    do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr)
+    do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr, write_format)
   end
 
-  defp do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr) do
+  defp do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr, write_format) do
     if :atomics.get(stop, 1) == 1 do
       :ok
     else
@@ -407,33 +499,58 @@ defmodule RealisticWorkload do
 
       payload =
         devs
-        |> Enum.map(&build_payload(&1, ts_ms))
+        |> Enum.map(&build_payload(&1, ts_ms, write_format))
         |> IO.iodata_to_binary()
 
-      post_write(client, payload, ets, wid, ctr, total_mc)
+      post_write(client, payload, ets, wid, ctr, total_mc, write_format)
 
       base = :atomics.get(int_ms, 1)
       jitter = max(trunc(base * 0.2), 1)
       sleep = max(base - jitter + :rand.uniform(jitter * 2), 1)
       Process.sleep(sleep)
 
-      do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr)
+      do_batch_write(devs, mc, client, stop, int_ms, ets, wid, ctr, write_format)
     end
   end
 
-  defp build_payload(dev, ts_ms) do
+  defp build_payload(dev, ts_ms, :prometheus) do
     for {metric, labeled} <- dev.metric_lines do
       val = gen_value(metric, ts_ms, dev.id)
       [labeled, ?\s, Float.to_string(val), ?\s, Integer.to_string(ts_ms), ?\n]
     end
   end
 
-  defp post_write(client, payload, ets, wid, ctr, mc) do
+  defp build_payload(dev, ts_ms, :victoria) do
+    for {metric, metric_json} <- dev.victoria_metrics do
+      val = gen_value(metric, ts_ms, dev.id)
+
+      [
+        ~s({"metric":),
+        metric_json,
+        ~s(,"values":[),
+        Float.to_string(val),
+        ~s(],"timestamps":[),
+        Integer.to_string(ts_ms),
+        "]}\n"
+      ]
+    end
+  end
+
+  defp post_write(client, payload, ets, wid, ctr, mc, write_format) do
+    {path, content_type} =
+      case write_format do
+        :prometheus -> {"/api/v1/import/prometheus", "text/plain"}
+        :victoria -> {"/api/v1/import", "application/x-ndjson"}
+      end
+
     {us, result} =
       :timer.tc(fn ->
         try do
-          Req.post(client, url: "/api/v1/import/prometheus", body: payload,
-            headers: [{"content-type", "text/plain"}])
+          Req.post(client,
+            url: path,
+            body: payload,
+            headers: [{"content-type", content_type}]
+          )
         rescue
           e -> {:error, e}
         end
@@ -445,7 +562,9 @@ defmodule RealisticWorkload do
     :counters.add(ctr, 3, mc)
 
     case result do
-      {:ok, %{status: s}} when s in 200..299 -> :ok
+      {:ok, %{status: s}} when s in 200..299 ->
+        :counters.add(ctr, 4, mc)
+
       _ ->
         :counters.add(ctr, 2, 1)
     end
@@ -453,11 +572,11 @@ defmodule RealisticWorkload do
 
   # --- Query loop (aggressive ramp, paced to write interval / 5) ---
 
-  defp query_loop(devices, client, stop, interval_ms, ets, qid, ctr) do
-    do_query(devices, client, stop, interval_ms, ets, qid, ctr)
+  defp query_loop(devices, client, stop, interval_ms, ets, qid, ctr, query_format) do
+    do_query(devices, client, stop, interval_ms, ets, qid, ctr, query_format)
   end
 
-  defp do_query(devices, client, stop, interval_ms, ets, qid, ctr) do
+  defp do_query(devices, client, stop, interval_ms, ets, qid, ctr, query_format) do
     if :atomics.get(stop, 1) == 1 do
       :ok
     else
@@ -465,30 +584,54 @@ defmodule RealisticWorkload do
       dev = Enum.random(devices)
       now = System.os_time(:second)
 
-      run_query(type, metric, dev, now, range_s, step, client, ets, qid, ctr)
+      run_query(type, metric, dev, now, range_s, step, client, ets, qid, ctr, query_format)
 
       # Aggressive pacing: write_interval / 5, floor 5ms
       write_int = :atomics.get(interval_ms, 1)
       q_sleep = max(div(write_int, 5), 5) + :rand.uniform(5)
       Process.sleep(q_sleep)
 
-      do_query(devices, client, stop, interval_ms, ets, qid, ctr)
+      do_query(devices, client, stop, interval_ms, ets, qid, ctr, query_format)
     end
   end
 
-  defp run_query(type, metric, dev, now, range_s, step, client, ets, qid, ctr) do
+  defp run_query(type, metric, dev, now, range_s, step, client, ets, qid, ctr, query_format) do
     query = ~s(#{metric}{host="#{dev.host}"})
 
     {us, result} =
       try do
         case type do
           :instant ->
-            :timer.tc(fn -> Req.get(client, url: "/api/v1/query", params: [query: query]) end)
+            params =
+              case query_format do
+                :promql -> [query: query]
+                :native -> [metric: metric, host: dev.host]
+              end
+
+            :timer.tc(fn -> Req.get(client, url: "/api/v1/query", params: params) end)
 
           :range ->
+            params =
+              case query_format do
+                :promql ->
+                  [query: query, start: now - range_s, end: now, step: step]
+
+                :native ->
+                  [
+                    metric: metric,
+                    host: dev.host,
+                    start: now - range_s,
+                    end: now,
+                    step: step,
+                    aggregate: "avg"
+                  ]
+              end
+
             :timer.tc(fn ->
-              Req.get(client, url: "/api/v1/query_range",
-                params: [query: query, start: now - range_s, end: now, step: step])
+              Req.get(client,
+                url: "/api/v1/query_range",
+                params: params
+              )
             end)
         end
       rescue
@@ -505,6 +648,13 @@ defmodule RealisticWorkload do
     end
   end
 
+  defp parse_query_format("promql"), do: :promql
+  defp parse_query_format("native"), do: :native
+
+  defp parse_query_format(other) do
+    raise ArgumentError, "--query-format must be promql or native, got: #{inspect(other)}"
+  end
+
   # --- Data generation ---
 
   defp gen_value(metric, ts_ms, dev_id) do
@@ -513,37 +663,98 @@ defmodule RealisticWorkload do
     dh = :erlang.phash2(dev_id) / 4_294_967_295
 
     case metric do
-      "node_cpu_seconds_total" -> Float.round(1000.0 + ts_ms / 100_000 + dh * 500.0 + n * 10.0, 2)
-      "node_memory_MemAvailable_bytes" -> Float.round(2.0e9 + n * 6.0e9 + dh * 2.0e9, 0)
-      "node_memory_MemTotal_bytes" -> Float.round(8.0e9 + dh * 8.0e9, 0)
-      "node_memory_Buffers_bytes" -> Float.round(1.0e8 + n * 5.0e8, 0)
-      "node_memory_Cached_bytes" -> Float.round(5.0e8 + n * 2.0e9, 0)
-      "node_filesystem_avail_bytes" -> Float.round(5.0e10 + n * 2.0e11 + dh * 1.0e11, 0)
-      "node_filesystem_size_bytes" -> Float.round(5.0e11 + dh * 5.0e11, 0)
-      "node_disk_read_bytes_total" -> Float.round(1.0e9 + ts_ms / 1_000 * 1000 + n * 1.0e5, 0)
-      "node_disk_written_bytes_total" -> Float.round(2.0e9 + ts_ms / 1_000 * 2000 + n * 2.0e5, 0)
-      "node_disk_io_time_seconds_total" -> Float.round(500.0 + ts_ms / 1.0e6 + n * 5.0, 2)
-      "node_network_receive_bytes_total" -> Float.round(5.0e9 + ts_ms / 1_000 * 5000 + n * 5.0e5, 0)
-      "node_network_transmit_bytes_total" -> Float.round(3.0e9 + ts_ms / 1_000 * 3000 + n * 3.0e5, 0)
-      "node_network_receive_errs_total" -> Float.round(n * 100.0, 0)
-      "node_network_transmit_errs_total" -> Float.round(n * 50.0, 0)
-      "node_load1" -> Float.round(0.5 + n * 4.0 + dh * 2.0, 2)
-      "node_load5" -> Float.round(0.4 + n * 3.0 + dh * 1.5, 2)
-      "node_load15" -> Float.round(0.3 + n * 2.0 + dh * 1.0, 2)
-      "node_time_seconds" -> Float.round(ts_ms / 1_000.0, 3)
-      "node_boot_time_seconds" -> Float.round(ts_ms / 1_000 - 86_400.0 * (1 + dh * 30), 0)
-      "node_context_switches_total" -> Float.round(1.0e6 + ts_ms / 100 + n * 1.0e4, 0)
-      "node_entropy_avail_bits" -> Float.round(2000.0 + n * 2000.0, 0)
-      "node_filefd_allocated" -> Float.round(500.0 + n * 2000.0 + dh * 500.0, 0)
-      "node_forks_total" -> Float.round(1.0e5 + ts_ms / 1.0e4 + n * 1000.0, 0)
-      "node_intr_total" -> Float.round(5.0e7 + ts_ms / 100 + n * 1.0e5, 0)
-      "node_procs_running" -> Float.round(1.0 + n * 8.0, 0)
-      "node_procs_blocked" -> Float.round(n * 2.0, 0)
-      "node_scrape_collector_duration_seconds" -> Float.round(0.001 + n * 0.05, 4)
-      "node_scrape_collector_success" -> 1.0
-      "node_nf_conntrack_entries" -> Float.round(100.0 + n * 5000.0 + dh * 1000.0, 0)
-      "node_vmstat_pgfault" -> Float.round(1.0e7 + ts_ms / 1_000 + n * 5.0e4, 0)
-      _ -> Float.round(n * 100.0, 2)
+      "node_cpu_seconds_total" ->
+        Float.round(1000.0 + ts_ms / 100_000 + dh * 500.0 + n * 10.0, 2)
+
+      "node_memory_MemAvailable_bytes" ->
+        Float.round(2.0e9 + n * 6.0e9 + dh * 2.0e9, 0)
+
+      "node_memory_MemTotal_bytes" ->
+        Float.round(8.0e9 + dh * 8.0e9, 0)
+
+      "node_memory_Buffers_bytes" ->
+        Float.round(1.0e8 + n * 5.0e8, 0)
+
+      "node_memory_Cached_bytes" ->
+        Float.round(5.0e8 + n * 2.0e9, 0)
+
+      "node_filesystem_avail_bytes" ->
+        Float.round(5.0e10 + n * 2.0e11 + dh * 1.0e11, 0)
+
+      "node_filesystem_size_bytes" ->
+        Float.round(5.0e11 + dh * 5.0e11, 0)
+
+      "node_disk_read_bytes_total" ->
+        Float.round(1.0e9 + ts_ms / 1_000 * 1000 + n * 1.0e5, 0)
+
+      "node_disk_written_bytes_total" ->
+        Float.round(2.0e9 + ts_ms / 1_000 * 2000 + n * 2.0e5, 0)
+
+      "node_disk_io_time_seconds_total" ->
+        Float.round(500.0 + ts_ms / 1.0e6 + n * 5.0, 2)
+
+      "node_network_receive_bytes_total" ->
+        Float.round(5.0e9 + ts_ms / 1_000 * 5000 + n * 5.0e5, 0)
+
+      "node_network_transmit_bytes_total" ->
+        Float.round(3.0e9 + ts_ms / 1_000 * 3000 + n * 3.0e5, 0)
+
+      "node_network_receive_errs_total" ->
+        Float.round(n * 100.0, 0)
+
+      "node_network_transmit_errs_total" ->
+        Float.round(n * 50.0, 0)
+
+      "node_load1" ->
+        Float.round(0.5 + n * 4.0 + dh * 2.0, 2)
+
+      "node_load5" ->
+        Float.round(0.4 + n * 3.0 + dh * 1.5, 2)
+
+      "node_load15" ->
+        Float.round(0.3 + n * 2.0 + dh * 1.0, 2)
+
+      "node_time_seconds" ->
+        Float.round(ts_ms / 1_000.0, 3)
+
+      "node_boot_time_seconds" ->
+        Float.round(ts_ms / 1_000 - 86_400.0 * (1 + dh * 30), 0)
+
+      "node_context_switches_total" ->
+        Float.round(1.0e6 + ts_ms / 100 + n * 1.0e4, 0)
+
+      "node_entropy_avail_bits" ->
+        Float.round(2000.0 + n * 2000.0, 0)
+
+      "node_filefd_allocated" ->
+        Float.round(500.0 + n * 2000.0 + dh * 500.0, 0)
+
+      "node_forks_total" ->
+        Float.round(1.0e5 + ts_ms / 1.0e4 + n * 1000.0, 0)
+
+      "node_intr_total" ->
+        Float.round(5.0e7 + ts_ms / 100 + n * 1.0e5, 0)
+
+      "node_procs_running" ->
+        Float.round(1.0 + n * 8.0, 0)
+
+      "node_procs_blocked" ->
+        Float.round(n * 2.0, 0)
+
+      "node_scrape_collector_duration_seconds" ->
+        Float.round(0.001 + n * 0.05, 4)
+
+      "node_scrape_collector_success" ->
+        1.0
+
+      "node_nf_conntrack_entries" ->
+        Float.round(100.0 + n * 5000.0 + dh * 1000.0, 0)
+
+      "node_vmstat_pgfault" ->
+        Float.round(1.0e7 + ts_ms / 1_000 + n * 5.0e4, 0)
+
+      _ ->
+        Float.round(n * 100.0, 2)
     end
   end
 
@@ -558,9 +769,96 @@ defmodule RealisticWorkload do
     )
   end
 
+  defp parse_write_format("prometheus"), do: :prometheus
+  defp parse_write_format("victoria"), do: :victoria
+
+  defp parse_write_format(other) do
+    raise ArgumentError,
+          "--write-format must be prometheus or victoria, got: #{inspect(other)}"
+  end
+
+  defp seed_rng(seed, role, index) do
+    a = :erlang.phash2({seed, role, index, 1}, 4_294_967_295) + 1
+    b = :erlang.phash2({seed, role, index, 2}, 4_294_967_295) + 1
+    c = :erlang.phash2({seed, role, index, 3}, 4_294_967_295) + 1
+    :rand.seed(:exsss, {a, b, c})
+  end
+
+  defp health_snapshot(:tm, client) do
+    case Req.get(client, url: "/health") do
+      {:ok, %{status: 200, body: body}} when is_map(body) ->
+        %{
+          completed_points: body["completed_points"],
+          queued_batches: body["queued_batches"] || 0,
+          in_flight_batches: body["in_flight_batches"] || 0,
+          oldest_queued_ms: body["oldest_queued_ms"] || 0,
+          completion_source:
+            if(is_integer(body["completed_points"]), do: :storage, else: :admission)
+        }
+
+      _ ->
+        empty_health(:unavailable)
+    end
+  end
+
+  defp health_snapshot(_target, _client), do: empty_health(:admission)
+
+  defp empty_health(source) do
+    %{
+      completed_points: nil,
+      queued_batches: 0,
+      in_flight_batches: 0,
+      oldest_queued_ms: 0,
+      completion_source: source
+    }
+  end
+
+  defp completed_delta(
+         %{completed_points: before_points},
+         %{completed_points: after_points},
+         _admitted
+       )
+       when is_integer(before_points) and is_integer(after_points) do
+    max(after_points - before_points, 0)
+  end
+
+  defp completed_delta(_before, _after, admitted), do: admitted
+
+  defp drain_target(:tm, client) do
+    before = health_snapshot(:tm, client)
+
+    {elapsed_us, response} =
+      :timer.tc(fn -> Req.post(client, url: "/api/v1/flush", body: "") end)
+
+    after_health = health_snapshot(:tm, client)
+
+    status =
+      case response do
+        {:ok, %{status: code}} -> code
+        _ -> 0
+      end
+
+    IO.puts(
+      "  Final drain: #{fmt_us(elapsed_us)}, HTTP #{status}, " <>
+        "queued=#{after_health.queued_batches}, in-flight=#{after_health.in_flight_batches}"
+    )
+
+    %{
+      supported: status == 200,
+      elapsed_us: elapsed_us,
+      status: status,
+      before: before,
+      after: after_health
+    }
+  end
+
+  defp drain_target(_target, _client), do: %{supported: false}
+
   defp verify_target(name, url) do
     case Req.get("#{url}/health", retry: false) do
-      {:ok, %{status: 200}} -> IO.puts("  #{name} OK at #{url}")
+      {:ok, %{status: 200}} ->
+        IO.puts("  #{name} OK at #{url}")
+
       other ->
         IO.puts("  ERROR: #{name} not reachable at #{url}: #{inspect(other)}")
         System.halt(1)
@@ -584,13 +882,19 @@ defmodule RealisticWorkload do
   # --- Formatting ---
 
   defp fmt_int(n) when is_float(n), do: fmt_int(trunc(n))
-  defp fmt_int(n) when n >= 1_000_000, do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
+  defp fmt_int(n) when n >= 1_000_000,
+    do: "#{:erlang.float_to_binary(n / 1_000_000, decimals: 1)}M"
+
   defp fmt_int(n) when n >= 1_000, do: "#{:erlang.float_to_binary(n / 1_000, decimals: 1)}K"
   defp fmt_int(n), do: Integer.to_string(n)
 
   defp fmt_us(0), do: "—"
   defp fmt_us(us) when is_float(us), do: fmt_us(trunc(us))
-  defp fmt_us(us) when us >= 1_000_000, do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 2)}s"
+
+  defp fmt_us(us) when us >= 1_000_000,
+    do: "#{:erlang.float_to_binary(us / 1_000_000, decimals: 2)}s"
+
   defp fmt_us(us) when us >= 1_000, do: "#{:erlang.float_to_binary(us / 1_000, decimals: 2)}ms"
   defp fmt_us(us), do: "#{us}us"
 
@@ -634,15 +938,28 @@ defmodule RealisticWorkload do
     if skip_vm do
       IO.puts(
         "  " <>
-          pad_r("Interval", c) <> pad_l("Req/s", c) <> pad_l("Pts/s", c) <>
-          pad_l("p50", c) <> pad_l("p99", c) <> pad_l("p999", c)
+          pad_r("Interval", c) <>
+          pad_l("Req/s", c) <>
+          pad_l("Admit/s", c) <>
+          pad_l("Done/s", c) <>
+          pad_l("Queue", c) <>
+          pad_l("Oldest", c) <>
+          pad_l("p50", c) <>
+          pad_l("p95", c) <>
+          pad_l("p99", c)
       )
     else
       IO.puts(
         "  " <>
           pad_r("Interval", c) <>
-          pad_l("TM Pts/s", c) <> pad_l("TM p50", c) <> pad_l("TM p99", c) <> pad_l("TM p999", c) <>
-          pad_l("VM Pts/s", c) <> pad_l("VM p50", c) <> pad_l("VM p99", c) <> pad_l("VM p999", c)
+          pad_l("TM Done/s", c) <>
+          pad_l("TM p50", c) <>
+          pad_l("TM p95", c) <>
+          pad_l("TM p99", c) <>
+          pad_l("VM Done/s", c) <>
+          pad_l("VM p50", c) <>
+          pad_l("VM p95", c) <>
+          pad_l("VM p99", c)
       )
     end
 
@@ -657,36 +974,42 @@ defmodule RealisticWorkload do
             "  " <>
               pad_r(format_interval(int_s), c) <>
               pad_l(fmt_int(tm_r.w_reqs / tm_r.elapsed_s), c) <>
-              pad_l(fmt_int(tm_r.w_pts / tm_r.elapsed_s), c) <>
+              pad_l(fmt_int(tm_r.w_admitted / tm_r.elapsed_s), c) <>
+              pad_l(fmt_int(tm_r.w_completed / tm_r.elapsed_s), c) <>
+              pad_l(fmt_int(tm_r.queued_batches), c) <>
+              pad_l("#{tm_r.oldest_queued_ms}ms", c) <>
               pad_l(fmt_us(percentile(tm_r.w_lats, 50)), c) <>
+              pad_l(fmt_us(percentile(tm_r.w_lats, 95)), c) <>
               pad_l(fmt_us(percentile(tm_r.w_lats, 99)), c) <>
-              pad_l(fmt_us(percentile(tm_r.w_lats, 99.9)), c) <>
               err_suffix(tm_r.w_errs, nil)
           )
         end
       else
         tm_part =
           if tm_r do
-            pad_l(fmt_int(tm_r.w_pts / tm_r.elapsed_s), c) <>
+            pad_l(fmt_int(tm_r.w_completed / tm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(tm_r.w_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(tm_r.w_lats, 99)), c) <>
-              pad_l(fmt_us(percentile(tm_r.w_lats, 99.9)), c)
+              pad_l(fmt_us(percentile(tm_r.w_lats, 95)), c) <>
+              pad_l(fmt_us(percentile(tm_r.w_lats, 99)), c)
           else
             pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
           end
 
         vm_part =
           if vm_r do
-            pad_l(fmt_int(vm_r.w_pts / vm_r.elapsed_s), c) <>
+            pad_l(fmt_int(vm_r.w_completed / vm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(vm_r.w_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(vm_r.w_lats, 99)), c) <>
-              pad_l(fmt_us(percentile(vm_r.w_lats, 99.9)), c)
+              pad_l(fmt_us(percentile(vm_r.w_lats, 95)), c) <>
+              pad_l(fmt_us(percentile(vm_r.w_lats, 99)), c)
           else
             pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
           end
 
         IO.puts(
-          "  " <> pad_r(format_interval(int_s), c) <> tm_part <> vm_part <>
+          "  " <>
+            pad_r(format_interval(int_s), c) <>
+            tm_part <>
+            vm_part <>
             err_suffix(tm_r && tm_r.w_errs, vm_r && vm_r.w_errs)
         )
       end
@@ -703,19 +1026,20 @@ defmodule RealisticWorkload do
     if skip_vm do
       IO.puts(
         "  " <>
-          pad_r("W Pts/s", c) <> pad_l("Q/s", c) <>
-          pad_l("p50", c) <> pad_l("p99", c) <> pad_l("p999", c)
+          pad_r("W Pts/s", c) <>
+          pad_l("Q/s", c) <>
+          pad_l("p50", c) <> pad_l("p95", c) <> pad_l("p99", c)
       )
 
       for int_ms <- intervals do
         if tm_r = Map.get(tm, int_ms) do
           IO.puts(
             "  " <>
-              pad_r(fmt_int(tm_r.w_pts / tm_r.elapsed_s), c) <>
+              pad_r(fmt_int(tm_r.w_completed / tm_r.elapsed_s), c) <>
               pad_l(fmt_int(tm_r.q_count / tm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(tm_r.q_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(tm_r.q_lats, 99)), c) <>
-              pad_l(fmt_us(percentile(tm_r.q_lats, 99.9)), c)
+              pad_l(fmt_us(percentile(tm_r.q_lats, 95)), c) <>
+              pad_l(fmt_us(percentile(tm_r.q_lats, 99)), c)
           )
         end
       end
@@ -723,8 +1047,11 @@ defmodule RealisticWorkload do
       IO.puts(
         "  " <>
           pad_r("W Pts/s", c) <>
-          pad_l("TM Q/s", c) <> pad_l("TM p50", c) <> pad_l("TM p99", c) <> pad_l("TM p999", c) <>
-          pad_l("VM Q/s", c) <> pad_l("VM p50", c) <> pad_l("VM p99", c) <> pad_l("VM p999", c)
+          pad_l("TM Q/s", c) <>
+          pad_l("TM p50", c) <>
+          pad_l("TM p95", c) <>
+          pad_l("TM p99", c) <>
+          pad_l("VM Q/s", c) <> pad_l("VM p50", c) <> pad_l("VM p95", c) <> pad_l("VM p99", c)
       )
 
       for int_ms <- intervals do
@@ -733,14 +1060,14 @@ defmodule RealisticWorkload do
 
         # Use whichever has data for the pts/s label
         ref = tm_r || vm_r
-        pts_label = fmt_int(ref.w_pts / ref.elapsed_s)
+        pts_label = fmt_int(ref.w_completed / ref.elapsed_s)
 
         tm_q =
           if tm_r && tm_r.q_count > 0 do
             pad_l(fmt_int(tm_r.q_count / tm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(tm_r.q_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(tm_r.q_lats, 99)), c) <>
-              pad_l(fmt_us(percentile(tm_r.q_lats, 99.9)), c)
+              pad_l(fmt_us(percentile(tm_r.q_lats, 95)), c) <>
+              pad_l(fmt_us(percentile(tm_r.q_lats, 99)), c)
           else
             pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
           end
@@ -749,8 +1076,8 @@ defmodule RealisticWorkload do
           if vm_r && vm_r.q_count > 0 do
             pad_l(fmt_int(vm_r.q_count / vm_r.elapsed_s), c) <>
               pad_l(fmt_us(percentile(vm_r.q_lats, 50)), c) <>
-              pad_l(fmt_us(percentile(vm_r.q_lats, 99)), c) <>
-              pad_l(fmt_us(percentile(vm_r.q_lats, 99.9)), c)
+              pad_l(fmt_us(percentile(vm_r.q_lats, 95)), c) <>
+              pad_l(fmt_us(percentile(vm_r.q_lats, 99)), c)
           else
             pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c) <> pad_l("—", c)
           end
@@ -760,23 +1087,32 @@ defmodule RealisticWorkload do
     end
   end
 
-  defp print_summary(tm_url, series_count, tm_steps, vm_steps, skip_vm) do
+  defp print_summary(tm_url, series_count, tm_run, vm_run, skip_vm) do
+    tm_steps = tm_run.steps
     IO.puts("")
     IO.puts("  Summary (#{fmt_int(series_count)} series)")
     IO.puts("  " <> String.duplicate("=", 64))
 
-    tm_peak = Enum.max_by(tm_steps, &(&1.w_pts / &1.elapsed_s))
-    tm_peak_pts = trunc(tm_peak.w_pts / tm_peak.elapsed_s)
-    IO.puts("  TM peak:      #{fmt_int(tm_peak_pts)} pts/s at #{format_interval(tm_peak.interval_s)} interval")
+    tm_peak = Enum.max_by(tm_steps, &(&1.w_completed / &1.elapsed_s))
+    tm_peak_pts = trunc(tm_peak.w_completed / tm_peak.elapsed_s)
+
+    IO.puts(
+      "  TM peak:      #{fmt_int(tm_peak_pts)} pts/s at #{format_interval(tm_peak.interval_s)} interval"
+    )
 
     tm_total_q = Enum.reduce(tm_steps, 0, &(&1.q_count + &2))
     tm_total_qe = Enum.reduce(tm_steps, 0, &(&1.q_errs + &2))
     IO.puts("  TM queries:   #{fmt_int(tm_total_q)} total, #{tm_total_qe} errors")
+    IO.puts("  TM drain:     #{fmt_us(tm_run.drain.elapsed_us)}")
 
     unless skip_vm do
-      vm_peak = Enum.max_by(vm_steps, &(&1.w_pts / &1.elapsed_s))
-      vm_peak_pts = trunc(vm_peak.w_pts / vm_peak.elapsed_s)
-      IO.puts("  VM peak:      #{fmt_int(vm_peak_pts)} pts/s at #{format_interval(vm_peak.interval_s)} interval")
+      vm_steps = vm_run.steps
+      vm_peak = Enum.max_by(vm_steps, &(&1.w_completed / &1.elapsed_s))
+      vm_peak_pts = trunc(vm_peak.w_completed / vm_peak.elapsed_s)
+
+      IO.puts(
+        "  VM peak:      #{fmt_int(vm_peak_pts)} pts/s at #{format_interval(vm_peak.interval_s)} interval"
+      )
 
       vm_total_q = Enum.reduce(vm_steps, 0, &(&1.q_count + &2))
       vm_total_qe = Enum.reduce(vm_steps, 0, &(&1.q_errs + &2))
@@ -787,8 +1123,11 @@ defmodule RealisticWorkload do
     case Req.get("#{tm_url}/health") do
       {:ok, %{status: 200, body: h}} when is_map(h) ->
         series = h["series"] || 0
-        points = (h["points"] || 0) + (h["buffer_points"] || 0)
-        IO.puts("  TM verified:  #{fmt_int(series)} series, #{fmt_int(points)} points (expected #{fmt_int(series_count)} series)")
+        points = h["points"] || 0
+
+        IO.puts(
+          "  TM verified:  #{fmt_int(series)} series, #{fmt_int(points)} points (expected #{fmt_int(series_count)} series)"
+        )
 
       _ ->
         IO.puts("  TM health:    (could not verify)")

@@ -33,10 +33,10 @@ All options are passed to the `TimelessMetrics` child spec:
 | `self_monitor` | `boolean()` | `true` | Enable internal self-monitoring metrics |
 | `self_monitor_labels` | `map()` | `%{}` | Labels applied to self-monitoring metrics |
 | `scraping` | `boolean()` | `true` | Enable the Prometheus scraping subsystem |
-| `engine` | `:rust \| :libsql \| :legacy` | `:rust` | Engine selection. `:libsql` is the opt-in single-database preview; `:legacy` exists only for compatibility and migration work |
+| `engine` | `:rust \| :libsql \| :legacy` | `:rust` | Standalone embedded-library engine selection. Production Stack installations use the external Rust/libSQL owner; `:legacy` exists only for compatibility and migration work |
 | `reader_pool_size` | `pos_integer()` | `max(div(schedulers, 2), 2)` | Number of read-only SQLite connections used by `engine: :libsql` |
 
-### libSQL engine preview
+### Embedded libSQL engine
 
 `engine: :libsql` loads the `timeless-libsql` extension into SQLite and stores
 raw blocks, rollups, the durable series registry, and application metadata in

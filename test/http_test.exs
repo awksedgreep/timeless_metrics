@@ -58,7 +58,15 @@ defmodule TimelessMetrics.HTTPTest do
 
     assert resp.status == 204
 
-    TimelessMetrics.flush(:http_test)
+    flush = TimelessMetrics.TestHTTP.post(@port, "/api/v1/flush", "")
+    assert flush.status == 200
+
+    assert %{
+             "status" => "ok",
+             "admitted_batches" => 1,
+             "completed_batches" => 1,
+             "completed_points" => 3
+           } = :json.decode(flush.body)
 
     {:ok, cpu_points} =
       TimelessMetrics.query(:http_test, "cpu_usage", %{"host" => "web-1"},
@@ -111,6 +119,13 @@ defmodule TimelessMetrics.HTTPTest do
     assert body["status"] == "ok"
     assert is_integer(body["series"])
     assert is_integer(body["points"])
+    assert is_integer(body["completed_points"])
+    assert is_integer(body["admitted_batches"])
+    assert is_integer(body["completed_batches"])
+    assert is_integer(body["queued_batches"])
+    assert is_integer(body["in_flight_batches"])
+    assert is_integer(body["oldest_queued_ms"])
+    assert is_integer(body["import_errors"])
     assert is_integer(body["queries"])
   end
 
@@ -770,6 +785,7 @@ defmodule TimelessMetrics.HTTPTest do
     resp = TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", lines)
 
     assert resp.status == 401
+    assert TimelessMetrics.TestHTTP.post(@port, "/api/v1/flush", "").status == 401
 
     resp =
       TimelessMetrics.TestHTTP.post(@port, "/api/v1/import", lines,
@@ -777,6 +793,13 @@ defmodule TimelessMetrics.HTTPTest do
       )
 
     assert resp.status == 204
+
+    flush =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/flush", "",
+        headers: [{"authorization", "Bearer #{@secret}"}]
+      )
+
+    assert flush.status == 200
 
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
   end

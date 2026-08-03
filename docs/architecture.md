@@ -1,10 +1,13 @@
 # Architecture
 
-This document describes the current default architecture of TimelessMetrics.
+This document describes the standalone embedded-library architecture of
+TimelessMetrics. The default Timeless Stack production architecture instead
+runs `timeless-metrics-api` as an external Rust/libSQL owner and keeps this OTP
+application loaded for control compatibility and automatic migration only.
 
 The important versioned truth is:
 - the default engine is the Rust engine
-- the SQLite/libSQL block-store engine is available as an opt-in preview
+- the SQLite/libSQL block-store engine is available to embedded-library users
 - the legacy Elixir engine still exists, but it is no longer the primary design target
 
 If you are reading older notes that describe ETS shard buffers, SegmentBuilder, ALP, or SQLite-backed raw storage as the hot path, those describe the legacy engine, not the default runtime on `main`.
@@ -71,7 +74,7 @@ The legacy engine is still available through explicit configuration:
 {TimelessMetrics, name: :metrics, data_dir: "/tmp/metrics", engine: :legacy}
 ```
 
-The single-database libSQL preview is also explicit:
+The single-database embedded libSQL engine is also explicit:
 
 ```elixir
 {TimelessMetrics, name: :metrics, data_dir: "/tmp/metrics", engine: :libsql}
@@ -169,7 +172,7 @@ Important behavior:
 - chunk naming is designed to avoid restart-time overwrite collisions
 - out-of-order points are normalized before chunk metadata is written
 
-### libSQL preview storage model
+### Embedded libSQL storage model
 
 The libSQL engine uses the same `data_dir/metrics.db` that already holds admin
 state. `timeless-libsql` shadow tables in that database hold the series
