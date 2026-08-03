@@ -19,11 +19,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check out timeless-libsql extension
+        uses: actions/checkout@v4
+        with:
+          repository: awksedgreep/timeless-libsql
+          ref: a72634e3aa2d523b468acdb0aac2870d5c5e5b31
+          path: timeless-libsql
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Build timeless-libsql extension
+        working-directory: timeless-libsql
+        run: |
+          cargo build --locked --release -p timeless-ext
+          mkdir -p ../../timeless-libsql/target/release
+          cp target/release/libtimeless_ext.so ../../timeless-libsql/target/release/libtimeless_ext.so
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
