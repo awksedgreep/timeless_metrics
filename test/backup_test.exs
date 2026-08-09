@@ -62,7 +62,7 @@ defmodule TimelessMetrics.BackupTest do
     Exqlite.Sqlite3.close(conn)
   end
 
-  test "backup includes shard directories" do
+  test "backup includes the engine's data files" do
     now = System.os_time(:second)
 
     for i <- 0..4 do
@@ -76,12 +76,18 @@ defmodule TimelessMetrics.BackupTest do
     {:ok, result} = TimelessMetrics.backup(:backup_test, @backup_dir)
 
     assert "metrics.db" in result.files
-    # Rust engine uses "rust_engine", legacy uses "shard_*"
-    has_data =
-      "rust_engine" in result.files or
-        Enum.any?(result.files, &String.starts_with?(&1, "shard_"))
 
-    assert has_data
+    # libSQL (the default) stores samples IN metrics.db, so the single
+    # snapshot is the complete backup; the rust engine adds a
+    # "rust_engine" directory, legacy adds "shard_*" directories.
+    case :persistent_term.get({TimelessMetrics, :backup_test, :engine}, nil) do
+      :libsql ->
+        assert result.total_bytes > 0
+
+      _ ->
+        assert "rust_engine" in result.files or
+                 Enum.any?(result.files, &String.starts_with?(&1, "shard_"))
+    end
   end
 
   test "backup during active writes does not crash" do

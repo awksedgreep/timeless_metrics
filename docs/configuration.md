@@ -33,7 +33,7 @@ All options are passed to the `TimelessMetrics` child spec:
 | `self_monitor` | `boolean()` | `true` | Enable internal self-monitoring metrics |
 | `self_monitor_labels` | `map()` | `%{}` | Labels applied to self-monitoring metrics |
 | `scraping` | `boolean()` | `true` | Enable the Prometheus scraping subsystem |
-| `engine` | `:rust \| :libsql \| :legacy` | `:rust` | Standalone embedded-library engine selection. Production Stack installations use the external Rust/libSQL owner; `:legacy` exists only for compatibility and migration work |
+| `engine` | `:libsql \| :rust \| :legacy` | `:libsql` | Standalone embedded-library engine selection. `:rust` is the explicit rollback path for migrated stores; production Stack installations use the external Rust/libSQL owner; `:legacy` exists only for compatibility and migration work |
 | `reader_pool_size` | `pos_integer()` | `max(div(schedulers, 2), 2)` | Number of read-only SQLite connections used by `engine: :libsql` |
 
 ### Embedded libSQL engine
@@ -46,11 +46,12 @@ queries reuse prepared SQLite statements while independent caller processes
 still spread across the pool. Supported scalar aggregates execute in the
 extension; unsupported or bucketed shapes retain the raw fallback.
 
-New or empty data directories can opt in directly. For a data directory that
-already contains Rust-engine chunks, run the verified offline migration before
-starting with `engine: :libsql`; see [Operations](operations.md#rust-to-libsql-migration).
-The engine will fail startup if it finds an unmigrated, non-empty
-`rust_engine/` directory.
+New or empty data directories start on libSQL directly — it is the default.
+For a data directory that already contains Rust-engine chunks, run the
+verified offline migration before upgrading, or configure `engine: :rust`
+explicitly; see [Operations](operations.md#rust-to-libsql-migration).
+The engine deliberately fails startup if it finds an unmigrated, non-empty
+`rust_engine/` directory — it never silently ignores existing data.
 
 ### Legacy-only options
 

@@ -11,7 +11,7 @@ defmodule TimelessMetrics.Supervisor do
 
   @impl true
   def init(opts) do
-    engine = Keyword.get(opts, :engine, :rust)
+    engine = Keyword.get(opts, :engine, :libsql)
 
     case engine do
       engine when engine in [:legacy, :actor, :sharded] ->
@@ -19,18 +19,18 @@ defmodule TimelessMetrics.Supervisor do
 
         Logger.warning(
           "TimelessMetrics engine: #{inspect(engine)} is deprecated and will be removed in 7.0. " <>
-            "The Rust engine (the default) is the supported path. " <>
+            "The libSQL engine (the default) is the supported path. " <>
             "Legacy-only features (rollup tiers/query_daily, mode: :memory) need porting or explicit " <>
             "retirement before 7.0 — see notes/promql_vm_parity_plan_2026-07-24.md Phase 0."
         )
 
         init_legacy(opts)
 
-      :libsql ->
-        init_hot(opts, :libsql)
+      :rust ->
+        init_hot(opts, :rust)
 
       _ ->
-        init_hot(opts, :rust)
+        init_hot(opts, :libsql)
     end
   end
 

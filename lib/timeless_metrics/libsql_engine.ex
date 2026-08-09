@@ -552,6 +552,10 @@ defmodule TimelessMetrics.LibsqlEngine do
 
   @impl true
   def init(opts) do
+    # Trap exits so terminate/2 (final ingest-transaction commit + flush)
+    # runs on ordinary supervisor shutdown — without this, buffered
+    # points die with the process instead of reaching the store.
+    Process.flag(:trap_exit, true)
     store = Keyword.fetch!(opts, :store)
     data_dir = Keyword.fetch!(opts, :data_dir)
     schema = Keyword.fetch!(opts, :schema)
@@ -1256,125 +1260,80 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
   end
 
-  defp read_sql(store, sql, params \\ []) do
+  # The v0.5.0 extension guards vtab reads with a publication gate: a
+  # read that lands while another connection's write transaction holds
+  # unpublished state fails fast with a "retry, as for SQLITE_BUSY"
+  # error instead of exposing partial state. The barrier commits OUR
+  # pending ingest transaction, but continuous ingest can reopen one
+  # between the barrier and the read — so gate errors re-barrier and
+  # retry a bounded number of times before surfacing.
+  @read_gate_attempts 10
+  @read_gate_sleep_ms 2
+
+  defp barriered_read(store, request, fallback_sql, params, attempts \\ @read_gate_attempts) do
     with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:sql, sql, params}, :infinity)
-      else
-        write_sql(store, sql, params)
+      result =
+        if target = select_reader(store) do
+          GenServer.call(target, request, :infinity)
+        else
+          write_sql(store, fallback_sql, params)
+        end
+
+      case result do
+        {:error, message} when attempts > 1 ->
+          if retriable_read_gate?(message) do
+            Process.sleep(@read_gate_sleep_ms)
+            barriered_read(store, request, fallback_sql, params, attempts - 1)
+          else
+            result
+          end
+
+        _ ->
+          result
       end
     end
   end
 
-  defp read_raw_points(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:raw_points, params}, :infinity)
-      else
-        write_sql(store, raw_points_sql(), params)
-      end
-    end
-  end
+  defp retriable_read_gate?(message) when is_binary(message),
+    do: String.contains?(message, "blocked by a pending writer transaction")
 
-  defp read_raw_points_by_id(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:raw_points_by_id, params}, :infinity)
-      else
-        write_sql(store, raw_points_by_id_sql(), params)
-      end
-    end
-  end
+  defp retriable_read_gate?(_), do: false
 
-  defp read_raw_frame(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:raw_frame, params}, :infinity)
-      else
-        write_sql(store, raw_frame_sql(), params)
-      end
-    end
-  end
+  defp read_sql(store, sql, params \\ []),
+    do: barriered_read(store, {:sql, sql, params}, sql, params)
 
-  defp read_aggregate_frame(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:aggregate_frame, params}, :infinity)
-      else
-        write_sql(store, aggregate_frame_sql(), params)
-      end
-    end
-  end
+  defp read_raw_points(store, params),
+    do: barriered_read(store, {:raw_points, params}, raw_points_sql(), params)
 
-  defp read_latest_frame(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:latest_frame, params}, :infinity)
-      else
-        write_sql(store, latest_frame_sql(), params)
-      end
-    end
-  end
+  defp read_raw_points_by_id(store, params),
+    do: barriered_read(store, {:raw_points_by_id, params}, raw_points_by_id_sql(), params)
 
-  defp read_aggregate(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:aggregate, params}, :infinity)
-      else
-        write_sql(store, aggregate_sql(), params)
-      end
-    end
-  end
+  defp read_raw_frame(store, params),
+    do: barriered_read(store, {:raw_frame, params}, raw_frame_sql(), params)
 
-  defp read_aggregate_by_id(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:aggregate_by_id, params}, :infinity)
-      else
-        write_sql(store, aggregate_by_id_sql(), params)
-      end
-    end
-  end
+  defp read_aggregate_frame(store, params),
+    do: barriered_read(store, {:aggregate_frame, params}, aggregate_frame_sql(), params)
 
-  defp read_latest(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:latest, params}, :infinity)
-      else
-        write_sql(store, latest_sql(), params)
-      end
-    end
-  end
+  defp read_latest_frame(store, params),
+    do: barriered_read(store, {:latest_frame, params}, latest_frame_sql(), params)
 
-  defp read_latest_by_id(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:latest_by_id, params}, :infinity)
-      else
-        write_sql(store, latest_by_id_sql(), params)
-      end
-    end
-  end
+  defp read_aggregate(store, params),
+    do: barriered_read(store, {:aggregate, params}, aggregate_sql(), params)
 
-  defp read_window_batches(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:window_batches, params}, :infinity)
-      else
-        write_sql(store, window_batches_sql(), params)
-      end
-    end
-  end
+  defp read_aggregate_by_id(store, params),
+    do: barriered_read(store, {:aggregate_by_id, params}, aggregate_by_id_sql(), params)
 
-  defp read_rollup_batches(store, params) do
-    with :ok <- read_barrier(store) do
-      if target = select_reader(store) do
-        GenServer.call(target, {:rollup_batches, params}, :infinity)
-      else
-        write_sql(store, rollup_batches_sql(), params)
-      end
-    end
-  end
+  defp read_latest(store, params),
+    do: barriered_read(store, {:latest, params}, latest_sql(), params)
+
+  defp read_latest_by_id(store, params),
+    do: barriered_read(store, {:latest_by_id, params}, latest_by_id_sql(), params)
+
+  defp read_window_batches(store, params),
+    do: barriered_read(store, {:window_batches, params}, window_batches_sql(), params)
+
+  defp read_rollup_batches(store, params),
+    do: barriered_read(store, {:rollup_batches, params}, rollup_batches_sql(), params)
 
   defp read_barrier(store) do
     GenServer.call(writer_name(store), :read_barrier, :infinity)

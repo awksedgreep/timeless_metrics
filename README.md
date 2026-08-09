@@ -32,10 +32,10 @@ The default Timeless Stack installation now uses the external
 the control plane and this OTP application is loaded for compatibility and
 automatic migration without starting a second storage owner. The standalone
 embedded-library API described below is a separate compatibility surface and
-continues to default to its original Rust engine in this release.
+now also defaults to the libSQL engine; `engine: :rust` remains available
+as the explicit rollback configuration.
 
-For standalone embedded-library users, the libSQL engine is available with
-`engine: :libsql`.
+For standalone embedded-library users, the libSQL engine is the default.
 It embeds the `timeless-libsql` SQLite extension so time-series blocks, the
 series catalog, rollups, and TimelessMetrics admin data all live in one
 `metrics.db` file. The public Elixir and HTTP APIs remain the same. Existing

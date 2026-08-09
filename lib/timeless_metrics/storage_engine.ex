@@ -32,9 +32,9 @@ defmodule TimelessMetrics.StorageEngine do
   end
 
   def backend(store) do
-    case :persistent_term.get({TimelessMetrics, store, :engine}, :rust) do
-      :libsql -> TimelessMetrics.LibsqlEngine
-      _ -> TimelessMetrics.RustEngine
+    case :persistent_term.get({TimelessMetrics, store, :engine}, :libsql) do
+      :rust -> TimelessMetrics.RustEngine
+      _ -> TimelessMetrics.LibsqlEngine
     end
   end
 end
