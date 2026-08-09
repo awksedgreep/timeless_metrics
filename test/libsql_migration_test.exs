@@ -92,6 +92,9 @@ defmodule TimelessMetrics.LibsqlMigrationTest do
              TimelessMetrics.Supervisor.start_link(
                name: @store,
                engine: :libsql,
+               # Refusal is now the OPT-OUT behavior; the default
+               # auto-converts (covered by libsql_auto_migrate_test.exs).
+               auto_migrate: false,
                data_dir: data_dir,
                scraping: false,
                self_monitor: false,

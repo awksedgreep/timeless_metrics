@@ -39,6 +39,8 @@ defmodule TimelessMetrics.Supervisor do
     data_dir = Keyword.get(opts, :data_dir, "data")
     memory_only = Keyword.get(opts, :mode) == :memory
 
+    if engine == :libsql, do: maybe_auto_migrate_rust_store!(data_dir, opts)
+
     schema =
       case Keyword.get(opts, :schema) do
         nil -> TimelessMetrics.Schema.default()
@@ -364,5 +366,76 @@ defmodule TimelessMetrics.Supervisor do
     Supervisor.init(children ++ alert_children ++ self_monitor_children ++ scraper_children,
       strategy: :rest_for_one
     )
+  end
+
+  # Auto-convert an unmigrated rust_engine/ store at startup (the legacy
+  # engine is on a deprecation clock). This runs the SAME journaled,
+  # resumable, digest-verified LibsqlMigration the mix task runs — staged
+  # candidate, cold validation, atomic activation, source preserved for
+  # rollback — just invoked automatically, blocking startup until done.
+  # Opt out with `auto_migrate: false` (store opts or app env) to get the
+  # engine's strict refusal instead.
+  defp maybe_auto_migrate_rust_store!(data_dir, opts) do
+    auto? =
+      Keyword.get(
+        opts,
+        :auto_migrate,
+        Application.get_env(:timeless_metrics, :auto_migrate, true)
+      )
+
+    rust_dir = Path.join(data_dir, "rust_engine")
+    has_rust_data? = match?({:ok, [_ | _]}, File.ls(rust_dir))
+
+    if auto? and has_rust_data? and not libsql_migration_activated?(data_dir) do
+      require Logger
+
+      Logger.warning(
+        "timeless_metrics: auto-converting the legacy rust_engine/ store in #{data_dir} " <>
+          "to the libSQL engine (staged, verified, then activated; the source is preserved " <>
+          "for rollback). Set auto_migrate: false to disable."
+      )
+
+      case TimelessMetrics.LibsqlMigration.run(data_dir, activate: true) do
+        {:ok, report} ->
+          Logger.info(
+            "timeless_metrics: rust_engine/ conversion complete " <>
+              "(#{inspect(Map.take(report, [:series, :points, :bytes]))})"
+          )
+
+          :ok
+
+        {:error, reason} ->
+          raise "timeless_metrics: automatic rust_engine/ conversion failed: #{inspect(reason)}. " <>
+                  "The staged migration is resumable — restart to resume, or run " <>
+                  "mix timeless_metrics.migrate_libsql #{data_dir} --activate manually, " <>
+                  "or set engine: :rust to keep the legacy engine."
+      end
+    end
+
+    :ok
+  end
+
+  # Post-activation, rust_engine/ is deliberately preserved for rollback —
+  # detect the activation marker in metrics.db so we convert exactly once.
+  defp libsql_migration_activated?(data_dir) do
+    db_path = Path.join(data_dir, "metrics.db")
+
+    with true <- File.exists?(db_path),
+         {:ok, conn} <- Exqlite.Sqlite3.open(db_path, mode: :readonly) do
+      try do
+        case TimelessMetrics.DB.execute(
+               conn,
+               "SELECT 1 FROM _metadata WHERE key = 'libsql_migration' LIMIT 1",
+               []
+             ) do
+          {:ok, [[1]]} -> true
+          _ -> false
+        end
+      after
+        Exqlite.Sqlite3.close(conn)
+      end
+    else
+      _ -> false
+    end
   end
 end
