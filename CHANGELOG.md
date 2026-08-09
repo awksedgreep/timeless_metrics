@@ -1,5 +1,41 @@
 # Changelog
 
+## 6.4.1 (2026-08-09)
+
+**The rust_engine conversion no longer holds whole series in memory.** It
+materialised each series as an Elixir list several times over, so peak memory
+tracked the largest series rather than any batch size. On a 3.9 GB host this
+OOM-killed the VM mid-migration and left a staged store the restart could not
+resume.
+
+Points are now read a page at a time through the legacy reader's cursor,
+written as each page arrives, and folded into a running digest. Verification
+reads the target back in density-sized timestamp windows and compares count
+and digest, instead of holding source and target in memory together.
+
+Paging alone made the conversion quadratic in time, which turned out to be
+three defects in `legacy_query_page`, all on the read side. It never pruned
+chunks, passing the full int64 range even though every chunk carries
+`min_ts`/`max_ts` and the cursor sets a floor. It re-decompressed each chunk
+on every page. And it built a full sort key, including a `String` clone, for
+every point of every page before discarding nearly all of them. The third
+dominated; the first two together were worth about 25%.
+
+Measured over one series, peak memory and wall clock:
+
+| points | before | after |
+|---|---|---|
+| 1M | 628.5 MB / 1166 ms | 32.6 MB / 1081 ms |
+| 2M | 1101.4 MB / 2152 ms | 29.3 MB / 2326 ms |
+| 4M | 2353.2 MB / 4094 ms | 29.2 MB / 5335 ms |
+
+Memory is flat where it grew linearly — 80x lower at 4M points — and wall
+clock is comparable to the original rather than 5x worse. Time is still mildly
+superlinear because each page rescans its chunk, now at two integer
+comparisons per point.
+
+No public API change.
+
 ## 6.4.0 (2026-08-09)
 
 **Automatic rust_engine conversion.** Starting a store on the (default)
