@@ -481,8 +481,26 @@ struct EngineResource {
 /// A deliberately separate resource type for release migration.  It exposes
 /// no mutation NIFs, so a caller cannot accidentally flush, compact, recover,
 /// or otherwise alter the rollback source through this handle.
+/// One decoded chunk, kept between paged legacy reads.
+///
+/// A page returns at most 4096 points but must decode every chunk that could
+/// contribute to it. Chunks routinely hold the whole series, so without this
+/// the same chunk is decompressed once per page and the cost of walking a
+/// series grows with the square of its size. The migration advances its cursor
+/// monotonically, so holding the most recent chunk is enough to decode each one
+/// once.
+///
+/// This lives on the legacy reader rather than on `Engine` so the ingest path
+/// is untouched.
+struct DecodedChunk {
+    path: PathBuf,
+    data_offset: u64,
+    points: Arc<Vec<(i64, f64)>>,
+}
+
 struct LegacyReaderResource {
     engine: Engine,
+    decoded: Mutex<Option<DecodedChunk>>,
 }
 
 unsafe impl Send for EngineResource {}
@@ -711,6 +729,7 @@ impl Engine {
         labels: &Labels,
         after: Option<LegacyCursor>,
         limit: usize,
+        decoded: &Mutex<Option<DecodedChunk>>,
     ) -> EngineResult<(Vec<(i64, f64)>, Option<LegacyCursor>, bool)> {
         if !(1..=4096).contains(&limit) {
             return Err("legacy migration page limit must be between 1 and 4096".into());
@@ -728,9 +747,16 @@ impl Engine {
             .filter(|((key, _, _), _)| *key == partition)
             .map(|(_, meta)| meta.clone())
             .collect::<Vec<_>>();
+        // Ordered by time, not by file position, so the scan below can stop as
+        // soon as the remaining chunks start after the page it is filling.
+        // Points are ranked primarily by timestamp, so chunk timestamp bounds
+        // are enough to decide a chunk cannot contribute without decoding it.
         metas.sort_by(|left, right| {
-            (left.path.as_os_str(), left.data_offset)
-                .cmp(&(right.path.as_os_str(), right.data_offset))
+            (left.min_ts, left.path.as_os_str(), left.data_offset).cmp(&(
+                right.min_ts,
+                right.path.as_os_str(),
+                right.data_offset,
+            ))
         });
 
         let after = after.map(LegacyPointKey::from_cursor);
@@ -739,10 +765,51 @@ impl Engine {
         // before the next, bounding memory by one chunk plus one public batch.
         let retained = limit + 1;
         let mut page = BinaryHeap::<LegacyPointKey>::with_capacity(retained);
+        // Shared across the chunks of one page so two chunks in the same file
+        // do not read it twice.  Scoped to the page, not to the engine, so it
+        // is released as soon as the page is built.
+        let mut page_file_cache = HashMap::new();
+        let mut decoded_guard = decoded.lock().map_err(|_| "legacy chunk cache poisoned")?;
         for meta in metas {
-            let mut one_file_cache = HashMap::new();
-            let points =
-                self.read_chunk_data_cached(&meta, i64::MIN, i64::MAX, &mut one_file_cache)?;
+            // Everything in this chunk predates the cursor, so every point in
+            // it would be discarded below.
+            if after
+                .as_ref()
+                .is_some_and(|cursor| meta.max_ts < cursor.timestamp)
+            {
+                continue;
+            }
+            // The heap is full and this chunk begins after the largest point it
+            // holds.  Metas are time-ordered, so no later chunk can contribute
+            // either.
+            if page.len() >= retained
+                && page
+                    .peek()
+                    .is_some_and(|largest| meta.min_ts > largest.timestamp)
+            {
+                break;
+            }
+            let points = match decoded_guard.as_ref() {
+                Some(cached)
+                    if cached.path == meta.path && cached.data_offset == meta.data_offset =>
+                {
+                    Arc::clone(&cached.points)
+                }
+                _ => {
+                    let points = Arc::new(self.read_chunk_data_cached(
+                        &meta,
+                        i64::MIN,
+                        i64::MAX,
+                        &mut page_file_cache,
+                    )?);
+                    *decoded_guard = Some(DecodedChunk {
+                        path: meta.path.clone(),
+                        data_offset: meta.data_offset,
+                        points: Arc::clone(&points),
+                    });
+                    points
+                }
+            };
             let relative_path = meta
                 .path
                 .strip_prefix(&self.data_dir)
@@ -750,7 +817,25 @@ impl Engine {
                 .to_str()
                 .ok_or_else(|| format!("legacy chunk path is not UTF-8: {}", meta.path.display()))?
                 .to_owned();
-            for (ordinal, (timestamp, value)) in points.into_iter().enumerate() {
+            for (ordinal, &(timestamp, value)) in points.iter().enumerate() {
+                // Points are ranked by timestamp first, so these two integer
+                // comparisons settle the outcome for all but the handful of
+                // points that tie on it. Building the full key first would
+                // clone `relative_path` for every point of every page, which
+                // dominated the cost of walking a large series.
+                if after
+                    .as_ref()
+                    .is_some_and(|cursor| timestamp < cursor.timestamp)
+                {
+                    continue;
+                }
+                if page.len() >= retained
+                    && page
+                        .peek()
+                        .is_some_and(|largest| timestamp > largest.timestamp)
+                {
+                    continue;
+                }
                 let key = LegacyPointKey {
                     timestamp,
                     value_bits: value.to_bits(),
@@ -3490,7 +3575,10 @@ fn engine_info<'a>(
 #[rustler::nif(schedule = "DirtyIo")]
 fn engine_legacy_open(data_dir: String) -> Result<ResourceArc<LegacyReaderResource>, String> {
     let engine = Engine::new_read_only(PathBuf::from(data_dir))?;
-    Ok(ResourceArc::new(LegacyReaderResource { engine }))
+    Ok(ResourceArc::new(LegacyReaderResource {
+        engine,
+        decoded: Mutex::new(None),
+    }))
 }
 
 #[rustler::nif]
@@ -3509,10 +3597,13 @@ fn engine_legacy_query_page(
     limit: usize,
 ) -> Result<(Vec<(i64, f64)>, Option<LegacyCursor>, bool), String> {
     let labels = labels.into_iter().collect::<BTreeMap<_, _>>();
-    let (points, next, has_more) = resource
-        .deref()
-        .engine
-        .legacy_query_page(&metric, &labels, after, limit)?;
+    let (points, next, has_more) = resource.deref().engine.legacy_query_page(
+        &metric,
+        &labels,
+        after,
+        limit,
+        &resource.deref().decoded,
+    )?;
     Ok((points, next, has_more))
 }
 

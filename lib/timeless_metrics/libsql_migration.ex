@@ -13,6 +13,16 @@ defmodule TimelessMetrics.LibsqlMigration do
   @migration_store :timeless_libsql_migration_target
   @stage_name ".libsql-migration"
 
+  # Points are streamed from the source a page at a time rather than a series at
+  # a time. The legacy reader decodes one chunk at a time and retains only the
+  # smallest `limit` points past the cursor, so peak memory is bounded by the
+  # page rather than by the largest series. 4096 is the reader's own ceiling.
+  @page_limit 4_096
+
+  # Verification reads the target back in timestamp windows sized from the
+  # observed density of each series, so neither side is ever fully resident.
+  @verify_window_points 50_000
+
   def run(data_dir, opts \\ []) do
     activate? = Keyword.get(opts, :activate, false)
     activation_failpoint = Keyword.get(opts, :activation_failpoint)
@@ -144,7 +154,10 @@ defmodule TimelessMetrics.LibsqlMigration do
   end
 
   defp import_and_verify(source_db, source_engine, stage_dir, source_fingerprints) do
-    source = Nif.engine_new(source_engine, 8_192, 64, 8, 0, false)
+    # Opened read-only through the legacy reader: it exposes a cursor-paged
+    # query the writable engine handle does not, and it cannot mutate the source
+    # we are still relying on for rollback.
+    {:ok, source} = normalize(Nif.engine_legacy_open(source_engine))
 
     child =
       {TimelessMetrics,
@@ -161,25 +174,19 @@ defmodule TimelessMetrics.LibsqlMigration do
     try do
       series = source_series(source)
 
-      {series_count, point_count} =
-        Enum.reduce(series, {0, 0}, fn {metric, labels}, {series_count, point_count} ->
+      {series_count, point_count, summaries} =
+        Enum.reduce(series, {0, 0, []}, fn {metric, labels}, {series_count, point_count, acc} ->
           {:ok, _sid} =
             TimelessMetrics.LibsqlEngine.resolve_series(@migration_store, metric, labels)
 
-          points = source_points(source, metric, labels)
+          summary = import_series(source, metric, labels)
 
-          points
-          |> Enum.chunk_every(100_000)
-          |> Enum.each(fn chunk ->
-            entries = Enum.map(chunk, fn {ts, value} -> {metric, labels, value, ts} end)
-            :ok = TimelessMetrics.LibsqlEngine.write_batch(@migration_store, entries)
-          end)
-
-          {series_count + 1, point_count + length(points)}
+          {series_count + 1, point_count + summary.count,
+           [{metric, labels, summary} | acc]}
         end)
 
       :ok = TimelessMetrics.LibsqlEngine.flush(@migration_store)
-      verify_all(source, series)
+      verify_all(Enum.reverse(summaries))
       assert_integrity()
       verify_source_fingerprints!(source_fingerprints, source_db, source_engine)
       write_marker(source_db, source_engine, source_fingerprints, series_count, point_count)
@@ -189,66 +196,171 @@ defmodule TimelessMetrics.LibsqlMigration do
        %{series: series_count, points: point_count, staged_db: Path.join(stage_dir, "metrics.db")}}
     after
       Supervisor.stop(supervisor)
-      _ = Nif.engine_shutdown(source)
+      # The legacy reader is a resource handle with no explicit close; it is
+      # released when the VM collects it.
     end
   rescue
     error -> {:error, Exception.format(:error, error, __STACKTRACE__)}
   end
 
   defp source_series(source) do
-    {:ok, metrics} = normalize(Nif.engine_list_metrics(source))
+    {:ok, series} = normalize(Nif.engine_legacy_list_series(source))
+    Enum.map(series, fn {metric, labels} -> {metric, Map.new(labels)} end)
+  end
 
-    metrics
-    |> Enum.flat_map(fn metric ->
-      {:ok, labels_sets} = normalize(Nif.engine_list_series(source, metric))
-      Enum.map(labels_sets, &{metric, Map.new(&1)})
+  # Stream one series from the source into the target, writing each page as it
+  # arrives and folding it into a running digest. Nothing larger than a page is
+  # ever held, and the digest lets verification compare the two stores without
+  # materialising either side.
+  defp import_series(source, metric, labels) do
+    stream_series(source, metric, labels, nil, %{
+      count: 0,
+      digest: :crypto.hash_init(:sha256),
+      ts_min: nil,
+      ts_max: nil
+    })
+  end
+
+  defp stream_series(source, metric, labels, cursor, acc) do
+    {:ok, {points, next, has_more}} =
+      normalize(Nif.engine_legacy_query_page(source, metric, labels, cursor, @page_limit))
+
+    acc = write_page(metric, labels, points, acc)
+
+    if has_more and not is_nil(next) do
+      stream_series(source, metric, labels, next, acc)
+    else
+      %{acc | digest: :crypto.hash_final(acc.digest)}
+    end
+  end
+
+  defp write_page(_metric, _labels, [], acc), do: acc
+
+  defp write_page(metric, labels, points, acc) do
+    entries = Enum.map(points, fn {ts, value} -> {metric, labels, value, ts} end)
+    :ok = TimelessMetrics.LibsqlEngine.write_batch(@migration_store, entries)
+    fold_points(points, acc)
+  end
+
+  # Pages arrive ordered by (timestamp, value bits), so folding them in cursor
+  # order produces a digest that a timestamp-ordered read of the target can
+  # reproduce exactly.
+  defp fold_points(points, acc) do
+    Enum.reduce(points, acc, fn {ts, value}, inner ->
+      %{
+        inner
+        | count: inner.count + 1,
+          digest: :crypto.hash_update(inner.digest, point_bytes(ts, value)),
+          ts_min: min_ts(inner.ts_min, ts),
+          ts_max: max_ts(inner.ts_max, ts)
+      }
     end)
   end
 
-  defp source_points(source, metric, labels) do
-    {:ok, rows} =
-      normalize(
-        Nif.engine_query_range(
-          source,
-          metric,
-          labels,
-          -9_223_372_036_854_775_808,
-          9_223_372_036_854_775_807
-        )
+  defp min_ts(nil, ts), do: ts
+  defp min_ts(current, ts), do: min(current, ts)
+
+  defp max_ts(nil, ts), do: ts
+  defp max_ts(current, ts), do: max(current, ts)
+
+  defp point_bytes(ts, value),
+    do: <<ts::big-signed-integer-64, value_bits(value)::big-unsigned-integer-64>>
+
+  defp verify_all(summaries) do
+    Enum.each(summaries, fn {metric, labels, summary} ->
+      verify_series(metric, labels, summary)
+    end)
+  end
+
+  defp verify_series(metric, labels, %{count: 0}) do
+    {:ok, points} =
+      TimelessMetrics.LibsqlEngine.query_raw(@migration_store, metric, labels,
+        from: -9_223_372_036_854_775_808,
+        to: 9_223_372_036_854_775_807
       )
 
-    rows
-    |> Enum.flat_map(fn {_returned_labels, points} -> points end)
-    |> Enum.sort_by(fn {ts, value} -> {ts, float_bits(value)} end)
+    unless points == [] do
+      raise "verification failed for #{metric} #{inspect(labels)}: " <>
+              "source=0 target=#{length(points)}"
+    end
+
+    :ok
   end
 
-  defp verify_all(source, series) do
-    Enum.each(series, fn {metric, labels} ->
-      expected = source_points(source, metric, labels)
+  defp verify_series(metric, labels, summary) do
+    {count, digest} =
+      summary
+      |> verify_windows()
+      |> Enum.reduce({0, :crypto.hash_init(:sha256)}, fn {from, to}, {count, digest} ->
+        points = target_window(metric, labels, from, to)
 
-      {:ok, actual} =
-        TimelessMetrics.LibsqlEngine.query_raw(@migration_store, metric, labels,
-          from: -9_223_372_036_854_775_808,
-          to: 9_223_372_036_854_775_807
-        )
+        {count + length(points),
+         Enum.reduce(points, digest, fn {ts, value}, inner ->
+           :crypto.hash_update(inner, point_bytes(ts, value))
+         end)}
+      end)
 
-      actual = Enum.sort_by(actual, fn {ts, value} -> {ts, float_bits(value)} end)
+    digest = :crypto.hash_final(digest)
 
-      unless bit_exact?(expected, actual) do
+    cond do
+      count != summary.count ->
         raise "verification failed for #{metric} #{inspect(labels)}: " <>
-                "source=#{length(expected)} target=#{length(actual)}"
-      end
+                "source=#{summary.count} target=#{count}"
+
+      digest != summary.digest ->
+        raise "verification failed for #{metric} #{inspect(labels)}: " <>
+                "#{count} points match in number but not in value"
+
+      true ->
+        :ok
+    end
+  end
+
+  # Read one window of the target and put it in the same canonical order the
+  # source pages arrived in. `query_raw/4` orders by timestamp alone, so points
+  # sharing a timestamp are re-sorted here by value bits to match.
+  #
+  # The window bounds are applied again in Elixir because inclusivity is decided
+  # by the storage extension. Filtering here keeps windows disjoint whatever it
+  # does; a bound that silently dropped points would fail the count check.
+  defp target_window(metric, labels, from, to) do
+    {:ok, points} =
+      TimelessMetrics.LibsqlEngine.query_raw(@migration_store, metric, labels,
+        from: from,
+        to: to
+      )
+
+    points
+    |> Enum.filter(fn {ts, _value} -> ts >= from and ts <= to end)
+    |> Enum.sort_by(fn {ts, value} -> {ts, value_bits(value)} end)
+  end
+
+  # Size windows from the observed density of the series so each read returns
+  # roughly @verify_window_points, rather than the whole series at once.
+  defp verify_windows(%{ts_min: ts_min, ts_max: ts_max, count: count}) do
+    span = ts_max - ts_min + 1
+    width = max(div(span * @verify_window_points, max(count, 1)), 1)
+
+    Stream.unfold(ts_min, fn
+      from when from > ts_max ->
+        nil
+
+      from ->
+        to = min(from + width - 1, ts_max)
+        {{from, to}, to + 1}
     end)
   end
 
-  defp bit_exact?(left, right) when length(left) != length(right), do: false
-
-  defp bit_exact?(left, right) do
-    Enum.zip(left, right)
-    |> Enum.all?(fn {{lts, lv}, {rts, rv}} -> lts == rts and float_bits(lv) == float_bits(rv) end)
+  # The source orders points by `f64::to_bits()`, a u64 compared numerically.
+  # Comparing the raw little-endian float bytes instead would order them
+  # lexicographically, which is a different sequence — the two digests would
+  # then disagree on any series holding several points at one timestamp.
+  # Big-endian packing reproduces the source's integer, and keeps the digest
+  # identical across architectures.
+  defp value_bits(value) do
+    <<bits::big-unsigned-integer-64>> = <<value * 1.0::big-float-64>>
+    bits
   end
-
-  defp float_bits(value), do: <<value * 1.0::float-native-64>>
 
   defp assert_integrity do
     db = :"#{@migration_store}_db"
