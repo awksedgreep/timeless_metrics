@@ -404,11 +404,19 @@ defmodule TimelessMetrics.LibsqlMigration do
     if File.exists?(backup) do
       {:error, "activation backup already exists: #{backup}"}
     else
-      with :ok <- File.rename(current, backup),
+      # The single-shot stage+activate path arrives here with the staged
+      # candidate's WAL still live (the resume path checkpoints inside
+      # verify_staged). Checkpoint before renaming — moving a SQLite
+      # file away from its -wal would strand uncheckpointed commits —
+      # and carry any remaining sidecars through the rename so the
+      # stage dir is actually empty for rmdir.
+      with :ok <- checkpoint_staged(staged),
+           :ok <- File.rename(current, backup),
            :ok <- activation_failpoint(failpoint, :after_source_rename),
            :ok <- move_sqlite_sidecars(current, backup),
            :ok <- File.rename(staged, current),
            :ok <- activation_failpoint(failpoint, :after_staged_rename),
+           :ok <- move_sqlite_sidecars(staged, current),
            :ok <- sync_file(current),
            :ok <- File.rmdir(stage_dir) do
         :ok
@@ -422,6 +430,22 @@ defmodule TimelessMetrics.LibsqlMigration do
 
   defp activation_failpoint(point, point), do: {:error, {:injected_activation_failure, point}}
   defp activation_failpoint(_configured, _point), do: :ok
+
+  defp checkpoint_staged(staged) do
+    with {:ok, conn} <- Exqlite.Sqlite3.open(staged) do
+      try do
+        with {:ok, _} <- TimelessMetrics.DB.execute(conn, "PRAGMA busy_timeout = 1000", []),
+             {:ok, [[0, _, _]]} <-
+               TimelessMetrics.DB.execute(conn, "PRAGMA wal_checkpoint(TRUNCATE)", []) do
+          :ok
+        else
+          other -> {:error, "staged checkpoint failed: #{inspect(other)}"}
+        end
+      after
+        Exqlite.Sqlite3.close(conn)
+      end
+    end
+  end
 
   defp recover_activation(current, backup, staged, stage_dir) do
     if File.exists?(backup) do
