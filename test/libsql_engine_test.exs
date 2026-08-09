@@ -22,6 +22,21 @@ defmodule TimelessMetrics.LibsqlEngineTest do
     {:ok, data_dir: data_dir}
   end
 
+  test "capability preflight raises loudly without the extension surface" do
+    # A connection that never loaded the extension stands in for a
+    # pre-handshake (< 0.4.0) timeless-libsql: the writer must refuse it
+    # with an error naming the requirement, never drive it silently.
+    {:ok, conn} = Exqlite.Sqlite3.open(":memory:")
+
+    try do
+      assert_raise RuntimeError, ~r/capability preflight failed.*resolved-v1/s, fn ->
+        TimelessMetrics.LibsqlEngine.verify_capabilities!(conn)
+      end
+    after
+      Exqlite.Sqlite3.close(conn)
+    end
+  end
+
   test "named and resolved batches share the matcher-aware raw waist" do
     assert :ok =
              TimelessMetrics.write_batch(@store, [

@@ -10,6 +10,8 @@ defmodule TimelessMetrics.LibsqlEngine do
 
   use GenServer
 
+  require Logger
+
   @table "metric_samples"
   @flush_interval :timer.seconds(10)
   @ingest_transaction_ms 5
@@ -555,6 +557,7 @@ defmodule TimelessMetrics.LibsqlEngine do
     schema = Keyword.fetch!(opts, :schema)
     reject_unmigrated_rust_store!(store, data_dir)
     conn = open_connection(Path.join(data_dir, "metrics.db"), Keyword.get(opts, :extension_path))
+    verify_capabilities!(conn)
     create_table(conn, schema)
     {:ok, insert_stmt} = Exqlite.Sqlite3.prepare(conn, insert_command_sql())
     query_frame_features = detect_query_frame_features(conn)
@@ -793,6 +796,43 @@ defmodule TimelessMetrics.LibsqlEngine do
     :persistent_term.erase({__MODULE__, state.store, :query_frame_features})
     :ets.delete(state.cache)
     :ok
+  end
+
+  # The COMPATIBILITY.md preflight, engine-side: the loaded extension must
+  # advertise the capability document, data ABI 1, and the resolved-v1
+  # metrics batch this engine writes. Checked once per writer start (all
+  # connections load the same .so); failure is loud and names what was
+  # found — a pre-handshake extension must never be driven silently.
+  @doc false
+  def verify_capabilities!(conn) do
+    with {:ok, [[json]]} <-
+           TimelessMetrics.DB.execute(conn, "SELECT timeless_capabilities()", []),
+         capabilities <- :json.decode(json),
+         true <- capabilities["data_abi"] == 1,
+         batches when is_list(batches) <-
+           get_in(capabilities, ["signals", "metrics", "batches"]),
+         true <- "resolved-v1" in batches do
+      Logger.info(
+        "timeless-libsql extension #{capabilities["extension_version"]} " <>
+          "(data ABI #{capabilities["data_abi"]}) capability preflight passed"
+      )
+
+      :ok
+    else
+      other ->
+        raise "timeless-libsql capability preflight failed — the loaded extension " <>
+                "does not advertise data ABI 1 with metrics resolved-v1 batches " <>
+                "(need timeless-libsql >= 0.4.0; got: #{inspect(other)})"
+    end
+  rescue
+    error in [RuntimeError] ->
+      if error.message =~ "capability preflight failed" do
+        reraise error, __STACKTRACE__
+      else
+        raise "timeless-libsql capability preflight failed — the loaded extension " <>
+                "does not advertise data ABI 1 with metrics resolved-v1 batches " <>
+                "(need timeless-libsql >= 0.4.0; got: #{Exception.message(error)})"
+      end
   end
 
   # -- Connection helpers --------------------------------------------------
