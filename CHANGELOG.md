@@ -1,5 +1,62 @@
 # Changelog
 
+## 6.3.0 (2026-08-08)
+
+**libSQL is now the default storage engine** — the final step of the
+libSQL migration plan, after its opt-in field period. `engine: :rust`
+remains available as the explicit rollback configuration; startup still
+refuses loudly on an unmigrated non-empty `rust_engine/` directory (run
+`mix timeless_metrics.migrate_libsql` first).
+
+- Re-pinned the embedded `timeless-libsql` extension from a pre-handshake
+  Aug 1 development rev to the released **v0.5.0** tag (CI now checks out
+  the same tag). Stored data needs no migration: data ABI stays 1 and the
+  packed frame formats are unchanged.
+- The libSQL writer now performs the capability preflight at startup
+  (`timeless_capabilities()`: data ABI 1 + resolved-v1 batches), logs the
+  negotiated extension version, and refuses a pre-handshake extension
+  with an error naming the requirement.
+- The writer traps exits so its final ingest-transaction commit + flush
+  run on ordinary supervisor shutdown; buffered points survive restarts.
+- Reads cooperate with the v0.5.0 extension's publication gate: a
+  "retry, as for SQLITE_BUSY" gate error re-barriers and retries a
+  bounded number of times instead of surfacing on the first attempt.
+
+## 6.2.6 (2026-08-03)
+
+Merged the Rust telemetry data-plane release: the external
+`timeless-metrics-api` owner becomes the production Stack default, with
+this OTP application loaded for compatibility and migration
+(`owner: :external` starts no second storage owner). CI builds
+`timeless-libsql` from source and runs the suite against it.
+
+## 6.2.5 (2026-08-03)
+
+Packaging only: fixed arm64 macOS zstd cross-compilation for the
+precompiled NIF artifacts.
+
+## 6.2.4 (2026-08-03)
+
+Packaging only: fixed macOS precompiler tap trust for published
+artifacts.
+
+## 6.2.3 (2026-08-03)
+
+The libSQL storage engine lands as an **opt-in** (`engine: :libsql`):
+the `timeless-libsql` SQLite extension stores blocks, rollups, the
+series registry, and admin data in one `metrics.db`, consuming the
+packed query-frame surfaces (TRF1/TAF1/TLF1/TRB1). Recorded validation:
+1.41M pts/s ingest, 1.586 bytes/point, VM differential 182/182, and
+frame-path query wins up to 37–239x.
+
+- Verified offline Rust→libSQL conversion (`mix
+  timeless_metrics.migrate_libsql`), bounded resumable release
+  migration with journaling and identity digests, and a crash-safe
+  release-startup cutover state machine for the external stack.
+- External storage ownership mode (`owner: :external`).
+- Metrics API POC sessions 1–6 recorded; the standalone Rust data plane
+  kept for the release that became 6.2.6.
+
 ## 6.2.2 (2026-07-24)
 
 Performance: PromQL evaluation parallelizes per series across schedulers,
