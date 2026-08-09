@@ -1,5 +1,21 @@
 # Changelog
 
+## 6.4.0 (2026-08-09)
+
+**Automatic rust_engine conversion.** Starting a store on the (default)
+libSQL engine over an unmigrated legacy `rust_engine/` directory now
+converts it automatically at startup — the same staged, journaled,
+digest-verified migration as `mix timeless_metrics.migrate_libsql
+--activate`, invoked for you: startup blocks until the conversion
+verifies and activates, the legacy store and pre-migration database are
+preserved for rollback, and restarts never re-convert. Set
+`auto_migrate: false` to restore the strict refusal. The legacy `:rust`
+engine is deprecated for removal in roughly three months (~2026-11).
+
+Also fixes single-shot `--activate` activation: the staged candidate is
+checkpointed before the rename (previously its live WAL could strand
+commits and the leftover sidecars failed the stage-dir cleanup).
+
 ## 6.3.0 (2026-08-08)
 
 **libSQL is now the default storage engine** — the final step of the
