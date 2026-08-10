@@ -11,7 +11,7 @@ defmodule TimelessMetrics.Supervisor do
 
   @impl true
   def init(opts) do
-    engine = Keyword.get(opts, :engine, :libsql)
+    engine = opts |> Keyword.get(:engine, :libsql) |> validate_engine()
 
     case engine do
       engine when engine in [:legacy, :actor, :sharded] ->
@@ -29,9 +29,35 @@ defmodule TimelessMetrics.Supervisor do
       :rust ->
         init_hot(opts, :rust)
 
-      _ ->
+      :libsql ->
         init_hot(opts, :libsql)
     end
+  end
+
+  @valid_engines [:libsql, :rust, :legacy, :actor, :sharded]
+
+  defp validate_engine(engine) when engine in @valid_engines, do: engine
+
+  # `:elixir` is what timeless_logs and timeless_traces call *their*
+  # previous-generation engine. It used to fall through to libSQL here, so an
+  # operator carrying that vocabulary across packages asked for the legacy
+  # engine and silently got libSQL — along with an automatic conversion of the
+  # store, since `auto_migrate` defaults to true. Naming the right value is the
+  # whole point of refusing.
+  defp validate_engine(:elixir) do
+    raise ArgumentError,
+          "invalid :timeless_metrics :engine :elixir — that is timeless_logs' and " <>
+            "timeless_traces' name for their legacy engine. timeless_metrics uses " <>
+            ":rust for its previous-generation engine, or :libsql."
+  end
+
+  # Never resolve an unrecognised engine to a default. Guessing here meant a
+  # typo silently converted the store, while the same typo in the sibling
+  # packages silently kept the legacy one.
+  defp validate_engine(other) do
+    raise ArgumentError,
+          "invalid :timeless_metrics :engine #{inspect(other)}; expected one of " <>
+            "#{inspect(@valid_engines)}"
   end
 
   defp init_hot(opts, engine) do
