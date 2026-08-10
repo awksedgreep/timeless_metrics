@@ -8,6 +8,8 @@ defmodule TimelessMetrics.LibsqlMigration do
   untouched for rollback.
   """
 
+  require Logger
+
   alias TimelessMetrics.RustEngine.Nif
 
   @migration_store :timeless_libsql_migration_target
@@ -31,7 +33,8 @@ defmodule TimelessMetrics.LibsqlMigration do
     stage_dir = Path.join(data_dir, @stage_name)
     stage_db = Path.join(stage_dir, "metrics.db")
 
-    with :ok <- require_source(source_db, source_engine) do
+    with :ok <- require_source(source_db, source_engine),
+         :ok <- discard_incomplete_stage(stage_dir, stage_db) do
       if activate? and File.dir?(stage_dir) do
         activate_staged(
           data_dir,
@@ -112,6 +115,45 @@ defmodule TimelessMetrics.LibsqlMigration do
     end
   end
 
+  # A staging directory left behind by a migration that died partway — OOM kill,
+  # power loss, container restart — carries no completion marker and can never
+  # be activated. Left in place it is fatal on every subsequent boot: the
+  # activate path refuses it as incomplete and the staging path refuses to start
+  # because the directory exists, so the application never comes up again and
+  # the advice to "restart to resume" cannot succeed. The stage is scratch —
+  # `metrics.db` and `rust_engine/` are never written during staging — so the
+  # right response is to throw it away and stage again.
+  #
+  # Only an unverifiable stage is discarded. One that verifies is a genuinely
+  # resumable migration and is left for `activate_staged/6` to finish.
+  defp discard_incomplete_stage(stage_dir, stage_db) do
+    cond do
+      not File.dir?(stage_dir) ->
+        :ok
+
+      not File.regular?(stage_db) ->
+        discard_stage(stage_dir, "no staged database was written")
+
+      true ->
+        case verify_staged(stage_db) do
+          {:ok, _marker} -> :ok
+          {:error, reason} -> discard_stage(stage_dir, reason)
+        end
+    end
+  end
+
+  defp discard_stage(stage_dir, reason) do
+    Logger.warning(
+      "timeless_metrics: discarding an unusable migration stage at #{stage_dir} " <>
+        "(#{reason}); the source store is untouched and staging will start over"
+    )
+
+    case File.rm_rf(stage_dir) do
+      {:ok, _} -> :ok
+      {:error, posix, path} -> {:error, "cannot remove stale stage #{path}: #{inspect(posix)}"}
+    end
+  end
+
   defp require_clean_stage(stage_dir) do
     if File.exists?(stage_dir) do
       {:error, "migration staging path already exists: #{stage_dir}"}
@@ -181,8 +223,7 @@ defmodule TimelessMetrics.LibsqlMigration do
 
           summary = import_series(source, metric, labels)
 
-          {series_count + 1, point_count + summary.count,
-           [{metric, labels, summary} | acc]}
+          {series_count + 1, point_count + summary.count, [{metric, labels, summary} | acc]}
         end)
 
       :ok = TimelessMetrics.LibsqlEngine.flush(@migration_store)
