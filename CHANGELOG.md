@@ -1,4 +1,15 @@
 # Changelog
+## 6.4.2 (2026-08-10)
+
+**Vendored SQLite extension moves to timeless-libsql v0.6.0.** That release adds
+`reindex:<keys>`, which rewrites a store's posting lists so a widened
+`index_keys` allowlist applies to blocks written before the change. `index_keys`
+is fixed at virtual-table creation and postings are written at insert time, so
+without it a newly indexed key prunes away every older block — the entries are
+still stored, but queries stop returning them.
+
+No behaviour change for metrics; this is the extension `timeless_logs` needs in
+order to migrate an existing store.
 
 ## 6.4.1 (2026-08-09)
 
