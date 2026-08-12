@@ -1,4 +1,22 @@
 # Changelog
+## 6.6.0 (2026-08-11)
+
+**Vendored SQLite extension moves to timeless-libsql v0.6.1.** Two behavior
+changes ride the bundle:
+
+- *Auto-optimize:* the logs and spans engines run a budgeted optimize from
+  the flush path (every 30th flush, or immediately at 32k raw entries), so
+  embedded stores compress without any host scheduling. Previously a host
+  that only flushed accumulated raw blocks until retention deleted them
+  uncompressed.
+- *Engine pins:* the engine and its buffer survive writer-connection churn
+  in the extension's process-global registry — a killed writer process no
+  longer loses buffered points; the durability loss boundary is OS-process
+  death.
+
+Pairs with timeless_logs/timeless_traces 1.10 (compressed stats surfaced)
+and the 0.7.18/0.3.16 dashboards (tiles read them).
+
 ## 6.4.2 (2026-08-10)
 
 **Vendored SQLite extension moves to timeless-libsql v0.6.0.** That release adds
