@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: awksedgreep/timeless-libsql
-          ref: v0.6.1
+          ref: v0.6.2
           path: timeless-libsql
 
       - name: Install Rust toolchain

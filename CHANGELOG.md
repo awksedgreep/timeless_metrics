@@ -1,4 +1,14 @@
 # Changelog
+## 6.6.1 (2026-08-11)
+
+**Vendored SQLite extension moves to timeless-libsql v0.6.2.** Each optimize
+pass now persists cumulative raw-in/compressed-out byte totals in the store's
+`_meta`, exported via `timeless_stats` as `compression_input_bytes_total` /
+`compression_output_bytes_total` — durable across restarts, unlike the
+process-local optimize profile counters. Pairs with timeless_logs /
+timeless_traces 1.11, whose dashboards show a compression ratio backed by
+these totals.
+
 ## 6.6.0 (2026-08-11)
 
 **Vendored SQLite extension moves to timeless-libsql v0.6.1.** Two behavior
