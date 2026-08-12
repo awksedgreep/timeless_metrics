@@ -1,4 +1,12 @@
 # Changelog
+## 6.6.2 (2026-08-11)
+
+**Vendored SQLite extension moves to timeless-libsql v0.6.3.** Compression
+totals now credit merge passes on the output side, so the dashboards' ratio
+converges to the store's true figure instead of freezing at first-pass
+compression of trickle-sized blocks (~1.3x displayed over data whose real
+density is an order of magnitude better).
+
 ## 6.6.1 (2026-08-11)
 
 **Vendored SQLite extension moves to timeless-libsql v0.6.2.** Each optimize
