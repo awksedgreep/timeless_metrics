@@ -751,7 +751,7 @@ defmodule TimelessMetrics.LibsqlEngineTest do
     end
   end
 
-  test "writer crash loses only unflushed work and resumes from durable blocks" do
+  test "writer crash preserves buffered work: the engine outlives the connection" do
     assert :ok = TimelessMetrics.write(@store, "crash", %{}, 1.0, timestamp: 10)
     assert :ok = TimelessMetrics.flush(@store)
     assert :ok = TimelessMetrics.write(@store, "crash", %{}, 2.0, timestamp: 20)
@@ -768,7 +768,13 @@ defmodule TimelessMetrics.LibsqlEngineTest do
     assert :ok = TimelessMetrics.write(@store, "crash", %{}, 3.0, timestamp: 30)
     assert :ok = TimelessMetrics.flush(@store)
 
-    assert {:ok, [{10, 1.0}, {30, 3.0}]} =
+    # Since extension 0.6.1 (P1 per-connection engine pins) the engine —
+    # buffer included — lives in the extension's process-global registry, so
+    # a killed writer's replacement reattaches to it and the buffered point
+    # survives. Before that, the buffer died with the connection and ts=20
+    # was the crash casualty this test asserted. The loss boundary is now
+    # OS-process death, which an in-process test cannot simulate.
+    assert {:ok, [{10, 1.0}, {20, 2.0}, {30, 3.0}]} =
              TimelessMetrics.query(@store, "crash", %{}, from: 0, to: 40)
   end
 
