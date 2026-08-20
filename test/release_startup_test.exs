@@ -341,9 +341,16 @@ defmodule TimelessMetrics.ReleaseStartupTest do
 
   defp opts, do: [extension_path: extension_path()]
 
+  # Mirrors LibsqlEngine.extension_path/0: an explicit override first, then the
+  # vendored extension the Makefile builds as part of `mix compile`.
+  #
+  # This previously fell back to a sibling timeless-libsql checkout, so the file
+  # only ran on a machine that happened to have that repo cloned *and* built.
+  # Everywhere else these tests failed on a missing dlopen target, which at a
+  # glance is indistinguishable from a real regression.
   defp extension_path do
     System.get_env("TIMELESS_EXT_PATH") ||
-      Path.expand("../../timeless-libsql/target/release/libtimeless_ext.so", __DIR__)
+      Application.app_dir(:timeless_metrics, "priv/native/timeless_sqlite_ext.so")
   end
 
   defp temp_dir(prefix) do

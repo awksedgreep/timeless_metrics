@@ -3,6 +3,13 @@ defmodule TimelessMetrics.DB.Migrations do
 
   @max_retries 8
 
+  # Highest schema version this module migrates to. Single source of truth:
+  # ReleaseStartup gates legacy databases on it, and that gate was previously a
+  # literal that a migration could silently outgrow.
+  @current_version 9
+
+  def current_version, do: @current_version
+
   def run(conn) do
     create_metadata_table(conn)
     version = get_version(conn)

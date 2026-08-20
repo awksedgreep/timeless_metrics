@@ -355,16 +355,18 @@ defmodule TimelessMetrics.ReleaseStartup do
              conn,
              "SELECT CAST(value AS INTEGER) FROM _metadata WHERE key='schema_version'"
            ) do
+      max_version = TimelessMetrics.DB.Migrations.current_version()
+
       cond do
-        version > 8 ->
+        version > max_version ->
           {:state, :incompatible_version,
-           %{error: "legacy metrics schema #{version} is newer than supported 8"}}
+           %{error: "legacy metrics schema #{version} is newer than supported #{max_version}"}}
 
         version < 1 ->
           {:state, :incompatible_version,
            %{
              error:
-               "legacy metrics schema #{version} is too old; supported versions are 1 through 8"
+               "legacy metrics schema #{version} is too old; supported versions are 1 through #{max_version}"
            }}
 
         true ->

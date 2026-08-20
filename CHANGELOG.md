@@ -29,6 +29,19 @@ the receiver cannot read; over HTTP that surfaces as a 400.
 
 Schema version 9 adds a nullable `webhook_format` column to `alert_rules`.
 
+**The legacy schema gate is derived rather than duplicated.** `ReleaseStartup`
+rejected any database newer than a hardcoded version 8, so bumping the schema to 9
+would have made existing databases fail startup as `incompatible_version`. The gate
+now reads `TimelessMetrics.DB.Migrations.current_version/0`, so a future migration
+cannot outgrow it silently.
+
+**Test harness no longer depends on an unbuilt sibling checkout.** `release_startup_test`
+resolved the SQLite extension from `../../timeless-libsql/target/release`, so it only
+ran where that repo was cloned and built; everywhere else five tests failed on a missing
+`dlopen` target. It now mirrors `LibsqlEngine.extension_path/0` and uses the vendored
+extension the Makefile builds during compile. Those failures had been masking the schema
+gate bug above.
+
 ## 6.6.2 (2026-08-11)
 
 **Vendored SQLite extension moves to timeless-libsql v0.6.3.** Compression
