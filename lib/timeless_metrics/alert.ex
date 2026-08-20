@@ -503,12 +503,29 @@ defmodule TimelessMetrics.Alert do
              [{:timeout, 10_000}],
              []
            ) do
-        {:ok, _} ->
+        {:ok, {{_version, status, _reason}, _headers, _body}} when status in 200..299 ->
           :ok
 
+        # :httpc returns {:ok, _} for ANY completed exchange, so a rejected delivery
+        # (429 from a rate-limited notification service, 5xx, a stale 404 endpoint)
+        # looks identical to success unless the status is inspected. An alert nobody
+        # receives is the failure mode operators are least able to detect on their own,
+        # so this is logged at :error rather than :warning.
+        {:ok, {{_version, status, _reason}, _headers, body}} ->
+          Logger.error(
+            "Alert webhook rejected for #{rule.name}: HTTP #{status} #{inspect(truncate(body))}"
+          )
+
         {:error, reason} ->
-          Logger.warning("Alert webhook failed for #{rule.name}: #{inspect(reason)}")
+          Logger.error("Alert webhook failed for #{rule.name}: #{inspect(reason)}")
       end
     end)
+  end
+
+  # Response bodies land in the log, so cap them — an HTML error page from a
+  # misconfigured endpoint should not swamp the alert log.
+  defp truncate(body, max \\ 200) do
+    str = to_string(body)
+    if byte_size(str) > max, do: binary_part(str, 0, max) <> "...", else: str
   end
 end
