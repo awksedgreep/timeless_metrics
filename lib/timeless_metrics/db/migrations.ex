@@ -300,7 +300,16 @@ defmodule TimelessMetrics.DB.Migrations do
     run_from(conn, 8)
   end
 
-  defp run_from(_conn, 8), do: :ok
+  defp run_from(conn, 8) do
+    execute(conn, "BEGIN")
+    # NULL means the generic JSON payload, so existing rules keep their behaviour.
+    execute(conn, "ALTER TABLE alert_rules ADD COLUMN webhook_format TEXT")
+    set_version(conn, 9)
+    execute(conn, "COMMIT")
+    run_from(conn, 9)
+  end
+
+  defp run_from(_conn, 9), do: :ok
 
   defp execute(conn, sql, params \\ []) do
     execute_with_retry(conn, sql, params, @max_retries)

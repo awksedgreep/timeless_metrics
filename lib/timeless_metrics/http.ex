@@ -996,11 +996,18 @@ defmodule TimelessMetrics.HTTP do
               labels: params["labels"] || %{},
               duration: params["duration"] || 0,
               aggregate: String.to_existing_atom(params["aggregate"] || "avg"),
-              webhook_url: params["webhook_url"]
+              webhook_url: params["webhook_url"],
+              webhook_format: params["webhook_format"]
             ]
 
-            {:ok, id} = TimelessMetrics.create_alert(store, opts)
-            json_resp(req, 201, %{id: id, status: "created"})
+            try do
+              {:ok, id} = TimelessMetrics.create_alert(store, opts)
+              json_resp(req, 201, %{id: id, status: "created"})
+            rescue
+              # An unrecognised webhook_format fails closed rather than silently
+              # sending the generic payload; surface it as a 400, not a crash.
+              e in ArgumentError -> json_error(req, 400, Exception.message(e))
+            end
 
           _ ->
             json_error(

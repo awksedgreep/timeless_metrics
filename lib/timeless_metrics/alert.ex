@@ -25,6 +25,7 @@ defmodule TimelessMetrics.Alert do
     duration = Keyword.get(opts, :duration, 0)
     aggregate = to_string(Keyword.get(opts, :aggregate, :avg))
     webhook_url = Keyword.get(opts, :webhook_url)
+    webhook_format = normalize_format(Keyword.get(opts, :webhook_format))
     created_at = System.os_time(:second)
 
     {:ok, id} =
@@ -32,8 +33,8 @@ defmodule TimelessMetrics.Alert do
         TimelessMetrics.DB.execute(
           conn,
           """
-          INSERT INTO alert_rules (name, metric, labels, condition, threshold, duration, aggregate, webhook_url, enabled, created_at)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)
+          INSERT INTO alert_rules (name, metric, labels, condition, threshold, duration, aggregate, webhook_url, webhook_format, enabled, created_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)
           """,
           [
             name,
@@ -44,6 +45,7 @@ defmodule TimelessMetrics.Alert do
             duration,
             aggregate,
             webhook_url,
+            webhook_format,
             created_at
           ]
         )
@@ -62,7 +64,7 @@ defmodule TimelessMetrics.Alert do
     {:ok, rows} =
       TimelessMetrics.DB.read(
         db,
-        "SELECT id, name, metric, labels, condition, threshold, duration, aggregate, webhook_url, enabled FROM alert_rules ORDER BY id"
+        "SELECT id, name, metric, labels, condition, threshold, duration, aggregate, webhook_url, webhook_format, enabled FROM alert_rules ORDER BY id"
       )
 
     rules =
@@ -76,6 +78,7 @@ defmodule TimelessMetrics.Alert do
                           duration,
                           aggregate,
                           webhook_url,
+                          webhook_format,
                           enabled
                         ] ->
         # Get current state for this rule
@@ -106,6 +109,7 @@ defmodule TimelessMetrics.Alert do
           duration: duration,
           aggregate: aggregate,
           webhook_url: webhook_url,
+          webhook_format: webhook_format,
           enabled: enabled == 1,
           states: states
         }
@@ -117,12 +121,12 @@ defmodule TimelessMetrics.Alert do
   @doc """
   Update an alert rule (partial update).
 
-  Supported fields: name, metric, labels, condition, threshold, duration, aggregate, webhook_url, enabled.
+  Supported fields: name, metric, labels, condition, threshold, duration, aggregate, webhook_url, webhook_format, enabled.
   Only provided fields are updated.
 
   Returns `:ok`.
   """
-  @updatable_fields ~w(name metric labels condition threshold duration aggregate webhook_url enabled)
+  @updatable_fields ~w(name metric labels condition threshold duration aggregate webhook_url webhook_format enabled)
 
   def update_rule(db, rule_id, opts) do
     fields =
@@ -138,6 +142,7 @@ defmodule TimelessMetrics.Alert do
             "aggregate" -> to_string(v)
             "threshold" -> v * 1.0
             "enabled" -> if(v, do: 1, else: 0)
+            "webhook_format" -> normalize_format(v)
             _ -> v
           end
 
@@ -480,26 +485,14 @@ defmodule TimelessMetrics.Alert do
 
     chart_url = "chart?metric=#{rule.metric}&#{label_params}&from=-1h&theme=auto"
 
-    payload =
-      :json.encode(%{
-        alert: rule.name,
-        metric: rule.metric,
-        labels: labels,
-        value: value,
-        threshold: rule.threshold,
-        condition: rule.condition,
-        aggregate: rule.aggregate,
-        state: state,
-        triggered_at: timestamp,
-        url: chart_url
-      })
-      |> IO.iodata_to_binary()
+    {url, body} = build_delivery(rule, labels, value, state, timestamp, chart_url)
+    payload = body |> :json.encode() |> IO.iodata_to_binary()
 
     # Fire and forget — don't block the alert loop on webhook delivery
     Task.start(fn ->
       case :httpc.request(
              :post,
-             {String.to_charlist(rule.webhook_url), [], ~c"application/json", payload},
+             {String.to_charlist(url), [], ~c"application/json", payload},
              [{:timeout, 10_000}],
              []
            ) do
@@ -521,6 +514,94 @@ defmodule TimelessMetrics.Alert do
       end
     end)
   end
+
+  @webhook_formats ~w(ntfy generic)
+
+  # Fail closed on an unrecognised format rather than silently sending the
+  # generic payload somewhere that cannot read it.
+  defp normalize_format(nil), do: nil
+
+  defp normalize_format(value) do
+    case to_string(value) do
+      "generic" -> nil
+      format when format in @webhook_formats -> format
+      other -> raise ArgumentError, "invalid webhook_format #{inspect(other)}, expected one of: #{Enum.join(@webhook_formats, ", ")}"
+    end
+  end
+
+  # ntfy parses a JSON body only at its **root** endpoint. Posting JSON to a
+  # topic path makes the entire envelope the message text, which is why alerts
+  # arrived as unreadable blobs. Translate into ntfy's own schema and post to the
+  # root, carrying the topic in the body.
+  @doc false
+  # Public only so the payload translation can be tested directly.
+  def build_delivery(rule, labels, value, state, timestamp, chart_url)
+
+  def build_delivery(%{webhook_format: "ntfy"} = rule, labels, value, state, _timestamp, chart_url) do
+    {base, topic} = split_ntfy_url(rule.webhook_url)
+    state = to_string(state)
+    firing? = state == "firing"
+
+    label_text =
+      case Enum.map(labels, fn {k, v} -> "#{k}=#{v}" end) do
+        [] -> ""
+        parts -> " {" <> Enum.join(parts, ", ") <> "}"
+      end
+
+    message =
+      "#{rule.metric}#{label_text} is #{format_number(value)}" <>
+        " (#{rule.aggregate} #{rule.condition} #{format_number(rule.threshold)})\n#{chart_url}"
+
+    body = %{
+      topic: topic,
+      title: "#{String.upcase(state)}: #{rule.name}",
+      message: message,
+      # Firing should be able to cut through; a recovery notice should not be
+      # as loud as the outage it is clearing.
+      priority: if(firing?, do: 4, else: 3),
+      tags: [if(firing?, do: "rotating_light", else: "white_check_mark")]
+    }
+
+    {base, body}
+  end
+
+  def build_delivery(rule, labels, value, state, timestamp, chart_url) do
+    {rule.webhook_url,
+     %{
+       alert: rule.name,
+       metric: rule.metric,
+       labels: labels,
+       value: value,
+       threshold: rule.threshold,
+       condition: rule.condition,
+       aggregate: rule.aggregate,
+       state: state,
+       triggered_at: timestamp,
+       url: chart_url
+     }}
+  end
+
+  @doc false
+  # "https://ntfy.sh/my-topic" -> {"https://ntfy.sh/", "my-topic"}
+  # Self-hosted under a prefix works too:
+  # "https://host/ntfy/alerts" -> {"https://host/ntfy/", "alerts"}
+  def split_ntfy_url(url) do
+    uri = URI.parse(url)
+    segments = (uri.path || "") |> String.split("/", trim: true)
+
+    {topic, prefix} =
+      case List.pop_at(segments, -1) do
+        {nil, _} -> {"", []}
+        {last, rest} -> {last, rest}
+      end
+
+    base = URI.to_string(%{uri | path: "/" <> Enum.join(prefix ++ [""], "/"), query: nil, fragment: nil})
+
+    {base, topic}
+  end
+
+  defp format_number(n) when is_float(n), do: :erlang.float_to_binary(n, [:short])
+  defp format_number(n), do: to_string(n)
 
   # Response bodies land in the log, so cap them — an HTML error page from a
   # misconfigured endpoint should not swamp the alert log.

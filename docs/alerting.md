@@ -254,7 +254,7 @@ curl -X POST http://localhost:8428/api/v1/alerts \
 
 ### Connecting to ntfy.sh
 
-[ntfy](https://ntfy.sh) works out of the box — just point `webhook_url` at your topic. Since TimelessMetrics sends JSON, ntfy will accept it directly and you'll get push notifications on your phone or desktop:
+[ntfy](https://ntfy.sh) is supported directly. Point `webhook_url` at your topic **and set `webhook_format` to `"ntfy"`**:
 
 ```bash
 curl -X POST http://localhost:8428/api/v1/alerts \
@@ -267,9 +267,35 @@ curl -X POST http://localhost:8428/api/v1/alerts \
     "threshold": 85.0,
     "duration": 600,
     "aggregate": "avg",
-    "webhook_url": "https://ntfy.sh/my-noc-alerts"
+    "webhook_url": "https://ntfy.sh/my-noc-alerts",
+    "webhook_format": "ntfy"
   }'
 ```
+
+You get a titled, prioritised notification:
+
+```
+FIRING: Uplink saturation
+port_utilization {port=ae0} is 91.4 (avg above 85.0)
+```
+
+`firing` is sent at priority 4 with a `rotating_light` tag; `resolved` at priority 3
+with `white_check_mark`, so a recovery is not as loud as the outage it clears.
+
+### Why the format matters
+
+**ntfy parses a JSON body only at its root endpoint.** Posted to a topic path
+(`https://ntfy.sh/<topic>`), ntfy treats the raw body as the message text, so the whole
+alert envelope arrives as an unreadable blob with no title and no priority — and it
+returns 200, so nothing looks wrong.
+
+With `webhook_format: "ntfy"` the payload is translated into ntfy's own schema and posted
+to the root endpoint, with the topic taken from the URL you configured. Self-hosted
+instances under a path prefix work too: `https://ntfy.example.com/ops/noc-alerts` posts to
+`https://ntfy.example.com/ops/` with topic `noc-alerts`.
+
+Omit `webhook_format` (or set it to `"generic"`) to keep the original JSON envelope for
+receivers that want to parse it themselves.
 
 For richer notifications with titles and priority, route through a small transformer:
 

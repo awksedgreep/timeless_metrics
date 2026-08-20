@@ -1,4 +1,34 @@
 # Changelog
+## 6.6.3 (2026-08-20)
+
+**Alert webhooks now report deliveries the receiver rejected.** `:httpc.request/4`
+answers `{:ok, _}` for any completed exchange, so the delivery clause matched every
+response that came back at all. A 429 from a rate-limited notification service, a
+5xx, or a 404 from a stale endpoint was indistinguishable from success and produced
+no log line whatsoever — only transport-level failures were ever reported. An alert
+the operator never receives is the failure they are least equipped to notice unaided,
+so rejections are now logged at `:error`.
+
+Observed in practice: ntfy.sh rate-limits by source IP, and a sender behind a shared
+egress IP gets 429s that this code read as success.
+
+Delivery remains fire-and-forget; a rejected webhook is not retried and the series
+still transitions to firing.
+
+**New `webhook_format` on alert rules, with native ntfy support.** ntfy parses a JSON
+body only at its root endpoint; posted to a topic path it treats the raw body as the
+message text, so alerts arrived as an unreadable JSON blob with no title or priority —
+and returned 200, so nothing looked wrong. Setting `webhook_format: "ntfy"` translates
+the payload into ntfy's schema and posts to the root endpoint, taking the topic from
+the configured URL. `firing` is sent at priority 4 with a `rotating_light` tag,
+`resolved` at priority 3.
+
+Omitted or `"generic"` keeps the existing JSON envelope, so existing rules are
+unaffected. An unrecognised value fails closed rather than silently sending a payload
+the receiver cannot read; over HTTP that surfaces as a 400.
+
+Schema version 9 adds a nullable `webhook_format` column to `alert_rules`.
+
 ## 6.6.2 (2026-08-11)
 
 **Vendored SQLite extension moves to timeless-libsql v0.6.3.** Compression
