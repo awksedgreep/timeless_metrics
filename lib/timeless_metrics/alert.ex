@@ -196,11 +196,42 @@ defmodule TimelessMetrics.Alert do
 
     {:ok, rules} = list_rules(db)
 
-    Enum.each(rules, fn rule ->
-      if rule.enabled do
-        evaluate_rule(store, db, rule)
-      end
-    end)
+    rules
+    |> Enum.filter(& &1.enabled)
+    |> Enum.each(&safely_evaluate(store, db, &1))
+
+    :ok
+  rescue
+    # list_rules/1 raises rather than returning an error when the rules table
+    # is unreachable. Letting that propagate would restart the evaluator on a
+    # loop and stop alerting entirely, silently.
+    error ->
+      Logger.error("alert evaluation skipped: cannot read rules: " <> Exception.message(error))
+      {:error, error}
+  end
+
+  # One rule must not be able to end the pass. A metric that no longer exists,
+  # or a reader that is briefly unreachable, would otherwise raise out of
+  # Enum.each and — under the evaluator's supervisor — turn into a restart
+  # loop that stops evaluating every OTHER rule too. Alerting that has quietly
+  # stopped looks exactly like alerting with nothing to report.
+  defp safely_evaluate(store, db, rule) do
+    evaluate_rule(store, db, rule)
+  rescue
+    error ->
+      Logger.error(
+        "alert rule #{rule.id} (#{rule.name}) failed to evaluate: " <>
+          Exception.message(error)
+      )
+
+      :error
+  catch
+    kind, reason ->
+      Logger.error(
+        "alert rule #{rule.id} (#{rule.name}) failed to evaluate: #{inspect({kind, reason})}"
+      )
+
+      :error
   end
 
   defp evaluate_rule(store, db, rule) do
@@ -210,7 +241,7 @@ defmodule TimelessMetrics.Alert do
     agg = String.to_existing_atom(rule.aggregate)
 
     {:ok, results} =
-      TimelessMetrics.query_aggregate_multi(store, rule.metric, label_filter,
+      reader().query_aggregate_multi(store, rule.metric, label_filter,
         from: now - lookback,
         to: now,
         bucket: {lookback, :seconds},
@@ -234,6 +265,14 @@ defmodule TimelessMetrics.Alert do
         update_state(db, rule, series_key, labels, value, breaching, now)
       end
     end)
+  end
+
+  # Where rule evaluation reads metrics from. Defaults to this library's own
+  # store; a deployment whose metrics live behind a data plane (owner:
+  # :external, where no in-process store exists) points this at an adapter
+  # exposing the same query_aggregate_multi/4.
+  defp reader do
+    Application.get_env(:timeless_metrics, :alert_reader, TimelessMetrics)
   end
 
   defp check_condition(value, "above", threshold), do: value > threshold
@@ -523,9 +562,15 @@ defmodule TimelessMetrics.Alert do
 
   defp normalize_format(value) do
     case to_string(value) do
-      "generic" -> nil
-      format when format in @webhook_formats -> format
-      other -> raise ArgumentError, "invalid webhook_format #{inspect(other)}, expected one of: #{Enum.join(@webhook_formats, ", ")}"
+      "generic" ->
+        nil
+
+      format when format in @webhook_formats ->
+        format
+
+      other ->
+        raise ArgumentError,
+              "invalid webhook_format #{inspect(other)}, expected one of: #{Enum.join(@webhook_formats, ", ")}"
     end
   end
 
@@ -537,7 +582,14 @@ defmodule TimelessMetrics.Alert do
   # Public only so the payload translation can be tested directly.
   def build_delivery(rule, labels, value, state, timestamp, chart_url)
 
-  def build_delivery(%{webhook_format: "ntfy"} = rule, labels, value, state, _timestamp, chart_url) do
+  def build_delivery(
+        %{webhook_format: "ntfy"} = rule,
+        labels,
+        value,
+        state,
+        _timestamp,
+        chart_url
+      ) do
     {base, topic} = split_ntfy_url(rule.webhook_url)
     state = to_string(state)
     firing? = state == "firing"
@@ -595,7 +647,13 @@ defmodule TimelessMetrics.Alert do
         {last, rest} -> {last, rest}
       end
 
-    base = URI.to_string(%{uri | path: "/" <> Enum.join(prefix ++ [""], "/"), query: nil, fragment: nil})
+    base =
+      URI.to_string(%{
+        uri
+        | path: "/" <> Enum.join(prefix ++ [""], "/"),
+          query: nil,
+          fragment: nil
+      })
 
     {base, topic}
   end

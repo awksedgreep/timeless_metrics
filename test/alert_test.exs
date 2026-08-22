@@ -459,4 +459,99 @@ defmodule TimelessMetrics.AlertTest do
     assert length(rule.states) == 3
     assert Enum.all?(rule.states, &(&1.state == "firing"))
   end
+
+  describe "evaluation resilience and reader indirection" do
+    defmodule RaisingReader do
+      @moduledoc false
+      def query_aggregate_multi(_store, _metric, _labels, _opts) do
+        raise "data plane unreachable"
+      end
+    end
+
+    defmodule RecordingReader do
+      @moduledoc false
+      def query_aggregate_multi(_store, metric, _labels, _opts) do
+        send(:alert_reader_probe, {:read, metric})
+        {:ok, []}
+      end
+    end
+
+    setup do
+      on_exit(fn -> Application.delete_env(:timeless_metrics, :alert_reader) end)
+      :ok
+    end
+
+    test "a reader that raises does not stop the pass or the evaluator" do
+      # A transient data-plane failure used to propagate out of evaluate/1.
+      # Under the evaluator's supervisor that is a restart loop, and alerting
+      # stops entirely -- indistinguishable from having nothing to report.
+      {:ok, _} =
+        TimelessMetrics.create_alert(:alert_test,
+          name: "will raise",
+          metric: "cpu_usage",
+          condition: :above,
+          threshold: 1.0,
+          webhook_url: "http://localhost:9999/webhook"
+        )
+
+      Application.put_env(:timeless_metrics, :alert_reader, RaisingReader)
+
+      assert :ok = TimelessMetrics.Alert.evaluate(:alert_test)
+    end
+
+    test "one failing rule does not prevent the others from evaluating" do
+      for name <- ["first", "second"] do
+        {:ok, _} =
+          TimelessMetrics.create_alert(:alert_test,
+            name: name,
+            metric: "metric_#{name}",
+            condition: :above,
+            threshold: 1.0,
+            webhook_url: "http://localhost:9999/webhook"
+          )
+      end
+
+      Process.register(self(), :alert_reader_probe)
+
+      on_exit(fn ->
+        if Process.whereis(:alert_reader_probe), do: Process.unregister(:alert_reader_probe)
+      end)
+
+      Application.put_env(:timeless_metrics, :alert_reader, RecordingReader)
+
+      assert :ok = TimelessMetrics.Alert.evaluate(:alert_test)
+
+      assert_received {:read, "metric_first"}
+      assert_received {:read, "metric_second"}
+    end
+
+    test "reads go through the configured reader" do
+      # How a deployment whose metrics live behind a data plane evaluates at
+      # all: there is no in-process store to read under owner: :external.
+      {:ok, _} =
+        TimelessMetrics.create_alert(:alert_test,
+          name: "routed",
+          metric: "routed_metric",
+          condition: :above,
+          threshold: 1.0,
+          webhook_url: "http://localhost:9999/webhook"
+        )
+
+      Process.register(self(), :alert_reader_probe)
+
+      on_exit(fn ->
+        if Process.whereis(:alert_reader_probe), do: Process.unregister(:alert_reader_probe)
+      end)
+
+      Application.put_env(:timeless_metrics, :alert_reader, RecordingReader)
+
+      assert :ok = TimelessMetrics.Alert.evaluate(:alert_test)
+      assert_received {:read, "routed_metric"}
+    end
+
+    test "the default reader is this library" do
+      Application.delete_env(:timeless_metrics, :alert_reader)
+      assert :ok = TimelessMetrics.Alert.evaluate(:alert_test)
+    end
+  end
 end
