@@ -1,4 +1,15 @@
 # Changelog
+## 6.6.5 (2026-08-23)
+
+**The bundled libSQL extension jumps from 0.6.3 to 0.7.7** — nine releases,
+including the fix for the block-store→libsql migration hang that affected
+embedded upgrades, plus the honest storage counters (`bytes_on_disk` data
+payload, `index_bytes`, and for logs/traces the persistent
+`ingest_raw_bytes_total`). Every app embedding this package (and loading
+this extension for timeless_logs/timeless_traces) gets the current engine
+again. The vendored crate's `timeless-ext` tag is the single line that
+governs this; it had silently aged while the package around it shipped.
+
 ## 6.6.3 (2026-08-20)
 
 **Alert webhooks now report deliveries the receiver rejected.** `:httpc.request/4`
