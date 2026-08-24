@@ -4398,11 +4398,18 @@ mod tests {
             vec![("cpu".to_owned(), 1), ("cpu".to_owned(), 2)]
         );
 
-        let (first, cursor, more) = reader.legacy_query_page("cpu", &base, None, 2).unwrap();
+        let decoded = Mutex::new(None);
+        let (first, cursor, more) = reader
+            .legacy_query_page("cpu", &base, None, 2, &decoded)
+            .unwrap();
         assert!(more);
-        let (second, cursor, more) = reader.legacy_query_page("cpu", &base, cursor, 2).unwrap();
+        let (second, cursor, more) = reader
+            .legacy_query_page("cpu", &base, cursor, 2, &decoded)
+            .unwrap();
         assert!(!more);
-        let (empty, _, more) = reader.legacy_query_page("cpu", &base, cursor, 2).unwrap();
+        let (empty, _, more) = reader
+            .legacy_query_page("cpu", &base, cursor, 2, &decoded)
+            .unwrap();
         assert!(!more);
         let actual = first.into_iter().chain(second).collect::<Vec<_>>();
         assert_eq!(actual.len(), 4);
@@ -4414,6 +4421,92 @@ mod tests {
         assert!(empty.is_empty());
         drop(reader);
         assert_eq!(source_bytes(&dir), before);
+    }
+
+    /// Full-store scan harness: set TMS_LEGACY_SCAN_DIR to a legacy
+    /// `rust_engine` directory and this pages every series exactly the way
+    /// the release migration does. Skipped when the variable is absent.
+    #[test]
+    fn legacy_scan_full_store() {
+        let Some(dir) = std::env::var_os("TMS_LEGACY_SCAN_DIR") else {
+            return;
+        };
+        let reader = Engine::new_read_only(PathBuf::from(dir)).unwrap();
+        let series = reader.legacy_series();
+        let decoded = Mutex::new(None);
+        let mut total = 0usize;
+        for (index, (metric, labels)) in series.iter().enumerate() {
+            let labels = labels
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let mut cursor = None;
+            loop {
+                let (points, next, more) = reader
+                    .legacy_query_page(metric, &labels, cursor, 4096, &decoded)
+                    .unwrap();
+                total += points.len();
+                cursor = next;
+                if !more {
+                    break;
+                }
+            }
+            if index % 100_000 == 0 {
+                eprintln!("scanned {index} series, {total} points");
+            }
+        }
+        eprintln!("TOTAL {total} points over {} series", series.len());
+    }
+
+    /// Companion to `legacy_scan_full_store`: dump every point and series
+    /// identity in the release-migration digest's input form, so an external
+    /// checker can recompute the journal's identity digest from the source.
+    #[test]
+    fn legacy_dump_full_store() {
+        let Some(dir) = std::env::var_os("TMS_LEGACY_DUMP_DIR") else {
+            return;
+        };
+        use std::io::Write;
+        let reader = Engine::new_read_only(PathBuf::from(dir)).unwrap();
+        let series = reader.legacy_series();
+        let decoded = Mutex::new(None);
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        for (metric, labels) in &series {
+            let ordered = labels
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let labels_json = if ordered.is_empty() {
+                "{}".to_owned()
+            } else {
+                let body = ordered
+                    .iter()
+                    .map(|(key, value)| format!("\"{key}\":\"{value}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{{body}}}")
+            };
+            let mut cursor = None;
+            loop {
+                let (points, next, more) = reader
+                    .legacy_query_page(metric, &ordered, cursor, 4096, &decoded)
+                    .unwrap();
+                for (timestamp, value) in points {
+                    writeln!(
+                        out,
+                        "D\t{metric}\t{labels_json}\t{timestamp}\t{:016x}",
+                        value.to_bits()
+                    )
+                    .unwrap();
+                }
+                cursor = next;
+                if !more {
+                    break;
+                }
+            }
+            writeln!(out, "S\t{metric}\t{labels_json}").unwrap();
+        }
     }
 
     #[test]
