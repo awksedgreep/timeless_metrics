@@ -191,7 +191,8 @@ defmodule TimelessMetrics.Supervisor do
              store: name,
              data_dir: data_dir,
              schema: schema,
-             extension_path: Keyword.get(opts, :extension_path)}
+             extension_path: Keyword.get(opts, :extension_path),
+             maintenance: Keyword.get(opts, :maintenance, true)}
           ] ++ readers
 
         :rust ->

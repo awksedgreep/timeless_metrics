@@ -1,4 +1,58 @@
 # Changelog
+## Unreleased
+
+**The migration candidate no longer runs wall-clock maintenance (#2).** The
+candidate store's writer scheduled the production `:compact` (5 min) and
+`:retention` (1 h) timers with the default schema, so any copy phase longer
+than an hour had raw chunks older than `now - raw_retention` (default 7 days)
+pruned out of the half-built candidate — whether a migration was lossless
+was a race against the writer's own clock. Confirmed three ways on the same
+real data: the 2026-08-23 incident (2,419,903 points lost to the 16:46 tick),
+a serialized local run (identical surviving-set digest, deletion captured
+live at T+1h00m12s), and the unmodified 0.7.18 image on a scratch volume.
+`LibsqlEngine` now takes `maintenance: false` — the staging profile: no
+periodic compact, no retention prune; only the maintenance `stage/2`
+explicitly orders runs. Note for operators: cutover still arms the
+destination schema's retention — migrated historical raw older than the raw
+window is pruned by the first post-cutover tick unless the schema says
+otherwise (see issue #2 follow-up).
+
+**Empty-series checkpoints batch, and staging commits stop fsyncing (#3).**
+One fsync'd transaction per point-less series put a 1M-junk-series registry
+at ~140 series/s — nearly two hours of copy, which is exactly what carried
+the incident across the retention tick. Runs of fully-empty series now
+coalesce into one `migration_resolve_batch` transaction (≤1,024 resolves +
+one journal update; the identity digest is a commutative sum and resolve is
+idempotent, so resume replays an open batch harmlessly), and the staging
+writer runs `PRAGMA synchronous = NORMAL` (`migration_tune`) — the
+`wal_checkpoint(TRUNCATE)` before validation remains the durability barrier.
+
+**The block-store→libsql migration hang is actually fixed here.** The 6.6.5
+notes credited the extension bump with this fix, but the hang lives in this
+package: `ReleaseMigration`'s cold validation probed the candidate once per
+series with `SELECT series_id FROM timeless_series(...) WHERE name=? AND
+labels=?`. `name` and `labels` are TVF output columns — the planner cannot
+push them down — so every probe materialized the full catalog:
+O(series²) across the loop. A store carrying ~1M series validated for hours
+at 100% CPU with the metrics port never binding, and would not have finished
+for weeks. Validation now takes one catalog scan up front and resolves each
+series from a map, keeping the exact identity-equality semantics (the same
+canonical labels JSON is compared, and a duplicated or absent identity still
+fails validation). Measured: staging 20k series now completes in ~41s where
+the old probe pattern alone projected ~7 minutes at that size, growing
+quadratically from there.
+
+**Migration resume survives a release upgrade.** The resume gate compared the
+stored source-manifest digest byte-for-byte, but `:json.encode` writes
+atom-keyed maps in atom-table order — an artifact of the running VM instance,
+not of the data. A journal written by one build therefore failed resume under
+any other build with a spurious "legacy metrics source changed since migration
+began", exactly the situation of an operator upgrading to obtain the migration
+fix above. The gate now falls back to comparing the decoded manifests, which
+is order-independent; an unchanged source resumes, a genuinely changed source
+still refuses. Reproduced against a journal written by the v0.7.18 stack image
+and resumed under this build.
+
 ## 6.6.5 (2026-08-23)
 
 **The bundled libSQL extension jumps from 0.6.3 to 0.7.7** — nine releases,

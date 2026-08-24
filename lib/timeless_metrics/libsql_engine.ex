@@ -226,6 +226,35 @@ defmodule TimelessMetrics.LibsqlEngine do
     )
   end
 
+  @doc false
+  # One transaction for a run of point-less series: N vtab 'resolve'
+  # commands plus a single journal UPDATE and events INSERT. The identity
+  # digest is a commutative sum and 'resolve' is idempotent, so a crash
+  # mid-batch resumes by replaying the whole batch harmlessly. Turns the
+  # migration's one-fsync-per-empty-series pattern into one fsync per
+  # batch (see issue #3).
+  def migration_resolve_batch(store, identities, journal, opts \\ []) do
+    failpoint = Keyword.get(opts, :failpoint)
+
+    entries =
+      Enum.map(identities, fn {metric, labels} -> {metric, encode_json(Map.new(labels))} end)
+
+    GenServer.call(
+      writer_name(store),
+      {:migration_resolve_batch, entries, journal, failpoint},
+      :infinity
+    )
+  end
+
+  @doc false
+  # Staging-only durability profile: WAL + synchronous=NORMAL. The
+  # candidate is journaled and cold-validated, so losing the WAL tail in
+  # a crash only re-runs work; finish_public_maintenance's
+  # wal_checkpoint(TRUNCATE) is the durability barrier before validation.
+  def migration_tune(store) do
+    GenServer.call(writer_name(store), :migration_tune, :infinity)
+  end
+
   def ingest_prometheus(store, body, default_ts \\ nil) do
     now = default_ts || System.os_time(:second)
     {entries, errors} = TimelessMetrics.PrometheusNif.parse(body)
@@ -577,8 +606,17 @@ defmodule TimelessMetrics.LibsqlEngine do
     :persistent_term.put({__MODULE__, store, :series_cache}, cache)
     :persistent_term.put({__MODULE__, store, :query_frame_features}, query_frame_features)
     schedule_flush()
-    rollup_timer = schedule_compact(schema.rollup_interval)
-    retention_timer = schedule_retention(schema.retention_interval)
+
+    # maintenance: false is the staging profile (release migration): no
+    # periodic compact and, above all, no wall-clock retention prune. A
+    # half-built migration candidate holds historical data that a
+    # `prune:now-raw_retention` tick would destroy mid-copy — whether a
+    # copy is lossless must not depend on racing the writer's timers
+    # (issue #2: the 2026-08-23 incident lost 2.42M points to exactly
+    # one such tick).
+    maintenance? = Keyword.get(opts, :maintenance, true)
+    rollup_timer = if maintenance?, do: schedule_compact(schema.rollup_interval)
+    retention_timer = if maintenance?, do: schedule_retention(schema.retention_interval)
 
     {:ok,
      %{
@@ -699,6 +737,84 @@ defmodule TimelessMetrics.LibsqlEngine do
           _ = TimelessMetrics.DB.execute(state.conn, "ROLLBACK", [])
           {:reply, {:error, Exception.message(error)}, state}
       end
+    else
+      {{:error, _} = error, state} -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:migration_resolve_batch, entries, journal, failpoint}, _from, state) do
+    with {:ok, state} <- finish_ingest_transaction(state) do
+      {:ok, _} = TimelessMetrics.DB.execute(state.conn, "BEGIN IMMEDIATE", [])
+
+      try do
+        Enum.each(entries, fn {metric, labels_json} ->
+          {:ok, _} =
+            TimelessMetrics.DB.execute(
+              state.conn,
+              "INSERT INTO #{@table}(#{@table}, name, labels) VALUES ('resolve', ?1, ?2)",
+              [metric, labels_json]
+            )
+        end)
+
+        migration_failpoint!(failpoint, :disk_full)
+        migration_failpoint!(failpoint, :after_batch_before_journal)
+
+        {:ok, _} =
+          TimelessMetrics.DB.execute(
+            state.conn,
+            """
+            UPDATE _timeless_migration
+            SET phase = ?1, series_index = ?2, cursor_json = ?3,
+                records_completed = ?4, series_completed = ?5,
+                identity_digest = ?6, updated_at_ns = ?7,
+                checkpoints = checkpoints + 1
+            WHERE singleton = 1
+            """,
+            [
+              journal.phase,
+              journal.series_index,
+              journal.cursor_json,
+              journal.records_completed,
+              journal.series_completed,
+              journal.identity_digest,
+              journal.updated_at_ns
+            ]
+          )
+
+        {:ok, _} =
+          TimelessMetrics.DB.execute(
+            state.conn,
+            """
+            INSERT INTO _timeless_migration_events
+              (phase, series_index, cursor_json, records_completed, at_ns)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            """,
+            [
+              journal.phase,
+              journal.series_index,
+              journal.cursor_json,
+              journal.records_completed,
+              journal.updated_at_ns
+            ]
+          )
+
+        migration_failpoint!(failpoint, :after_journal_before_commit)
+        {:ok, _} = TimelessMetrics.DB.execute(state.conn, "COMMIT", [])
+        {:reply, :ok, state}
+      rescue
+        error ->
+          _ = TimelessMetrics.DB.execute(state.conn, "ROLLBACK", [])
+          {:reply, {:error, Exception.message(error)}, state}
+      end
+    else
+      {{:error, _} = error, state} -> {:reply, error, state}
+    end
+  end
+
+  def handle_call(:migration_tune, _from, state) do
+    with {:ok, state} <- finish_ingest_transaction(state) do
+      {:ok, _} = TimelessMetrics.DB.execute(state.conn, "PRAGMA synchronous = NORMAL", [])
+      {:reply, :ok, state}
     else
       {{:error, _} = error, state} -> {:reply, error, state}
     end

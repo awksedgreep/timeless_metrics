@@ -38,6 +38,7 @@ defmodule TimelessMetrics.ReleaseMigration do
          {:ok, supervisor} <- start_candidate(candidate_dir, opts) do
       try do
         with :ok <- require_migration_capability(),
+             :ok <- LibsqlEngine.migration_tune(@migration_store),
              {:ok, journal} <- initialize_or_resume(manifest, info, length(series)),
              {:ok, copied} <- copy_series(reader, series, journal, opts),
              {:ok, maintenance} <- finish_public_maintenance(),
@@ -140,6 +141,11 @@ defmodule TimelessMetrics.ReleaseMigration do
   defp start_candidate(candidate_dir, opts) do
     schema = Keyword.get(opts, :schema, TimelessMetrics.Schema.default())
 
+    # maintenance: false is the staging profile — no periodic compact, no
+    # wall-clock retention prune. The candidate holds historical data
+    # mid-copy that a `prune:now-raw_retention` tick destroys (issue #2);
+    # maintenance runs only where stage/2 explicitly orders it, and
+    # tiering applies post-cutover under the operator's schema.
     child =
       {TimelessMetrics,
        name: @migration_store,
@@ -150,6 +156,7 @@ defmodule TimelessMetrics.ReleaseMigration do
        schema: schema,
        scraping: false,
        self_monitor: false,
+       maintenance: false,
        reader_pool_size: 1}
 
     Supervisor.start_link([child], strategy: :one_for_one)
@@ -219,7 +226,7 @@ defmodule TimelessMetrics.ReleaseMigration do
       DB.read(
         db,
         """
-        SELECT version, signal, phase, source_manifest_digest,
+        SELECT version, signal, phase, source_manifest_json, source_manifest_digest,
                series_index, cursor_json, records_completed, records_total,
                series_completed, series_total, identity_digest, checkpoints, retries
         FROM _timeless_migration WHERE singleton = 1
@@ -262,6 +269,7 @@ defmodule TimelessMetrics.ReleaseMigration do
           version,
           signal,
           phase,
+          stored_manifest_json,
           digest,
           series_index,
           cursor_json,
@@ -282,7 +290,7 @@ defmodule TimelessMetrics.ReleaseMigration do
           signal != @signal ->
             {:error, "candidate journal belongs to #{signal}, not #{@signal}"}
 
-          digest != manifest.digest ->
+          not manifest_matches?(stored_manifest_json, digest, manifest) ->
             {:error, "legacy metrics source changed since migration began"}
 
           records_total != map_value(info, "points") or recorded_series_total != series_total ->
@@ -357,10 +365,18 @@ defmodule TimelessMetrics.ReleaseMigration do
      }}
   end
 
+  # One fsync'd checkpoint transaction per point-less series turns a
+  # high-cardinality junk registry into hours of wall clock (issue #3),
+  # so runs of fully-empty series coalesce into one batched checkpoint.
+  # The identity digest is a commutative sum and 'resolve' is idempotent,
+  # so resume after a crash replays the open batch harmlessly.
+  @empty_batch_size 1_024
+
   defp copy_series(reader, series, journal, opts) do
     series
     |> Enum.with_index()
-    |> Enum.reduce_while({:ok, journal}, fn {identity, index}, {:ok, state} ->
+    |> Enum.reduce_while({:ok, Map.put(journal, :pending, [])}, fn {identity, index},
+                                                                   {:ok, state} ->
       cond do
         index < state.series_index ->
           {:cont, {:ok, state}}
@@ -375,57 +391,148 @@ defmodule TimelessMetrics.ReleaseMigration do
           end
       end
     end)
+    |> case do
+      {:ok, state} ->
+        with {:ok, state} <- flush_pending(state, opts) do
+          {:ok, Map.delete(state, :pending)}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp flush_pending(%{pending: []} = state, _opts), do: {:ok, state}
+
+  defp flush_pending(%{pending: pending} = state, opts) do
+    checkpoint_number = state.checkpoints + 1
+    failpoint = selected_failpoint(opts[:failpoint], checkpoint_number)
+
+    if failpoint == :before_batch, do: throw({:migration_failpoint, :before_batch})
+
+    write_started = System.monotonic_time(:nanosecond)
+
+    with :ok <-
+           LibsqlEngine.migration_resolve_batch(
+             @migration_store,
+             Enum.reverse(pending),
+             journal_params(state),
+             failpoint: failpoint
+           ) do
+      state = %{
+        state
+        | pending: [],
+          checkpoints: checkpoint_number,
+          public_write_ns:
+            state.public_write_ns + System.monotonic_time(:nanosecond) - write_started
+      }
+
+      observe_hwm(candidate_path_from_store())
+
+      if failpoint == :after_checkpoint,
+        do: throw({:migration_failpoint, :after_checkpoint})
+
+      {:ok, state}
+    end
   end
 
   defp copy_one_series(reader, {metric, labels} = identity, index, state, opts) do
     scan_started = System.monotonic_time(:nanosecond)
 
     case LegacyReader.page(reader, metric, labels, state.cursor, @page_size) do
-      {:ok, points, next_cursor, has_more?} ->
+      # A fully-empty series (no cursor, no data, no continuation): fold
+      # its identity into the pending resolve batch instead of paying a
+      # checkpoint transaction of its own.
+      {:ok, [], _next_cursor, false} when state.cursor == nil ->
         scan_ns = System.monotonic_time(:nanosecond) - scan_started
 
         state =
           identity
-          |> checkpoint_state(index, state, points, next_cursor, has_more?)
+          |> checkpoint_state(index, state, [], nil, false)
           |> Map.update!(:source_scan_ns, &(&1 + scan_ns))
+          |> Map.update!(:pending, &[identity | &1])
 
-        checkpoint_number = state.checkpoints + 1
-        failpoint = selected_failpoint(opts[:failpoint], checkpoint_number)
+        if length(state.pending) >= @empty_batch_size do
+          flush_pending(state, opts)
+        else
+          {:ok, state}
+        end
 
-        if failpoint == :before_batch, do: throw({:migration_failpoint, :before_batch})
+      {:ok, points, next_cursor, has_more?} ->
+        scan_ns = System.monotonic_time(:nanosecond) - scan_started
 
-        write_started = System.monotonic_time(:nanosecond)
+        case flush_pending(state, opts) do
+          {:ok, state} ->
+            copy_series_pages(
+              reader,
+              identity,
+              index,
+              state,
+              opts,
+              points,
+              next_cursor,
+              has_more?,
+              scan_ns
+            )
 
-        with :ok <-
-               LibsqlEngine.migration_checkpoint(
-                 @migration_store,
-                 identity,
-                 points,
-                 journal_params(state),
-                 failpoint: failpoint,
-                 final_page: not has_more?
-               ) do
-          committed = %{
-            state
-            | checkpoints: checkpoint_number,
-              public_write_ns:
-                state.public_write_ns + System.monotonic_time(:nanosecond) - write_started
-          }
-
-          observe_hwm(candidate_path_from_store())
-
-          if failpoint == :after_checkpoint,
-            do: throw({:migration_failpoint, :after_checkpoint})
-
-          if has_more? do
-            copy_one_series(reader, identity, index, committed, opts)
-          else
-            {:ok, committed}
-          end
+          {:error, _} = error ->
+            error
         end
 
       {:error, reason} ->
         {:error, "failed reading legacy metrics series #{metric} #{inspect(labels)}: #{reason}"}
+    end
+  end
+
+  defp copy_series_pages(
+         reader,
+         identity,
+         index,
+         state,
+         opts,
+         points,
+         next_cursor,
+         has_more?,
+         scan_ns
+       ) do
+    state =
+      identity
+      |> checkpoint_state(index, state, points, next_cursor, has_more?)
+      |> Map.update!(:source_scan_ns, &(&1 + scan_ns))
+
+    checkpoint_number = state.checkpoints + 1
+    failpoint = selected_failpoint(opts[:failpoint], checkpoint_number)
+
+    if failpoint == :before_batch, do: throw({:migration_failpoint, :before_batch})
+
+    write_started = System.monotonic_time(:nanosecond)
+
+    with :ok <-
+           LibsqlEngine.migration_checkpoint(
+             @migration_store,
+             identity,
+             points,
+             journal_params(state),
+             failpoint: failpoint,
+             final_page: not has_more?
+           ) do
+      committed = %{
+        state
+        | checkpoints: checkpoint_number,
+          public_write_ns:
+            state.public_write_ns + System.monotonic_time(:nanosecond) - write_started
+      }
+
+      observe_hwm(candidate_path_from_store())
+
+      if failpoint == :after_checkpoint,
+        do: throw({:migration_failpoint, :after_checkpoint})
+
+      if has_more? do
+        copy_one_series(reader, identity, index, committed, opts)
+      else
+        {:ok, committed}
+      end
     end
   end
 
@@ -569,30 +676,55 @@ defmodule TimelessMetrics.ReleaseMigration do
   end
 
   defp target_digest(conn, series) do
-    Enum.reduce_while(series, {:ok, %{digest: zero_digest(), points: 0, series: 0}}, fn
-      {metric, labels} = identity, {:ok, acc} ->
-        labels_json = canonical_json(labels)
+    with {:ok, catalog} <- target_catalog(conn) do
+      Enum.reduce_while(series, {:ok, %{digest: zero_digest(), points: 0, series: 0}}, fn
+        {metric, labels} = identity, {:ok, acc} ->
+          labels_json = canonical_json(labels)
 
-        with {:ok, [[series_id]]} <-
-               DB.execute(
-                 conn,
-                 "SELECT series_id FROM timeless_series('metric_samples') WHERE name=?1 AND labels=?2",
-                 [metric, labels_json]
-               ),
-             {:ok, point_state} <- stream_target_points(conn, metric, series_id, identity, acc) do
-          {:cont,
-           {:ok,
-            %{
-              point_state
-              | digest: digest_add(point_state.digest, series_identity(identity)),
-                series: point_state.series + 1
-            }}}
-        else
-          other ->
-            {:halt,
-             {:error, "target series mismatch for #{metric} #{labels_json}: #{inspect(other)}"}}
-        end
-    end)
+          with {:ok, series_id} <- Map.fetch(catalog, {metric, labels_json}),
+               {:ok, point_state} <- stream_target_points(conn, metric, series_id, identity, acc) do
+            {:cont,
+             {:ok,
+              %{
+                point_state
+                | digest: digest_add(point_state.digest, series_identity(identity)),
+                  series: point_state.series + 1
+              }}}
+          else
+            :error ->
+              {:halt,
+               {:error,
+                "target series mismatch for #{metric} #{labels_json}: absent from candidate catalog"}}
+
+            other ->
+              {:halt,
+               {:error, "target series mismatch for #{metric} #{labels_json}: #{inspect(other)}"}}
+          end
+      end)
+    end
+  end
+
+  # One catalog scan shared by the whole validation pass. A per-series
+  # `WHERE name=? AND labels=?` probe cannot be pushed into the TVF (those
+  # are output columns, not hidden arguments), so each probe materializes
+  # every catalog row — O(series²) across the loop, which on a
+  # high-cardinality store ran for days without finishing.
+  defp target_catalog(conn) do
+    with {:ok, rows} <-
+           DB.execute(
+             conn,
+             "SELECT series_id, name, labels FROM timeless_series('metric_samples')",
+             []
+           ) do
+      catalog =
+        Map.new(rows, fn [series_id, name, labels_json] -> {{name, labels_json}, series_id} end)
+
+      if map_size(catalog) == length(rows) do
+        {:ok, catalog}
+      else
+        {:error, "candidate catalog repeats a (name, labels) identity"}
+      end
+    end
   end
 
   defp stream_target_points(conn, metric, series_id, identity, state) do
@@ -727,6 +859,20 @@ defmodule TimelessMetrics.ReleaseMigration do
     {:ok, %{files: files, json: json, digest: sha256(json), bytes: Enum.sum_by(files, & &1.size)}}
   rescue
     error -> {:error, "failed to inventory legacy metrics source: #{Exception.message(error)}"}
+  end
+
+  # `:json.encode` writes atom-keyed maps in atom-table order, which differs
+  # between VM instances, so the stored digest only matches a journal written
+  # by the same build. A resume under a new release must compare the decoded
+  # manifests instead: JSON objects decode to binary-keyed maps, whose
+  # equality is order-independent.
+  defp manifest_matches?(stored_json, stored_digest, manifest) do
+    stored_digest == manifest.digest or
+      try do
+        :json.decode(stored_json) == :json.decode(manifest.json)
+      rescue
+        _ -> false
+      end
   end
 
   defp verify_manifest(root, paths, expected) do
