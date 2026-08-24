@@ -1,5 +1,5 @@
 # Changelog
-## Unreleased
+## 6.6.6 (2026-08-24)
 
 **The migration candidate no longer runs wall-clock maintenance (#2).** The
 candidate store's writer scheduled the production `:compact` (5 min) and
