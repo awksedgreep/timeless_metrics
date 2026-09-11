@@ -2,6 +2,11 @@
 
 TimelessMetrics has a built-in alert engine that evaluates threshold rules against live metric data and delivers webhook notifications on state changes.
 
+Webhook delivery verifies HTTPS certificates and blocks loopback, link-local,
+and private-network destinations by default. Set
+`config :timeless_metrics, webhook_allow_private: true` only when alerts must
+reach a trusted internal receiver.
+
 ## How It Works
 
 Alert evaluation piggybacks on the **rollup tick** — no extra timers or polling. Every rollup interval (default: 5 minutes), TimelessMetrics:

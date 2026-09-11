@@ -13,7 +13,7 @@ defmodule TimelessMetrics.IngestWorker do
   use GenServer
 
   @drain_interval_ms 10
-  @max_batch 100
+  @max_batch 500
 
   defstruct [:store, :queue, :worker_id, :format]
 
@@ -31,7 +31,7 @@ defmodule TimelessMetrics.IngestWorker do
   def enqueue(queue_table, body, format) do
     key = :erlang.unique_integer([:positive, :monotonic])
     enqueued_at = System.monotonic_time(:millisecond)
-    :ets.insert(queue_table, {key, enqueued_at, :ezstd.compress(body, 2), format})
+    :ets.insert(queue_table, {key, enqueued_at, {:raw, body}, format})
     :ok
   end
 
@@ -147,9 +147,9 @@ defmodule TimelessMetrics.IngestWorker do
     registry = :"#{state.store}_registry"
     shard_count = :persistent_term.get({TimelessMetrics, state.store, :shard_count})
 
-    Enum.each(entries, fn {_key, _enqueued_at, compressed_body, format} ->
+    Enum.each(entries, fn {_key, _enqueued_at, queued_body, format} ->
       try do
-        body = :ezstd.decompress(compressed_body)
+        body = decode_queued_body(queued_body)
 
         case format do
           :prometheus -> process_prometheus(body, state.store, registry, shard_count)
@@ -164,6 +164,9 @@ defmodule TimelessMetrics.IngestWorker do
       end
     end)
   end
+
+  defp decode_queued_body({:raw, body}), do: body
+  defp decode_queued_body({:zstd, body}), do: :ezstd.decompress(body)
 
   defp process_prometheus(body, store, registry, shard_count) do
     rust? = :persistent_term.get({TimelessMetrics, store, :engine}, nil) in [:rust, :libsql]
@@ -210,13 +213,13 @@ defmodule TimelessMetrics.IngestWorker do
   defp process_json(body, store, registry, shard_count) do
     lines = :binary.split(body, <<"\n">>, [:global, :trim_all])
 
-    {groups, count, errors} =
+    {reversed_groups, count, errors} =
       Enum.reduce(lines, {%{}, 0, 0}, fn line, {groups, count, errors} ->
         case parse_json_line(line) do
           {:ok, line_groups, line_count} ->
             merged =
               Enum.reduce(line_groups, groups, fn {key, points}, acc ->
-                Map.update(acc, key, points, &(points ++ &1))
+                Map.update(acc, key, Enum.reverse(points), &Enum.reverse(points, &1))
               end)
 
             {merged, count + line_count, errors}
@@ -225,6 +228,8 @@ defmodule TimelessMetrics.IngestWorker do
             {groups, count, errors + 1}
         end
       end)
+
+    groups = Map.new(reversed_groups, fn {key, points} -> {key, Enum.reverse(points)} end)
 
     TimelessMetrics.Stats.add_http_import_errors(store, errors)
 

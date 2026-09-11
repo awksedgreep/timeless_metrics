@@ -116,11 +116,12 @@ defmodule TimelessMetrics.BackupTest do
     TimelessMetrics.write(:backup_test, "http_metric", %{"x" => "y"}, 42.0, timestamp: now - 60)
     TimelessMetrics.flush(:backup_test)
 
-    http_backup_dir = @backup_dir <> "_http"
+    backup_name = "http-#{System.unique_integer([:positive])}"
+    http_backup_dir = Path.join([@data_dir, "backups", backup_name])
 
     on_exit(fn -> File.rm_rf!(http_backup_dir) end)
 
-    body = :json.encode(%{path: http_backup_dir}) |> IO.iodata_to_binary()
+    body = :json.encode(%{path: backup_name}) |> IO.iodata_to_binary()
 
     resp =
       TimelessMetrics.TestHTTP.post(@port, "/api/v1/backup", body,
@@ -134,6 +135,35 @@ defmodule TimelessMetrics.BackupTest do
     assert is_list(result["files"])
     assert result["total_bytes"] > 0
     assert File.exists?(Path.join(http_backup_dir, "metrics.db"))
+  end
+
+  test "HTTP POST /api/v1/backup rejects traversal and absolute paths" do
+    for path <- ["../outside", "/tmp/outside", "nested/outside"] do
+      body = :json.encode(%{path: path}) |> IO.iodata_to_binary()
+
+      resp =
+        TimelessMetrics.TestHTTP.post(@port, "/api/v1/backup", body,
+          content_type: "application/json"
+        )
+
+      assert resp.status == 400
+    end
+  end
+
+  test "HTTP POST /api/v1/backup rejects a symlink target" do
+    root = Path.join(@data_dir, "backups")
+    File.mkdir_p!(root)
+    link = Path.join(root, "escape")
+    File.ln_s!(@backup_dir, link)
+
+    body = :json.encode(%{path: "escape"}) |> IO.iodata_to_binary()
+
+    resp =
+      TimelessMetrics.TestHTTP.post(@port, "/api/v1/backup", body,
+        content_type: "application/json"
+      )
+
+    assert resp.status == 400
   end
 
   test "HTTP POST /api/v1/backup uses default path when no body" do

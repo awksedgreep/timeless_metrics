@@ -23,6 +23,18 @@ defmodule TimelessMetrics do
       )
   """
 
+  @type store :: atom()
+  @type metric_name :: String.t()
+  @type labels :: %{optional(String.t()) => String.t()}
+  @type timestamp :: integer()
+  @type value :: number() | String.t()
+  @type point :: {timestamp(), value()}
+  @type write_entry ::
+          {metric_name(), labels(), value()}
+          | {metric_name(), labels(), value(), timestamp()}
+  @type api_result(result) :: {:ok, result} | {:error, term()}
+  @type command_result :: :ok | :noop | {:error, term()}
+
   # Batch sizes above this threshold use parallel resolution + shard writes
   @parallel_batch_threshold 1_000
 
@@ -31,6 +43,7 @@ defmodule TimelessMetrics do
   end
 
   @doc "Start a TimelessMetrics instance as part of a supervision tree."
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
 
@@ -53,6 +66,7 @@ defmodule TimelessMetrics do
     * `opts` - Optional keyword list:
       * `:timestamp` - Unix timestamp in seconds (default: now)
   """
+  @spec write(store(), metric_name(), labels(), value(), keyword()) :: command_result()
   def write(store, metric_name, labels, value, opts \\ []) do
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
     TimelessMetrics.Stats.incr_writes(store)
@@ -75,6 +89,7 @@ defmodule TimelessMetrics do
   Each entry is a tuple of `{metric_name, labels, value}` or
   `{metric_name, labels, value, timestamp}`.
   """
+  @spec write_batch(store(), [write_entry()]) :: command_result()
   def write_batch(store, entries) do
     TimelessMetrics.Stats.incr_writes(store)
     TimelessMetrics.Stats.add_points(store, length(entries))
@@ -119,6 +134,7 @@ defmodule TimelessMetrics do
   Write entries directly, one per unique series. Same as write_batch/2
   for the sharded engine.
   """
+  @spec write_each(store(), [write_entry()]) :: command_result()
   def write_each(store, entries) do
     write_batch(store, entries)
   end
@@ -128,21 +144,23 @@ defmodule TimelessMetrics do
 
   Cache the result for repeated writes to the same series.
   """
+  @spec resolve_series(store(), metric_name(), labels()) :: api_result(integer())
   def resolve_series(store, metric_name, labels) do
     if rust_engine?(store) do
       TimelessMetrics.StorageEngine.resolve_series(store, metric_name, labels)
     else
       registry = :"#{store}_registry"
-      TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)
+      {:ok, TimelessMetrics.SeriesRegistry.get_or_create(registry, metric_name, labels)}
     end
   end
 
   @doc """
   Write directly using a pre-resolved series ID. Zero lookup cost.
 
-      sid = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
+      {:ok, sid} = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
       TimelessMetrics.write_resolved(:metrics, sid, 73.2, timestamp: ts)
   """
+  @spec write_resolved(store(), integer(), value(), keyword()) :: command_result()
   def write_resolved(store, series_id, value, opts \\ []) do
     timestamp = Keyword.get(opts, :timestamp, System.os_time(:second))
 
@@ -165,6 +183,7 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [{timestamp, value}, ...]}`.
   """
+  @spec query(store(), metric_name(), labels(), keyword()) :: api_result([point()])
   def query(store, metric_name, labels, opts \\ []) do
     TimelessMetrics.Stats.incr_queries(store)
 
@@ -185,6 +204,7 @@ defmodule TimelessMetrics do
   query paths, the outer series list is unordered; sort it in the caller when
   presentation order matters.
   """
+  @spec query_multi(store(), metric_name(), labels(), keyword()) :: api_result([map()])
   def query_multi(store, metric_name, label_filter \\ %{}, opts \\ []) do
     TimelessMetrics.Stats.incr_queries(store)
 
@@ -192,6 +212,34 @@ defmodule TimelessMetrics do
       TimelessMetrics.StorageEngine.query_multi(store, metric_name, label_filter, opts)
     else
       query_multi_legacy(store, metric_name, label_filter, opts)
+    end
+  end
+
+  @doc """
+  Query raw points for several metric names in one engine operation.
+
+  Returns `{:ok, [%{metric: name, labels: labels, points: points}, ...]}`.
+  """
+  @spec query_multi_metrics(store(), [metric_name()], labels(), keyword()) :: api_result([map()])
+  def query_multi_metrics(store, metric_names, label_filter \\ %{}, opts \\ []) do
+    if rust_engine?(store) do
+      TimelessMetrics.StorageEngine.query_multi_metrics(store, metric_names, label_filter, opts)
+    else
+      metric_names
+      |> Enum.reduce_while({:ok, []}, fn metric, {:ok, acc} ->
+        case query_multi(store, metric, label_filter, opts) do
+          {:ok, series} ->
+            tagged = Enum.map(series, &Map.put(&1, :metric, metric))
+            {:cont, {:ok, :lists.reverse(tagged, acc)}}
+
+          {:error, _} = error ->
+            {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+        {:error, _} = error -> error
+      end
     end
   end
 
@@ -226,15 +274,16 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [{bucket_timestamp, aggregate_value}, ...]}`.
   """
+  @spec query_aggregate(store(), metric_name(), labels(), keyword()) :: api_result([point()])
   def query_aggregate(store, metric_name, labels, opts) do
     if rust_engine?(store) do
       # Exact-label single series: filter via multi, then match the label set
       # exactly (the filter alone would also match series with extra labels).
-      {:ok, results} = query_aggregate_multi(store, metric_name, labels, opts)
-
-      case Enum.find(results, fn %{labels: l} -> l == labels end) do
-        %{data: data} -> {:ok, data}
-        nil -> {:ok, []}
+      with {:ok, results} <- query_aggregate_multi(store, metric_name, labels, opts) do
+        case Enum.find(results, fn %{labels: l} -> l == labels end) do
+          %{data: data} -> {:ok, data}
+          nil -> {:ok, []}
+        end
       end
     else
       registry = :"#{store}_registry"
@@ -250,6 +299,7 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{labels: %{...}, data: [{bucket_ts, agg_value}, ...]}, ...]}`.
   """
+  @spec query_aggregate_multi(store(), metric_name(), labels(), keyword()) :: api_result([map()])
   def query_aggregate_multi(store, metric_name, label_filter \\ %{}, opts) do
     TimelessMetrics.Stats.incr_queries(store)
 
@@ -307,21 +357,24 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{group: %{"hostname" => "host_0"}, data: [{ts, val}]}, ...]}`.
   """
+  @spec query_aggregate_grouped(store(), metric_name(), labels(), keyword()) ::
+          api_result([map()])
   def query_aggregate_grouped(store, metric_name, label_filter \\ %{}, opts) do
     group_by = Keyword.fetch!(opts, :group_by)
-    {:ok, results} = query_aggregate_multi(store, metric_name, label_filter, opts)
 
-    aggregate_fn = cross_series_aggregate_fn(opts)
+    with {:ok, results} <- query_aggregate_multi(store, metric_name, label_filter, opts) do
+      aggregate_fn = cross_series_aggregate_fn(opts)
 
-    grouped =
-      results
-      |> Enum.group_by(fn %{labels: l} -> Map.take(l, List.wrap(group_by)) end)
-      |> Enum.map(fn {group, series_results} ->
-        data = cross_aggregate(series_results, aggregate_fn)
-        %{group: group, data: data}
-      end)
+      grouped =
+        results
+        |> Enum.group_by(fn %{labels: l} -> Map.take(l, List.wrap(group_by)) end)
+        |> Enum.map(fn {group, series_results} ->
+          data = cross_aggregate(series_results, aggregate_fn)
+          %{group: group, data: data}
+        end)
 
-    {:ok, grouped}
+      {:ok, grouped}
+    end
   end
 
   # Cross-series merge honors the explicit :cross_series_aggregate option and
@@ -335,28 +388,25 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{group: %{...}, data: [{ts, val}]}, ...]}`.
   """
+  @spec query_aggregate_grouped_metrics(store(), [metric_name()], labels(), keyword()) ::
+          api_result([map()])
   def query_aggregate_grouped_metrics(store, metric_names, label_filter \\ %{}, opts)
       when is_list(metric_names) do
-    all_results =
-      metric_names
-      |> Task.async_stream(fn metric ->
-        {:ok, results} = query_aggregate_multi(store, metric, label_filter, opts)
-        results
-      end)
-      |> Enum.flat_map(fn {:ok, results} -> results end)
+    with {:ok, all_results} <-
+           query_aggregates_for_metrics(store, metric_names, label_filter, opts) do
+      group_by = Keyword.fetch!(opts, :group_by)
+      aggregate_fn = cross_series_aggregate_fn(opts)
 
-    group_by = Keyword.fetch!(opts, :group_by)
-    aggregate_fn = cross_series_aggregate_fn(opts)
+      grouped =
+        all_results
+        |> Enum.group_by(fn %{labels: l} -> Map.take(l, List.wrap(group_by)) end)
+        |> Enum.map(fn {group, series_results} ->
+          data = cross_aggregate(series_results, aggregate_fn)
+          %{group: group, data: data}
+        end)
 
-    grouped =
-      all_results
-      |> Enum.group_by(fn %{labels: l} -> Map.take(l, List.wrap(group_by)) end)
-      |> Enum.map(fn {group, series_results} ->
-        data = cross_aggregate(series_results, aggregate_fn)
-        %{group: group, data: data}
-      end)
-
-    {:ok, grouped}
+      {:ok, grouped}
+    end
   end
 
   @doc """
@@ -364,33 +414,42 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{labels: %{...}, data: [{ts, val}]}, ...]}`.
   """
+  @spec query_aggregate_multi_filtered(store(), metric_name(), labels(), keyword()) ::
+          api_result([map()])
   def query_aggregate_multi_filtered(store, metric_name, label_filter \\ %{}, opts) do
     threshold = Keyword.get(opts, :threshold)
     threshold_fn = Keyword.get(opts, :threshold_fn, :last)
-    {:ok, results} = query_aggregate_multi(store, metric_name, label_filter, opts)
 
-    filtered =
-      if threshold do
-        Enum.filter(results, fn %{data: data} ->
-          val =
-            case threshold_fn do
-              :last -> data |> List.last() |> elem(1)
-              :max -> data |> Enum.map(&elem(&1, 1)) |> Enum.max(fn -> 0 end)
-              :avg -> data |> Enum.map(&elem(&1, 1)) |> then(&(Enum.sum(&1) / max(length(&1), 1)))
-            end
+    with {:ok, results} <- query_aggregate_multi(store, metric_name, label_filter, opts) do
+      filtered =
+        if threshold do
+          Enum.filter(results, fn %{data: data} ->
+            val =
+              case threshold_fn do
+                :last ->
+                  data |> List.last() |> then(&if(&1, do: elem(&1, 1), else: 0))
 
-          compare_threshold(val, threshold)
-        end)
-      else
-        results
-      end
+                :max ->
+                  data |> Enum.map(&elem(&1, 1)) |> Enum.max(fn -> 0 end)
 
-    {:ok, filtered}
+                :avg ->
+                  data |> Enum.map(&elem(&1, 1)) |> then(&(Enum.sum(&1) / max(length(&1), 1)))
+              end
+
+            compare_threshold(val, threshold)
+          end)
+        else
+          results
+        end
+
+      {:ok, filtered}
+    end
   end
 
   @doc """
   Sort results by a value function and take top N.
   """
+  @spec top_n([item], non_neg_integer(), (item -> term())) :: [item] when item: term()
   def top_n(results, n, order_fn \\ &last_value/1) do
     results
     |> Enum.sort_by(order_fn, :desc)
@@ -411,15 +470,38 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{metric: name, labels: %{...}, data: [{ts, val}, ...]}, ...]}`.
   """
+  @spec query_aggregate_multi_metrics(store(), [metric_name()], labels(), keyword()) ::
+          api_result([map()])
   def query_aggregate_multi_metrics(store, metric_names, label_filter \\ %{}, opts)
       when is_list(metric_names) do
+    with {:ok, results} <- query_aggregates_for_metrics(store, metric_names, label_filter, opts) do
+      {:ok, results}
+    end
+  end
+
+  defp query_aggregates_for_metrics(store, metric_names, label_filter, opts) do
     metric_names
-    |> Task.async_stream(fn metric ->
-      {:ok, results} = query_aggregate_multi(store, metric, label_filter, opts)
-      Enum.map(results, &Map.put(&1, :metric, metric))
+    |> Task.async_stream(
+      fn metric ->
+        case query_aggregate_multi(store, metric, label_filter, opts) do
+          {:ok, results} -> {:ok, Enum.map(results, &Map.put(&1, :metric, metric))}
+          {:error, _} = error -> error
+        end
+      end,
+      max_concurrency: System.schedulers_online(),
+      timeout: :timer.seconds(30),
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce_while({:ok, []}, fn
+      {:ok, {:ok, results}}, {:ok, acc} -> {:cont, {:ok, :lists.reverse(results, acc)}}
+      {:ok, {:error, _} = error}, _acc -> {:halt, error}
+      {:exit, :timeout}, _acc -> {:halt, {:error, :timeout}}
+      {:exit, reason}, _acc -> {:halt, {:error, {:query_failed, reason}}}
     end)
-    |> Enum.flat_map(fn {:ok, results} -> results end)
-    |> then(&{:ok, &1})
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _} = error -> error
+    end
   end
 
   @doc """
@@ -427,6 +509,8 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{bucket: ts, avg: v, min: v, max: v, count: n, sum: v, last: v}, ...]}`.
   """
+  @spec query_daily(store(), metric_name(), labels(), timestamp(), timestamp()) ::
+          api_result([map()])
   def query_daily(store, metric_name, labels, from, to) do
     if :persistent_term.get({TimelessMetrics, store, :engine}, nil) == :libsql do
       TimelessMetrics.LibsqlEngine.query_rollup(store, metric_name, labels, 86_400, from, to)
@@ -442,6 +526,7 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, {timestamp, value}}` or `{:ok, nil}`.
   """
+  @spec latest(store(), metric_name(), labels()) :: api_result(point() | nil)
   def latest(store, metric_name, labels) do
     if rust_engine?(store) do
       TimelessMetrics.StorageEngine.latest(store, metric_name, labels)
@@ -458,6 +543,7 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{labels: %{...}, timestamp: ts, value: val}, ...]}`.
   """
+  @spec latest_multi(store(), metric_name(), labels()) :: api_result([map()])
   def latest_multi(store, metric_name, label_filter \\ %{}) do
     if rust_engine?(store) do
       TimelessMetrics.StorageEngine.latest_multi(store, metric_name, label_filter)
@@ -495,34 +581,41 @@ defmodule TimelessMetrics do
   # values as-is in ETS and the SegmentBuilder handles codec selection.
 
   @doc "Write a single text metric point."
+  @spec write_text(store(), metric_name(), labels(), String.t(), keyword()) :: command_result()
   def write_text(store, metric_name, labels, value, opts \\ []) do
     write(store, metric_name, labels, value, opts)
   end
 
   @doc "Write a batch of text metric points."
+  @spec write_text_batch(store(), [write_entry()]) :: command_result()
   def write_text_batch(store, entries) do
     write_batch(store, entries)
   end
 
   @doc "Query text time series points for a single series."
+  @spec query_text(store(), metric_name(), labels(), keyword()) :: api_result([point()])
   def query_text(store, metric_name, labels, opts \\ []) do
     query(store, metric_name, labels, opts)
   end
 
   @doc "Query text points across multiple series matching a label filter."
+  @spec query_text_multi(store(), metric_name(), labels(), keyword()) :: api_result([map()])
   def query_text_multi(store, metric_name, label_filter \\ %{}, opts \\ []) do
     query_multi(store, metric_name, label_filter, opts)
   end
 
   @doc "Get the latest text value for a series."
+  @spec latest_text(store(), metric_name(), labels()) :: api_result(point() | nil)
   def latest_text(store, metric_name, labels) do
     latest(store, metric_name, labels)
   end
 
   @doc "No-op for sharded engine (no per-series blocks to merge)."
+  @spec merge_now(store()) :: :noop
   def merge_now(_store), do: :noop
 
   @doc "Force flush all buffered data to disk."
+  @spec flush(store()) :: command_result()
   def flush(store) do
     if rust_engine?(store) do
       TimelessMetrics.StorageEngine.flush(store)
@@ -532,23 +625,32 @@ defmodule TimelessMetrics do
   end
 
   defp flush_legacy(store) do
-    TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     shard_count = buffer_shard_count(store)
 
-    # Flush buffers → SegmentBuilder (sync)
-    for i <- 0..(shard_count - 1) do
-      GenServer.call(:"#{store}_shard_#{i}", :flush_sync, :infinity)
+    with :ok <- TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry"),
+         :ok <-
+           run_shard_commands(shard_count, fn i ->
+             TimelessMetrics.Call.maintenance(:"#{store}_shard_#{i}", :flush_sync)
+           end),
+         :ok <-
+           run_shard_commands(shard_count, fn i ->
+             TimelessMetrics.SegmentBuilder.flush(:"#{store}_builder_#{i}")
+           end) do
+      :ok
     end
+  end
 
-    # Flush SegmentBuilder → disk (sync)
-    for i <- 0..(shard_count - 1) do
-      TimelessMetrics.SegmentBuilder.flush(:"#{store}_builder_#{i}")
-    end
-
-    :ok
+  defp run_shard_commands(shard_count, operation) do
+    Enum.reduce_while(0..(shard_count - 1), :ok, fn index, :ok ->
+      case operation.(index) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
   end
 
   @doc "Create a consistent online backup."
+  @spec backup(store(), Path.t()) :: api_result(map())
   def backup(store, target_dir) do
     case :persistent_term.get({TimelessMetrics, store, :engine}, nil) do
       :libsql -> backup_libsql(store, target_dir)
@@ -558,88 +660,84 @@ defmodule TimelessMetrics do
   end
 
   defp backup_libsql(store, target_dir) do
-    flush(store)
     db = :"#{store}_db"
-    File.mkdir_p!(target_dir)
-    db_target = Path.join(target_dir, "metrics.db")
-    {:ok, _} = TimelessMetrics.DB.backup(db, db_target)
 
-    db_size =
-      case File.stat(db_target) do
-        {:ok, %{size: size}} -> size
-        _ -> 0
-      end
+    with :ok <- flush(store),
+         :ok <- File.mkdir_p(target_dir),
+         db_target = Path.join(target_dir, "metrics.db"),
+         {:ok, _} <- TimelessMetrics.DB.backup(db, db_target) do
+      db_size =
+        case File.stat(db_target) do
+          {:ok, %{size: size}} -> size
+          _ -> 0
+        end
 
-    {:ok, %{path: target_dir, files: ["metrics.db"], total_bytes: db_size}}
+      {:ok, %{path: target_dir, files: ["metrics.db"], total_bytes: db_size}}
+    end
   end
 
   defp backup_rust(store, target_dir) do
-    flush(store)
     data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir})
     db = :"#{store}_db"
 
-    File.mkdir_p!(target_dir)
+    with :ok <- flush(store),
+         :ok <- File.mkdir_p(target_dir),
+         db_target = Path.join(target_dir, "metrics.db"),
+         {:ok, _} <- TimelessMetrics.DB.write(db, "VACUUM INTO ?1", [db_target]) do
+      # Copy Rust engine data
+      engine_src = Path.join(data_dir, "rust_engine")
+      engine_dst = Path.join(target_dir, "rust_engine")
+      engine_bytes = copy_dir(engine_src, engine_dst)
 
-    # SQLite backup (admin data: alerts, annotations, scrape targets)
-    db_target = Path.join(target_dir, "metrics.db")
-    TimelessMetrics.DB.write(db, "VACUUM INTO ?1", [db_target])
+      db_size =
+        case File.stat(db_target) do
+          {:ok, %{size: s}} -> s
+          _ -> 0
+        end
 
-    # Copy Rust engine data
-    engine_src = Path.join(data_dir, "rust_engine")
-    engine_dst = Path.join(target_dir, "rust_engine")
-    engine_bytes = copy_dir(engine_src, engine_dst)
-
-    db_size =
-      case File.stat(db_target) do
-        {:ok, %{size: s}} -> s
-        _ -> 0
-      end
-
-    {:ok,
-     %{
-       path: target_dir,
-       files: ["metrics.db", "rust_engine"],
-       total_bytes: db_size + engine_bytes
-     }}
+      {:ok,
+       %{
+         path: target_dir,
+         files: ["metrics.db", "rust_engine"],
+         total_bytes: db_size + engine_bytes
+       }}
+    end
   end
 
   defp backup_legacy(store, target_dir) do
     # Flush pending series registrations to SQLite
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     # Flush all buffers and segment builders to disk
-    flush(store)
-
     data_dir = :persistent_term.get({TimelessMetrics, store, :data_dir})
     db = :"#{store}_db"
 
-    File.mkdir_p!(target_dir)
+    with :ok <- flush(store),
+         :ok <- File.mkdir_p(target_dir),
+         db_target = Path.join(target_dir, "metrics.db"),
+         {:ok, _} <- TimelessMetrics.DB.write(db, "VACUUM INTO ?1", [db_target]) do
+      # Copy shard directories
+      shard_count = buffer_shard_count(store)
 
-    # 1. VACUUM INTO for SQLite
-    db_target = Path.join(target_dir, "metrics.db")
-    TimelessMetrics.DB.write(db, "VACUUM INTO ?1", [db_target])
+      shard_bytes =
+        for i <- 0..(shard_count - 1) do
+          src = Path.join(data_dir, "shard_#{i}")
+          dst = Path.join(target_dir, "shard_#{i}")
+          copy_dir(src, dst)
+        end
+        |> Enum.sum()
 
-    # 2. Copy shard directories
-    shard_count = buffer_shard_count(store)
+      db_size =
+        case File.stat(db_target) do
+          {:ok, %{size: s}} -> s
+          _ -> 0
+        end
 
-    shard_bytes =
-      for i <- 0..(shard_count - 1) do
-        src = Path.join(data_dir, "shard_#{i}")
-        dst = Path.join(target_dir, "shard_#{i}")
-        copy_dir(src, dst)
-      end
-      |> Enum.sum()
+      files =
+        ["metrics.db"] ++
+          for i <- 0..(shard_count - 1), do: "shard_#{i}"
 
-    db_size =
-      case File.stat(db_target) do
-        {:ok, %{size: s}} -> s
-        _ -> 0
-      end
-
-    files =
-      ["metrics.db"] ++
-        for i <- 0..(shard_count - 1), do: "shard_#{i}"
-
-    {:ok, %{path: target_dir, files: files, total_bytes: db_size + shard_bytes}}
+      {:ok, %{path: target_dir, files: files, total_bytes: db_size + shard_bytes}}
+    end
   end
 
   defp copy_dir(src, dst) do
@@ -674,6 +772,7 @@ defmodule TimelessMetrics do
   end
 
   @doc "Get store info and statistics."
+  @spec info(store()) :: map() | {:error, term()}
   def info(store) do
     if rust_engine?(store) do
       TimelessMetrics.StorageEngine.info(store)
@@ -808,17 +907,19 @@ defmodule TimelessMetrics do
   defp max_ts(left, right), do: max(left, right)
 
   @doc "Force a daily rollup run."
+  @spec rollup(store()) :: command_result()
   def rollup(store) do
     case :persistent_term.get({TimelessMetrics, store, :engine}, nil) do
       :libsql -> TimelessMetrics.LibsqlEngine.rollup(store)
       :rust -> :ok
-      _ -> GenServer.call(:"#{store}_rollup", {:run, :all}, :infinity)
+      _ -> TimelessMetrics.Call.maintenance(:"#{store}_rollup", {:run, :all})
     end
   end
 
   @doc """
   Force retention enforcement now.
   """
+  @spec enforce_retention(store()) :: command_result()
   def enforce_retention(store) do
     if rust_engine?(store) do
       schema = get_schema(store)
@@ -833,7 +934,7 @@ defmodule TimelessMetrics do
           :ok
       end
     else
-      GenServer.call(:"#{store}_retention", :enforce, :infinity)
+      TimelessMetrics.Call.maintenance(:"#{store}_retention", :enforce)
     end
   end
 
@@ -842,6 +943,7 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, ["cpu_usage", "mem_usage", ...]}`.
   """
+  @spec list_metrics(store()) :: api_result([metric_name()])
   def list_metrics(store) do
     if rust_engine?(store) do
       TimelessMetrics.StorageEngine.list_metrics(store)
@@ -854,18 +956,18 @@ defmodule TimelessMetrics do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
 
-    {:ok, rows} =
-      TimelessMetrics.DB.read(
-        db,
-        """
-        SELECT metric_name
-        FROM series
-        GROUP BY metric_name
-        ORDER BY COUNT(*) DESC, metric_name ASC
-        """
-      )
-
-    {:ok, Enum.map(rows, fn [name] -> name end)}
+    with {:ok, rows} <-
+           TimelessMetrics.DB.read(
+             db,
+             """
+             SELECT metric_name
+             FROM series
+             GROUP BY metric_name
+             ORDER BY COUNT(*) DESC, metric_name ASC
+             """
+           ) do
+      {:ok, Enum.map(rows, fn [name] -> name end)}
+    end
   end
 
   @doc """
@@ -873,6 +975,7 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{labels: %{"host" => "web-1"}, ...}, ...]}`.
   """
+  @spec list_series(store(), metric_name()) :: api_result([map()])
   def list_series(store, metric_name) do
     if rust_engine?(store) do
       TimelessMetrics.StorageEngine.list_series(store, metric_name)
@@ -885,14 +988,14 @@ defmodule TimelessMetrics do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
 
-    {:ok, rows} =
-      TimelessMetrics.DB.read(
-        db,
-        "SELECT labels FROM series WHERE metric_name = ?1 ORDER BY labels",
-        [metric_name]
-      )
-
-    {:ok, Enum.map(rows, fn [labels_str] -> %{labels: decode_labels(labels_str)} end)}
+    with {:ok, rows} <-
+           TimelessMetrics.DB.read(
+             db,
+             "SELECT labels FROM series WHERE metric_name = ?1 ORDER BY labels",
+             [metric_name]
+           ) do
+      {:ok, Enum.map(rows, fn [labels_str] -> %{labels: decode_labels(labels_str)} end)}
+    end
   end
 
   @doc """
@@ -900,6 +1003,7 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, ["web-1", "web-2", ...]}`.
   """
+  @spec label_values(store(), metric_name(), String.t()) :: api_result([String.t()])
   def label_values(store, metric_name, label_key) do
     if rust_engine?(store) do
       TimelessMetrics.StorageEngine.label_values(store, metric_name, label_key)
@@ -912,24 +1016,26 @@ defmodule TimelessMetrics do
     TimelessMetrics.SeriesRegistry.flush_pending(:"#{store}_registry")
     db = :"#{store}_db"
 
-    {:ok, rows} =
-      TimelessMetrics.DB.read(db, "SELECT labels FROM series WHERE metric_name = ?1", [
-        metric_name
-      ])
+    with {:ok, rows} <-
+           TimelessMetrics.DB.read(db, "SELECT labels FROM series WHERE metric_name = ?1", [
+             metric_name
+           ]) do
+      result =
+        rows
+        |> Enum.map(fn [labels_str] -> decode_labels(labels_str) end)
+        |> Enum.flat_map(fn labels -> Map.get(labels, label_key) |> List.wrap() end)
+        |> Enum.uniq()
+        |> Enum.sort()
 
-    result =
-      rows
-      |> Enum.map(fn [labels_str] -> decode_labels(labels_str) end)
-      |> Enum.flat_map(fn labels -> Map.get(labels, label_key) |> List.wrap() end)
-      |> Enum.uniq()
-      |> Enum.sort()
-
-    {:ok, result}
+      {:ok, result}
+    end
   end
 
   @doc """
   Register metadata for a metric (type, unit, description).
   """
+  @spec register_metric(store(), metric_name(), atom(), keyword()) ::
+          TimelessMetrics.DB.query_result()
   def register_metric(store, metric_name, metric_type, opts \\ []) do
     db = :"#{store}_db"
     type_str = to_string(metric_type)
@@ -948,22 +1054,23 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, %{type: :gauge, unit: "%", description: "..."}}` or `{:ok, nil}`.
   """
+  @spec get_metadata(store(), metric_name()) :: api_result(map() | nil)
   def get_metadata(store, metric_name) do
     db = :"#{store}_db"
 
-    {:ok, rows} =
-      TimelessMetrics.DB.read(
-        db,
-        "SELECT metric_type, unit, description FROM metric_metadata WHERE metric_name = ?1",
-        [metric_name]
-      )
+    with {:ok, rows} <-
+           TimelessMetrics.DB.read(
+             db,
+             "SELECT metric_type, unit, description FROM metric_metadata WHERE metric_name = ?1",
+             [metric_name]
+           ) do
+      case rows do
+        [[type, unit, desc]] ->
+          {:ok, %{type: String.to_atom(type), unit: unit, description: desc}}
 
-    case rows do
-      [[type, unit, desc]] ->
-        {:ok, %{type: String.to_atom(type), unit: unit, description: desc}}
-
-      [] ->
-        {:ok, nil}
+        [] ->
+          {:ok, nil}
+      end
     end
   end
 
@@ -972,27 +1079,24 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, id}`.
   """
+  @spec annotate(store(), timestamp(), String.t(), keyword()) :: api_result(integer())
   def annotate(store, timestamp, title, opts \\ []) do
     db = :"#{store}_db"
     description = Keyword.get(opts, :description)
     tags = Keyword.get(opts, :tags, []) |> Enum.join(",")
     created_at = System.os_time(:second)
 
-    {:ok, id} =
-      TimelessMetrics.DB.write_transaction(db, fn conn ->
-        TimelessMetrics.DB.execute(
-          conn,
-          "INSERT INTO annotations (timestamp, title, description, tags, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-          [timestamp, title, description, tags, created_at]
-        )
-
-        {:ok, [[id]]} =
-          TimelessMetrics.DB.execute(conn, "SELECT last_insert_rowid()", [])
-
+    TimelessMetrics.DB.write_transaction(db, fn conn ->
+      with {:ok, _} <-
+             TimelessMetrics.DB.execute(
+               conn,
+               "INSERT INTO annotations (timestamp, title, description, tags, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+               [timestamp, title, description, tags, created_at]
+             ),
+           {:ok, [[id]]} <- TimelessMetrics.DB.execute(conn, "SELECT last_insert_rowid()", []) do
         id
-      end)
-
-    {:ok, id}
+      end
+    end)
   end
 
   @doc """
@@ -1000,45 +1104,50 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{id: n, timestamp: ts, title: "...", description: "...", tags: [...]}]}`.
   """
+  @spec annotations(store(), timestamp(), timestamp(), keyword()) :: api_result([map()])
   def annotations(store, from, to, opts \\ []) do
     db = :"#{store}_db"
     tag_filter = Keyword.get(opts, :tags, [])
 
-    {:ok, rows} =
-      TimelessMetrics.DB.read(
-        db,
-        "SELECT id, timestamp, title, description, tags FROM annotations WHERE timestamp >= ?1 AND timestamp <= ?2 ORDER BY timestamp",
-        [from, to]
-      )
+    with {:ok, rows} <-
+           TimelessMetrics.DB.read(
+             db,
+             "SELECT id, timestamp, title, description, tags FROM annotations WHERE timestamp >= ?1 AND timestamp <= ?2 ORDER BY timestamp",
+             [from, to]
+           ) do
+      results =
+        rows
+        |> Enum.map(fn [id, ts, title, desc, tags_str] ->
+          tags =
+            if tags_str && tags_str != "", do: String.split(tags_str, ",", trim: true), else: []
 
-    results =
-      rows
-      |> Enum.map(fn [id, ts, title, desc, tags_str] ->
-        tags =
-          if tags_str && tags_str != "", do: String.split(tags_str, ",", trim: true), else: []
+          %{id: id, timestamp: ts, title: title, description: desc, tags: tags}
+        end)
+        |> then(fn results ->
+          if tag_filter == [] do
+            results
+          else
+            filter_set = MapSet.new(tag_filter)
 
-        %{id: id, timestamp: ts, title: title, description: desc, tags: tags}
-      end)
-      |> then(fn results ->
-        if tag_filter == [] do
-          results
-        else
-          filter_set = MapSet.new(tag_filter)
+            Enum.filter(results, fn %{tags: tags} ->
+              tags |> MapSet.new() |> MapSet.intersection(filter_set) |> MapSet.size() > 0
+            end)
+          end
+        end)
 
-          Enum.filter(results, fn %{tags: tags} ->
-            tags |> MapSet.new() |> MapSet.intersection(filter_set) |> MapSet.size() > 0
-          end)
-        end
-      end)
-
-    {:ok, results}
+      {:ok, results}
+    end
   end
 
   @doc "Delete an annotation by ID."
+  @spec delete_annotation(store(), integer()) :: command_result()
   def delete_annotation(store, id) do
     db = :"#{store}_db"
-    TimelessMetrics.DB.write(db, "DELETE FROM annotations WHERE id = ?1", [id])
-    :ok
+
+    case TimelessMetrics.DB.write(db, "DELETE FROM annotations WHERE id = ?1", [id]) do
+      {:ok, _} -> :ok
+      {:error, _} = error -> error
+    end
   end
 
   @doc """
@@ -1046,30 +1155,35 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, rule_id}`.
   """
+  @spec create_alert(store(), keyword()) :: api_result(integer())
   def create_alert(store, opts) do
     db = :"#{store}_db"
     TimelessMetrics.Alert.create_rule(db, opts)
   end
 
   @doc "List all alert rules with current state."
+  @spec list_alerts(store()) :: api_result([map()])
   def list_alerts(store) do
     db = :"#{store}_db"
     TimelessMetrics.Alert.list_rules(db)
   end
 
   @doc "Update an alert rule (partial update). Returns `:ok`."
+  @spec update_alert(store(), integer(), keyword()) :: command_result()
   def update_alert(store, rule_id, opts) do
     db = :"#{store}_db"
     TimelessMetrics.Alert.update_rule(db, rule_id, opts)
   end
 
   @doc "Delete an alert rule."
+  @spec delete_alert(store(), integer()) :: command_result()
   def delete_alert(store, rule_id) do
     db = :"#{store}_db"
     TimelessMetrics.Alert.delete_rule(db, rule_id)
   end
 
   @doc "Evaluate all alert rules against current data."
+  @spec evaluate_alerts(store()) :: command_result()
   def evaluate_alerts(store) do
     TimelessMetrics.Alert.evaluate(store)
   end
@@ -1079,12 +1193,14 @@ defmodule TimelessMetrics do
 
   Options: `:limit`, `:rule_id`, `:acknowledged` (true/false/nil).
   """
+  @spec alert_history(store(), keyword()) :: api_result([map()])
   def alert_history(store, opts \\ []) do
     db = :"#{store}_db"
     TimelessMetrics.Alert.list_history(db, opts)
   end
 
   @doc "Acknowledge an alert history entry by ID."
+  @spec acknowledge_alert(store(), integer()) :: command_result()
   def acknowledge_alert(store, history_id) do
     db = :"#{store}_db"
     TimelessMetrics.Alert.acknowledge_alert(db, history_id)
@@ -1095,6 +1211,7 @@ defmodule TimelessMetrics do
 
   Options: `:acknowledged_only` (default true), `:before` (timestamp cutoff).
   """
+  @spec clear_alert_history(store(), keyword()) :: command_result()
   def clear_alert_history(store, opts \\ []) do
     db = :"#{store}_db"
     TimelessMetrics.Alert.clear_history(db, opts)
@@ -1105,6 +1222,7 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{labels: map, data: [{ts, val}], forecast: [{ts, val}]}, ...]}`.
   """
+  @spec forecast(store(), metric_name(), labels(), keyword()) :: api_result([map()])
   def forecast(store, metric_name, labels, opts) do
     from = Keyword.fetch!(opts, :from)
     to = Keyword.get(opts, :to, System.os_time(:second))
@@ -1114,23 +1232,23 @@ defmodule TimelessMetrics do
 
     bucket_seconds = bucket_to_seconds(bucket)
 
-    {:ok, results} =
-      query_aggregate_multi(store, metric_name, labels,
-        from: from,
-        to: to,
-        bucket: bucket,
-        aggregate: aggregate
-      )
+    with {:ok, results} <-
+           query_aggregate_multi(store, metric_name, labels,
+             from: from,
+             to: to,
+             bucket: bucket,
+             aggregate: aggregate
+           ) do
+      forecasts =
+        Enum.map(results, fn %{labels: l, data: data} ->
+          case TimelessMetrics.Forecast.predict(data, horizon: horizon, bucket: bucket_seconds) do
+            {:ok, predictions} -> %{labels: l, data: data, forecast: predictions}
+            {:error, _} -> %{labels: l, data: data, forecast: []}
+          end
+        end)
 
-    forecasts =
-      Enum.map(results, fn %{labels: l, data: data} ->
-        case TimelessMetrics.Forecast.predict(data, horizon: horizon, bucket: bucket_seconds) do
-          {:ok, predictions} -> %{labels: l, data: data, forecast: predictions}
-          {:error, _} -> %{labels: l, data: data, forecast: []}
-        end
-      end)
-
-    {:ok, forecasts}
+      {:ok, forecasts}
+    end
   end
 
   @doc """
@@ -1138,6 +1256,7 @@ defmodule TimelessMetrics do
 
   Returns `{:ok, [%{labels: map, analysis: [%{timestamp, value, expected, score, anomaly}]}, ...]}`.
   """
+  @spec detect_anomalies(store(), metric_name(), labels(), keyword()) :: api_result([map()])
   def detect_anomalies(store, metric_name, labels, opts) do
     from = Keyword.fetch!(opts, :from)
     to = Keyword.get(opts, :to, System.os_time(:second))
@@ -1145,23 +1264,23 @@ defmodule TimelessMetrics do
     aggregate = Keyword.get(opts, :aggregate, :avg)
     sensitivity = Keyword.get(opts, :sensitivity, :medium)
 
-    {:ok, results} =
-      query_aggregate_multi(store, metric_name, labels,
-        from: from,
-        to: to,
-        bucket: bucket,
-        aggregate: aggregate
-      )
+    with {:ok, results} <-
+           query_aggregate_multi(store, metric_name, labels,
+             from: from,
+             to: to,
+             bucket: bucket,
+             aggregate: aggregate
+           ) do
+      detections =
+        Enum.map(results, fn %{labels: l, data: data} ->
+          case TimelessMetrics.Anomaly.detect(data, sensitivity: sensitivity) do
+            {:ok, analysis} -> %{labels: l, analysis: analysis}
+            {:error, _} -> %{labels: l, analysis: []}
+          end
+        end)
 
-    detections =
-      Enum.map(results, fn %{labels: l, data: data} ->
-        case TimelessMetrics.Anomaly.detect(data, sensitivity: sensitivity) do
-          {:ok, analysis} -> %{labels: l, analysis: analysis}
-          {:error, _} -> %{labels: l, analysis: []}
-        end
-      end)
-
-    {:ok, detections}
+      {:ok, detections}
+    end
   end
 
   defp bucket_to_seconds(:minute), do: 60
@@ -1171,6 +1290,7 @@ defmodule TimelessMetrics do
   defp bucket_to_seconds(n) when is_integer(n), do: n
 
   @doc false
+  @spec merge_series_data([[point()]], atom()) :: [point()]
   def merge_series_data(series_data_list, aggregate_fn) do
     series_data_list
     |> Enum.flat_map(& &1)

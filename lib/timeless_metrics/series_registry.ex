@@ -91,7 +91,7 @@ defmodule TimelessMetrics.SeriesRegistry do
 
   @doc "Flush pending series registrations to SQLite synchronously."
   def flush_pending(registry) do
-    GenServer.call(registry, :flush_pending, :infinity)
+    TimelessMetrics.Call.write(registry, :flush_pending)
   end
 
   @doc "Lookup series metadata by ID."

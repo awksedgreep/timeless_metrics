@@ -1491,24 +1491,23 @@ defmodule TimelessMetrics.PromQL do
 
     inner_ctx = %{ctx | from: inner_from, to: inner_to, step: res}
 
-    with {:ok, series} <- eval_vector(inner, inner_ctx) do
-      fun = rollup_window_fun(f, window)
+    fun = rollup_window_fun(f, window)
 
-      out =
-        series
-        |> Task.async_stream(
-          fn %{labels: labels, data: data} ->
-            labels = if keep_name, do: labels, else: Map.delete(labels, "__name__")
-            %{labels: labels, data: grid_eval(data, ctx.from, ctx.to, ctx.step, window, fun)}
-          end,
-          max_concurrency: System.schedulers_online(),
-          ordered: false,
-          timeout: :infinity
-        )
-        |> Enum.flat_map(fn {:ok, s} -> [s] end)
-        |> Enum.reject(&(&1.data == []))
-
-      {:ok, {:vector, out}}
+    with {:ok, series} <- eval_vector(inner, inner_ctx),
+         {:ok, out} <-
+           series
+           |> Task.async_stream(
+             fn %{labels: labels, data: data} ->
+               labels = if keep_name, do: labels, else: Map.delete(labels, "__name__")
+               %{labels: labels, data: grid_eval(data, ctx.from, ctx.to, ctx.step, window, fun)}
+             end,
+             max_concurrency: System.schedulers_online(),
+             ordered: false,
+             timeout: :timer.seconds(30),
+             on_timeout: :kill_task
+           )
+           |> collect_evaluation_tasks() do
+      {:ok, {:vector, Enum.reject(out, &(&1.data == []))}}
     end
   end
 
@@ -1568,28 +1567,30 @@ defmodule TimelessMetrics.PromQL do
         |> Enum.flat_map(fn %{labels: l, data: data} ->
           case parse_le(Map.fetch!(l, "le")) do
             nil -> []
-            le -> [{le, Map.new(data)}]
+            le -> [{le, data}]
           end
         end)
         |> Enum.sort_by(fn {le, _} -> le_rank(le) end)
 
-      ts_all =
-        parsed
-        |> Enum.flat_map(fn {_le, m} -> Map.keys(m) end)
-        |> Enum.uniq()
-        |> Enum.sort()
+      # Transpose once. The previous implementation rebuilt one map per bucket
+      # and then probed every bucket for every timestamp (O(T*B) lookups plus
+      # repeated key materialization).
+      by_timestamp =
+        Enum.reduce(parsed, %{}, fn {le, bucket_data}, acc ->
+          Enum.reduce(bucket_data, acc, fn
+            {ts, value}, acc when is_number(value) ->
+              Map.update(acc, ts, [{le, value}], &[{le, value} | &1])
+
+            _point, acc ->
+              acc
+          end)
+        end)
 
       data =
-        Enum.flat_map(ts_all, fn ts ->
-          pairs =
-            Enum.flat_map(parsed, fn {le, m} ->
-              case Map.fetch(m, ts) do
-                {:ok, v} when is_number(v) -> [{le, v}]
-                _ -> []
-              end
-            end)
-
-          case bucket_quantile(phi, pairs) do
+        by_timestamp
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.flat_map(fn {ts, reversed_pairs} ->
+          case bucket_quantile(phi, Enum.reverse(reversed_pairs)) do
             :skip -> []
             v -> [{ts, v}]
           end
@@ -1822,8 +1823,7 @@ defmodule TimelessMetrics.PromQL do
       |> Enum.flat_map(fn {_ts, points} ->
         points
         |> Enum.filter(fn {_ts, v, _idx} -> is_number(v) end)
-        |> Enum.sort_by(fn {_ts, v, _idx} -> v end, if(op == :topk, do: :desc, else: :asc))
-        |> Enum.take(k)
+        |> bounded_select_k(op, k)
       end)
       |> Enum.group_by(fn {_ts, _v, idx} -> idx end)
 
@@ -1838,6 +1838,27 @@ defmodule TimelessMetrics.PromQL do
           [%{labels: labels, data: data}]
       end
     end)
+  end
+
+  defp bounded_select_k(_points, _op, k) when k <= 0, do: []
+
+  defp bounded_select_k(points, op, k) do
+    points
+    |> Enum.reduce(:gb_sets.empty(), fn {ts, value, idx}, selected ->
+      tie_rank = if op == :topk, do: -idx, else: idx
+      selected = :gb_sets.add({value, tie_rank, ts, idx}, selected)
+
+      if :gb_sets.size(selected) > k do
+        case op do
+          :topk -> elem(:gb_sets.take_smallest(selected), 1)
+          :bottomk -> elem(:gb_sets.take_largest(selected), 1)
+        end
+      else
+        selected
+      end
+    end)
+    |> :gb_sets.to_list()
+    |> Enum.map(fn {value, _tie_rank, ts, idx} -> {ts, value, idx} end)
   end
 
   defp agg_values(op, vals, param) do
@@ -2571,31 +2592,50 @@ defmodule TimelessMetrics.PromQL do
 
   defp eval_windowed(sel, window, keep_name, ctx, window_fun) do
     with {:ok, raw} <- fetch_raw(sel, window, keep_name, ctx),
-         :ok <- check_sample_budget(raw) do
-      from = ctx.from - sel.offset
-      to = ctx.to - sel.offset
+         :ok <- check_sample_budget(raw),
+         {:ok, series} <-
+           raw
+           |> Task.async_stream(
+             fn %{labels: labels, points: points} ->
+               data =
+                 points
+                 |> ensure_sorted()
+                 |> grid_eval(
+                   ctx.from - sel.offset,
+                   ctx.to - sel.offset,
+                   ctx.step,
+                   window,
+                   window_fun
+                 )
+                 |> shift_data(sel.offset)
 
-      # Per-series evaluation is independent — fan out across schedulers.
-      series =
-        raw
-        |> Task.async_stream(
-          fn %{labels: labels, points: points} ->
-            data =
-              points
-              |> ensure_sorted()
-              |> grid_eval(from, to, ctx.step, window, window_fun)
-              |> shift_data(sel.offset)
+               %{labels: labels, data: data}
+             end,
+             max_concurrency: System.schedulers_online(),
+             ordered: false,
+             timeout: :timer.seconds(30),
+             on_timeout: :kill_task
+           )
+           |> collect_evaluation_tasks() do
+      {:ok, Enum.reject(series, &(&1.data == []))}
+    end
+  end
 
-            %{labels: labels, data: data}
-          end,
-          max_concurrency: System.schedulers_online(),
-          ordered: false,
-          timeout: :infinity
-        )
-        |> Enum.flat_map(fn {:ok, s} -> [s] end)
-        |> Enum.reject(&(&1.data == []))
+  defp collect_evaluation_tasks(stream) do
+    stream
+    |> Enum.reduce_while({:ok, []}, fn
+      {:ok, series}, {:ok, acc} ->
+        {:cont, {:ok, [series | acc]}}
 
-      {:ok, series}
+      {:exit, :timeout}, _acc ->
+        {:halt, {:error, "PromQL evaluation timed out"}}
+
+      {:exit, reason}, _acc ->
+        {:halt, {:error, "PromQL evaluation task failed: #{inspect(reason)}"}}
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _} = error -> error
     end
   end
 
@@ -2625,44 +2665,31 @@ defmodule TimelessMetrics.PromQL do
   defp shift_data(data, offset), do: Enum.map(data, fn {ts, v} -> {ts + offset, v} end)
 
   defp fetch_raw(%{pattern: nil, metric: metric} = sel, window, keep_name, ctx) do
-    {:ok, results} =
-      TimelessMetrics.query_multi(ctx.store, metric, sel.labels,
-        from: ctx.from - sel.offset - window,
-        to: ctx.to - sel.offset
-      )
-
-    {:ok,
-     Enum.map(results, fn %{labels: l, points: pts} ->
-       %{labels: maybe_name(l, metric, keep_name), points: pts}
-     end)}
+    with {:ok, results} <-
+           TimelessMetrics.query_multi(ctx.store, metric, sel.labels,
+             from: ctx.from - sel.offset - window,
+             to: ctx.to - sel.offset
+           ) do
+      {:ok,
+       Enum.map(results, fn %{labels: l, points: pts} ->
+         %{labels: maybe_name(l, metric, keep_name), points: pts}
+       end)}
+    end
   end
 
   defp fetch_raw(%{pattern: pattern} = sel, window, keep_name, ctx) do
-    with {:ok, regex} <- compile_anchored(pattern) do
-      {:ok, all_metrics} = TimelessMetrics.list_metrics(ctx.store)
-
-      results =
-        all_metrics
-        |> Enum.filter(&Regex.match?(regex, &1))
-        |> Task.async_stream(
-          fn metric ->
-            {:ok, results} =
-              TimelessMetrics.query_multi(ctx.store, metric, sel.labels,
-                from: ctx.from - sel.offset - window,
-                to: ctx.to - sel.offset
-              )
-
-            Enum.map(results, fn %{labels: l, points: pts} ->
-              %{labels: maybe_name(l, metric, keep_name), points: pts}
-            end)
-          end,
-          max_concurrency: System.schedulers_online(),
-          ordered: false,
-          timeout: :infinity
-        )
-        |> Enum.flat_map(fn {:ok, series} -> series end)
-
-      {:ok, results}
+    with {:ok, regex} <- compile_anchored(pattern),
+         {:ok, all_metrics} <- TimelessMetrics.list_metrics(ctx.store),
+         metrics = Enum.filter(all_metrics, &Regex.match?(regex, &1)),
+         {:ok, results} <-
+           TimelessMetrics.query_multi_metrics(ctx.store, metrics, sel.labels,
+             from: ctx.from - sel.offset - window,
+             to: ctx.to - sel.offset
+           ) do
+      {:ok,
+       Enum.map(results, fn %{metric: metric, labels: labels, points: points} ->
+         %{labels: maybe_name(labels, metric, keep_name), points: points}
+       end)}
     end
   end
 

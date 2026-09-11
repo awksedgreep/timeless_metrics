@@ -34,12 +34,12 @@ defmodule TimelessMetrics.Rollup do
 
   @doc "Force a rollup of a specific tier (or all tiers)."
   def run(rollup, tier \\ :all) do
-    GenServer.call(rollup, {:run, tier}, :infinity)
+    TimelessMetrics.Call.maintenance(rollup, {:run, tier})
   end
 
   @doc "Force a late-arrival catch-up scan."
   def catch_up(rollup) do
-    GenServer.call(rollup, :catch_up, :infinity)
+    TimelessMetrics.Call.maintenance(rollup, :catch_up)
   end
 
   # --- Server ---
@@ -72,12 +72,23 @@ defmodule TimelessMetrics.Rollup do
 
   @impl true
   def handle_info(:tick, state) do
-    run_all_tiers(state)
+    case run_all_tiers(state) do
+      {:error, reason} -> Logger.warning("Scheduled rollup did not complete: #{inspect(reason)}")
+      :ok -> :ok
+    end
+
     tick = state.tick_count + 1
 
     state =
       if rem(tick, state.late_every_n_ticks) == 0 do
-        catch_up_late_arrivals(state)
+        case catch_up_late_arrivals(state) do
+          {:error, reason} ->
+            Logger.warning("Scheduled late-arrival catch-up did not complete: #{inspect(reason)}")
+
+          :ok ->
+            :ok
+        end
+
         %{state | tick_count: tick}
       else
         %{state | tick_count: tick}
@@ -98,21 +109,18 @@ defmodule TimelessMetrics.Rollup do
 
   @impl true
   def handle_call(:catch_up, _from, state) do
-    catch_up_late_arrivals(state)
-    {:reply, :ok, state}
+    {:reply, catch_up_late_arrivals(state), state}
   end
 
   def handle_call({:run, :all}, _from, state) do
-    run_all_tiers(state)
-    {:reply, :ok, state}
+    {:reply, run_all_tiers(state), state}
   end
 
   def handle_call({:run, tier_name}, _from, state) do
     tier = Enum.find(state.schema.tiers, &(&1.name == tier_name))
 
     if tier do
-      run_tier(tier, state)
-      {:reply, :ok, state}
+      {:reply, run_tier(tier, state), state}
     else
       {:reply, {:error, :unknown_tier}, state}
     end
@@ -121,8 +129,11 @@ defmodule TimelessMetrics.Rollup do
   # --- Core Logic ---
 
   defp run_all_tiers(state) do
-    Enum.each(state.schema.tiers, fn tier ->
-      run_tier(tier, state)
+    Enum.reduce_while(state.schema.tiers, :ok, fn tier, :ok ->
+      case run_tier(tier, state) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
     end)
   end
 
@@ -130,7 +141,7 @@ defmodule TimelessMetrics.Rollup do
     shard_count = :persistent_term.get({TimelessMetrics, state.store, :shard_count})
     source = source_for_tier(tier, state.schema.tiers)
 
-    {us, _} =
+    {us, results} =
       :timer.tc(fn ->
         tasks =
           for i <- 0..(shard_count - 1) do
@@ -138,7 +149,7 @@ defmodule TimelessMetrics.Rollup do
             Task.async(fn -> run_tier_on_shard(tier, source, builder, state) end)
           end
 
-        Task.await_many(tasks, :infinity)
+        await_tasks(tasks)
       end)
 
     :telemetry.execute(
@@ -146,6 +157,8 @@ defmodule TimelessMetrics.Rollup do
       %{duration_us: us},
       %{tier: tier.name}
     )
+
+    first_task_error(results)
   end
 
   defp run_tier_on_shard(tier, source, builder, state) do
@@ -172,7 +185,10 @@ defmodule TimelessMetrics.Rollup do
 
         {:error, e} ->
           Logger.warning("Shard rollup failed for #{tier.name} on #{builder}: #{inspect(e)}")
+          {:error, e}
       end
+    else
+      :ok
     end
   end
 
@@ -312,7 +328,7 @@ defmodule TimelessMetrics.Rollup do
   defp catch_up_late_arrivals(state) do
     shard_count = :persistent_term.get({TimelessMetrics, state.store, :shard_count})
 
-    Enum.each(state.schema.tiers, fn tier ->
+    Enum.reduce_while(state.schema.tiers, :ok, fn tier, :ok ->
       source = source_for_tier(tier, state.schema.tiers)
 
       tasks =
@@ -321,7 +337,10 @@ defmodule TimelessMetrics.Rollup do
           Task.async(fn -> catch_up_shard(tier, source, builder, state) end)
         end
 
-      Task.await_many(tasks, :infinity)
+      case tasks |> await_tasks() |> first_task_error() do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
     end)
   end
 
@@ -416,11 +435,38 @@ defmodule TimelessMetrics.Rollup do
     TimelessMetrics.TextCodec.decompress(text_blob)
   end
 
+  defp decompress_segment(<<0xFA, compressed::binary>>, _compression) do
+    {:ok, :erlang.binary_to_term(:ezstd.decompress(compressed), [:safe])}
+  end
+
   defp decompress_segment(_blob, _compression) do
     {:error, "Legacy Gorilla-compressed segment is no longer supported"}
   end
 
   defp schedule_tick(interval) do
     Process.send_after(self(), :tick, interval)
+  end
+
+  defp await_tasks(tasks) do
+    tasks
+    |> Task.yield_many(:timer.seconds(60))
+    |> Enum.map(fn
+      {_task, {:ok, result}} ->
+        case result do
+          {:error, _} = error -> error
+          _ -> :ok
+        end
+
+      {task, nil} ->
+        Task.shutdown(task, :brutal_kill)
+        {:error, :timeout}
+
+      {_task, {:exit, reason}} ->
+        {:error, reason}
+    end)
+  end
+
+  defp first_task_error(results) do
+    Enum.find(results, :ok, &match?({:error, _}, &1))
   end
 end

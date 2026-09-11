@@ -47,6 +47,9 @@ defmodule TimelessMetrics.LibsqlAutoMigrateTest do
 
     assert length(points) == 2
 
+    assert :persistent_term.get({TimelessMetrics, @store, :schema}).raw_retention_seconds ==
+             :forever
+
     # Rollback material is preserved, exactly like the manual migration.
     assert File.exists?(Path.join(data_dir, "metrics.db.pre-libsql"))
     assert File.dir?(Path.join(data_dir, "rust_engine"))
@@ -69,5 +72,8 @@ defmodule TimelessMetrics.LibsqlAutoMigrateTest do
              TimelessMetrics.query(@store, "cpu", %{"host" => "b"}, from: 0, to: 100)
 
     assert length(points) == 1
+
+    assert :persistent_term.get({TimelessMetrics, @store, :schema}).raw_retention_seconds ==
+             :forever
   end
 end

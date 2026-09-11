@@ -131,6 +131,34 @@ defmodule TimelessMetrics.InfluxTest do
       assert length(results) == 10
     end
 
+    test "preserves every sample when a body uses the parallel parser" do
+      base_ts = 1_700_000_000
+
+      body =
+        0..4_999
+        |> Enum.map_join("\n", fn i ->
+          "cpu,hostname=parallel usage_user=#{i}.0 #{(base_ts + i) * 1_000_000_000}"
+        end)
+        |> Kernel.<>("\n")
+
+      assert byte_size(body) > 256 * 1024
+      assert %{status: 204} = TimelessMetrics.TestHTTP.post(@port, "/write", body)
+      assert :ok = TimelessMetrics.flush(:influx_test)
+
+      assert {:ok, points} =
+               TimelessMetrics.query(
+                 :influx_test,
+                 "cpu_usage_user",
+                 %{"hostname" => "parallel"},
+                 from: base_ts,
+                 to: base_ts + 4_999
+               )
+
+      assert length(points) == 5_000
+      assert hd(points) == {base_ts, 0.0}
+      assert List.last(points) == {base_ts + 4_999, 4_999.0}
+    end
+
     test "handles integer field values with 'i' suffix" do
       body = "mem,hostname=host_0 total=8589934592i 1700000000000000000\n"
 

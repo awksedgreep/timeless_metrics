@@ -22,6 +22,7 @@ defmodule TimelessMetrics.Application do
           {:ok, data_dir} ->
             port = Keyword.get(config, :port, 8428)
             bearer_token = Keyword.get(config, :bearer_token)
+            max_body = Keyword.get(config, :max_body, 10 * 1024 * 1024)
 
             store_opts =
               config
@@ -31,6 +32,9 @@ defmodule TimelessMetrics.Application do
                 :schema,
                 :reader_pool_size,
                 :ingest_workers,
+                :ingest_transaction_ms,
+                :ingest_transaction_max,
+                :busy_timeout,
                 :alert_interval,
                 :self_monitor,
                 :self_monitor_labels,
@@ -51,14 +55,20 @@ defmodule TimelessMetrics.Application do
                 :defer_compression,
                 :raw_buffer_max,
                 :rollup_interval,
-                :retention_interval
+                :retention_interval,
+                :extension_path,
+                :maintenance,
+                :auto_migrate
               ])
               |> Keyword.merge(name: :timeless_metrics, data_dir: data_dir)
 
             [
               {TimelessMetrics, store_opts},
               {TimelessMetrics.HTTP,
-               store: :timeless_metrics, port: port, bearer_token: bearer_token}
+               store: :timeless_metrics,
+               port: port,
+               bearer_token: bearer_token,
+               max_body: max_body}
             ]
 
           :error ->

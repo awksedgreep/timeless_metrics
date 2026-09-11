@@ -24,8 +24,8 @@ defmodule TimelessMetrics.Buffer do
 
   @default_backpressure_threshold 50_000
 
-  # Number of metadata keys stored in ETS (__builder_pid__, __counter__, __threshold__, __bp_state__, __rate_state__)
-  @metadata_key_count 3
+  # Number of metadata keys stored alongside points in ETS.
+  @metadata_key_count 5
 
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -45,7 +45,7 @@ defmodule TimelessMetrics.Buffer do
       :ok ->
         :ets.insert(
           table,
-          {{series_id, timestamp, :erlang.unique_integer([:positive, :monotonic])}, value}
+          {{series_id, timestamp, next_sequence(table)}, value}
         )
 
         [{:__counter__, counter}] = :ets.lookup(table, :__counter__)
@@ -75,15 +75,18 @@ defmodule TimelessMetrics.Buffer do
 
     case check_backpressure(shard_name) do
       :ok ->
+        point_count = length(points)
+        last_sequence = reserve_sequences(table, point_count)
+        first_sequence = last_sequence - point_count + 1
+
         rows =
-          Enum.map(points, fn {sid, ts, val} ->
-            {{sid, ts, :erlang.unique_integer([:positive, :monotonic])}, val}
-          end)
+          points
+          |> Enum.with_index(first_sequence)
+          |> Enum.map(fn {{sid, ts, val}, sequence} -> {{sid, ts, sequence}, val} end)
 
         :ets.insert(table, rows)
 
         [{:__counter__, counter}] = :ets.lookup(table, :__counter__)
-        point_count = length(points)
         :atomics.add(counter, 1, point_count)
 
         :ok
@@ -165,6 +168,11 @@ defmodule TimelessMetrics.Buffer do
     :ets.insert(table, {:__builder_pid__, builder_pid})
     :ets.insert(table, {:__counter__, counter})
 
+    sequence = :atomics.new(1, signed: false)
+    :ets.insert(table, {:__sequence__, sequence})
+
+    :ets.insert(table, {:__backpressure_threshold__, backpressure_threshold})
+
     # Backpressure cache: index 1 = 0 (ok) or 1 (backpressure), index 2 = last check monotonic ms
     bp_state = :atomics.new(2, signed: true)
     :ets.insert(table, {:__bp_state__, bp_state})
@@ -188,6 +196,12 @@ defmodule TimelessMetrics.Buffer do
     {:reply, :ok, state}
   end
 
+  def handle_call(:drain_points, _from, state) do
+    {points, grouped} = take_buffer_points(state)
+    TimelessMetrics.Stats.add_points_merged(state.store, length(points))
+    {:reply, {:ok, grouped}, state}
+  end
+
   @impl true
   def terminate(_reason, state) do
     do_flush_sync(state)
@@ -199,7 +213,17 @@ defmodule TimelessMetrics.Buffer do
   # Synchronous flush — flushes ALL points regardless of per-series count.
   # Used by terminate and explicit flush calls.
   defp do_flush_sync(state) do
-    cutoff = :erlang.unique_integer([:positive, :monotonic])
+    {points, grouped} = take_buffer_points(state)
+
+    if points != [] do
+      TimelessMetrics.SegmentBuilder.ingest_sync(state.segment_builder, grouped)
+      TimelessMetrics.Stats.add_points_merged(state.store, length(points))
+    end
+  end
+
+  defp take_buffer_points(state) do
+    sequence = :ets.lookup_element(state.table, :__sequence__, 2)
+    cutoff = :atomics.get(sequence, 1)
 
     select_spec = [
       {{{:"$1", :"$2", :"$3"}, :"$4"}, [{:"=<", :"$3", cutoff}], [{{:"$1", :"$2", :"$4"}}]}
@@ -211,12 +235,8 @@ defmodule TimelessMetrics.Buffer do
     :ets.select_delete(state.table, delete_spec)
     :atomics.put(state.counter, 1, max(:ets.info(state.table, :size) - @metadata_key_count, 0))
 
-    if points != [] do
-      count = length(points)
-      grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
-      TimelessMetrics.SegmentBuilder.ingest_sync(state.segment_builder, grouped)
-      TimelessMetrics.Stats.add_points_merged(state.store, count)
-    end
+    grouped = Enum.group_by(points, &elem(&1, 0), fn {_, ts, val} -> {ts, val} end)
+    {points, grouped}
   end
 
   @bp_cache_ttl_ms 100
@@ -229,16 +249,17 @@ defmodule TimelessMetrics.Buffer do
       now_ms = :erlang.monotonic_time(:millisecond)
       last_check = :atomics.get(bp_state, 2)
 
-      if now_ms - last_check < @bp_cache_ttl_ms do
+      if last_check != 0 and now_ms - last_check < @bp_cache_ttl_ms do
         # Return cached result
         if :atomics.get(bp_state, 1) == 1, do: {:error, :backpressure}, else: :ok
       else
         # Stale cache — do the real check
         builder_pid = :ets.lookup_element(table, :__builder_pid__, 2)
+        threshold = :ets.lookup_element(table, :__backpressure_threshold__, 2)
 
         result =
           case Process.info(builder_pid, :message_queue_len) do
-            {:message_queue_len, len} when len > @default_backpressure_threshold ->
+            {:message_queue_len, len} when len > threshold ->
               :atomics.put(bp_state, 1, 1)
               {:error, :backpressure}
 
@@ -257,5 +278,14 @@ defmodule TimelessMetrics.Buffer do
 
   defp table_name(name) when is_atom(name) do
     :"#{name}_buf"
+  end
+
+  defp next_sequence(table), do: reserve_sequences(table, 1)
+
+  defp reserve_sequences(_table, 0), do: 0
+
+  defp reserve_sequences(table, count) do
+    sequence = :ets.lookup_element(table, :__sequence__, 2)
+    :atomics.add_get(sequence, 1, count)
   end
 end

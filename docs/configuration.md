@@ -130,6 +130,20 @@ When running as a container, these environment variables configure the instance:
 | `TIMELESS_DATA_DIR` | `/data` | Storage directory |
 | `TIMELESS_PORT` | `8428` | HTTP listen port |
 | `TIMELESS_BEARER_TOKEN` | *(none)* | Bearer token for API auth (unset = no auth) |
+| `TIMELESS_READER_POOL_SIZE` | scheduler-based | libSQL reader count |
+| `TIMELESS_INGEST_WORKERS` | scheduler-based | HTTP ingest worker count |
+| `TIMELESS_FLUSH_INTERVAL_MS` | `10000` | libSQL flush interval |
+| `TIMELESS_INGEST_TRANSACTION_MS` | `5` | Maximum ingest transaction age |
+| `TIMELESS_INGEST_TRANSACTION_MAX` | `256` | Batches per ingest transaction |
+| `TIMELESS_BUSY_TIMEOUT_MS` | `5000` | SQLite busy timeout |
+| `TIMELESS_MAX_BODY_BYTES` | `10485760` | HTTP request body limit |
+| `TIMELESS_AUTO_MIGRATE` | `true` | Automatically migrate a detected Rust store |
+| `TIMELESS_MAINTENANCE` | `true` | Enable periodic compaction and retention |
+| `TIMELESS_DEFER_COMPRESSION` | `false` | Defer legacy segment recompression |
+| `TIMELESS_EXT_PATH` | bundled extension | Override the timeless-libSQL extension path |
+
+Invalid integer and boolean values emit a warning and use the documented
+default; they do not abort release startup.
 
 ## Tuning guidance
 
@@ -168,13 +182,16 @@ Use a custom schema when your retention tiers need to match your dashboarding ho
 
 ### Multiple store instances
 
-You can run multiple independent stores in the same application:
+You can run multiple independent stores in the same application. Rocket's
+module-handler interface supports one `TimelessMetrics.HTTP` listener per VM;
+starting a second listener returns `{:error, {:already_started, pid}}` instead
+of silently routing it to the wrong store. Expose additional stores through
+the Elixir API or a separately scoped HTTP adapter.
 
 ```elixir
 children = [
   {TimelessMetrics, name: :app_metrics, data_dir: "/data/app"},
   {TimelessMetrics, name: :infra_metrics, data_dir: "/data/infra"},
-  {TimelessMetrics.HTTP, store: :app_metrics, port: 8428},
-  {TimelessMetrics.HTTP, store: :infra_metrics, port: 8429}
+  {TimelessMetrics.HTTP, store: :app_metrics, port: 8428}
 ]
 ```

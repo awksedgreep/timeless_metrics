@@ -9,6 +9,7 @@ covers the Elixir API, the HTTP interface, and the SVG charting endpoint.
 ## Table of Contents
 
 - [Elixir API](#elixir-api)
+  - [Return and Error Contract](#return-and-error-contract)
   - [Starting a Store](#starting-a-store)
   - [Writing Data](#writing-data)
   - [Writing Text Data](#writing-text-data)
@@ -46,6 +47,20 @@ covers the Elixir API, the HTTP interface, and the SVG charting endpoint.
 ---
 
 ## Elixir API
+
+### Return and Error Contract
+
+Public data and administration operations use tagged tuples at the boundary:
+operations that return data use `{:ok, value}` and recoverable failures use
+`{:error, reason}`. Commands return `:ok` (or `:noop` where documented) and may
+return `{:error, reason}`. Calls that exceed their bounded read, write, or
+maintenance deadline return `{:error, :timeout}`; calls to a stopped store return
+`{:error, :unavailable}`.
+
+Invalid required options, unsupported argument shapes, and calls made before the
+store is started are programmer/configuration errors and may raise. Store startup
+also fails through the normal OTP child-start error when its database or migration
+cannot be initialized safely.
 
 ### Starting a Store
 
@@ -175,7 +190,7 @@ throughput. If you are intentionally running `engine: :legacy`, you can still us
 pre-resolved writes:
 
 ```elixir
-sid = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
+{:ok, sid} = TimelessMetrics.resolve_series(:metrics, "cpu_usage", %{"host" => "web-1"})
 TimelessMetrics.write_resolved(:metrics, sid, 73.2)
 TimelessMetrics.write_resolved(:metrics, sid, 74.1, timestamp: 1_700_000_060)
 ```
@@ -430,12 +445,9 @@ curl -H "Authorization: Bearer my-secret-token" \
   http://localhost:8428/api/v1/query_range?metric=cpu_usage&from=-1h
 ```
 
-**Via query parameter** (browsers, embedded charts):
-
-```
-http://localhost:8428/chart?metric=cpu_usage&from=-6h&token=my-secret-token
-http://localhost:8428/?token=my-secret-token
-```
+Tokens are accepted only in the `Authorization` header. Query-string tokens
+are intentionally rejected because URLs are commonly retained in proxy and
+access logs.
 
 **Elixir library usage** (pass `:bearer_token` in HTTP opts):
 
@@ -445,11 +457,13 @@ http://localhost:8428/?token=my-secret-token
 
 | Response | Meaning |
 |---|---|
-| `401 {"error":"unauthorized"}` | No token provided (missing header and no `?token=` param) |
+| `401 {"error":"unauthorized"}` | No bearer token provided in the `Authorization` header |
 | `403 {"error":"forbidden"}` | Token provided but doesn't match |
 
 When `TIMELESS_BEARER_TOKEN` is not set, all endpoints are open (no auth enforced).
 `/health` is always open regardless of token configuration.
+Production deployments should set a token and provide TLS and rate limiting at
+the reverse proxy.
 
 ### Ingest Endpoints
 

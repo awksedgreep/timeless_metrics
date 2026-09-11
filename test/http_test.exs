@@ -131,18 +131,16 @@ defmodule TimelessMetrics.HTTPTest do
 
   test "GET /health returns store stats for rust engine stores" do
     rust_dir = "/tmp/timeless_http_rust_test_#{System.unique_integer([:positive])}"
-    rust_port = @port + 1
 
     start_supervised!({TimelessMetrics, name: :http_rust_test, data_dir: rust_dir, engine: :rust})
-    start_supervised!({TimelessMetrics.HTTP, store: :http_rust_test, port: rust_port})
-    Process.sleep(50)
+    :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_rust_test, nil})
 
     on_exit(fn ->
       File.rm_rf!(rust_dir)
       :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
     end)
 
-    resp = TimelessMetrics.TestHTTP.get(rust_port, "/health")
+    resp = TimelessMetrics.TestHTTP.get(@port, "/health")
 
     assert resp.status == 200
     body = :json.decode(resp.body)
@@ -586,6 +584,14 @@ defmodule TimelessMetrics.HTTPTest do
 
   @secret "test-secret-token"
 
+  test "a second HTTP server is rejected instead of replacing global config" do
+    assert {:error, {:already_started, pid}} =
+             TimelessMetrics.HTTP.start_link(store: :other_store, port: 18_499)
+
+    assert is_pid(pid)
+    assert :persistent_term.get({TimelessMetrics.HTTP, :config}) == {:http_test, nil}
+  end
+
   test "auth disabled: requests work without token" do
     resp = TimelessMetrics.TestHTTP.get(@port, "/health")
 
@@ -661,7 +667,7 @@ defmodule TimelessMetrics.HTTPTest do
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
   end
 
-  test "auth enabled: token via query param grants access" do
+  test "auth enabled: token via query param is rejected" do
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, @secret})
     now = 1_700_000_000
 
@@ -671,12 +677,12 @@ defmodule TimelessMetrics.HTTPTest do
         "/api/v1/query?metric=cpu&from=#{now}&to=#{now + 60}&token=#{@secret}"
       )
 
-    assert resp.status == 200
+    assert resp.status == 401
 
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
   end
 
-  test "auth enabled: wrong token via query param returns 403" do
+  test "auth enabled: wrong token via query param is treated as missing" do
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, @secret})
     now = 1_700_000_000
 
@@ -686,7 +692,7 @@ defmodule TimelessMetrics.HTTPTest do
         "/api/v1/query?metric=cpu&from=#{now}&to=#{now + 60}&token=wrong"
       )
 
-    assert resp.status == 403
+    assert resp.status == 401
 
     :persistent_term.put({TimelessMetrics.HTTP, :config}, {:http_test, nil})
   end

@@ -28,94 +28,104 @@ defmodule TimelessMetrics.Alert do
     webhook_format = normalize_format(Keyword.get(opts, :webhook_format))
     created_at = System.os_time(:second)
 
-    {:ok, id} =
-      TimelessMetrics.DB.write_transaction(db, fn conn ->
-        TimelessMetrics.DB.execute(
-          conn,
-          """
-          INSERT INTO alert_rules (name, metric, labels, condition, threshold, duration, aggregate, webhook_url, webhook_format, enabled, created_at)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)
-          """,
-          [
-            name,
-            metric,
-            labels,
-            condition,
-            threshold,
-            duration,
-            aggregate,
-            webhook_url,
-            webhook_format,
-            created_at
-          ]
-        )
-
-        {:ok, [[id]]} = TimelessMetrics.DB.execute(conn, "SELECT last_insert_rowid()", [])
+    TimelessMetrics.DB.write_transaction(db, fn conn ->
+      with {:ok, _} <-
+             TimelessMetrics.DB.execute(
+               conn,
+               """
+               INSERT INTO alert_rules (name, metric, labels, condition, threshold, duration, aggregate, webhook_url, webhook_format, enabled, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)
+               """,
+               [
+                 name,
+                 metric,
+                 labels,
+                 condition,
+                 threshold,
+                 duration,
+                 aggregate,
+                 webhook_url,
+                 webhook_format,
+                 created_at
+               ]
+             ),
+           {:ok, [[id]]} <- TimelessMetrics.DB.execute(conn, "SELECT last_insert_rowid()", []) do
         id
-      end)
-
-    {:ok, id}
+      end
+    end)
   end
 
   @doc """
   List all alert rules with their current state.
   """
   def list_rules(db) do
-    {:ok, rows} =
-      TimelessMetrics.DB.read(
-        db,
-        "SELECT id, name, metric, labels, condition, threshold, duration, aggregate, webhook_url, webhook_format, enabled FROM alert_rules ORDER BY id"
-      )
-
-    rules =
-      Enum.map(rows, fn [
-                          id,
-                          name,
-                          metric,
-                          labels,
-                          condition,
-                          threshold,
-                          duration,
-                          aggregate,
-                          webhook_url,
-                          webhook_format,
-                          enabled
-                        ] ->
-        # Get current state for this rule
-        {:ok, state_rows} =
-          TimelessMetrics.DB.read(
-            db,
-            "SELECT series_labels, state, triggered_at, last_value FROM alert_state WHERE rule_id = ?1",
-            [id]
-          )
-
-        states =
-          Enum.map(state_rows, fn [series_labels, state, triggered_at, last_value] ->
-            %{
-              series_labels: :json.decode(series_labels),
-              state: state,
-              triggered_at: triggered_at,
-              last_value: last_value
-            }
-          end)
-
-        %{
-          id: id,
-          name: name,
-          metric: metric,
-          labels: :json.decode(labels || "{}"),
-          condition: condition,
-          threshold: threshold,
-          duration: duration,
-          aggregate: aggregate,
-          webhook_url: webhook_url,
-          webhook_format: webhook_format,
-          enabled: enabled == 1,
-          states: states
-        }
+    with {:ok, rows} <-
+           TimelessMetrics.DB.read(
+             db,
+             "SELECT id, name, metric, labels, condition, threshold, duration, aggregate, webhook_url, webhook_format, enabled FROM alert_rules ORDER BY id"
+           ) do
+      rows
+      |> Enum.reduce_while({:ok, []}, fn row, {:ok, acc} ->
+        case build_rule(db, row) do
+          {:ok, rule} -> {:cont, {:ok, [rule | acc]}}
+          {:error, _} = error -> {:halt, error}
+        end
       end)
+      |> case do
+        {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+        {:error, _} = error -> error
+      end
+    end
+  end
 
-    {:ok, rules}
+  defp build_rule(
+         db,
+         [
+           id,
+           name,
+           metric,
+           labels,
+           condition,
+           threshold,
+           duration,
+           aggregate,
+           webhook_url,
+           webhook_format,
+           enabled
+         ]
+       ) do
+    with {:ok, state_rows} <-
+           TimelessMetrics.DB.read(
+             db,
+             "SELECT series_labels, state, triggered_at, last_value FROM alert_state WHERE rule_id = ?1",
+             [id]
+           ) do
+      states =
+        Enum.map(state_rows, fn [series_labels, state, triggered_at, last_value] ->
+          %{
+            series_labels: :json.decode(series_labels),
+            state: state,
+            triggered_at: triggered_at,
+            last_value: last_value
+          }
+        end)
+
+      {:ok,
+       %{
+         id: id,
+         name: name,
+         metric: metric,
+         labels: :json.decode(labels || "{}"),
+         condition: condition,
+         threshold: threshold,
+         duration: duration,
+         aggregate: aggregate,
+         webhook_url: webhook_url,
+         webhook_format: webhook_format,
+         enabled: enabled == 1,
+         states: states
+       }}
+    end
   end
 
   @doc """
@@ -158,22 +168,21 @@ defmodule TimelessMetrics.Alert do
       values = Enum.map(fields, fn {_k, v} -> v end) ++ [rule_id]
       id_placeholder = "?#{length(fields) + 1}"
 
-      TimelessMetrics.DB.write(
-        db,
-        "UPDATE alert_rules SET #{set_clause} WHERE id = #{id_placeholder}",
-        values
-      )
-
-      # Clear alert state when disabling so re-enable starts fresh
-      if Enum.any?(fields, fn {k, v} -> k == "enabled" and v == 0 end) do
-        TimelessMetrics.DB.write(
-          db,
-          "DELETE FROM alert_state WHERE rule_id = ?1",
-          [rule_id]
-        )
+      with {:ok, _} <-
+             TimelessMetrics.DB.write(
+               db,
+               "UPDATE alert_rules SET #{set_clause} WHERE id = #{id_placeholder}",
+               values
+             ) do
+        # Clear alert state when disabling so re-enable starts fresh.
+        if Enum.any?(fields, fn {k, v} -> k == "enabled" and v == 0 end) do
+          db
+          |> TimelessMetrics.DB.write("DELETE FROM alert_state WHERE rule_id = ?1", [rule_id])
+          |> command_result()
+        else
+          :ok
+        end
       end
-
-      :ok
     end
   end
 
@@ -181,9 +190,12 @@ defmodule TimelessMetrics.Alert do
   Delete an alert rule and its state.
   """
   def delete_rule(db, rule_id) do
-    TimelessMetrics.DB.write(db, "DELETE FROM alert_state WHERE rule_id = ?1", [rule_id])
-    TimelessMetrics.DB.write(db, "DELETE FROM alert_rules WHERE id = ?1", [rule_id])
-    :ok
+    with {:ok, _} <-
+           TimelessMetrics.DB.write(db, "DELETE FROM alert_state WHERE rule_id = ?1", [rule_id]),
+         {:ok, _} <-
+           TimelessMetrics.DB.write(db, "DELETE FROM alert_rules WHERE id = ?1", [rule_id]) do
+      :ok
+    end
   end
 
   @doc """
@@ -194,20 +206,18 @@ defmodule TimelessMetrics.Alert do
   def evaluate(store) do
     db = :"#{store}_db"
 
-    {:ok, rules} = list_rules(db)
+    case list_rules(db) do
+      {:ok, rules} ->
+        rules
+        |> Enum.filter(& &1.enabled)
+        |> Enum.each(&safely_evaluate(store, db, &1))
 
-    rules
-    |> Enum.filter(& &1.enabled)
-    |> Enum.each(&safely_evaluate(store, db, &1))
+        :ok
 
-    :ok
-  rescue
-    # list_rules/1 raises rather than returning an error when the rules table
-    # is unreachable. Letting that propagate would restart the evaluator on a
-    # loop and stop alerting entirely, silently.
-    error ->
-      Logger.error("alert evaluation skipped: cannot read rules: " <> Exception.message(error))
-      {:error, error}
+      {:error, reason} = error ->
+        Logger.error("alert evaluation skipped: cannot read rules: #{inspect(reason)}")
+        error
+    end
   end
 
   # One rule must not be able to end the pass. A metric that no longer exists,
@@ -216,7 +226,17 @@ defmodule TimelessMetrics.Alert do
   # loop that stops evaluating every OTHER rule too. Alerting that has quietly
   # stopped looks exactly like alerting with nothing to report.
   defp safely_evaluate(store, db, rule) do
-    evaluate_rule(store, db, rule)
+    case evaluate_rule(store, db, rule) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "alert rule #{rule.id} (#{rule.name}) failed to evaluate: #{inspect(reason)}"
+        )
+
+        :error
+    end
   rescue
     error ->
       Logger.error(
@@ -240,31 +260,31 @@ defmodule TimelessMetrics.Alert do
     label_filter = rule.labels
     agg = String.to_existing_atom(rule.aggregate)
 
-    {:ok, results} =
-      reader().query_aggregate_multi(store, rule.metric, label_filter,
-        from: now - lookback,
-        to: now,
-        bucket: {lookback, :seconds},
-        aggregate: agg
-      )
+    with {:ok, results} <-
+           reader().query_aggregate_multi(store, rule.metric, label_filter,
+             from: now - lookback,
+             to: now,
+             bucket: {lookback, :seconds},
+             aggregate: agg
+           ) do
+      Enum.each(results, fn %{labels: labels, data: buckets} ->
+        value =
+          case buckets do
+            [] ->
+              nil
 
-    Enum.each(results, fn %{labels: labels, data: buckets} ->
-      value =
-        case buckets do
-          [] ->
-            nil
+            _ ->
+              {_ts, val} = List.last(buckets)
+              val
+          end
 
-          _ ->
-            {_ts, val} = List.last(buckets)
-            val
+        if value != nil do
+          breaching = check_condition(value, rule.condition, rule.threshold)
+          series_key = :json.encode(labels) |> IO.iodata_to_binary()
+          update_state(db, rule, series_key, labels, value, breaching, now)
         end
-
-      if value != nil do
-        breaching = check_condition(value, rule.condition, rule.threshold)
-        series_key = :json.encode(labels) |> IO.iodata_to_binary()
-        update_state(db, rule, series_key, labels, value, breaching, now)
-      end
-    end)
+      end)
+    end
   end
 
   # Where rule evaluation reads metrics from. Defaults to this library's own
@@ -411,53 +431,53 @@ defmodule TimelessMetrics.Alert do
 
     where = if where_clauses == [], do: "", else: "WHERE " <> Enum.join(where_clauses, " AND ")
 
-    {:ok, rows} =
-      TimelessMetrics.DB.read(
-        db,
-        """
-        SELECT id, rule_id, rule_name, metric, series_labels, state, value, threshold, condition, triggered_at, resolved_at, acknowledged, created_at
-        FROM alert_history
-        #{where}
-        ORDER BY created_at DESC
-        LIMIT ?#{length(params) + 1}
-        """,
-        params ++ [limit]
-      )
+    with {:ok, rows} <-
+           TimelessMetrics.DB.read(
+             db,
+             """
+             SELECT id, rule_id, rule_name, metric, series_labels, state, value, threshold, condition, triggered_at, resolved_at, acknowledged, created_at
+             FROM alert_history
+             #{where}
+             ORDER BY created_at DESC
+             LIMIT ?#{length(params) + 1}
+             """,
+             params ++ [limit]
+           ) do
+      entries =
+        Enum.map(rows, fn [
+                            id,
+                            rule_id,
+                            rule_name,
+                            metric,
+                            series_labels,
+                            state,
+                            value,
+                            threshold,
+                            condition,
+                            triggered_at,
+                            resolved_at,
+                            ack,
+                            created_at
+                          ] ->
+          %{
+            id: id,
+            rule_id: rule_id,
+            rule_name: rule_name,
+            metric: metric,
+            series_labels: :json.decode(series_labels),
+            state: state,
+            value: value,
+            threshold: threshold,
+            condition: condition,
+            triggered_at: triggered_at,
+            resolved_at: resolved_at,
+            acknowledged: ack == 1,
+            created_at: created_at
+          }
+        end)
 
-    entries =
-      Enum.map(rows, fn [
-                          id,
-                          rule_id,
-                          rule_name,
-                          metric,
-                          series_labels,
-                          state,
-                          value,
-                          threshold,
-                          condition,
-                          triggered_at,
-                          resolved_at,
-                          ack,
-                          created_at
-                        ] ->
-        %{
-          id: id,
-          rule_id: rule_id,
-          rule_name: rule_name,
-          metric: metric,
-          series_labels: :json.decode(series_labels),
-          state: state,
-          value: value,
-          threshold: threshold,
-          condition: condition,
-          triggered_at: triggered_at,
-          resolved_at: resolved_at,
-          acknowledged: ack == 1,
-          created_at: created_at
-        }
-      end)
-
-    {:ok, entries}
+      {:ok, entries}
+    end
   end
 
   defp build_history_filters(rule_id, acknowledged) do
@@ -479,13 +499,12 @@ defmodule TimelessMetrics.Alert do
   Acknowledge a history entry by ID.
   """
   def acknowledge_alert(db, history_id) do
-    TimelessMetrics.DB.write(
-      db,
+    db
+    |> TimelessMetrics.DB.write(
       "UPDATE alert_history SET acknowledged = 1 WHERE id = ?1",
       [history_id]
     )
-
-    :ok
+    |> command_result()
   end
 
   @doc """
@@ -499,22 +518,26 @@ defmodule TimelessMetrics.Alert do
     acknowledged_only = Keyword.get(opts, :acknowledged_only, true)
     before = Keyword.get(opts, :before, System.os_time(:second) - 7 * 86_400)
 
-    if acknowledged_only do
-      TimelessMetrics.DB.write(
-        db,
-        "DELETE FROM alert_history WHERE acknowledged = 1 AND created_at < ?1",
-        [before]
-      )
-    else
-      TimelessMetrics.DB.write(
-        db,
-        "DELETE FROM alert_history WHERE created_at < ?1",
-        [before]
-      )
-    end
+    result =
+      if acknowledged_only do
+        TimelessMetrics.DB.write(
+          db,
+          "DELETE FROM alert_history WHERE acknowledged = 1 AND created_at < ?1",
+          [before]
+        )
+      else
+        TimelessMetrics.DB.write(
+          db,
+          "DELETE FROM alert_history WHERE created_at < ?1",
+          [before]
+        )
+      end
 
-    :ok
+    command_result(result)
   end
+
+  defp command_result({:ok, _}), do: :ok
+  defp command_result({:error, _} = error), do: error
 
   defp deliver_webhook(rule, labels, value, state, timestamp) do
     label_params =
@@ -527,32 +550,117 @@ defmodule TimelessMetrics.Alert do
     {url, body} = build_delivery(rule, labels, value, state, timestamp, chart_url)
     payload = body |> :json.encode() |> IO.iodata_to_binary()
 
-    # Fire and forget — don't block the alert loop on webhook delivery
+    # Fire and forget — don't block the alert loop on DNS or delivery.
     Task.start(fn ->
-      case :httpc.request(
-             :post,
-             {String.to_charlist(url), [], ~c"application/json", payload},
-             [{:timeout, 10_000}],
-             []
-           ) do
-        {:ok, {{_version, status, _reason}, _headers, _body}} when status in 200..299 ->
-          :ok
-
-        # :httpc returns {:ok, _} for ANY completed exchange, so a rejected delivery
-        # (429 from a rate-limited notification service, 5xx, a stale 404 endpoint)
-        # looks identical to success unless the status is inspected. An alert nobody
-        # receives is the failure mode operators are least able to detect on their own,
-        # so this is logged at :error rather than :warning.
-        {:ok, {{_version, status, _reason}, _headers, body}} ->
-          Logger.error(
-            "Alert webhook rejected for #{rule.name}: HTTP #{status} #{inspect(truncate(body))}"
-          )
-
-        {:error, reason} ->
-          Logger.error("Alert webhook failed for #{rule.name}: #{inspect(reason)}")
+      case validate_webhook_url(url) do
+        :ok -> deliver_webhook_request(url, payload, rule.name)
+        {:error, reason} -> Logger.error("Alert webhook blocked for #{rule.name}: #{reason}")
       end
     end)
   end
+
+  @doc false
+  def validate_webhook_url(url) when is_binary(url) do
+    uri = URI.parse(url)
+
+    cond do
+      uri.scheme not in ["http", "https"] ->
+        {:error, "URL scheme must be http or https"}
+
+      not is_binary(uri.host) or uri.host == "" ->
+        {:error, "URL must include a host"}
+
+      Application.get_env(:timeless_metrics, :webhook_allow_private, false) ->
+        :ok
+
+      true ->
+        reject_private_webhook_host(uri.host)
+    end
+  end
+
+  def validate_webhook_url(_url), do: {:error, "URL must be a string"}
+
+  defp deliver_webhook_request(url, payload, rule_name) do
+    case :httpc.request(
+           :post,
+           {String.to_charlist(url), [], ~c"application/json", payload},
+           webhook_http_options(url),
+           []
+         ) do
+      {:ok, {{_version, status, _reason}, _headers, _body}} when status in 200..299 ->
+        :ok
+
+      # :httpc returns {:ok, _} for ANY completed exchange, so a rejected delivery
+      # (429 from a rate-limited notification service, 5xx, a stale 404 endpoint)
+      # looks identical to success unless the status is inspected.
+      {:ok, {{_version, status, _reason}, _headers, body}} ->
+        Logger.error(
+          "Alert webhook rejected for #{rule_name}: HTTP #{status} #{inspect(truncate(body))}"
+        )
+
+      {:error, reason} ->
+        Logger.error("Alert webhook failed for #{rule_name}: #{inspect(reason)}")
+    end
+  end
+
+  defp webhook_http_options(url) do
+    # Do not follow redirects: validating only the configured host and then
+    # following a 30x to a private address would bypass the SSRF policy.
+    base = [{:timeout, 10_000}, {:connect_timeout, 5_000}, {:autoredirect, false}]
+
+    if URI.parse(url).scheme == "https" do
+      ssl = [
+        verify: :verify_peer,
+        cacerts: :public_key.cacerts_get(),
+        customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
+      ]
+
+      [{:ssl, ssl} | base]
+    else
+      base
+    end
+  end
+
+  defp reject_private_webhook_host(host) do
+    addresses =
+      [:inet, :inet6]
+      |> Enum.flat_map(fn family ->
+        case :inet.getaddrs(String.to_charlist(host), family) do
+          {:ok, found} -> found
+          {:error, _} -> []
+        end
+      end)
+
+    cond do
+      String.downcase(host) == "localhost" ->
+        {:error, "private and loopback webhook targets are disabled"}
+
+      addresses == [] ->
+        {:error, "webhook host could not be resolved"}
+
+      Enum.any?(addresses, &private_address?/1) ->
+        {:error, "private and loopback webhook targets are disabled"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp private_address?({a, _, _, _}) when a in [0, 10, 127], do: true
+  defp private_address?({169, 254, _, _}), do: true
+  defp private_address?({172, b, _, _}) when b in 16..31, do: true
+  defp private_address?({192, 168, _, _}), do: true
+  defp private_address?({a, _, _, _}) when a >= 224, do: true
+  defp private_address?({0, 0, 0, 0, 0, 0, 0, n}) when n in [0, 1], do: true
+
+  defp private_address?({0, 0, 0, 0, 0, 0xFFFF, high, low}) do
+    private_address?({div(high, 256), rem(high, 256), div(low, 256), rem(low, 256)})
+  end
+
+  defp private_address?({a, _, _, _, _, _, _, _}) when a in 0xFC00..0xFDFF, do: true
+  defp private_address?({a, _, _, _, _, _, _, _}) when a in 0xFE80..0xFEBF, do: true
+  defp private_address?({a, _, _, _, _, _, _, _}) when a in 0xFF00..0xFFFF, do: true
+  defp private_address?(_address), do: false
 
   @webhook_formats ~w(ntfy generic)
 

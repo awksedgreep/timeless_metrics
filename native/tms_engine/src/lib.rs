@@ -1,4 +1,4 @@
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use rayon::prelude::*;
 use rustler::types::tuple::make_tuple;
 use rustler::{Atom, Binary, Encoder, Env, ResourceArc, Term};
@@ -768,7 +768,7 @@ impl Engine {
         // Shared across the chunks of one page so two chunks in the same file
         // do not read it twice.  Scoped to the page, not to the engine, so it
         // is released as soon as the page is built.
-        let mut page_file_cache = HashMap::new();
+        let page_file_cache = DashMap::new();
         let mut decoded_guard = decoded.lock().map_err(|_| "legacy chunk cache poisoned")?;
         for meta in metas {
             // Everything in this chunk predates the cursor, so every point in
@@ -800,7 +800,7 @@ impl Engine {
                         &meta,
                         i64::MIN,
                         i64::MAX,
-                        &mut page_file_cache,
+                        &page_file_cache,
                     )?);
                     *decoded_guard = Some(DecodedChunk {
                         path: meta.path.clone(),
@@ -1730,14 +1730,14 @@ impl Engine {
         let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
 
         for (key, chunks) in candidates {
-            let mut per_query_cache: HashMap<PathBuf, Arc<Vec<u8>>> = HashMap::new();
+            let per_query_cache: DashMap<PathBuf, Arc<Vec<u8>>> = DashMap::new();
             let mut points: Vec<(i64, f64)> = Vec::new();
             for (_, meta) in &chunks {
                 points.extend(self.read_chunk_data_cached(
                     meta,
                     i64::MIN,
                     i64::MAX,
-                    &mut per_query_cache,
+                    &per_query_cache,
                 )?);
             }
             if points.is_empty() {
@@ -1950,10 +1950,12 @@ impl Engine {
                 .collect()
         };
 
+        let file_cache = DashMap::new();
+
         candidates
             .into_par_iter()
             .map(|(sid, labels)| {
-                let points = self.query_range_by_id(sid, t_start, t_end)?;
+                let points = self.query_range_by_id_cached(sid, t_start, t_end, &file_cache)?;
                 Ok(if points.is_empty() {
                     None
                 } else {
@@ -1970,23 +1972,12 @@ impl Engine {
             .collect()
     }
 
-    /// Query a single series by ID.
-    fn query_range_by_id(
-        &self,
-        series_id: i64,
-        t_start: i64,
-        t_end: i64,
-    ) -> EngineResult<Vec<(i64, f64)>> {
-        let mut file_cache: HashMap<PathBuf, Arc<Vec<u8>>> = HashMap::new();
-        self.query_range_by_id_cached(series_id, t_start, t_end, &mut file_cache)
-    }
-
     fn query_range_by_id_cached(
         &self,
         series_id: i64,
         t_start: i64,
         t_end: i64,
-        file_cache: &mut HashMap<PathBuf, Arc<Vec<u8>>>,
+        file_cache: &DashMap<PathBuf, Arc<Vec<u8>>>,
     ) -> EngineResult<Vec<(i64, f64)>> {
         let pk = PartitionKey { series_id };
 
@@ -2018,6 +2009,17 @@ impl Engine {
         Ok(results)
     }
 
+    #[cfg(test)]
+    fn query_range_by_id(
+        &self,
+        series_id: i64,
+        t_start: i64,
+        t_end: i64,
+    ) -> EngineResult<Vec<(i64, f64)>> {
+        let file_cache = DashMap::new();
+        self.query_range_by_id_cached(series_id, t_start, t_end, &file_cache)
+    }
+
     /// Aggregate query by metric + labels. Returns per-series aggregates.
     fn query_aggregate_labeled(
         &self,
@@ -2035,10 +2037,13 @@ impl Engine {
                 .collect()
         };
 
+        let file_cache = DashMap::new();
+
         candidates
             .into_par_iter()
             .map(|(sid, labels)| {
-                let value = self.query_aggregate_by_id(sid, t_start, t_end, agg)?;
+                let value =
+                    self.query_aggregate_by_id_cached(sid, t_start, t_end, agg, &file_cache)?;
                 Ok(value.map(|val| (labels, val)))
             })
             .filter_map(|result: EngineResult<Option<(Labels, f64)>>| match result {
@@ -2049,24 +2054,13 @@ impl Engine {
             .collect()
     }
 
-    fn query_aggregate_by_id(
-        &self,
-        series_id: i64,
-        t_start: i64,
-        t_end: i64,
-        agg: AggFn,
-    ) -> EngineResult<Option<f64>> {
-        let mut file_cache: HashMap<PathBuf, Arc<Vec<u8>>> = HashMap::new();
-        self.query_aggregate_by_id_cached(series_id, t_start, t_end, agg, &mut file_cache)
-    }
-
     fn query_aggregate_by_id_cached(
         &self,
         series_id: i64,
         t_start: i64,
         t_end: i64,
         agg: AggFn,
-        file_cache: &mut HashMap<PathBuf, Arc<Vec<u8>>>,
+        file_cache: &DashMap<PathBuf, Arc<Vec<u8>>>,
     ) -> EngineResult<Option<f64>> {
         let pk = PartitionKey { series_id };
 
@@ -2153,8 +2147,8 @@ impl Engine {
         t_start: i64,
         t_end: i64,
     ) -> Result<Vec<(i64, f64)>, String> {
-        let mut file_cache: HashMap<PathBuf, Arc<Vec<u8>>> = HashMap::new();
-        self.read_chunk_data_cached(meta, t_start, t_end, &mut file_cache)
+        let file_cache: DashMap<PathBuf, Arc<Vec<u8>>> = DashMap::new();
+        self.read_chunk_data_cached(meta, t_start, t_end, &file_cache)
     }
 
     fn read_chunk_data_cached(
@@ -2162,31 +2156,35 @@ impl Engine {
         meta: &ChunkMeta,
         t_start: i64,
         t_end: i64,
-        per_query_cache: &mut HashMap<PathBuf, Arc<Vec<u8>>>,
+        per_query_cache: &DashMap<PathBuf, Arc<Vec<u8>>>,
     ) -> Result<Vec<(i64, f64)>, String> {
-        let data: Arc<Vec<u8>> = if let Some(d) = per_query_cache.get(&meta.path) {
-            Arc::clone(d)
-        } else if let Some(entry) = self.file_cache.get(&meta.path) {
-            if entry.0.elapsed() < FILE_CACHE_TTL {
-                Arc::clone(&entry.1)
-            } else {
-                drop(entry);
-                self.file_cache.remove(&meta.path);
-                let data: Arc<Vec<u8>> = Arc::new(fs::read(&meta.path).map_err(|e| e.to_string())?);
-                self.file_cache
-                    .insert(meta.path.clone(), (Instant::now(), Arc::clone(&data)));
+        let data: Arc<Vec<u8>> = match per_query_cache.entry(meta.path.clone()) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
+                let data = if let Some(cached) = self.file_cache.get(&meta.path) {
+                    if cached.0.elapsed() < FILE_CACHE_TTL {
+                        Arc::clone(&cached.1)
+                    } else {
+                        drop(cached);
+                        self.file_cache.remove(&meta.path);
+                        let data: Arc<Vec<u8>> =
+                            Arc::new(fs::read(&meta.path).map_err(|e| e.to_string())?);
+                        self.file_cache
+                            .insert(meta.path.clone(), (Instant::now(), Arc::clone(&data)));
+                        data
+                    }
+                } else {
+                    let data: Arc<Vec<u8>> =
+                        Arc::new(fs::read(&meta.path).map_err(|e| e.to_string())?);
+                    self.file_cache
+                        .insert(meta.path.clone(), (Instant::now(), Arc::clone(&data)));
+                    data
+                };
+
+                entry.insert(Arc::clone(&data));
                 data
             }
-        } else {
-            let data: Arc<Vec<u8>> = Arc::new(fs::read(&meta.path).map_err(|e| e.to_string())?);
-            self.file_cache
-                .insert(meta.path.clone(), (Instant::now(), Arc::clone(&data)));
-            data
         };
-
-        per_query_cache
-            .entry(meta.path.clone())
-            .or_insert_with(|| Arc::clone(&data));
 
         let (ts_data, val_data) = if meta.data_offset > 0 {
             Self::parse_partition_data(&data, meta.data_offset as usize)?
@@ -3408,7 +3406,7 @@ fn engine_shutdown(resource: ResourceArc<EngineResource>) -> Result<Atom, String
 
 /// Query range for all series matching metric + labels.
 /// Returns [{%{label => value}, [{ts, val}]}]
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn engine_query_range(
     resource: ResourceArc<EngineResource>,
     metric: String,
@@ -3431,7 +3429,7 @@ fn engine_query_range(
 
 /// Aggregate query for all series matching metric + labels.
 /// Returns [{%{label => value}, value}]
-#[rustler::nif(schedule = "DirtyCpu")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn engine_query_aggregate(
     resource: ResourceArc<EngineResource>,
     metric: String,

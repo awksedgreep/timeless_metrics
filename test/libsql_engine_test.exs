@@ -78,6 +78,60 @@ defmodule TimelessMetrics.LibsqlEngineTest do
              TimelessMetrics.label_values(@store, "cpu", "host")
   end
 
+  test "batch series resolution uses one writer request and caches every identity" do
+    pairs = [
+      {"batch_resolve", %{"host" => "a"}},
+      {"batch_resolve", %{"host" => "b"}},
+      {"batch_resolve", %{"host" => "a"}}
+    ]
+
+    assert {:ok, resolved} = TimelessMetrics.LibsqlEngine.resolve_series_batch(@store, pairs)
+    assert map_size(resolved) == 2
+
+    assert {:ok, ^resolved} = TimelessMetrics.LibsqlEngine.resolve_series_batch(@store, pairs)
+  end
+
+  test "multi-metric raw queries share one batched reader request" do
+    assert :ok =
+             TimelessMetrics.write_batch(@store, [
+               {"cpu_batch", %{"host" => "a"}, 1.0, 10},
+               {"memory_batch", %{"host" => "a"}, 2.0, 11},
+               {"ignored_batch", %{"host" => "b"}, 3.0, 12}
+             ])
+
+    assert {:ok, results} =
+             TimelessMetrics.query_multi_metrics(
+               @store,
+               ["cpu_batch", "memory_batch"],
+               %{"host" => "a"},
+               from: 0,
+               to: 20
+             )
+
+    assert Map.new(results, &{&1.metric, &1.points}) == %{
+             "cpu_batch" => [{10, 1.0}],
+             "memory_batch" => [{11, 2.0}]
+           }
+  end
+
+  test "sorted point batches use a k-way merge and retain duplicate timestamps" do
+    assert [{1, 1.0}, {2, 2.0}, {2, 20.0}, {3, 3.0}, {4, 4.0}] ==
+             TimelessMetrics.LibsqlEngine.merge_sorted_points([
+               [{1, 1.0}, {2, 2.0}, {4, 4.0}],
+               [{2, 20.0}, {3, 3.0}],
+               []
+             ])
+  end
+
+  test "label cache lookup returns :miss instead of raising" do
+    cache = :ets.new(:label_cache_miss_test, [:set])
+    assert :miss = TimelessMetrics.LibsqlEngine.lookup_cached_labels(cache, 42)
+    :ets.insert(cache, {{:series_labels, 42}, %{"host" => "a"}})
+
+    assert {:ok, %{"host" => "a"}} =
+             TimelessMetrics.LibsqlEngine.lookup_cached_labels(cache, 42)
+  end
+
   test "matcher and discovery pushdown stays differential with Elixir semantics" do
     labels = [
       %{"host" => "web-1", "env" => "prod", "code" => "a"},

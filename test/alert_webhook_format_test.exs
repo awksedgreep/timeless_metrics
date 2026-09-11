@@ -6,7 +6,7 @@ defmodule TimelessMetrics.AlertWebhookFormatTest do
   entire envelope becomes the message text, so alerts arrive as an unreadable
   blob with no title or priority. These tests pin the translation that avoids it.
   """
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias TimelessMetrics.Alert
 
@@ -102,6 +102,30 @@ defmodule TimelessMetrics.AlertWebhookFormatTest do
 
     test "drops any query string" do
       assert {"https://ntfy.sh/", "t"} = Alert.split_ntfy_url("https://ntfy.sh/t?foo=bar")
+    end
+  end
+
+  describe "webhook URL validation" do
+    test "blocks loopback and private targets by default" do
+      assert {:error, _} = Alert.validate_webhook_url("http://127.0.0.1/hook")
+      assert {:error, _} = Alert.validate_webhook_url("http://10.0.0.1/hook")
+      assert {:error, _} = Alert.validate_webhook_url("http://[::1]/hook")
+      assert {:error, _} = Alert.validate_webhook_url("http://[::ffff:127.0.0.1]/hook")
+    end
+
+    test "allows an explicit private-network override" do
+      previous = Application.get_env(:timeless_metrics, :webhook_allow_private)
+      Application.put_env(:timeless_metrics, :webhook_allow_private, true)
+
+      on_exit(fn ->
+        if previous == nil do
+          Application.delete_env(:timeless_metrics, :webhook_allow_private)
+        else
+          Application.put_env(:timeless_metrics, :webhook_allow_private, previous)
+        end
+      end)
+
+      assert :ok = Alert.validate_webhook_url("http://127.0.0.1/hook")
     end
   end
 end

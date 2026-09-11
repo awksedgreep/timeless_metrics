@@ -13,6 +13,7 @@ defmodule TimelessMetrics.LibsqlEngine do
   require Logger
 
   @table "metric_samples"
+  @multi_metric_query_batch_size 100
   @flush_interval :timer.seconds(10)
   @ingest_transaction_ms 5
   @ingest_transaction_max 256
@@ -175,7 +176,7 @@ defmodule TimelessMetrics.LibsqlEngine do
       [] ->
         labels_json = encode_json(labels)
 
-        case GenServer.call(writer_name(store), {:resolve, metric, labels_json}, :infinity) do
+        case TimelessMetrics.Call.write(writer_name(store), {:resolve, metric, labels_json}) do
           {:ok, [[sid]]} ->
             true = cache_series(cache, key, sid)
             {:ok, sid}
@@ -190,14 +191,43 @@ defmodule TimelessMetrics.LibsqlEngine do
   end
 
   def resolve_series_batch(store, pairs) do
-    pairs
-    |> Enum.uniq()
-    |> Enum.reduce_while({:ok, %{}}, fn {metric, labels} = key, {:ok, acc} ->
-      case resolve_series(store, metric, labels) do
-        {:ok, sid} -> {:cont, {:ok, Map.put(acc, key, sid)}}
-        {:error, _} = error -> {:halt, error}
-      end
-    end)
+    cache = cache_ref(store)
+    keys = pairs |> Enum.map(fn {metric, labels} -> {metric, Map.new(labels)} end) |> Enum.uniq()
+
+    {resolved, missing} =
+      Enum.reduce(keys, {%{}, []}, fn key, {found, missing} ->
+        case :ets.lookup(cache, key) do
+          [{^key, sid}] -> {Map.put(found, key, sid), missing}
+          [] -> {found, [key | missing]}
+        end
+      end)
+
+    case missing do
+      [] ->
+        {:ok, resolved}
+
+      missing ->
+        request =
+          Enum.map(Enum.reverse(missing), fn {metric, labels} -> {metric, encode_json(labels)} end)
+
+        case TimelessMetrics.Call.write(writer_name(store), {:resolve_batch, request}) do
+          {:ok, ids} when length(ids) == length(request) ->
+            newly_resolved =
+              Enum.zip(Enum.reverse(missing), ids)
+              |> Map.new(fn {key, sid} ->
+                true = cache_series(cache, key, sid)
+                {key, sid}
+              end)
+
+            {:ok, Map.merge(resolved, newly_resolved)}
+
+          {:error, _} = error ->
+            error
+
+          other ->
+            {:error, "series batch resolution returned #{inspect(other)}"}
+        end
+    end
   end
 
   def write_resolved(store, sid, value, timestamp) do
@@ -300,8 +330,8 @@ defmodule TimelessMetrics.LibsqlEngine do
 
           multiple ->
             multiple
-            |> Enum.flat_map(&decode_point_batch/1)
-            |> Enum.sort_by(&elem(&1, 0))
+            |> Enum.map(&decode_point_batch/1)
+            |> merge_sorted_points()
         end
 
       {:ok, points}
@@ -313,6 +343,91 @@ defmodule TimelessMetrics.LibsqlEngine do
     to = Keyword.get(opts, :to, System.os_time(:second))
 
     raw_frame_series(store, metric, label_filter, from, to)
+  end
+
+  def query_multi_metrics(store, metrics, label_filter, opts) do
+    from = Keyword.get(opts, :from, 0)
+    to = Keyword.get(opts, :to, System.os_time(:second))
+
+    case TimelessMetrics.LabelMatch.split_libsql_pushdown(label_filter) do
+      :none ->
+        {:ok, []}
+
+      {pushdown, residual} ->
+        encoded_filter = encode_json(pushdown)
+
+        metrics
+        |> Enum.uniq()
+        |> Enum.chunk_every(@multi_metric_query_batch_size)
+        |> Enum.reduce_while({:ok, []}, fn batch, {:ok, acc} ->
+          case query_multi_metric_batch(store, batch, encoded_filter, residual, from, to) do
+            {:ok, series} -> {:cont, {:ok, :lists.reverse(series, acc)}}
+            {:error, _} = error -> {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+          {:error, _} = error -> error
+        end
+    end
+  end
+
+  defp query_multi_metric_batch(_store, [], _filter, _residual, _from, _to), do: {:ok, []}
+
+  defp query_multi_metric_batch(store, metrics, encoded_filter, residual, from, to) do
+    sql =
+      metrics
+      |> Enum.with_index()
+      |> Enum.map_join(" UNION ALL ", fn {_metric, index} ->
+        offset = index * 4
+
+        "SELECT ?#{offset + 1} AS metric, frame " <>
+          "FROM timeless_raw_frame('#{@table}', ?#{offset + 1}, ?#{offset + 2}, " <>
+          "?#{offset + 3}, ?#{offset + 4})"
+      end)
+
+    params = Enum.flat_map(metrics, &[&1, encoded_filter, from, to])
+
+    with {:ok, rows} <- read_sql(store, sql, params) do
+      decode_multi_metric_frames(store, rows, residual)
+    end
+  end
+
+  defp decode_multi_metric_frames(store, rows, residual) do
+    compiled = if residual == [], do: nil, else: TimelessMetrics.LabelMatch.compile(residual)
+
+    rows
+    |> Enum.reduce_while({:ok, []}, fn
+      [metric, frame], {:ok, acc} when is_binary(metric) and is_binary(frame) ->
+        frame_rows = [[frame]]
+
+        with :ok <- ensure_cached_labels(store, metric, frame_rows),
+             {:ok, series} <- decode_raw_frame_rows(store, frame_rows) do
+          tagged =
+            series
+            |> maybe_filter_raw_series(compiled)
+            |> Enum.map(&Map.put(&1, :metric, metric))
+
+          {:cont, {:ok, :lists.reverse(tagged, acc)}}
+        else
+          {:error, _} = error -> {:halt, error}
+        end
+
+      row, _acc ->
+        {:halt, {:error, "timeless_raw_frame returned a malformed row: #{inspect(row)}"}}
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp maybe_filter_raw_series(series, nil), do: series
+
+  defp maybe_filter_raw_series(series, compiled) do
+    Enum.filter(series, fn %{labels: labels} ->
+      TimelessMetrics.LabelMatch.match?(labels, compiled)
+    end)
   end
 
   def query_aggregate(store, metric, labels, opts) do
@@ -589,7 +704,14 @@ defmodule TimelessMetrics.LibsqlEngine do
     data_dir = Keyword.fetch!(opts, :data_dir)
     schema = Keyword.fetch!(opts, :schema)
     reject_unmigrated_rust_store!(store, data_dir)
-    conn = open_connection(Path.join(data_dir, "metrics.db"), Keyword.get(opts, :extension_path))
+
+    conn =
+      open_connection(
+        Path.join(data_dir, "metrics.db"),
+        Keyword.get(opts, :extension_path),
+        Keyword.get(opts, :busy_timeout, 5_000)
+      )
+
     verify_capabilities!(conn)
     create_table(conn, schema)
     {:ok, insert_stmt} = Exqlite.Sqlite3.prepare(conn, insert_command_sql())
@@ -605,7 +727,10 @@ defmodule TimelessMetrics.LibsqlEngine do
 
     :persistent_term.put({__MODULE__, store, :series_cache}, cache)
     :persistent_term.put({__MODULE__, store, :query_frame_features}, query_frame_features)
-    schedule_flush()
+    ingest_pending = :atomics.new(1, signed: false)
+    :persistent_term.put({__MODULE__, store, :ingest_pending}, ingest_pending)
+    flush_interval = Keyword.get(opts, :flush_interval, @flush_interval)
+    schedule_flush(flush_interval)
 
     # maintenance: false is the staging profile (release migration): no
     # periodic compact and, above all, no wall-clock retention prune. A
@@ -626,6 +751,11 @@ defmodule TimelessMetrics.LibsqlEngine do
        insert_stmt: insert_stmt,
        cache: cache,
        query_frame_features: query_frame_features,
+       ingest_pending: ingest_pending,
+       flush_interval: flush_interval,
+       ingest_transaction_ms: Keyword.get(opts, :ingest_transaction_ms, @ingest_transaction_ms),
+       ingest_transaction_max:
+         Keyword.get(opts, :ingest_transaction_max, @ingest_transaction_max),
        ingest_count: 0,
        ingest_timer: nil,
        ingest_token: nil,
@@ -827,7 +957,7 @@ defmodule TimelessMetrics.LibsqlEngine do
           {:ok, _} = result ->
             state = %{state | ingest_count: state.ingest_count + 1}
 
-            if state.ingest_count >= @ingest_transaction_max do
+            if state.ingest_count >= state.ingest_transaction_max do
               case finish_ingest_transaction(state) do
                 {:ok, state} -> {:reply, result, state}
                 {{:error, _} = error, state} -> {:reply, error, state}
@@ -872,10 +1002,49 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
   end
 
+  def handle_call({:resolve_batch, entries}, _from, state) do
+    with {:ok, state} <- finish_ingest_transaction(state),
+         {:ok, _} <- safe_execute(state.conn, "BEGIN IMMEDIATE", []) do
+      result =
+        Enum.reduce_while(entries, {:ok, []}, fn {metric, labels_json}, {:ok, ids} ->
+          with {:ok, _} <-
+                 safe_execute(
+                   state.conn,
+                   "INSERT INTO #{@table}(#{@table}, name, labels) VALUES ('resolve', ?1, ?2)",
+                   [metric, labels_json]
+                 ),
+               {:ok, [[sid]]} <- safe_execute(state.conn, "SELECT last_insert_rowid()", []) do
+            {:cont, {:ok, [sid | ids]}}
+          else
+            {:error, _} = error -> {:halt, error}
+          end
+        end)
+
+      case result do
+        {:ok, ids} ->
+          case safe_execute(state.conn, "COMMIT", []) do
+            {:ok, _} ->
+              {:reply, {:ok, Enum.reverse(ids)}, state}
+
+            {:error, _} = error ->
+              _ = safe_execute(state.conn, "ROLLBACK", [])
+              {:reply, error, state}
+          end
+
+        {:error, _} = error ->
+          _ = safe_execute(state.conn, "ROLLBACK", [])
+          {:reply, error, state}
+      end
+    else
+      {{:error, _} = error, state} -> {:reply, error, state}
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
   @impl true
   def handle_info(:flush, state) do
     state = finish_and_run_command(state, "flush")
-    schedule_flush()
+    schedule_flush(state.flush_interval)
     {:noreply, state}
   end
 
@@ -914,6 +1083,7 @@ defmodule TimelessMetrics.LibsqlEngine do
     Exqlite.Sqlite3.close(state.conn)
     :persistent_term.erase({__MODULE__, state.store, :series_cache})
     :persistent_term.erase({__MODULE__, state.store, :query_frame_features})
+    :persistent_term.erase({__MODULE__, state.store, :ingest_pending})
     :ets.delete(state.cache)
     :ok
   end
@@ -960,14 +1130,20 @@ defmodule TimelessMetrics.LibsqlEngine do
   def open_connection(db_path), do: open_connection(db_path, extension_path())
   def open_connection(db_path, nil), do: open_connection(db_path)
 
-  def open_connection(db_path, extension_path) do
+  def open_connection(db_path, extension_path),
+    do: open_connection(db_path, extension_path, 5_000)
+
+  def open_connection(db_path, nil, busy_timeout),
+    do: open_connection(db_path, extension_path(), busy_timeout)
+
+  def open_connection(db_path, extension_path, busy_timeout) do
     {:ok, conn} = Exqlite.Sqlite3.open(db_path)
 
     for sql <- [
           "PRAGMA mmap_size = 2147483648",
           "PRAGMA cache_size = -128000",
           "PRAGMA temp_store = MEMORY",
-          "PRAGMA busy_timeout = 5000"
+          "PRAGMA busy_timeout = #{busy_timeout}"
         ] do
       {:ok, _} = TimelessMetrics.DB.execute(conn, sql, [])
     end
@@ -1390,7 +1566,7 @@ defmodule TimelessMetrics.LibsqlEngine do
     with :ok <- read_barrier(store) do
       result =
         if target = select_reader(store) do
-          GenServer.call(target, request, :infinity)
+          TimelessMetrics.Call.read(target, request)
         else
           write_sql(store, fallback_sql, params)
         end
@@ -1398,7 +1574,7 @@ defmodule TimelessMetrics.LibsqlEngine do
       case result do
         {:error, message} when attempts > 1 ->
           if retriable_read_gate?(message) do
-            Process.sleep(@read_gate_sleep_ms)
+            Process.sleep(@read_gate_sleep_ms + :rand.uniform(@read_gate_sleep_ms))
             barriered_read(store, request, fallback_sql, params, attempts - 1)
           else
             result
@@ -1410,10 +1586,11 @@ defmodule TimelessMetrics.LibsqlEngine do
     end
   end
 
-  defp retriable_read_gate?(message) when is_binary(message),
-    do: String.contains?(message, "blocked by a pending writer transaction")
-
-  defp retriable_read_gate?(_), do: false
+  defp retriable_read_gate?(reason) do
+    reason
+    |> inspect()
+    |> String.contains?("blocked by a pending writer transaction")
+  end
 
   defp read_sql(store, sql, params \\ []),
     do: barriered_read(store, {:sql, sql, params}, sql, params)
@@ -1452,7 +1629,15 @@ defmodule TimelessMetrics.LibsqlEngine do
     do: barriered_read(store, {:rollup_batches, params}, rollup_batches_sql(), params)
 
   defp read_barrier(store) do
-    GenServer.call(writer_name(store), :read_barrier, :infinity)
+    case :persistent_term.get({__MODULE__, store, :ingest_pending}, nil) do
+      nil ->
+        TimelessMetrics.Call.write(writer_name(store), :read_barrier)
+
+      ref ->
+        if :atomics.get(ref, 1) == 0,
+          do: :ok,
+          else: TimelessMetrics.Call.write(writer_name(store), :read_barrier)
+    end
   end
 
   # Keep one caller on one prepared-statement connection so repeated query
@@ -1468,15 +1653,15 @@ defmodule TimelessMetrics.LibsqlEngine do
   end
 
   defp write_sql(store, sql, params) do
-    GenServer.call(writer_name(store), {:sql, sql, params}, :infinity)
+    TimelessMetrics.Call.write(writer_name(store), {:sql, sql, params})
   end
 
   defp insert_value(store, value) do
-    GenServer.call(writer_name(store), {:insert, value}, :infinity)
+    TimelessMetrics.Call.write(writer_name(store), {:insert, value})
   end
 
   defp command(store, command) do
-    case GenServer.call(writer_name(store), {:command, command}, :infinity) do
+    case TimelessMetrics.Call.maintenance(writer_name(store), {:command, command}) do
       {:ok, _} -> :ok
       {:error, _} = error -> error
     end
@@ -1508,8 +1693,9 @@ defmodule TimelessMetrics.LibsqlEngine do
   defp ensure_ingest_transaction(%{ingest_count: 0} = state) do
     case safe_execute(state.conn, "BEGIN IMMEDIATE", []) do
       {:ok, _} ->
+        :atomics.put(state.ingest_pending, 1, 1)
         token = make_ref()
-        timer = Process.send_after(self(), {:commit_ingest, token}, @ingest_transaction_ms)
+        timer = Process.send_after(self(), {:commit_ingest, token}, state.ingest_transaction_ms)
         {:ok, %{state | ingest_timer: timer, ingest_token: token}}
 
       {:error, _} = error ->
@@ -1541,6 +1727,8 @@ defmodule TimelessMetrics.LibsqlEngine do
   end
 
   defp clear_ingest_transaction(state) do
+    :atomics.put(state.ingest_pending, 1, 0)
+
     %{state | ingest_count: 0, ingest_timer: nil, ingest_token: nil}
   end
 
@@ -1574,11 +1762,11 @@ defmodule TimelessMetrics.LibsqlEngine do
   defp cache_ref(store) do
     case :persistent_term.get({__MODULE__, store, :series_cache}, nil) do
       nil ->
-        GenServer.call(writer_name(store), :cache_ref, :infinity)
+        TimelessMetrics.Call.read(writer_name(store), :cache_ref)
 
       cache ->
         if :ets.info(cache) == :undefined do
-          GenServer.call(writer_name(store), :cache_ref, :infinity)
+          TimelessMetrics.Call.read(writer_name(store), :cache_ref)
         else
           cache
         end
@@ -1676,10 +1864,21 @@ defmodule TimelessMetrics.LibsqlEngine do
     :ets.insert(cache, {{:series_labels, sid}, Map.new(labels)})
   end
 
-  defp cached_labels_by_sid(cache, sid) do
+  @doc false
+  def lookup_cached_labels(cache, sid) do
     key = {:series_labels, sid}
-    [{^key, labels}] = :ets.lookup(cache, key)
-    labels
+
+    case :ets.lookup(cache, key) do
+      [{^key, labels}] -> {:ok, labels}
+      [] -> :miss
+    end
+  end
+
+  defp cached_labels_by_sid(cache, sid) do
+    case lookup_cached_labels(cache, sid) do
+      {:ok, labels} -> labels
+      :miss -> %{}
+    end
   end
 
   defp ensure_cached_labels(_store, _metric, []), do: :ok
@@ -1709,14 +1908,30 @@ defmodule TimelessMetrics.LibsqlEngine do
 
   @doc false
   def encode_named_batch(entries) do
-    {series, index_by_key} =
-      entries
-      |> Enum.map(fn {metric, labels, _ts, _value} -> {metric, Map.new(labels)} end)
-      |> Enum.uniq()
-      |> Enum.with_index()
-      |> then(fn indexed -> {Enum.map(indexed, &elem(&1, 0)), Map.new(indexed)} end)
+    {series, _index_by_key, series_count, indexes, timestamps, values} =
+      Enum.reduce(entries, {[], %{}, 0, [], [], []}, fn
+        {metric, labels, ts, value},
+        {series, index_by_key, next_index, indexes, timestamps, values} ->
+          labels = if is_map(labels), do: labels, else: Map.new(labels)
+          key = {metric, labels}
 
-    header = <<0x01, 0, 0::little-16, length(series)::little-32, length(entries)::little-32>>
+          {index, series, index_by_key, next_index} =
+            case Map.fetch(index_by_key, key) do
+              {:ok, index} ->
+                {index, series, index_by_key, next_index}
+
+              :error ->
+                {next_index, [key | series], Map.put(index_by_key, key, next_index),
+                 next_index + 1}
+            end
+
+          {series, index_by_key, next_index, [<<index::little-32>> | indexes],
+           [<<ts::signed-little-64>> | timestamps], [<<value * 1.0::float-little-64>> | values]}
+      end)
+
+    series = Enum.reverse(series)
+
+    header = <<0x01, 0, 0::little-16, series_count::little-32, length(entries)::little-32>>
 
     series_table =
       Enum.map(series, fn {metric, labels} ->
@@ -1730,18 +1945,48 @@ defmodule TimelessMetrics.LibsqlEngine do
         ]
       end)
 
-    indexes =
-      Enum.map(entries, fn {metric, labels, _ts, _value} ->
-        <<Map.fetch!(index_by_key, {metric, Map.new(labels)})::little-32>>
+    IO.iodata_to_binary([
+      header,
+      series_table,
+      Enum.reverse(indexes),
+      Enum.reverse(timestamps),
+      Enum.reverse(values)
+    ])
+  end
+
+  @doc false
+  def merge_sorted_points(point_lists) do
+    queue =
+      point_lists
+      |> Enum.with_index()
+      |> Enum.reduce(:gb_sets.empty(), fn
+        {[{timestamp, value} | rest], stream}, queue ->
+          :gb_sets.add({timestamp, stream, value, rest}, queue)
+
+        {[], _stream}, queue ->
+          queue
       end)
 
-    timestamps =
-      Enum.map(entries, fn {_metric, _labels, ts, _value} -> <<ts::signed-little-64>> end)
+    do_merge_sorted_points(queue, [])
+  end
 
-    values =
-      Enum.map(entries, fn {_metric, _labels, _ts, value} -> <<value * 1.0::float-little-64>> end)
+  defp do_merge_sorted_points(queue, acc) do
+    if :gb_sets.is_empty(queue) do
+      Enum.reverse(acc)
+    else
+      {{timestamp, stream, value, rest}, queue} = :gb_sets.take_smallest(queue)
 
-    IO.iodata_to_binary([header, series_table, indexes, timestamps, values])
+      queue =
+        case rest do
+          [{next_timestamp, next_value} | tail] ->
+            :gb_sets.add({next_timestamp, stream, next_value, tail}, queue)
+
+          [] ->
+            queue
+        end
+
+      do_merge_sorted_points(queue, [{timestamp, value} | acc])
+    end
   end
 
   defp encode_resolved_batch(entries) do
@@ -1968,7 +2213,7 @@ defmodule TimelessMetrics.LibsqlEngine do
     |> Enum.sort_by(&elem(&1, 0))
   end
 
-  defp schedule_flush, do: Process.send_after(self(), :flush, @flush_interval)
+  defp schedule_flush(interval), do: Process.send_after(self(), :flush, interval)
   defp schedule_compact(interval), do: Process.send_after(self(), :compact, interval)
   defp schedule_retention(interval), do: Process.send_after(self(), :retention, interval)
 end
@@ -1977,7 +2222,7 @@ defmodule TimelessMetrics.LibsqlEngine.Reader do
   @moduledoc false
   use GenServer
 
-  @read_conflict_attempts 1_000
+  @read_conflict_attempts 100
   @read_conflict_sleep_ms 5
 
   def start_link(opts) do
@@ -1991,7 +2236,8 @@ defmodule TimelessMetrics.LibsqlEngine.Reader do
     conn =
       TimelessMetrics.LibsqlEngine.open_connection(
         Path.join(data_dir, "metrics.db"),
-        Keyword.get(opts, :extension_path)
+        Keyword.get(opts, :extension_path),
+        Keyword.get(opts, :busy_timeout, 5_000)
       )
 
     query_frame_features = TimelessMetrics.LibsqlEngine.detect_query_frame_features(conn)
@@ -2190,7 +2436,7 @@ defmodule TimelessMetrics.LibsqlEngine.Reader do
     case operation.() do
       {:error, reason} = error ->
         if read_conflict?(reason) do
-          Process.sleep(@read_conflict_sleep_ms)
+          Process.sleep(@read_conflict_sleep_ms + :rand.uniform(@read_conflict_sleep_ms))
           retry_read_conflict(operation, attempts - 1)
         else
           error

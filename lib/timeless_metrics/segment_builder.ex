@@ -45,17 +45,17 @@ defmodule TimelessMetrics.SegmentBuilder do
 
   @doc "Synchronous ingest. Used during shutdown to ensure data is received before termination."
   def ingest_sync(builder, grouped_points) do
-    GenServer.call(builder, {:ingest, grouped_points}, :infinity)
+    TimelessMetrics.Call.write(builder, {:ingest, grouped_points})
   end
 
   @doc "Force flush all open segments to disk."
   def flush(builder) do
-    GenServer.call(builder, :flush, :infinity)
+    TimelessMetrics.Call.maintenance(builder, :flush)
   end
 
   @doc "Get the count of points held in memory (not yet in a finalized segment)."
   def pending_point_count(builder) do
-    GenServer.call(builder, :pending_point_count, :infinity)
+    TimelessMetrics.Call.read(builder, :pending_point_count)
   end
 
   # --- Raw segment APIs (Phase 1: file-based storage) ---
@@ -140,7 +140,7 @@ defmodule TimelessMetrics.SegmentBuilder do
   Delete raw segments with end_time before cutoff. Goes through GenServer.
   """
   def delete_raw_before(builder_name, cutoff) do
-    GenServer.call(builder_name, {:delete_raw_before, cutoff}, :infinity)
+    TimelessMetrics.Call.maintenance(builder_name, {:delete_raw_before, cutoff})
   end
 
   @doc """
@@ -231,14 +231,14 @@ defmodule TimelessMetrics.SegmentBuilder do
   entries = [{series_id, chunk_start, chunk_end, bucket_count, blob}, ...]
   """
   def write_tier_batch(builder_name, tier_name, entries) do
-    GenServer.call(builder_name, {:write_tier_batch, tier_name, entries}, :infinity)
+    TimelessMetrics.Call.maintenance(builder_name, {:write_tier_batch, tier_name, entries})
   end
 
   @doc """
   Delete tier chunks where chunk_end < cutoff. Goes through GenServer.
   """
   def delete_tier_before(builder_name, tier_name, cutoff) do
-    GenServer.call(builder_name, {:delete_tier_before, tier_name, cutoff}, :infinity)
+    TimelessMetrics.Call.maintenance(builder_name, {:delete_tier_before, tier_name, cutoff})
   end
 
   # --- Watermark APIs (Phase 3: binary file + ETS) ---
@@ -257,7 +257,7 @@ defmodule TimelessMetrics.SegmentBuilder do
   Write a watermark value for a tier. Goes through GenServer.
   """
   def write_watermark(builder_name, tier_name, value) do
-    GenServer.call(builder_name, {:write_watermark, tier_name, value}, :infinity)
+    TimelessMetrics.Call.write(builder_name, {:write_watermark, tier_name, value})
   end
 
   # --- Compaction APIs (Phase 4) ---
@@ -282,7 +282,7 @@ defmodule TimelessMetrics.SegmentBuilder do
   Returns `{:ok, reclaimed_bytes}` or `:noop`.
   """
   def compact_tier(builder_name, tier_name, opts \\ []) do
-    GenServer.call(builder_name, {:compact_tier, tier_name, opts}, :infinity)
+    TimelessMetrics.Call.maintenance(builder_name, {:compact_tier, tier_name, opts})
   end
 
   # --- Server ---
@@ -436,11 +436,14 @@ defmodule TimelessMetrics.SegmentBuilder do
     # Stage 2: drain ETS buffer → fast compress (term_to_binary + zstd 1) → WAL + cache
     shard_name = :"#{state.store}_shard_#{state.shard_id}"
 
-    try do
-      GenServer.call(shard_name, :flush_sync, 5_000)
-    catch
-      :exit, _ -> :ok
-    end
+    state =
+      case TimelessMetrics.Call.write(shard_name, :drain_points) do
+        {:ok, grouped_points} when map_size(grouped_points) > 0 ->
+          %{state | segments: ingest_into_segments(grouped_points, state)}
+
+        _ ->
+          state
+      end
 
     # Fast-compress any accumulated in-memory segments
     all_segments = Map.values(state.segments)
@@ -571,6 +574,8 @@ defmodule TimelessMetrics.SegmentBuilder do
   end
 
   # Stage 3: read fast-compressed segments from cache, decompress, recompress with ALP
+  # The term is produced by term_to_binary in this module and decoded with [:safe].
+  # sobelow_skip ["Misc.BinToTerm"]
   defp promote_to_alp(state) do
     now = System.os_time(:second)
     current_bucket = segment_bucket(now, state.segment_duration)
@@ -609,7 +614,7 @@ defmodule TimelessMetrics.SegmentBuilder do
           |> Enum.flat_map(fn {_key, _sid, _start, _end, _count,
                                <<@fast_marker, compressed::binary>>} ->
             raw = :ezstd.decompress(compressed)
-            :erlang.binary_to_term(raw)
+            :erlang.binary_to_term(raw, [:safe])
           end)
           |> Enum.sort_by(&elem(&1, 0))
 

@@ -9,6 +9,7 @@ defmodule TimelessMetrics.StorageEngine do
         ingest_prometheus: 2,
         query_raw: 4,
         query_multi: 4,
+        query_multi_metrics: 4,
         query_aggregate: 4,
         query_aggregate_multi: 4,
         latest: 3,

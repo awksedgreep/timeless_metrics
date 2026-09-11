@@ -1,6 +1,7 @@
 _build/
 deps/
 .git/
+native/**/target/
 docs/
 test/
 *.db

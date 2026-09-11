@@ -68,17 +68,54 @@ defmodule TimelessMetrics.HTTP do
 
   def child_spec(opts) do
     store = Keyword.fetch!(opts, :store)
-    port = Keyword.get(opts, :port, 8428)
-    bearer_token = Keyword.get(opts, :bearer_token)
-
-    :persistent_term.put({__MODULE__, :config}, {store, bearer_token})
 
     %{
       id: {__MODULE__, store},
-      start:
-        {Rocket, :start_link, [[port: port, handler: __MODULE__, max_body: @max_body_bytes]]},
+      start: {__MODULE__, :start_link, [opts]},
       type: :supervisor
     }
+  end
+
+  @doc false
+  def start_link(opts) do
+    opts = Keyword.put_new(opts, :max_body, @max_body_bytes)
+    Supervisor.start_link(__MODULE__.Server, opts, name: __MODULE__.Server)
+  end
+
+  # Rocket accepts a module handler and does not pass listener-specific state
+  # to route callbacks. Own that limitation explicitly: a second listener now
+  # returns {:error, {:already_started, pid}} instead of silently replacing the
+  # first listener's store/token in persistent_term.
+  defmodule Server do
+    @moduledoc false
+    use Supervisor
+
+    @impl true
+    def init(opts) do
+      store = Keyword.fetch!(opts, :store)
+      port = Keyword.get(opts, :port, 8428)
+      bearer_token = Keyword.get(opts, :bearer_token)
+      max_body = Keyword.get(opts, :max_body, 10 * 1024 * 1024)
+
+      if bearer_token in [nil, ""] and Mix.env() == :prod do
+        Logger.warning(
+          "TimelessMetrics HTTP is starting without a bearer token; all endpoints except the " <>
+            "documented health check are exposed to the network. Set TIMELESS_BEARER_TOKEN or " <>
+            "the :bearer_token option. TLS and rate limiting must be provided by a reverse proxy."
+        )
+      end
+
+      :persistent_term.put({TimelessMetrics.HTTP, :config}, {store, bearer_token})
+
+      child = %{
+        id: Rocket,
+        start:
+          {Rocket, :start_link, [[port: port, handler: TimelessMetrics.HTTP, max_body: max_body]]},
+        type: :supervisor
+      }
+
+      Supervisor.init([child], strategy: :one_for_one)
+    end
   end
 
   # --- Config access ---
@@ -119,12 +156,8 @@ defmodule TimelessMetrics.HTTP do
         Rocket.Request.get_header(req, "authorization")
 
     case auth do
-      "Bearer " <> token ->
-        String.trim(token)
-
-      _ ->
-        {params, _} = Rocket.Request.query_params(req)
-        params["token"]
+      "Bearer " <> token -> String.trim(token)
+      _ -> nil
     end
   end
 
@@ -383,6 +416,7 @@ defmodule TimelessMetrics.HTTP do
           storage_bytes: info.storage_bytes,
           buffer_points: info.raw_buffer_points,
           bytes_per_point: info.bytes_per_point,
+          timeouts: stats.timeouts,
           promql_rejected: stats.promql_rejected,
           promql_rejections: TimelessMetrics.Stats.promql_rejections(store)
         })
@@ -411,16 +445,27 @@ defmodule TimelessMetrics.HTTP do
               end
           end
 
-        target_dir = parsed_path || default_backup_dir(store)
+        case resolve_http_backup_dir(store, parsed_path) do
+          {:ok, target_dir} ->
+            case TimelessMetrics.backup(store, target_dir) do
+              {:ok, info} ->
+                Logger.info("TimelessMetrics HTTP backup written to #{target_dir}")
 
-        {:ok, info} = TimelessMetrics.backup(store, target_dir)
+                json_resp(req, 200, %{
+                  status: "ok",
+                  path: info.path,
+                  files: info.files,
+                  total_bytes: info.total_bytes
+                })
 
-        json_resp(req, 200, %{
-          status: "ok",
-          path: info.path,
-          files: info.files,
-          total_bytes: info.total_bytes
-        })
+              {:error, reason} ->
+                Logger.error("TimelessMetrics HTTP backup failed: #{inspect(reason)}")
+                json_error(req, 500, "backup failed")
+            end
+
+          {:error, message} ->
+            json_error(req, 400, message)
+        end
     end
   end
 
@@ -451,7 +496,7 @@ defmodule TimelessMetrics.HTTP do
                   timestamps: Enum.map(timestamps, &(&1 * 1000))
                 })
               end)
-              |> Enum.join("\n")
+              |> Enum.intersperse("\n")
 
             Rocket.Response.send_iodata(req, 200, [{"content-type", "application/json"}], body)
 
@@ -515,7 +560,7 @@ defmodule TimelessMetrics.HTTP do
               data =
                 results
                 |> Enum.flat_map(fn %{labels: l, points: pts} ->
-                  case List.last(Enum.sort_by(pts, &elem(&1, 0))) do
+                  case Enum.max_by(pts, &elem(&1, 0), fn -> nil end) do
                     {ts, val} -> [%{labels: l, timestamp: ts, value: val}]
                     nil -> []
                   end
@@ -1939,16 +1984,47 @@ defmodule TimelessMetrics.HTTP do
     Path.join([data_dir, "backups", to_string(System.os_time(:second))])
   end
 
+  defp resolve_http_backup_dir(store, nil), do: {:ok, default_backup_dir(store)}
+
+  defp resolve_http_backup_dir(store, name) do
+    with true <- Path.type(name) == :relative,
+         true <- name not in [".", ".."],
+         true <- Path.basename(name) == name,
+         false <- String.contains?(name, ["/", "\\"]),
+         root <- default_backup_root(store),
+         :ok <- File.mkdir_p(root),
+         :ok <- reject_symlink(root),
+         canonical_root <- Path.expand(root),
+         target <- Path.join(canonical_root, name),
+         :ok <- reject_symlink(target) do
+      {:ok, target}
+    else
+      _ -> {:error, "backup path must be a filename inside data_dir/backups"}
+    end
+  end
+
+  defp default_backup_root(store) do
+    db_path = TimelessMetrics.DB.db_path(:"#{store}_db")
+    Path.join(Path.dirname(db_path), "backups")
+  end
+
+  defp reject_symlink(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :symlink}} -> {:error, :symlink}
+      {:ok, _} -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp parse_theme("dark"), do: :dark
   defp parse_theme("light"), do: :light
   defp parse_theme(_), do: :auto
 
-  defp json_encode!(term), do: term |> nullify() |> :json.encode() |> IO.iodata_to_binary()
+  defp json_encode!(term), do: :json.encode(term, &json_encoder/2)
 
-  defp nullify(nil), do: :null
-  defp nullify(map) when is_map(map), do: Map.new(map, fn {k, v} -> {k, nullify(v)} end)
-  defp nullify(list) when is_list(list), do: Enum.map(list, &nullify/1)
-  defp nullify(other), do: other
+  defp json_encoder(nil, _encode), do: "null"
+  defp json_encoder(value, encode), do: :json.encode_value(value, encode)
 
   defp scalar_html do
     """
@@ -1976,7 +2052,7 @@ defmodule TimelessMetrics.HTTP do
   end
 
   @max_error_samples 3
-  @parallel_parse_threshold 2_000
+  @parallel_parse_threshold_bytes 256 * 1024
 
   defp safe_json_decode(bin) do
     :json.decode(bin)
@@ -1985,15 +2061,17 @@ defmodule TimelessMetrics.HTTP do
   end
 
   defp merge_parse_results(results) do
-    Enum.reduce(results, {%{}, 0, 0, []}, fn {groups, count, errors, samples},
-                                             {acc_groups, acc_count, acc_errors, acc_samples} ->
-      merged =
-        Enum.reduce(groups, acc_groups, fn {key, points}, acc ->
-          Map.update(acc, key, points, &(points ++ &1))
-        end)
+    {entries, errors, samples} =
+      Enum.reduce(results, {[], 0, []}, fn {chunk_entries, chunk_errors, chunk_samples},
+                                           {acc_entries, acc_errors, acc_samples} ->
+        {
+          :lists.reverse(chunk_entries, acc_entries),
+          acc_errors + chunk_errors,
+          :lists.reverse(chunk_samples, acc_samples)
+        }
+      end)
 
-      {merged, acc_count + count, acc_errors + errors, acc_samples ++ samples}
-    end)
+    {Enum.reverse(entries), errors, samples |> Enum.reverse() |> Enum.take(@max_error_samples)}
   end
 
   # --- InfluxDB line protocol parser ---
@@ -2007,7 +2085,7 @@ defmodule TimelessMetrics.HTTP do
     lines = :binary.split(body, <<"\n">>, [:global])
 
     {all_entries, errors, error_samples} =
-      if length(lines) >= @parallel_parse_threshold do
+      if byte_size(body) >= @parallel_parse_threshold_bytes do
         parse_influx_lines_parallel(lines)
       else
         parse_influx_lines_sequential(lines)
@@ -2047,20 +2125,24 @@ defmodule TimelessMetrics.HTTP do
         end
       end)
 
-    {entries, errors, Enum.take(Enum.reverse(samples), @max_error_samples)}
+    {Enum.reverse(entries), errors, Enum.take(Enum.reverse(samples), @max_error_samples)}
   end
 
   defp parse_influx_lines_parallel(lines) do
-    chunk_count = System.schedulers_online()
-
-    chunks =
+    results =
       lines
-      |> Enum.chunk_every(div(length(lines), chunk_count) + 1)
-      |> Enum.map(fn chunk ->
-        Task.async(fn -> parse_influx_lines_sequential(chunk) end)
+      |> Stream.chunk_every(1_000)
+      |> Task.async_stream(&parse_influx_lines_sequential/1,
+        max_concurrency: System.schedulers_online(),
+        timeout: :timer.seconds(30),
+        on_timeout: :kill_task,
+        ordered: true
+      )
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, reason} -> {[], 1, ["parallel parser task failed: #{inspect(reason)}"]}
       end)
 
-    results = Task.await_many(chunks, :timer.seconds(30))
     merge_parse_results(results)
   end
 

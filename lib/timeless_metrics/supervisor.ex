@@ -69,7 +69,7 @@ defmodule TimelessMetrics.Supervisor do
 
     schema =
       case Keyword.get(opts, :schema) do
-        nil -> TimelessMetrics.Schema.default()
+        nil -> default_schema(engine, data_dir)
         mod when is_atom(mod) -> mod.__schema__()
         %TimelessMetrics.Schema{} = s -> s
       end
@@ -179,20 +179,29 @@ defmodule TimelessMetrics.Supervisor do
                      [
                        name: reader_name,
                        data_dir: data_dir,
-                       extension_path: Keyword.get(opts, :extension_path)
+                       extension_path: Keyword.get(opts, :extension_path),
+                       busy_timeout: Keyword.get(opts, :busy_timeout, 5_000)
                      ]
                    ]}
               }
             end)
 
           [
-            {TimelessMetrics.DB, name: db_name, data_dir: data_dir},
+            {TimelessMetrics.DB,
+             name: db_name,
+             data_dir: data_dir,
+             reader_pool_size: reader_count,
+             busy_timeout: Keyword.get(opts, :busy_timeout, 5_000)},
             {TimelessMetrics.LibsqlEngine,
              store: name,
              data_dir: data_dir,
              schema: schema,
              extension_path: Keyword.get(opts, :extension_path),
-             maintenance: Keyword.get(opts, :maintenance, true)}
+             maintenance: Keyword.get(opts, :maintenance, true),
+             flush_interval: Keyword.get(opts, :flush_interval, :timer.seconds(10)),
+             ingest_transaction_ms: Keyword.get(opts, :ingest_transaction_ms, 5),
+             ingest_transaction_max: Keyword.get(opts, :ingest_transaction_max, 256),
+             busy_timeout: Keyword.get(opts, :busy_timeout, 5_000)}
           ] ++ readers
 
         :rust ->
@@ -236,18 +245,21 @@ defmodule TimelessMetrics.Supervisor do
     :persistent_term.put({TimelessMetrics, name, :schema}, schema)
     :persistent_term.put({TimelessMetrics, name, :shard_count}, shard_count)
     :persistent_term.put({TimelessMetrics, name, :data_dir}, data_dir)
+    :persistent_term.put({TimelessMetrics, name, :engine}, :legacy)
 
     TimelessMetrics.Stats.init(name)
 
     # Ingest queue: ETS table for raw HTTP bodies awaiting background processing
     ingest_queue = :"#{name}_ingest_queue"
 
-    :ets.new(ingest_queue, [
-      :named_table,
-      :ordered_set,
-      :public,
-      write_concurrency: :auto
-    ])
+    if :ets.whereis(ingest_queue) == :undefined do
+      :ets.new(ingest_queue, [
+        :named_table,
+        :ordered_set,
+        :public,
+        write_concurrency: :auto
+      ])
+    end
 
     :persistent_term.put({TimelessMetrics, name, :ingest_queue}, ingest_queue)
 
@@ -441,6 +453,29 @@ defmodule TimelessMetrics.Supervisor do
 
     :ok
   end
+
+  # A migrated Rust store did not have a retention policy. Applying the
+  # library's seven-day default after cutover would silently turn a lossless
+  # migration into data loss at the next retention tick. Keep migrated raw
+  # history until the operator supplies an explicit schema.
+  defp default_schema(:libsql, data_dir) do
+    schema = TimelessMetrics.Schema.default()
+
+    if libsql_migration_activated?(data_dir) do
+      require Logger
+
+      Logger.warning(
+        "timeless_metrics: migrated store has no explicit schema; preserving raw history " <>
+          "with raw_retention: :forever. Configure :schema to enable intentional pruning."
+      )
+
+      %{schema | raw_retention_seconds: :forever}
+    else
+      schema
+    end
+  end
+
+  defp default_schema(_engine, _data_dir), do: TimelessMetrics.Schema.default()
 
   # Post-activation, rust_engine/ is deliberately preserved for rollback —
   # detect the activation marker in metrics.db so we convert exactly once.

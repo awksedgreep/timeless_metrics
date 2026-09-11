@@ -81,10 +81,10 @@ The Rust and legacy engines can return additional engine data files.
 ### HTTP API
 
 ```bash
-# Backup to a server-side directory
+# Backup to data_dir/backups/nightly
 curl -X POST http://localhost:8428/api/v1/backup \
   -H 'Content-Type: application/json' \
-  -d '{"path": "/tmp/metrics_backup"}'
+  -d '{"path": "nightly"}'
 
 # Backup to default location (data_dir/backups/timestamp)
 curl -X POST http://localhost:8428/api/v1/backup
@@ -95,7 +95,7 @@ Response:
 ```json
 {
   "status": "ok",
-  "path": "/tmp/metrics_backup",
+  "path": "/data/backups/nightly",
   "files": ["metrics.db"],
   "total_bytes": 24000000
 }

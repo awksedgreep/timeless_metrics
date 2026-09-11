@@ -1,7 +1,18 @@
-# Stage 1: Build
-FROM hexpm/elixir:1.18.3-erlang-27.3-debian-bookworm-20250428 AS build
+# Rust 1.91+ is required by the native dependencies. Keep the toolchain in a
+# throwaway stage so it never reaches the runtime image.
+FROM docker.io/library/rust:1.98-bookworm AS rust-toolchain
 
-RUN apt-get update && apt-get install -y git gcc make libsqlite3-dev libzstd-dev
+# Stage 1: Build
+FROM docker.io/hexpm/elixir:1.20.2-erlang-29.0.2-debian-bookworm-20260623 AS build
+
+RUN apt-get update && apt-get install -y git gcc g++ make libsqlite3-dev libzstd-dev
+
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+ENV PATH="/usr/local/cargo/bin:${PATH}" \
+    CARGO_HOME="/usr/local/cargo" \
+    RUSTUP_HOME="/usr/local/rustup" \
+    TIMELESS_BUILD_FROM_SOURCE="1"
 
 WORKDIR /app
 ENV MIX_ENV=prod
@@ -13,10 +24,12 @@ RUN mix deps.compile
 COPY lib/ lib/
 COPY config/ config/
 COPY rel/ rel/
+COPY Makefile ./
+COPY native/ native/
 RUN mix release
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-0 libzstd1 libncurses6 locales && \
@@ -25,10 +38,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /data && chown 1000:1000 /data
 
 WORKDIR /app
-COPY --from=build /app/_build/prod/rel/timeless ./
+COPY --from=build /app/_build/prod/rel/timeless_metrics ./
 
 USER 1000:1000
 VOLUME /data
 EXPOSE 8428
 
-CMD ["bin/timeless", "start"]
+CMD ["bin/timeless_metrics", "start"]

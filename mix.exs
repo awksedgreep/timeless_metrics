@@ -9,6 +9,7 @@ defmodule TimelessMetrics.MixProject do
       version: @version,
       elixir: "~> 1.18",
       test_ignore_filters: [&String.starts_with?(&1, "test/support/")],
+      test_coverage: [tool: ExCoveralls],
       start_permanent: Mix.env() == :prod,
       compilers: [:elixir_make] ++ Mix.compilers(),
       make_clean: ["clean"],
@@ -21,13 +22,25 @@ defmodule TimelessMetrics.MixProject do
       # A source checkout must not silently restore a released NIF whose
       # exports predate the Rust sources being tested. Hex installs still use
       # the published precompiled artefact.
-      make_force_build: File.exists?(Path.join(__DIR__, ".git")),
+      make_force_build:
+        File.exists?(Path.join(__DIR__, ".git")) or
+          System.get_env("TIMELESS_BUILD_FROM_SOURCE") in ["1", "true"],
       description: "Embedded time series database for Elixir with a Rust-native hot path.",
       source_url: "https://github.com/awksedgreep/timeless_metrics",
       homepage_url: "https://github.com/awksedgreep/timeless_metrics",
       package: package(),
       docs: docs(),
       deps: deps()
+    ]
+  end
+
+  def cli do
+    [
+      preferred_envs: [
+        coveralls: :test,
+        "coveralls.github": :test,
+        "coveralls.html": :test
+      ]
     ]
   end
 
@@ -80,7 +93,10 @@ defmodule TimelessMetrics.MixProject do
       {:elixir_make, "~> 0.9", runtime: false},
       {:cc_precompiler, "~> 0.1", runtime: false},
       {:rustler, "~> 0.35"},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:sobelow, "~> 0.15", only: [:dev, :test], runtime: false},
+      {:excoveralls, "~> 0.18", only: :test, runtime: false}
     ]
   end
 end

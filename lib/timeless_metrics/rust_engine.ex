@@ -177,19 +177,19 @@ defmodule TimelessMetrics.RustEngine do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
 
-    {:ok, results} =
-      Nif.engine_query_range(ref(store), metric_name, labels, from, to)
-      |> normalize_nif_result()
+    with {:ok, results} <-
+           Nif.engine_query_range(ref(store), metric_name, labels, from, to)
+           |> normalize_nif_result() do
+      case results do
+        [{_labels, points}] ->
+          {:ok, points}
 
-    case results do
-      [{_labels, points}] ->
-        {:ok, points}
+        [] ->
+          {:ok, []}
 
-      [] ->
-        {:ok, []}
-
-      multiple ->
-        {:ok, Enum.flat_map(multiple, fn {_, pts} -> pts end) |> Enum.sort_by(&elem(&1, 0))}
+        multiple ->
+          {:ok, Enum.flat_map(multiple, fn {_, pts} -> pts end) |> Enum.sort_by(&elem(&1, 0))}
+      end
     end
   end
 
@@ -197,14 +197,33 @@ defmodule TimelessMetrics.RustEngine do
     from = Keyword.get(opts, :from, 0)
     to = Keyword.get(opts, :to, System.os_time(:second))
 
-    {:ok, results} = query_range_filtered(store, metric_name, label_filter, from, to)
+    with {:ok, results} <- query_range_filtered(store, metric_name, label_filter, from, to) do
+      formatted =
+        results
+        |> Enum.map(fn {labels, points} -> %{labels: labels, points: points} end)
+        |> Enum.reject(fn %{points: pts} -> pts == [] end)
 
-    formatted =
-      results
-      |> Enum.map(fn {labels, points} -> %{labels: labels, points: points} end)
-      |> Enum.reject(fn %{points: pts} -> pts == [] end)
+      {:ok, formatted}
+    end
+  end
 
-    {:ok, formatted}
+  def query_multi_metrics(store, metric_names, label_filter, opts) do
+    metric_names
+    |> Enum.uniq()
+    |> Enum.reduce_while({:ok, []}, fn metric, {:ok, acc} ->
+      case query_multi(store, metric, label_filter, opts) do
+        {:ok, series} ->
+          tagged = Enum.map(series, &Map.put(&1, :metric, metric))
+          {:cont, {:ok, :lists.reverse(tagged, acc)}}
+
+        {:error, _} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _} = error -> error
+    end
   end
 
   @doc """
@@ -215,19 +234,20 @@ defmodule TimelessMetrics.RustEngine do
   """
   def latest_multi(store, metric_name, label_filter) do
     now = System.os_time(:second)
-    {:ok, results} = query_range_filtered(store, metric_name, label_filter, 0, now)
 
-    latest =
-      Enum.flat_map(results, fn
-        {_labels, []} ->
-          []
+    with {:ok, results} <- query_range_filtered(store, metric_name, label_filter, 0, now) do
+      latest =
+        Enum.flat_map(results, fn
+          {_labels, []} ->
+            []
 
-        {labels, points} ->
-          {ts, val} = Enum.max_by(points, &elem(&1, 0))
-          [%{labels: labels, timestamp: ts, value: val}]
-      end)
+          {labels, points} ->
+            {ts, val} = Enum.max_by(points, &elem(&1, 0))
+            [%{labels: labels, timestamp: ts, value: val}]
+        end)
 
-    {:ok, latest}
+      {:ok, latest}
+    end
   end
 
   # The NIF label filter only supports exact string equality. Push the exact
@@ -236,21 +256,21 @@ defmodule TimelessMetrics.RustEngine do
   defp query_range_filtered(store, metric_name, label_filter, from, to) do
     {eq, complex} = TimelessMetrics.LabelMatch.split_pushdown(label_filter)
 
-    {:ok, results} =
-      Nif.engine_query_range(ref(store), metric_name, eq, from, to)
-      |> normalize_nif_result()
+    with {:ok, results} <-
+           Nif.engine_query_range(ref(store), metric_name, eq, from, to)
+           |> normalize_nif_result() do
+      case complex do
+        [] ->
+          {:ok, results}
 
-    case complex do
-      [] ->
-        {:ok, results}
+        _ ->
+          compiled = TimelessMetrics.LabelMatch.compile(complex)
 
-      _ ->
-        compiled = TimelessMetrics.LabelMatch.compile(complex)
-
-        {:ok,
-         Enum.filter(results, fn {labels, _pts} ->
-           TimelessMetrics.LabelMatch.match?(labels, compiled)
-         end)}
+          {:ok,
+           Enum.filter(results, fn {labels, _pts} ->
+             TimelessMetrics.LabelMatch.match?(labels, compiled)
+           end)}
+      end
     end
   end
 
