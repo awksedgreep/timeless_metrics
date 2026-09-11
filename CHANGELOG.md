@@ -1,4 +1,24 @@
 # Changelog
+
+## 6.6.7 (2026-09-11)
+
+**Public operations now have bounded, consistent failure behavior.** Store
+calls return tagged timeout/unavailable errors, SQLite failures are preserved,
+backups fail atomically, and ingestion survives writer restarts without losing
+buffered work. libSQL reads use a pool, series resolution and multi-metric reads
+are batched, and sorted batches use a k-way merge instead of repeated full
+sorts.
+
+**The HTTP and alert surfaces are hardened.** Bearer tokens are accepted only
+in authorization headers, request bodies are capped, backup targets cannot
+escape the managed backup directory, and alert webhooks verify TLS while
+blocking private-network destinations unless explicitly enabled. Runtime
+integer and boolean settings are parsed defensively, and a second global HTTP
+listener is rejected instead of silently stealing the first listener's config.
+
+The bundled timeless-libsql extension moves from v0.7.7 to v0.8.3 and Mix/Rust
+dependencies are refreshed, including ex_openzl 0.4.18.
+
 ## 6.6.6 (2026-08-24)
 
 **The migration candidate no longer runs wall-clock maintenance (#2).** The
