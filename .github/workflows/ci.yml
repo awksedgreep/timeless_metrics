@@ -1,15 +1,16 @@
 name: CI
 
 on:
-  workflow_dispatch:
   push:
-  pull_request:
+    tags:
+      - "**"
 
 permissions:
   contents: read
 
 jobs:
   test:
+    if: startsWith(github.ref, 'refs/tags/')
     name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
     runs-on: ubuntu-latest
 
