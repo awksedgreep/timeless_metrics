@@ -1,5 +1,26 @@
 # Changelog
 
+## 6.6.8 (2026-10-04)
+
+**The bundled timeless-libsql extension moves from v0.8.3 to v0.8.9.** No
+API change here; the SQL surface this package uses is the same. What the
+extension brings:
+
+- Metrics compaction sweeps end, are planned once, and merge small
+  compressed chunks, so a store whose series come and go (processes,
+  containers, jobs) no longer grows chunk counts without bound or keeps a
+  core busy.
+- Retention removes series it has left nothing of, and rollup chunks are
+  merged.
+- Selective metrics reads skip unrelated chunk-index gaps (8× faster with a
+  large catalog), and batch admission and regex-filtered queries are faster.
+- Strict trace time bounds, millisecond log batches, and reserved batch
+  bytes are handled correctly; every virtual-table callback returns a SQL
+  error rather than panicking.
+
+All 531 tests pass against it; timeless_logs and timeless_traces pass
+against the same build.
+
 ## 6.6.7 (2026-09-11)
 
 **Public operations now have bounded, consistent failure behavior.** Store
