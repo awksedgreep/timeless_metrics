@@ -90,7 +90,7 @@ defmodule TimelessMetrics.ReleaseStartup do
   @doc "Return readiness plus durable migration journal progress."
   def stats(data_dir, opts \\ []) do
     root = Path.expand(data_dir)
-    {:ok, detected} = detect(root, opts)
+    {:ok, detected} = detect(root, Keyword.put_new(opts, :integrity_check, false))
 
     progress =
       case detected.state do
@@ -309,8 +309,8 @@ defmodule TimelessMetrics.ReleaseStartup do
         with :ok <- require_sqlite_header(path),
              {:ok, conn} <- Exqlite.Sqlite3.open(path, mode: :readonly) do
           try do
-            with :ok <- load_extension(conn, extension_path(opts)),
-                 {:ok, [["ok"]]} <- execute(conn, "PRAGMA integrity_check"),
+            with :ok <- integrity_check(conn, opts),
+                 :ok <- load_extension(conn, extension_path(opts)),
                  {:ok, target?} <- table_exists?(conn, "metric_samples") do
               if target? do
                 with :ok <- require_signal_vtable(conn),
@@ -416,8 +416,8 @@ defmodule TimelessMetrics.ReleaseStartup do
         with :ok <- require_sqlite_header(path),
              {:ok, conn} <- Exqlite.Sqlite3.open(path, mode: :readonly) do
           try do
-            with :ok <- load_extension(conn, extension_path(opts)),
-                 {:ok, [["ok"]]} <- execute(conn, "PRAGMA integrity_check"),
+            with :ok <- integrity_check(conn, opts),
+                 :ok <- load_extension(conn, extension_path(opts)),
                  :ok <- require_signal_vtable(conn),
                  :ok <- require_schema_version(conn),
                  result <- inspect_role(conn, role) do
@@ -1038,6 +1038,27 @@ defmodule TimelessMetrics.ReleaseStartup do
   defp release_owner(conn) do
     _ = execute(conn, "ROLLBACK")
     Exqlite.Sqlite3.close(conn)
+  end
+
+  # Before the extension is loaded, on purpose. With the module registered
+  # the pragma connects the signal's virtual table, and connecting it opens
+  # the engine: every series and chunk of the store read into memory, to
+  # check pages that the pragma checks the same without it (the virtual
+  # table has no integrity hook of its own; its data is in ordinary shadow
+  # tables). On a 700k-series metrics store that was 12 s against 2.8 s.
+  #
+  # `integrity_check: false` skips it: `stats/2` runs straight after
+  # `prepare/2` checked the same file.
+  defp integrity_check(conn, opts) do
+    if Keyword.get(opts, :integrity_check, true) do
+      case execute(conn, "PRAGMA integrity_check") do
+        {:ok, [["ok"]]} -> :ok
+        {:error, _reason} = error -> error
+        other -> {:error, {:integrity_check, other}}
+      end
+    else
+      :ok
+    end
   end
 
   defp load_extension(conn, path) do
