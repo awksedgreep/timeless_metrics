@@ -328,10 +328,6 @@ defmodule TimelessMetrics.ReleaseStartup do
               {:error, reason} ->
                 {:state, :corruption,
                  %{error: "cannot validate metrics.db: #{inspect(reason)}", path: path}}
-
-              other ->
-                {:state, :corruption,
-                 %{error: "invalid metrics.db: #{inspect(other)}", path: path}}
             end
           after
             Exqlite.Sqlite3.close(conn)
@@ -432,10 +428,6 @@ defmodule TimelessMetrics.ReleaseStartup do
                    error: "cannot validate #{role} metrics database: #{inspect(reason)}",
                    path: path
                  }}
-
-              other ->
-                {:state, :corruption,
-                 %{error: "invalid #{role} metrics database: #{inspect(other)}", path: path}}
             end
           after
             Exqlite.Sqlite3.close(conn)
