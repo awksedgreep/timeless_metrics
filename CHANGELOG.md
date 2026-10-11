@@ -1,5 +1,16 @@
 # Changelog
 
+## 6.6.9 (2026-10-11)
+
+**Release startup no longer opens the whole store before the data plane
+starts.** `ReleaseStartup.prepare/2` ran `PRAGMA integrity_check` with the
+extension loaded, which connects the metrics virtual table and so reads
+every series and chunk into memory, and `stats/2` then ran the whole
+detection again. The pragma now runs before the extension is loaded (the
+virtual table has no integrity hook of its own, so the same pages are
+checked), and `stats/2` skips it. On a 3.1 GB store of 702,000 series,
+`prepare/2` plus `stats/2` took 24.6 s and now take 2.65 s (#19).
+
 ## 6.6.8 (2026-10-04)
 
 **The bundled timeless-libsql extension moves from v0.8.3 to v0.8.9.** No
